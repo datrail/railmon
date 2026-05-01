@@ -33,6 +33,8 @@ from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+from runtime_interaction import to_runtime_interaction
+
 SSLSNIFF_PATH = str(
     Path(__file__).resolve().parent.parent
     / "third_party"
@@ -403,12 +405,23 @@ class SslCollector:
             if proc.poll() is None:
                 proc.terminate()
 
+    def _format_http_interaction(self, interaction: dict, output_format: str) -> dict:
+        if output_format == "runtime-interaction":
+            return to_runtime_interaction(
+                interaction,
+                session_id=self.session_id,
+                capture_start=self.capture_start,
+            )
+        return interaction
+
     def run_http(self, webhook_url: Optional[str], output_file: Optional[str],
-                 batch_size: int = 5, flush_interval: float = 3.0):
+                 batch_size: int = 5, flush_interval: float = 3.0,
+                 output_format: str = "legacy-http"):
         """Run sslsniff, parse HTTP, and forward interactions."""
         cmd = self._build_cmd()
         print(f"[collector] Starting (HTTP mode): {' '.join(cmd)}", file=sys.stderr)
         print(f"[collector] Session: {self.session_id}", file=sys.stderr)
+        print(f"[collector] Output format: {output_format}", file=sys.stderr)
 
         out_f = open(output_file, "a") if output_file else None
         # Track pending requests by (pid, tid) — use FIFO queue to handle
@@ -420,6 +433,14 @@ class SslCollector:
         active_streams: dict[tuple[int, int], dict] = {}
         batch: list[dict] = []
         last_flush = time.time()
+
+        def _emit_interaction(interaction: dict):
+            emitted = self._format_http_interaction(interaction, output_format)
+            if out_f:
+                out_f.write(json.dumps(emitted, default=str) + "\n")
+                out_f.flush()
+            batch.append(emitted)
+            self._print_interaction(interaction)
 
         def _finalize_stream(key: tuple[int, int]):
             """Finalize an active SSE stream and add to batch."""
@@ -433,11 +454,7 @@ class SslCollector:
                 resp["is_sse"] = True
             resp.pop("_raw_body", None)
 
-            if out_f:
-                out_f.write(json.dumps(interaction, default=str) + "\n")
-                out_f.flush()
-            batch.append(interaction)
-            self._print_interaction(interaction)
+            _emit_interaction(interaction)
 
         try:
             proc = subprocess.Popen(
@@ -516,11 +533,7 @@ class SslCollector:
                             resp["body"] = ""  # will be filled on finalize
                             active_streams[key] = interaction
                         else:
-                            if out_f:
-                                out_f.write(json.dumps(interaction, default=str) + "\n")
-                                out_f.flush()
-                            batch.append(interaction)
-                            self._print_interaction(interaction)
+                            _emit_interaction(interaction)
 
                 now = time.time()
                 if len(batch) >= batch_size or (now - last_flush) >= flush_interval:
@@ -635,6 +648,15 @@ def main():
         default=None,
         help="Agent version string (e.g. 2.1.61). Auto-detected from binary path if not set.",
     )
+    parser.add_argument(
+        "--output-format",
+        choices=["legacy-http", "runtime-interaction"],
+        default="legacy-http",
+        help=(
+            "HTTP output schema. legacy-http preserves existing RailMon JSONL; "
+            "runtime-interaction emits Rail Center /v1/interactions events."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -676,7 +698,13 @@ def main():
     if args.mode == "raw":
         collector.run_raw(args.webhook, args.output, args.batch_size, args.flush_interval)
     else:
-        collector.run_http(args.webhook, args.output, args.batch_size, args.flush_interval)
+        collector.run_http(
+            args.webhook,
+            args.output,
+            args.batch_size,
+            args.flush_interval,
+            args.output_format,
+        )
 
 
 if __name__ == "__main__":
