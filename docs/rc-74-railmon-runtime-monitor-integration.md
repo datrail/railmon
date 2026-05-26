@@ -14,7 +14,7 @@ events locally, and forwards them to Rail Center.
 
 ## Status
 
-Implemented and pushed on `datrail-agent-monitor` `main`.
+Implemented and pushed on `datrail-agent-monitor` `master`.
 
 Code:
 
