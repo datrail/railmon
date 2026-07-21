@@ -4,12 +4,13 @@ RC-58 defines the standard output format that RailMon emits for Rail Center.
 The output must match the `RuntimeInteractionInput` payload accepted by Rail
 Center `POST /v1/interactions`.
 
-This document only covers RailMon formatting. RailCollector forwarding is
-covered by `rail-guardian/rail-collector/README.md` and RC-43.
+This document only covers RailMon formatting. RailCollector forwarding moved
+to the standalone `railscan` repository during the component split.
 
 ## Status
 
-Implemented in `datrail-agent-monitor`.
+Implemented in this `railmon` repository; history was split from
+`datrail-agent-monitor`.
 
 Code:
 

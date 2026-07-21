@@ -35,12 +35,14 @@ from urllib.error import URLError
 
 from runtime_interaction import to_runtime_interaction
 
-SSLSNIFF_PATH = str(
-    Path(__file__).resolve().parent.parent
-    / "third_party"
-    / "agentsight"
-    / "bpf"
-    / "sslsniff"
+SSLSNIFF_PATH = os.environ.get(
+    "SSLSNIFF_PATH",
+    str(
+        Path(__file__).resolve().parent.parent
+        / "ebpf-tls-tap"
+        / "bpf"
+        / "sslsniff"
+    ),
 )
 
 # ─── HTTP Parsing ───────────────────────────────────────────────────────────

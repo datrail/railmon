@@ -7,14 +7,13 @@ to Rail Center's Runtime Monitor ingestion endpoint:
 POST /v1/interactions
 ```
 
-The integration is implemented in `datrail-agent-monitor` by running
-RailCollector beside RailMon. RailMon captures runtime HTTP interactions and
-writes RuntimeInteraction JSONL. RailCollector follows that JSONL file, spools
-events locally, and forwards them to Rail Center.
+The integration was originally implemented in `datrail-agent-monitor` by
+running RailCollector beside RailMon. After the repository split, RailMon owns
+capture and JSONL output while RailCollector lives in `railscan`.
 
 ## Status
 
-Implemented and pushed on `datrail-agent-monitor` `master`.
+Implemented across the standalone `railmon` and `railscan` repositories.
 
 Code:
 
