@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang llvm gcc libelf-dev zlib1g-dev make \
+    clang llvm gcc libelf-dev libssl-dev zlib1g-dev make \
     && rm -rf /var/lib/apt/lists/*
 
 COPY ebpf-tls-tap/ /build/ebpf-tls-tap/
