@@ -7,8 +7,8 @@ or Rail Center `RuntimeInteraction` events.
 
 ## Dependency model
 
-RailMon uses a prebuilt **AgentSight** binary and runs `agentsight debug ssl` as
-a subprocess. Download it directly (no eBPF source tree or git submodule):
+RailMon **runs** a prebuilt [AgentSight](https://github.com/eunomia-bpf/agentsight)
+binary (`agentsight debug ssl`). Download it directly:
 
 ```bash
 mkdir -p bin
@@ -18,7 +18,11 @@ chmod +x bin/agentsight
 # or: make fetch-agentsight
 ```
 
-Point `AGENTSIGHT_PATH` / `--agentsight` at another binary if you already have one.
+`ebpf-tls-tap` is checked in as a **git submodule** for reference / optional
+local sslsniff builds. The collector does **not** invoke it by default; point
+`AGENTSIGHT_PATH` / `--agentsight` at `ebpf-tls-tap/bpf/sslsniff` only if you
+intentionally want the bare binary.
+
 
 ## Run
 

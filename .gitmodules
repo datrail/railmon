@@ -1,0 +1,3 @@
+[submodule "ebpf-tls-tap"]
+	path = ebpf-tls-tap
+	url = https://github.com/datrail/ebpf-tls-tap.git
