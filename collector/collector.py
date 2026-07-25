@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-eBPF SSL Collector — wraps sslsniff, parses HTTP, and forwards to webhook.
+eBPF SSL Collector — wraps AgentSight (`debug ssl`), parses HTTP, and forwards.
 
 Usage:
     # Forward raw SSL events to webhook
@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import binascii
 import json
 import os
 import re
@@ -35,15 +36,49 @@ from urllib.error import URLError
 
 from runtime_interaction import to_runtime_interaction
 
-SSLSNIFF_PATH = os.environ.get(
-    "SSLSNIFF_PATH",
-    str(
-        Path(__file__).resolve().parent.parent
-        / "ebpf-tls-tap"
-        / "bpf"
-        / "sslsniff"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+AGENTSIGHT_PATH = os.environ.get(
+    "AGENTSIGHT_PATH",
+    os.environ.get(
+        "SSLSNIFF_PATH",  # back-compat: older env name
+        str(_REPO_ROOT / "bin" / "agentsight"),
     ),
 )
+
+
+def normalize_ssl_event(event: dict) -> Optional[dict]:
+    """Normalize AgentSight or bare sslsniff JSON into a flat SSL event.
+
+    AgentSight `debug ssl` wraps each sslsniff event as::
+
+        {"source": "ssl", "data": { ...sslsniff fields... }, "pid": ..., ...}
+
+    Returns None for non-SSL / non-event lines.
+    """
+    if not isinstance(event, dict):
+        return None
+
+    # Unwrap AgentSight envelope
+    if event.get("source") == "ssl" and isinstance(event.get("data"), dict):
+        event = event["data"]
+    elif "function" not in event and isinstance(event.get("data"), dict):
+        # Defensive: some builds nest without source
+        nested = event["data"]
+        if "function" in nested or "data" in nested:
+            event = nested
+
+    if "function" not in event and event.get("data") is None:
+        return None
+
+    out = dict(event)
+    data = out.get("data")
+    if isinstance(data, str) and data.startswith("HEX:"):
+        try:
+            raw = binascii.unhexlify(data[4:])
+            out["data"] = raw.decode("latin-1", errors="replace")
+        except (binascii.Error, ValueError):
+            pass
+    return out
 
 # ─── HTTP Parsing ───────────────────────────────────────────────────────────
 
@@ -312,14 +347,16 @@ def send_to_webhook(url: str, payload: dict) -> bool:
 class SslCollector:
     def __init__(
         self,
-        sslsniff_path: str = SSLSNIFF_PATH,
+        agentsight_path: str = AGENTSIGHT_PATH,
         binary_path: Optional[str] = None,
         pid: Optional[int] = None,
         uid: Optional[int] = None,
         comm: Optional[str] = None,
         agent_version: Optional[str] = None,
+        # Back-compat alias
+        sslsniff_path: Optional[str] = None,
     ):
-        self.sslsniff_path = sslsniff_path
+        self.agentsight_path = sslsniff_path or agentsight_path
         self.binary_path = binary_path
         self.pid = pid
         self.uid = uid
@@ -341,21 +378,45 @@ class SslCollector:
         }
 
     def _build_cmd(self) -> list[str]:
-        cmd = [self.sslsniff_path]
+        """Build AgentSight capture command (or bare sslsniff if pointed there)."""
+        path = self.agentsight_path
+        name = Path(path).name
+
+        # Bare sslsniff binary: keep historical CLI.
+        if name == "sslsniff":
+            cmd = [path]
+            if self.binary_path:
+                cmd.extend(["--binary-path", self.binary_path])
+            if self.pid:
+                cmd.extend(["--pid", str(self.pid)])
+            if self.uid:
+                cmd.extend(["--uid", str(self.uid)])
+            if self.comm and not self.binary_path:
+                cmd.extend(["--comm", self.comm])
+            return cmd
+
+        # Default: agentsight debug ssl (JSONL SSL events on stdout).
+        cmd = [path, "debug", "ssl"]
         if self.binary_path:
             cmd.extend(["--binary-path", self.binary_path])
+
+        # sslsniff-style filters go after --
+        ssl_args: list[str] = []
         if self.pid:
-            cmd.extend(["--pid", str(self.pid)])
+            ssl_args.extend(["-p", str(self.pid)])
         if self.uid:
-            cmd.extend(["--uid", str(self.uid)])
+            ssl_args.extend(["-u", str(self.uid)])
         if self.comm and not self.binary_path:
             # --comm doesn't work well with --binary-path (thread name issue)
-            cmd.extend(["--comm", self.comm])
+            ssl_args.extend(["-c", self.comm])
+        if ssl_args:
+            cmd.append("--")
+            cmd.extend(ssl_args)
         return cmd
 
     def run_raw(self, webhook_url: Optional[str], output_file: Optional[str],
                 batch_size: int = 10, flush_interval: float = 2.0):
-        """Run sslsniff and forward raw events."""
+        """Run AgentSight SSL stream and forward raw events."""
         cmd = self._build_cmd()
         print(f"[collector] Starting: {' '.join(cmd)}", file=sys.stderr)
         print(f"[collector] Session: {self.session_id}", file=sys.stderr)
@@ -363,6 +424,7 @@ class SslCollector:
         out_f = open(output_file, "a") if output_file else None
         batch: list[dict] = []
         last_flush = time.time()
+        proc = None
 
         try:
             proc = subprocess.Popen(
@@ -374,13 +436,16 @@ class SslCollector:
                 if not line:
                     continue
                 try:
-                    event = json.loads(line)
+                    parsed = json.loads(line)
                 except json.JSONDecodeError:
-                    print(f"[collector] Skip non-JSON: {line[:80]}", file=sys.stderr)
+                    # AgentSight prints human banners; ignore non-JSON lines.
+                    continue
+                event = normalize_ssl_event(parsed)
+                if not event:
                     continue
 
                 if out_f:
-                    out_f.write(line + "\n")
+                    out_f.write(json.dumps(event, default=str) + "\n")
                     out_f.flush()
 
                 batch.append(event)
@@ -404,7 +469,7 @@ class SslCollector:
                 send_to_webhook(webhook_url, {**self._batch_metadata("raw"), "events": batch})
             if out_f:
                 out_f.close()
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 proc.terminate()
 
     def _format_http_interaction(self, interaction: dict, output_format: str) -> dict:
@@ -419,7 +484,7 @@ class SslCollector:
     def run_http(self, webhook_url: Optional[str], output_file: Optional[str],
                  batch_size: int = 5, flush_interval: float = 3.0,
                  output_format: str = "legacy-http"):
-        """Run sslsniff, parse HTTP, and forward interactions."""
+        """Run AgentSight SSL stream, parse HTTP, and forward interactions."""
         cmd = self._build_cmd()
         print(f"[collector] Starting (HTTP mode): {' '.join(cmd)}", file=sys.stderr)
         print(f"[collector] Session: {self.session_id}", file=sys.stderr)
@@ -468,8 +533,11 @@ class SslCollector:
                 if not line:
                     continue
                 try:
-                    event = json.loads(line)
+                    parsed = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                event = normalize_ssl_event(parsed)
+                if not event:
                     continue
 
                 if event.get("is_handshake"):
@@ -622,10 +690,12 @@ def main():
     parser.add_argument("--uid", type=int, default=None, help="Filter by UID")
     parser.add_argument("--comm", type=str, default=None, help="Filter by process name")
     parser.add_argument(
+        "--agentsight",
         "--sslsniff",
+        dest="agentsight",
         type=str,
-        default=SSLSNIFF_PATH,
-        help=f"Path to sslsniff binary (default: {SSLSNIFF_PATH})",
+        default=AGENTSIGHT_PATH,
+        help=f"Path to agentsight (or bare sslsniff) binary (default: {AGENTSIGHT_PATH})",
     )
     parser.add_argument(
         "--batch-size",
@@ -677,10 +747,13 @@ def main():
         else:
             print("[collector] Could not auto-detect Claude binary", file=sys.stderr)
 
-    # Verify sslsniff exists
-    sslsniff = args.sslsniff
-    if not Path(sslsniff).exists():
-        print(f"[collector] Error: sslsniff not found at {sslsniff}", file=sys.stderr)
+    agentsight = args.agentsight
+    if not Path(agentsight).exists():
+        print(
+            f"[collector] Error: agentsight not found at {agentsight}\n"
+            f"  Run: make fetch-agentsight",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Auto-detect agent version from binary path
@@ -689,7 +762,7 @@ def main():
         agent_version = Path(binary_path).name  # e.g. "2.1.61"
 
     collector = SslCollector(
-        sslsniff_path=sslsniff,
+        agentsight_path=agentsight,
         binary_path=binary_path,
         pid=args.pid,
         uid=args.uid,

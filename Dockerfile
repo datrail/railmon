@@ -1,24 +1,20 @@
-FROM debian:bookworm-slim AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang llvm gcc libelf-dev libssl-dev zlib1g-dev make \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY ebpf-tls-tap/ /build/ebpf-tls-tap/
-WORKDIR /build/ebpf-tls-tap/bpf
-RUN make sslsniff
-
 FROM debian:bookworm-slim
 
+ARG AGENTSIGHT_VERSION=v0.2.65
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 libelf1 zlib1g ca-certificates \
+    python3 ca-certificates curl libelf1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/ebpf-tls-tap/bpf/sslsniff /usr/local/bin/sslsniff
+# Prebuilt AgentSight release (embeds sslsniff eBPF probes).
+RUN curl -fsSL -o /usr/local/bin/agentsight \
+      "https://github.com/eunomia-bpf/agentsight/releases/download/${AGENTSIGHT_VERSION}/agentsight" \
+    && chmod +x /usr/local/bin/agentsight
+
 COPY collector/ /opt/railmon/
 RUN chmod +x /opt/railmon/entrypoint.sh
 
 WORKDIR /opt/railmon
-ENV SSLSNIFF_PATH=/usr/local/bin/sslsniff
+ENV AGENTSIGHT_PATH=/usr/local/bin/agentsight
 ENTRYPOINT ["/opt/railmon/entrypoint.sh"]
 CMD ["--help"]

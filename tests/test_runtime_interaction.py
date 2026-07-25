@@ -1,8 +1,12 @@
 import base64
 import json
+import sys
 import unittest
+from pathlib import Path
 
-from collector.runtime_interaction import to_runtime_interaction
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "collector"))
+
+from runtime_interaction import to_runtime_interaction  # noqa: E402
 
 
 class RuntimeInteractionTest(unittest.TestCase):

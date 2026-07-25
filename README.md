@@ -1,24 +1,24 @@
 # RailMon
 
-RailMon captures decrypted TLS traffic from AI-agent processes with
-`ebpf-tls-tap`, parses HTTP request/response pairs, redacts common credential
-headers, and emits JSON Lines or Rail Center `RuntimeInteraction` events.
+RailMon captures decrypted TLS traffic from AI-agent processes using
+[AgentSight](https://github.com/eunomia-bpf/agentsight), parses HTTP
+request/response pairs, redacts common credential headers, and emits JSON Lines
+or Rail Center `RuntimeInteraction` events.
 
 ## Dependency model
 
-`ebpf-tls-tap` is pinned as a git submodule. At runtime its `sslsniff` binary is
-a RailMon subprocess. Clone recursively so the eBPF source and its nested
-`libbpf`/`bpftool` dependencies are present:
+RailMon downloads a pinned **AgentSight** release binary (`bin/agentsight`) and
+runs `agentsight debug ssl` as a subprocess. No eBPF source tree or git submodule
+is required.
 
 ```bash
-git clone --recursive https://github.com/railxia/railmon.git
+git clone https://github.com/datrail/railmon.git
 cd railmon
-make build-ebpf
+make fetch-agentsight
 ```
 
-This commit pin is the initial reproducible integration contract. Publishing
-signed multi-architecture eBPF release artifacts can replace it later without
-folding the two repositories back together.
+Override the pin with `AGENTSIGHT_VERSION=vX.Y.Z make fetch-agentsight`, or point
+`AGENTSIGHT_PATH` / `--agentsight` at an existing binary.
 
 ## Run
 
@@ -39,14 +39,13 @@ sudo python3 collector/collector.py \
   --output runtime-interactions.jsonl
 ```
 
-Use `--sslsniff /path/to/sslsniff` or `SSLSNIFF_PATH` to override the pinned
-binary. See `python3 collector/collector.py --help` and [docs/](docs/) for the
-full capture and output contract.
+Use `--agentsight /path/to/agentsight` or `AGENTSIGHT_PATH` to override the
+downloaded binary. See `python3 collector/collector.py --help` and [docs/](docs/)
+for the full capture and output contract.
 
 ## Docker
 
 ```bash
-git submodule update --init --recursive
 docker build -t railmon .
 docker run --rm --privileged --pid=host -v /sys:/sys:ro railmon \
   --mode http --binary-path /proc/1/exe
@@ -64,5 +63,5 @@ make test
 
 ## License
 
-RailMon's Python code is MIT; see [LICENSE](LICENSE). The eBPF submodule has
-additional file-level license terms documented in its own repository.
+RailMon's Python code is MIT; see [LICENSE](LICENSE). AgentSight is a separate
+upstream project with its own license terms.
