@@ -1,25 +1,18 @@
 # RailMon
 
-RailMon captures decrypted TLS traffic from AI-agent processes using
-[AgentSight](https://github.com/eunomia-bpf/agentsight), parses HTTP
+RailMon captures decrypted TLS traffic from AI-agent processes, parses HTTP
 request/response pairs, redacts common credential headers, and emits JSON Lines
 or Rail Center `RuntimeInteraction` events.
 
-## Dependency model
-
-Download the [AgentSight](https://github.com/eunomia-bpf/agentsight) binary:
+## Build
 
 ```bash
-mkdir -p bin
-curl -fsSL -o bin/agentsight \
-  https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight
-chmod +x bin/agentsight
-# or: make fetch-agentsight
+make fetch-agentsight
 ```
 
 ## Run
 
-Capture to a local file (root or equivalent eBPF capabilities are required):
+Capture requires root or equivalent eBPF capabilities:
 
 ```bash
 sudo python3 collector/collector.py \
@@ -59,5 +52,6 @@ make test
 
 ## License
 
-RailMon's Python code is MIT; see [LICENSE](LICENSE). AgentSight is a separate
-upstream project with its own license terms.
+MIT; see [LICENSE](LICENSE).
+
+Using [AgentSight](https://github.com/eunomia-bpf/agentsight).
