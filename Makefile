@@ -1,19 +1,24 @@
 .PHONY: fetch-agentsight build-ebpf test docker clean
 
-AGENTSIGHT_VERSION ?= v0.2.65
+AGENTSIGHT_URL ?= https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight
 AGENTSIGHT_BIN := bin/agentsight
 
+# Direct download of the agentsight release binary (no build, no submodule).
 fetch-agentsight:
-	AGENTSIGHT_VERSION=$(AGENTSIGHT_VERSION) ./scripts/fetch-agentsight.sh
+	mkdir -p bin
+	curl -fsSL -o $(AGENTSIGHT_BIN) $(AGENTSIGHT_URL)
+	chmod +x $(AGENTSIGHT_BIN)
+	$(AGENTSIGHT_BIN) --version
 
-# Back-compat alias: eBPF capture now comes from AgentSight releases.
+# Back-compat alias.
 build-ebpf: fetch-agentsight
 
-test: fetch-agentsight
+test:
+	@test -x $(AGENTSIGHT_BIN) || $(MAKE) fetch-agentsight
 	python3 -m py_compile collector/collector.py collector/runtime_interaction.py
 	python3 -m unittest discover -s tests -v
 
-docker: fetch-agentsight
+docker:
 	docker build -t railmon .
 
 clean:

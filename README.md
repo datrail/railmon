@@ -7,18 +7,18 @@ or Rail Center `RuntimeInteraction` events.
 
 ## Dependency model
 
-RailMon downloads a pinned **AgentSight** release binary (`bin/agentsight`) and
-runs `agentsight debug ssl` as a subprocess. No eBPF source tree or git submodule
-is required.
+RailMon uses a prebuilt **AgentSight** binary and runs `agentsight debug ssl` as
+a subprocess. Download it directly (no eBPF source tree or git submodule):
 
 ```bash
-git clone https://github.com/datrail/railmon.git
-cd railmon
-make fetch-agentsight
+mkdir -p bin
+curl -fsSL -o bin/agentsight \
+  https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight
+chmod +x bin/agentsight
+# or: make fetch-agentsight
 ```
 
-Override the pin with `AGENTSIGHT_VERSION=vX.Y.Z make fetch-agentsight`, or point
-`AGENTSIGHT_PATH` / `--agentsight` at an existing binary.
+Point `AGENTSIGHT_PATH` / `--agentsight` at another binary if you already have one.
 
 ## Run
 
@@ -39,9 +39,8 @@ sudo python3 collector/collector.py \
   --output runtime-interactions.jsonl
 ```
 
-Use `--agentsight /path/to/agentsight` or `AGENTSIGHT_PATH` to override the
-downloaded binary. See `python3 collector/collector.py --help` and [docs/](docs/)
-for the full capture and output contract.
+See `python3 collector/collector.py --help` and [docs/](docs/) for the full
+capture and output contract.
 
 ## Docker
 
