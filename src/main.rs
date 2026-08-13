@@ -125,8 +125,11 @@ async fn main() -> Result<()> {
     // Clamped once, here: Duration::from_secs_f64 panics on a negative or NaN,
     // and the flag is user-supplied. The Python treated a negative interval as
     // "flush every event", which is what a floor of zero gives.
+    // Clamped at both ends. is_finite() alone lets 1e30 through, and
+    // Duration::from_secs_f64 panics above ~1.8e19; a NaN or a negative panics
+    // too. An hour is well past any sensible flush cadence.
     let flush_interval = Duration::from_secs_f64(if args.flush_interval.is_finite() {
-        args.flush_interval.max(0.0)
+        args.flush_interval.clamp(0.0, 3600.0)
     } else {
         2.0
     });
@@ -156,9 +159,10 @@ async fn main() -> Result<()> {
     };
 
     log::info!("session {session_id}, agentsight at {}", agentsight);
-    let mut stream = pipeline::event_stream(&agentsight, &filters).await?;
+    let (mut stream, stream_status) = pipeline::event_stream(&agentsight, &filters).await?;
 
     let mut pairer = Pairer::new();
+    let mut write_error: Option<anyhow::Error> = None;
     let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -192,7 +196,11 @@ async fn main() -> Result<()> {
                 // only after the buffer has been flushed.
                 if let Some(value) = emitted {
                     if let Err(error) = sink.emit(&value).await {
+                        // Break rather than `?`: returning here would skip
+                        // shutdown() and drop the buffered batch. The error is
+                        // carried out and surfaced after the flush.
                         log::error!("writing interaction: {error}");
+                        write_error = Some(error);
                         break;
                     }
                 }
@@ -215,5 +223,21 @@ async fn main() -> Result<()> {
         // large number of them means the pairing key is wrong for this agent.
         log::info!("{outstanding} request(s) had no response at exit");
     }
-    Ok(())
+
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+
+    // Attaching an eBPF probe is the common runtime failure here — it needs
+    // CAP_BPF and a matching kernel. Exiting 0 after it fails makes Docker,
+    // systemd and k8s all read the collector as healthy, so nothing restarts
+    // and nothing alerts. Report the probe's own status instead.
+    match stream_status.await {
+        Ok(Some(status)) if !status.success() => {
+            anyhow::bail!("probe exited with {status}")
+        }
+        // A dropped sender means we left the loop before the probe's output
+        // ended — ctrl_c, or a write error already reported. Not a failure.
+        _ => Ok(()),
+    }
 }

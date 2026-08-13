@@ -8,7 +8,7 @@
 //! attributing the result.
 
 use agentsight_capture::analyzers::{
-    Analyzer, AuthHeaderRemover, HTTPDecompressor, HTTPParser, SSEProcessor,
+    Analyzer, AuthHeaderRemover, HTTPDecompressor, HTTPParser, TimestampNormalizer,
 };
 use agentsight_capture::runners::EventStream;
 use agentsight_capture::Event;
@@ -150,8 +150,16 @@ fn decode_hex_latin1(hexed: &str) -> Option<String> {
     Some(out)
 }
 
-/// Spawn the probe and return a stream of analyzed events.
-pub async fn event_stream(agentsight_path: &str, filters: &CaptureFilters) -> Result<EventStream> {
+/// The probe's exit status, resolved once its output ends.
+pub type ProbeStatus = tokio::sync::oneshot::Receiver<Option<std::process::ExitStatus>>;
+
+/// Spawn the probe and return a stream of analyzed events, plus a handle to the
+/// probe's exit status so the caller can tell "captured nothing because the
+/// agent was idle" from "captured nothing because the probe could not attach".
+pub async fn event_stream(
+    agentsight_path: &str,
+    filters: &CaptureFilters,
+) -> Result<(EventStream, ProbeStatus)> {
     let cmd = build_command(agentsight_path, filters);
     log::info!("starting: {}", cmd.join(" "));
 
@@ -171,24 +179,37 @@ pub async fn event_stream(agentsight_path: &str, filters: &CaptureFilters) -> Re
         .context("probe produced no stdout pipe")?;
     let lines = BufReader::new(stdout).lines();
 
+    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+
     // The child rides in the stream's state, so it lives exactly as long as the
-    // capture and `kill_on_drop` stops it when the stream is dropped.
-    let raw = stream::unfold((lines, child), |(mut lines, child)| async move {
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if let Some(event) = ssl_event_from_line(&line) {
-                        return Some((event, (lines, child)));
+    // capture and `kill_on_drop` stops it when the stream is dropped. When its
+    // output ends we reap it and publish the exit status.
+    let raw = stream::unfold(
+        (lines, child, Some(status_tx)),
+        |(mut lines, mut child, mut status_tx)| async move {
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        if let Some(tx) = status_tx.take() {
+                            let _ = tx.send(child.wait().await.ok());
+                        }
+                        return None;
                     }
-                }
-                Ok(None) => return None,
-                Err(error) => {
-                    log::warn!("reading probe output: {error}");
-                    return None;
+                    Err(error) => {
+                        log::warn!("reading probe output: {error}");
+                        if let Some(tx) = status_tx.take() {
+                            let _ = tx.send(child.wait().await.ok());
+                        }
+                        return None;
+                    }
+                };
+                if let Some(event) = ssl_event_from_line(&line) {
+                    return Some((event, (lines, child, status_tx)));
                 }
             }
-        }
-    });
+        },
+    );
 
     // Redaction is last: it needs fully reassembled headers, not a fragment
     // that happens not to contain the token yet.
@@ -200,11 +221,24 @@ pub async fn event_stream(agentsight_path: &str, filters: &CaptureFilters) -> Re
     let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
         Box::new(HTTPParser::new().disable_raw_data()),
         Box::new(HTTPDecompressor::new()),
-        Box::new(SSEProcessor::default()),
-        // No TimestampNormalizer. It rewrites the event clock to wall time,
-        // which erases the probe's capture timestamp — the one thing the
-        // interaction's `timestamp` and `latency_ms` are measured from. The
-        // Python chain did not have it either.
+        // No SSEProcessor, deliberately. It is a filter_map: for a streaming
+        // response it swallows the parser's response event and emits its own,
+        // carrying no `message_type` — so the request never pairs, sits in
+        // `pending` for ever, and nothing is written. Since agent traffic to
+        // Anthropic and OpenAI is overwhelmingly `stream: true`, including it
+        // means capturing almost nothing. The Python chain did not use it
+        // either; it treated an SSE response as a response.
+        //
+        // Known limitation, inherited from that choice: a body split across
+        // several SSL reads is recorded from the first fragment only. The
+        // interaction's metadata — destination, status, latency — is complete;
+        // the body may be truncated. Accumulating it is worth its own change.
+        //
+        // TimestampNormalizer is required, not optional: sslsniff timestamps
+        // are `bpf_ktime_get_ns()`, nanoseconds since *boot*, and this is the
+        // only thing converting them to epoch milliseconds. Without it every
+        // interaction is dated 1970 and `interaction_id` hashes that.
+        Box::new(TimestampNormalizer::new()),
         Box::new(AuthHeaderRemover::new()),
     ];
 
@@ -215,7 +249,7 @@ pub async fn event_stream(agentsight_path: &str, filters: &CaptureFilters) -> Re
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    Ok(stream)
+    Ok((stream, status_rx))
 }
 
 /// One line of probe output becomes at most one `Event` the analyzers accept.
@@ -246,8 +280,10 @@ fn ssl_event_from_line(line: &str) -> Option<Event> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
+    // Raw boot-relative nanoseconds, which is the crate's convention on the
+    // way in: TimestampNormalizer later converts the field to epoch ms.
     Some(Event::new_with_timestamp(
-        timestamp_ns / 1_000_000,
+        timestamp_ns,
         "ssl".to_string(),
         pid,
         comm,
@@ -268,7 +304,7 @@ pub struct Pairer {
 }
 
 struct PendingRequest {
-    timestamp_ns: u64,
+    epoch_ms: u64,
     tid: u64,
     request: Value,
     size: usize,
@@ -280,16 +316,14 @@ impl Pairer {
     }
 
     /// Feed one analyzed event. Returns a paired interaction when this event
-    /// completes one. `event_timestamp_ms` is the capture clock, not the wall
-    /// clock: the recorded timestamp has to be when the traffic happened, not
-    /// when we got round to formatting it.
-    pub fn accept(&mut self, pid: u32, data: &Value, event_timestamp_ms: u64) -> Option<Value> {
+    /// completes one.
+    ///
+    /// `epoch_ms` is the event's own clock after normalization — when the
+    /// traffic happened, not when we got round to formatting it. The parsed
+    /// HTTP event carries no timestamp of its own, so this is the only source.
+    pub fn accept(&mut self, pid: u32, data: &Value, epoch_ms: u64) -> Option<Value> {
         let tid = data.get("tid").and_then(Value::as_u64).unwrap_or(0);
         let key = (pid, tid);
-        let timestamp_ns = data
-            .get("timestamp_ns")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| event_timestamp_ms.saturating_mul(1_000_000));
 
         match data.get("message_type").and_then(Value::as_str) {
             Some("request") => {
@@ -297,7 +331,7 @@ impl Pairer {
                     .entry(key)
                     .or_default()
                     .push_back(PendingRequest {
-                        timestamp_ns,
+                        epoch_ms,
                         tid,
                         request: message_body(data),
                         size: body_len(data),
@@ -306,13 +340,11 @@ impl Pairer {
             }
             Some("response") => {
                 let pending = self.pending.get_mut(&key)?.pop_front()?;
-                let latency_ms = timestamp_ns
-                    .checked_sub(pending.timestamp_ns)
-                    .map(|d| d as f64 / 1e6);
+                let latency_ms = epoch_ms.checked_sub(pending.epoch_ms).map(|d| d as f64);
 
                 Some(json!({
-                    "timestamp": ns_to_rfc3339(pending.timestamp_ns),
-                    "timestamp_ns": pending.timestamp_ns,
+                    "timestamp": ms_to_rfc3339(pending.epoch_ms),
+                    "timestamp_ns": pending.epoch_ms.saturating_mul(1_000_000),
                     "pid": pid,
                     "tid": pending.tid,
                     "request": pending.request,
@@ -333,10 +365,10 @@ impl Pairer {
     }
 }
 
-fn ns_to_rfc3339(timestamp_ns: u64) -> Value {
+fn ms_to_rfc3339(epoch_ms: u64) -> Value {
     match chrono::DateTime::from_timestamp(
-        (timestamp_ns / 1_000_000_000) as i64,
-        (timestamp_ns % 1_000_000_000) as u32,
+        (epoch_ms / 1_000) as i64,
+        ((epoch_ms % 1_000) * 1_000_000) as u32,
     ) {
         Some(dt) => Value::String(dt.to_rfc3339()),
         None => Value::Null,
@@ -360,13 +392,46 @@ fn message_body(data: &Value) -> Value {
         ] {
             obj.remove(key);
         }
+        // The upstream allowlist misses the header names Azure OpenAI, Gemini
+        // and forward proxies use, so scrub them here too rather than trusting
+        // one list. Belt and braces on the one thing that must not leak.
+        if let Some(headers) = obj.get_mut("headers").and_then(Value::as_object_mut) {
+            let extra = ["api-key", "x-goog-api-key", "proxy-authorization"];
+            for (key, value) in headers.iter_mut() {
+                if extra.iter().any(|e| key.eq_ignore_ascii_case(e)) {
+                    *value = Value::String("[REDACTED]".into());
+                }
+            }
+        }
     }
+    strip_nul(&mut out);
     out
 }
 
-/// Bytes on the wire, matching the Python's `event["len"]` — headers included,
-/// not just the parsed body, so a recorded size means what it did before.
-/// `total_size` is the crate's name for it.
+/// Rail Center stores the interaction in a Postgres TEXT column, and Postgres
+/// rejects a NUL byte outright. One binary body would otherwise fail the insert
+/// and take the rest of its batch down with it. The Python replaced the whole
+/// body; replacing just the NULs keeps more of it while staying insertable.
+fn strip_nul(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            if s.contains('\0') {
+                *s = s.replace('\0', "\u{fffd}");
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_nul),
+        Value::Object(map) => map.values_mut().for_each(strip_nul),
+        _ => {}
+    }
+}
+
+/// The parsed message's size as the HTTP parser measured it (`total_size`).
+///
+/// Not identical to the Python's `event["len"]`, which was the length of the
+/// SSL write: for a message split across reads the parser's figure covers what
+/// it reassembled, so the two differ. Both fields feed `interaction_id`, so ids
+/// are not comparable with the Python's for the same traffic — the formatter is
+/// faithful, the inputs are not.
 fn body_len(data: &Value) -> usize {
     for key in ["total_size", "len", "size"] {
         if let Some(v) = data.get(key).and_then(Value::as_u64) {
@@ -521,6 +586,40 @@ mod tests {
     }
 
     #[test]
+    fn nul_bytes_never_reach_the_sink() {
+        // Rail Center stores `raw` in a Postgres TEXT column, which rejects
+        // NUL outright — one binary body would fail the insert and take its
+        // whole batch with it.
+        let mut p = Pairer::new();
+        p.accept(1, &req(7, 1_000_000_000), 1000);
+        let mut r = resp(7, 1_100_000_000, 200);
+        r["body"] = json!("ok\u{0}binary");
+        let out = p.accept(1, &r, 1100).unwrap();
+        assert!(!serde_json::to_string(&out).unwrap().contains("\\u0000"));
+    }
+
+    #[test]
+    fn provider_specific_credential_headers_are_scrubbed_too() {
+        // The upstream allowlist covers Authorization and x-api-key but not
+        // these, and they are what Azure OpenAI, Gemini and proxies send.
+        let mut p = Pairer::new();
+        let mut r = req(7, 1_000_000_000);
+        r["headers"] = json!({
+            "api-key": "AZURE-SECRET",
+            "x-goog-api-key": "GEMINI-SECRET",
+            "proxy-authorization": "Basic PROXY-SECRET",
+            "host": "api.anthropic.com"
+        });
+        p.accept(1, &r, 1000);
+        let out = p.accept(1, &resp(7, 1_100_000_000, 200), 1100).unwrap();
+        let text = serde_json::to_string(&out).unwrap();
+        for secret in ["AZURE-SECRET", "GEMINI-SECRET", "PROXY-SECRET"] {
+            assert!(!text.contains(secret), "{secret} survived: {text}");
+        }
+        assert_eq!(out["request"]["headers"]["host"], "api.anthropic.com");
+    }
+
+    #[test]
     fn a_response_pairs_with_the_request_on_its_thread() {
         let mut p = Pairer::new();
         assert!(p.accept(1, &req(7, 1_000_000_000), 1000).is_none());
@@ -533,11 +632,18 @@ mod tests {
     }
 
     #[test]
-    fn the_timestamp_is_the_capture_time_not_the_emission_time() {
+    fn the_timestamp_is_the_events_epoch_clock() {
+        // The previous version of this test asserted a 1970 date and passed,
+        // which is how a broken clock shipped: the probe's timestamps are
+        // nanoseconds since *boot*, and the assertion enshrined the unconverted
+        // value as correct. Pairer now works in epoch milliseconds, which is
+        // what TimestampNormalizer produces.
         let mut p = Pairer::new();
-        p.accept(1, &req(7, 1_000_000_000), 1000);
-        let out = p.accept(1, &resp(7, 1_500_000_000, 200), 1500).unwrap();
-        assert_eq!(out["timestamp"], "1970-01-01T00:00:01+00:00");
+        let t0 = 1_786_600_000_000u64; // 2026-08-13, epoch ms
+        p.accept(1, &req(7, 0), t0);
+        let out = p.accept(1, &resp(7, 0, 200), t0 + 500).unwrap();
+        assert_eq!(out["timestamp"], "2026-08-13T05:46:40+00:00");
+        assert_eq!(out["latency_ms"], 500.0);
     }
 
     #[test]
