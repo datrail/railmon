@@ -27,9 +27,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Tracked, not pinned. AgentSight moves with us and a stale tap sees nothing —
 # the same decision the Cargo dependency makes with a caret requirement.
-RUN curl -fsSL -o /usr/local/bin/agentsight \
-      https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight \
-    && chmod +x /usr/local/bin/agentsight
+#
+# Upstream publishes an x86-64 release binary only, and the URL carries no
+# architecture, so curl happily succeeds on arm64 and installs a binary that
+# cannot exec. Guarded rather than downloaded blindly: an arm64 image is short a
+# probe, which fails honestly, instead of shipping something that builds and
+# then dies at runtime. RailScan's Dockerfile makes the same call.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      curl -fsSL -o /usr/local/bin/agentsight \
+        https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight \
+      && chmod +x /usr/local/bin/agentsight; \
+    else \
+      echo "no AgentSight release for ${TARGETARCH:-this architecture}; skipping" >&2; \
+    fi
 
 COPY --from=build /src/target/release/railmon /usr/local/bin/railmon
 

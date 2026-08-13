@@ -70,23 +70,35 @@ fn path_and_destination(request: Option<&Value>) -> (String, String) {
         .unwrap_or("/")
         .to_string();
 
-    // An absolute-form request target carries its own authority; that wins over
-    // the Host header, which is what urlsplit gives the Python version.
-    if let Some((scheme_end, _)) = raw_path.find("://").map(|i| (i, ())) {
-        let after = &raw_path[scheme_end + 3..];
-        if !after.is_empty() {
+    // Only an absolute-form target supplies its own authority, and only when
+    // the scheme is at the very start. Scanning for "://" anywhere lets the
+    // monitored process choose what gets recorded: an ordinary OAuth
+    // `?redirect_uri=https://evil.com/x` would otherwise be logged as a call to
+    // evil.com. Python's urlsplit requires the leading scheme; so does this.
+    if let Some((scheme, after)) = raw_path.split_once("://") {
+        let is_scheme = !scheme.is_empty()
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if is_scheme && !after.is_empty() {
             let (netloc, rest) = match after.find(['/', '?', '#']) {
                 Some(i) => (&after[..i], &after[i..]),
                 None => (after, ""),
             };
             if !netloc.is_empty() {
+                // urlsplit yields an empty path for `https://host?q=1`, and
+                // the Python then substitutes "/" before re-attaching the
+                // query — so the result is "/?q=1", not "?q=1".
                 let rest_no_frag = rest.split('#').next().unwrap_or("");
                 let path = if rest_no_frag.is_empty() {
-                    "/"
+                    "/".to_string()
+                } else if let Some(query) = rest_no_frag.strip_prefix('?') {
+                    format!("/?{query}")
                 } else {
-                    rest_no_frag
+                    rest_no_frag.to_string()
                 };
-                return (path.to_string(), netloc.to_string());
+                return (path, netloc.to_string());
             }
         }
     }
@@ -140,8 +152,15 @@ fn agent_id_from_x_rail(x_rail: Option<&str>) -> Option<String> {
 }
 
 /// sha256 over a canonical JSON seed. `serde_json::Map` is a BTreeMap, so keys
-/// are sorted and the encoding is compact — the same bytes Python's
-/// `sort_keys=True, separators=(",",":")` produces.
+/// are sorted and the encoding is compact, matching Python's
+/// `sort_keys=True, separators=(",",":")`.
+///
+/// The seed is then escaped to pure ASCII, because Python's `json.dumps`
+/// defaults to `ensure_ascii=True` and serde_json emits raw UTF-8. Without
+/// that step a session id or path containing any non-ASCII character hashes
+/// differently in the two implementations — `session_id="café"` gives Python
+/// `12d2a3bc…` and raw UTF-8 `3ac5f451…` — and the ids silently stop
+/// correlating for exactly the agents whose traffic is not plain ASCII.
 fn interaction_id(
     interaction: &Value,
     session_id: Option<&str>,
@@ -164,8 +183,29 @@ fn interaction_id(
     seed.insert("response_size".into(), field(interaction, "response_size"));
 
     let encoded = serde_json::to_string(&Value::Object(seed)).unwrap_or_default();
-    let digest = Sha256::digest(encoded.as_bytes());
+    let digest = Sha256::digest(ensure_ascii(&encoded).as_bytes());
     format!("railmon-{}", &hex(&digest)[..40])
+}
+
+/// Escape every non-ASCII character as `\uXXXX`, the way Python's
+/// `json.dumps(..., ensure_ascii=True)` does. Characters outside the basic
+/// multilingual plane become a surrogate pair, which is also what Python emits.
+fn ensure_ascii(encoded: &str) -> String {
+    if encoded.is_ascii() {
+        return encoded.to_string();
+    }
+    let mut out = String::with_capacity(encoded.len());
+    for ch in encoded.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            let mut buf = [0u16; 2];
+            for unit in ch.encode_utf16(&mut buf) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
 }
 
 fn field(interaction: &Value, key: &str) -> Value {
@@ -238,6 +278,47 @@ mod tests {
         assert_eq!(out["request"]["destination"], "api.anthropic.com");
         assert_eq!(out["request"]["path"], "/v1/messages");
         assert_eq!(out["response"]["status"], 200);
+    }
+
+    #[test]
+    fn a_scheme_inside_a_query_cannot_choose_the_destination() {
+        // The monitored process must not get to pick what we record. Values
+        // taken from the Python: an OAuth redirect_uri leaves both fields alone.
+        for (path, want_path, want_dest) in [
+            (
+                "/oauth/callback?redirect=https://evil.com/x",
+                "/oauth/callback?redirect=https://evil.com/x",
+                "api.anthropic.com",
+            ),
+            ("/a?b=c://d", "/a?b=c://d", "api.anthropic.com"),
+        ] {
+            let mut v = sample();
+            v["request"]["path"] = json!(path);
+            let out = to_runtime_interaction(&v, None, None, "railmon");
+            assert_eq!(out["request"]["path"], want_path, "path for {path}");
+            assert_eq!(out["request"]["destination"], want_dest, "dest for {path}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_target_with_only_a_query_keeps_the_root_path() {
+        let mut v = sample();
+        v["request"]["path"] = json!("https://host?q=1");
+        let out = to_runtime_interaction(&v, None, None, "railmon");
+        assert_eq!(out["request"]["path"], "/?q=1");
+        assert_eq!(out["request"]["destination"], "host");
+    }
+
+    #[test]
+    fn the_id_matches_python_for_non_ascii_input() {
+        // Values produced by the deleted runtime_interaction.py.
+        for (sid, want) in [
+            ("café", "railmon-7cf76655dbf2293397a04a1f4775d6d24e20c5ed"),
+            ("日本語", "railmon-7829b954cc702eaf0f61be82ea46104067843a6b"),
+        ] {
+            let out = to_runtime_interaction(&sample(), Some(sid), None, "railmon");
+            assert_eq!(out["interaction_id"], want, "session {sid}");
+        }
     }
 
     #[test]

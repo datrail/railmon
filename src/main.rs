@@ -63,14 +63,11 @@ struct Args {
     #[arg(long)]
     comm: Option<String>,
 
-    /// Path to the agentsight binary.
-    #[arg(
-        long,
-        alias = "sslsniff",
-        env = "AGENTSIGHT_PATH",
-        default_value = "/usr/local/bin/agentsight"
-    )]
-    agentsight: String,
+    /// Path to the agentsight (or bare sslsniff) binary. Defaults to
+    /// AGENTSIGHT_PATH, then SSLSNIFF_PATH, then ./bin/agentsight, then the
+    /// container path — the same order the Python resolved.
+    #[arg(long, alias = "sslsniff")]
+    agentsight: Option<String>,
 
     /// Interactions per webhook batch.
     #[arg(long, default_value_t = 10)]
@@ -88,6 +85,28 @@ struct Args {
     session_id: Option<String>,
 }
 
+/// The Python resolved AGENTSIGHT_PATH, then SSLSNIFF_PATH ("back-compat:
+/// older env name"), then a repo-relative bin/agentsight. Dropping the last two
+/// would mean `make fetch-agentsight` downloads a binary that a bare `railmon`
+/// then cannot find.
+fn resolve_probe_path(explicit: Option<String>) -> String {
+    if let Some(path) = explicit.filter(|p| !p.is_empty()) {
+        return path;
+    }
+    for key in ["AGENTSIGHT_PATH", "SSLSNIFF_PATH"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+    let local = std::path::Path::new("bin/agentsight");
+    if local.exists() {
+        return local.display().to_string();
+    }
+    "/usr/local/bin/agentsight".to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -96,18 +115,27 @@ async fn main() -> Result<()> {
     // Fail on a missing binary before opening sinks or claiming to capture:
     // the old failure mode was a collector that looked alive and produced
     // nothing.
-    if !std::path::Path::new(&args.agentsight).exists() {
+    let agentsight = resolve_probe_path(args.agentsight.clone());
+    if !std::path::Path::new(&agentsight).exists() {
         anyhow::bail!(
-            "agentsight not found at {} — set --agentsight or AGENTSIGHT_PATH, or run `make fetch-agentsight`",
-            args.agentsight
+            "probe not found at {agentsight} — set --agentsight, AGENTSIGHT_PATH or SSLSNIFF_PATH, or run `make fetch-agentsight`"
         );
     }
+
+    // Clamped once, here: Duration::from_secs_f64 panics on a negative or NaN,
+    // and the flag is user-supplied. The Python treated a negative interval as
+    // "flush every event", which is what a floor of zero gives.
+    let flush_interval = Duration::from_secs_f64(if args.flush_interval.is_finite() {
+        args.flush_interval.max(0.0)
+    } else {
+        2.0
+    });
 
     let mut sink = Sink::new(
         args.output.as_deref(),
         args.webhook.as_deref(),
         args.batch_size,
-        Duration::from_secs_f64(args.flush_interval),
+        flush_interval,
     )
     .context("configuring output")?;
 
@@ -127,11 +155,11 @@ async fn main() -> Result<()> {
         comm: args.comm.clone(),
     };
 
-    log::info!("session {session_id}, agentsight at {}", args.agentsight);
-    let mut stream = pipeline::event_stream(&args.agentsight, &filters).await?;
+    log::info!("session {session_id}, agentsight at {}", agentsight);
+    let mut stream = pipeline::event_stream(&agentsight, &filters).await?;
 
     let mut pairer = Pairer::new();
-    let mut ticker = tokio::time::interval(Duration::from_secs_f64(args.flush_interval.max(0.1)));
+    let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -144,7 +172,7 @@ async fn main() -> Result<()> {
                 let Some(event) = maybe_event else { break };
 
                 let emitted = match args.mode {
-                    Mode::Raw => Some(serde_json::to_value(&event)?),
+                    Mode::Raw => serde_json::to_value(&event).ok(),
                     Mode::Http => pairer
                         .accept(event.pid, &event.data, event.timestamp)
                         .map(|paired| match args.output_format {
@@ -158,8 +186,15 @@ async fn main() -> Result<()> {
                         }),
                 };
 
+                // Deliberately not `?`. Returning from here would skip
+                // shutdown() and silently drop every interaction still buffered
+                // for the webhook. A write failure is worth stopping for, but
+                // only after the buffer has been flushed.
                 if let Some(value) = emitted {
-                    sink.emit(&value).await?;
+                    if let Err(error) = sink.emit(&value).await {
+                        log::error!("writing interaction: {error}");
+                        break;
+                    }
                 }
             }
 
