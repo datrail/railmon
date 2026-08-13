@@ -1403,6 +1403,7 @@ version = "0.1.0"
 dependencies = [
  "agentsight-capture",
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "clap",

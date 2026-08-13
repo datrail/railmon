@@ -122,9 +122,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Clamped once, here: Duration::from_secs_f64 panics on a negative or NaN,
-    // and the flag is user-supplied. The Python treated a negative interval as
-    // "flush every event", which is what a floor of zero gives.
     // Clamped at both ends. is_finite() alone lets 1e30 through, and
     // Duration::from_secs_f64 panics above ~1.8e19; a NaN or a negative panics
     // too. An hour is well past any sensible flush cadence.
@@ -134,22 +131,25 @@ async fn main() -> Result<()> {
         2.0
     });
 
+    let session_id = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let capture_start = chrono::Utc::now().to_rfc3339();
+
     let mut sink = Sink::new(
         args.output.as_deref(),
         args.webhook.as_deref(),
         args.batch_size,
         flush_interval,
+        &session_id,
+        &capture_start,
     )
     .context("configuring output")?;
 
     if sink.is_silent() {
         log::warn!("no --webhook and no --output: interactions will be counted but not stored");
     }
-
-    let session_id = args
-        .session_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let capture_start = chrono::Utc::now().to_rfc3339();
 
     let filters = CaptureFilters {
         binary_path: args.binary_path.clone(),
@@ -228,6 +228,15 @@ async fn main() -> Result<()> {
         return Err(error);
     }
 
+    // Drop the stream before awaiting the probe's status. The oneshot sender
+    // lives inside the stream's state and is only fired while something polls
+    // it, so leaving the loop via ctrl_c would otherwise block here for ever —
+    // and `kill_on_drop` would never fire, leaving the probe running with its
+    // eBPF programs attached, which is what makes the *next* run fail to
+    // attach. Dropping it closes the channel; the `_` arm below treats that as
+    // "no status to report", which is correct for an interrupted capture.
+    drop(stream);
+
     // Attaching an eBPF probe is the common runtime failure here — it needs
     // CAP_BPF and a matching kernel. Exiting 0 after it fails makes Docker,
     // systemd and k8s all read the collector as healthy, so nothing restarts
@@ -237,7 +246,7 @@ async fn main() -> Result<()> {
             anyhow::bail!("probe exited with {status}")
         }
         // A dropped sender means we left the loop before the probe's output
-        // ended — ctrl_c, or a write error already reported. Not a failure.
+        // ended, which is what ctrl_c does. Not a failure.
         _ => Ok(()),
     }
 }

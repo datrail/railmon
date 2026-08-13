@@ -15,6 +15,9 @@ pub struct Sink {
     file: Option<std::fs::File>,
     webhook: Option<Webhook>,
     written: u64,
+    /// Batch metadata Rail Center requires on the envelope.
+    session_id: String,
+    capture_start: String,
 }
 
 struct Webhook {
@@ -33,6 +36,8 @@ impl Sink {
         webhook: Option<&str>,
         batch_size: usize,
         flush_interval: Duration,
+        session_id: &str,
+        capture_start: &str,
     ) -> Result<Self> {
         let file = match output {
             Some(path) => {
@@ -71,6 +76,8 @@ impl Sink {
                 failures: 0,
             }),
             written: 0,
+            session_id: session_id.to_string(),
+            capture_start: capture_start.to_string(),
         })
     }
 
@@ -92,7 +99,7 @@ impl Sink {
         if let Some(hook) = self.webhook.as_mut() {
             hook.batch.push(event.clone());
             if hook.batch.len() >= hook.batch_size {
-                hook.flush().await;
+                hook.flush(&self.session_id, &self.capture_start).await;
             }
         }
         Ok(())
@@ -102,14 +109,14 @@ impl Sink {
     pub async fn flush_if_due(&mut self) {
         if let Some(hook) = self.webhook.as_mut() {
             if !hook.batch.is_empty() && hook.last_flush.elapsed() >= hook.flush_interval {
-                hook.flush().await;
+                hook.flush(&self.session_id, &self.capture_start).await;
             }
         }
     }
 
     pub async fn shutdown(&mut self) {
         if let Some(hook) = self.webhook.as_mut() {
-            hook.flush().await;
+            hook.flush(&self.session_id, &self.capture_start).await;
             if hook.failures > 0 {
                 log::warn!("{} webhook batch(es) failed to deliver", hook.failures);
             }
@@ -128,12 +135,23 @@ impl Webhook {
     /// A failed batch is logged and dropped, never retried indefinitely and
     /// never fatal: the collector's job is to observe the agent, and it must
     /// not become the reason the host falls over when the sink is down.
-    async fn flush(&mut self) {
+    async fn flush(&mut self, session_id: &str, capture_start: &str) {
         if self.batch.is_empty() {
             return;
         }
-        let payload = std::mem::take(&mut self.batch);
-        let count = payload.len();
+        let interactions = std::mem::take(&mut self.batch);
+        let count = interactions.len();
+
+        // Rail Center's POST /v1/interactions takes an envelope —
+        // InteractionBatchRequest, with session_id required — not a bare array.
+        // Validated against its own Pydantic model: an array is rejected
+        // outright. The Python sent the same envelope.
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "agent": "railmon",
+            "capture_start": capture_start,
+            "interactions": interactions,
+        });
 
         match self.client.post(&self.url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -162,7 +180,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_sink_with_no_destination_says_so() {
-        let s = Sink::new(None, None, 10, Duration::from_secs(2)).unwrap();
+        let s = Sink::new(
+            None,
+            None,
+            10,
+            Duration::from_secs(2),
+            "s-1",
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap();
         assert!(s.is_silent());
     }
 
@@ -172,7 +198,15 @@ mod tests {
         let path = dir.join("out.jsonl");
         let _ = std::fs::remove_file(&path);
 
-        let mut s = Sink::new(Some(&path), None, 10, Duration::from_secs(2)).unwrap();
+        let mut s = Sink::new(
+            Some(&path),
+            None,
+            10,
+            Duration::from_secs(2),
+            "s-1",
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap();
         s.emit(&json!({"interaction_id": "a"})).await.unwrap();
         s.emit(&json!({"interaction_id": "b"})).await.unwrap();
         s.shutdown().await;
@@ -194,7 +228,15 @@ mod tests {
         let path = dir.join("deep").join("out.jsonl");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let mut s = Sink::new(Some(&path), None, 10, Duration::from_secs(2)).unwrap();
+        let mut s = Sink::new(
+            Some(&path),
+            None,
+            10,
+            Duration::from_secs(2),
+            "s-1",
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap();
         s.emit(&json!({"ok": true})).await.unwrap();
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);

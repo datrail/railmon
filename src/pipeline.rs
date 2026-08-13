@@ -153,6 +153,41 @@ fn decode_hex_latin1(hexed: &str) -> Option<String> {
 /// The probe's exit status, resolved once its output ends.
 pub type ProbeStatus = tokio::sync::oneshot::Receiver<Option<std::process::ExitStatus>>;
 
+/// Header names carrying a credential that AgentSight's own allowlist does not
+/// cover: Azure OpenAI, Gemini, and forward proxies.
+const EXTRA_CREDENTIAL_HEADERS: [&str; 3] = ["api-key", "x-goog-api-key", "proxy-authorization"];
+
+/// Redacts the credential headers upstream misses.
+///
+/// An analyzer rather than a step in `message_body`, so it covers `--mode raw`
+/// too: that mode serialises the analyzer event straight to the sink without
+/// going near the pairing code, and a scrub that only the paired path applies
+/// is a scrub with a documented way around it.
+struct ExtraCredentialRedactor;
+
+#[async_trait::async_trait]
+impl Analyzer for ExtraCredentialRedactor {
+    async fn process(
+        &mut self,
+        stream: EventStream,
+    ) -> std::result::Result<EventStream, Box<dyn std::error::Error + Send + Sync>> {
+        use futures::StreamExt as _;
+        Ok(Box::pin(stream.map(|mut event| {
+            if let Some(headers) = event.data.get_mut("headers").and_then(Value::as_object_mut) {
+                for (key, value) in headers.iter_mut() {
+                    if EXTRA_CREDENTIAL_HEADERS
+                        .iter()
+                        .any(|e| key.eq_ignore_ascii_case(e))
+                    {
+                        *value = Value::String("[REDACTED]".into());
+                    }
+                }
+            }
+            event
+        })))
+    }
+}
+
 /// Spawn the probe and return a stream of analyzed events, plus a handle to the
 /// probe's exit status so the caller can tell "captured nothing because the
 /// agent was idle" from "captured nothing because the probe could not attach".
@@ -229,10 +264,16 @@ pub async fn event_stream(
         // means capturing almost nothing. The Python chain did not use it
         // either; it treated an SSE response as a response.
         //
-        // Known limitation, inherited from that choice: a body split across
-        // several SSL reads is recorded from the first fragment only. The
-        // interaction's metadata — destination, status, latency — is complete;
-        // the body may be truncated. Accumulating it is worth its own change.
+        // This does cost something, and it is a regression rather than
+        // something inherited: the Python kept its own `active_streams` map
+        // keyed on (pid, tid), appended every later READ/RECV to the body and
+        // finalised on the next request or at shutdown. Without that, an
+        // HTTP/1.1 streamed response is recorded from its first SSL read only —
+        // measured at 81 of 532 bytes on an Anthropic-shaped stream, losing the
+        // model's reply text — and `latency_ms` is time-to-first-byte rather
+        // than stream duration. Destination, status and the request are intact,
+        // and HTTP/2 is unaffected because the crate reassembles DATA frames
+        // per stream. Re-accumulating HTTP/1.1 bodies is its own ticket.
         //
         // TimestampNormalizer is required, not optional: sslsniff timestamps
         // are `bpf_ktime_get_ns()`, nanoseconds since *boot*, and this is the
@@ -240,6 +281,7 @@ pub async fn event_stream(
         // interaction is dated 1970 and `interaction_id` hashes that.
         Box::new(TimestampNormalizer::new()),
         Box::new(AuthHeaderRemover::new()),
+        Box::new(ExtraCredentialRedactor),
     ];
 
     let mut stream: EventStream = Box::pin(raw);
@@ -392,20 +434,35 @@ fn message_body(data: &Value) -> Value {
         ] {
             obj.remove(key);
         }
-        // The upstream allowlist misses the header names Azure OpenAI, Gemini
-        // and forward proxies use, so scrub them here too rather than trusting
-        // one list. Belt and braces on the one thing that must not leak.
-        if let Some(headers) = obj.get_mut("headers").and_then(Value::as_object_mut) {
-            let extra = ["api-key", "x-goog-api-key", "proxy-authorization"];
-            for (key, value) in headers.iter_mut() {
-                if extra.iter().any(|e| key.eq_ignore_ascii_case(e)) {
-                    *value = Value::String("[REDACTED]".into());
-                }
-            }
-        }
     }
+    parse_json_body(&mut out);
     strip_nul(&mut out);
     out
+}
+
+/// Rail Center types `body` as an object (`HttpRequestPayload.body: dict | None`),
+/// but the HTTP parser hands it over as a string. Left as a string, every
+/// interaction is rejected with a 422 — verified against rail-center's own
+/// Pydantic model. The Python parsed it with `json.loads` for the same reason.
+///
+/// A body that is not a JSON object — plain text, or a top-level array — is
+/// dropped rather than coerced, because the schema has nowhere to put it and a
+/// rejected batch costs more than a missing body.
+fn parse_json_body(message: &mut Value) {
+    let Some(obj) = message.as_object_mut() else {
+        return;
+    };
+    let Some(text) = obj.get("body").and_then(Value::as_str) else {
+        return;
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(parsed @ Value::Object(_)) => {
+            obj.insert("body".into(), parsed);
+        }
+        _ => {
+            obj.remove("body");
+        }
+    }
 }
 
 /// Rail Center stores the interaction in a Postgres TEXT column, and Postgres
@@ -598,25 +655,37 @@ mod tests {
         assert!(!serde_json::to_string(&out).unwrap().contains("\\u0000"));
     }
 
-    #[test]
-    fn provider_specific_credential_headers_are_scrubbed_too() {
-        // The upstream allowlist covers Authorization and x-api-key but not
-        // these, and they are what Azure OpenAI, Gemini and proxies send.
-        let mut p = Pairer::new();
-        let mut r = req(7, 1_000_000_000);
-        r["headers"] = json!({
-            "api-key": "AZURE-SECRET",
-            "x-goog-api-key": "GEMINI-SECRET",
-            "proxy-authorization": "Basic PROXY-SECRET",
-            "host": "api.anthropic.com"
-        });
-        p.accept(1, &r, 1000);
-        let out = p.accept(1, &resp(7, 1_100_000_000, 200), 1100).unwrap();
-        let text = serde_json::to_string(&out).unwrap();
+    #[tokio::test]
+    async fn provider_specific_credential_headers_are_scrubbed_in_the_chain() {
+        // In the chain, not in message_body: --mode raw serialises the analyzer
+        // event straight to the sink and never touches the pairing code, so a
+        // scrub that lives only there has a documented way around it.
+        use futures::StreamExt as _;
+        let event = Event::new_with_timestamp(
+            0,
+            "http_parser".into(),
+            1,
+            "curl".into(),
+            json!({"message_type": "request", "headers": {
+                "api-key": "AZURE-SECRET",
+                "X-Goog-Api-Key": "GEMINI-SECRET",
+                "Proxy-Authorization": "Basic PROXY-SECRET",
+                "host": "api.anthropic.com"
+            }}),
+        );
+        let stream: EventStream = Box::pin(stream::iter(vec![event]));
+        let out = ExtraCredentialRedactor
+            .process(stream)
+            .await
+            .expect("analyzer")
+            .collect::<Vec<_>>()
+            .await;
+
+        let text = serde_json::to_string(&out[0].data).unwrap();
         for secret in ["AZURE-SECRET", "GEMINI-SECRET", "PROXY-SECRET"] {
             assert!(!text.contains(secret), "{secret} survived: {text}");
         }
-        assert_eq!(out["request"]["headers"]["host"], "api.anthropic.com");
+        assert_eq!(out[0].data["headers"]["host"], "api.anthropic.com");
     }
 
     #[test]
