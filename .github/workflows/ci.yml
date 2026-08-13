@@ -1,0 +1,110 @@
+# Test and build on every change, so a break surfaces on the pull request
+# rather than after a release tag exists.
+#
+# This is also called by container-release.yml, which gates publishing on it.
+# A tag can sit on any commit — including one that never went through a PR —
+# so the release path re-runs these checks rather than trusting that they ran
+# earlier.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Commit-ish to check out. A called workflow's `github.ref` is the
+          caller's, which on workflow_dispatch is the branch the run was
+          launched from rather than the tag being published — so the release
+          path passes the resolved tag explicitly. Empty means "whatever
+          triggered this run", which is right for pull_request and push.
+        type: string
+        required: false
+        default: ""
+
+# Declared here so this workflow is correct when triggered directly. A caller
+# may also set permissions on the calling job — those flow in, and this file
+# can only narrow them, never widen.
+permissions:
+  contents: read
+
+# Superseding a pull-request push is what you want; losing a commit's only CI
+# signal is not. So the group key differs by event: a PR groups by ref, so a new
+# push supersedes the last; everything else groups by SHA, so each commit gets
+# its own group and cannot be evicted.
+#
+# That second half matters because `cancel-in-progress: false` does not protect
+# a *pending* run — a newer run entering the group cancels a queued one either
+# way. Keyed by ref, three quick pushes to master would leave the middle commit
+# untested, which is the one case where a green master means nothing.
+#
+# `github.event_name` in a called workflow is the caller's, so the release path
+# reads `push` or `workflow_dispatch` here — never `pull_request`. Either way it
+# keys by SHA and runs to completion. Note the SHA differs between the two: a
+# tag push gives the tagged commit, a dispatch gives the HEAD of the branch the
+# run was launched from, which is why the tag itself travels through the `ref`
+# input rather than being inferred from the context here.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules follow the same rule as the release workflow: off unless the
+      # repository declares RAIL_SUBMODULES, and the cross-repo PAT is only
+      # handed to a checkout that is actually fetching from another repo.
+      #
+      # This depends on the caller passing `secrets: inherit`. `vars` reach a
+      # called workflow on their own, but secrets do not — without inherit,
+      # SUBMODULE_TOKEN resolves to an empty string while RAIL_SUBMODULES still
+      # reads truthy, and the recursive checkout would go out with a token that
+      # cannot read another repository.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: ${{ vars.RAIL_SUBMODULES || false }}
+          token: ${{ vars.RAIL_SUBMODULES && secrets.SUBMODULE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Cache the registry and the build tree. agentsight-capture pulls hyper,
+      # tokio and rusqlite, so a cold build is minutes and a warm one is not.
+      - uses: Swatinem/rust-cache@v2
+
+      # `make test` runs fmt, clippy with warnings denied, and the unit tests.
+      - run: make test
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: ${{ vars.RAIL_SUBMODULES || false }}
+          token: ${{ vars.RAIL_SUBMODULES && secrets.SUBMODULE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only — nothing is pushed from a pull request. Single-arch amd64:
+      # this is here to catch a Dockerfile that does not build, and the arm64
+      # leg costs QEMU emulation for a signal the amd64 leg already gives.
+      #
+      # amd64 is also the arch that can fail *specifically*: the Dockerfile
+      # installs the AgentSight release binary on amd64 and skips it elsewhere,
+      # so the arm64 leg does not exercise that path at all.
+      #
+      # The cache scope is shared with container-release.yml on purpose, so the
+      # multi-arch publish reuses these amd64 layers instead of rebuilding them.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,mode=max,scope=image
