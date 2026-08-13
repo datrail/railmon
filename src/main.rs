@@ -147,6 +147,21 @@ async fn main() -> Result<()> {
     )
     .context("configuring output")?;
 
+    // rail-center has no RuntimeInteraction endpoint: POST /v1/interactions
+    // takes HttpInteractionPayload, which is the legacy-http shape. Posting the
+    // other format gets a 202 and stores a row with no headers, so
+    // match_interactions_to_agents can never find x-rail and agent_id stays
+    // NULL — no error anywhere, just an interaction attributed to nobody. M1's
+    // exit criterion is a captured interaction with a real agent_id, so this is
+    // worth a warning rather than a silent success.
+    if args.webhook.is_some() && matches!(args.output_format, OutputFormat::RuntimeInteraction) {
+        log::warn!(
+            "--output-format runtime-interaction has no endpoint in Rail Center; \
+             POST /v1/interactions accepts the legacy-http shape and will store \
+             these rows unattributed. Use --output-format legacy-http for the webhook."
+        );
+    }
+
     if sink.is_silent() {
         log::warn!("no --webhook and no --output: interactions will be counted but not stored");
     }

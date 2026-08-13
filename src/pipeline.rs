@@ -183,9 +183,76 @@ impl Analyzer for ExtraCredentialRedactor {
                     }
                 }
             }
+
+            // An SSL event the parser did not recognise passes through with the
+            // whole wire text intact and no `headers` map — a CONNECT to a
+            // forward proxy, for instance, which is exactly where
+            // Proxy-Authorization lives. `--mode raw` writes that verbatim, so
+            // the credentials have to be taken out of the text itself.
+            if event.data.get("headers").is_none() {
+                if let Some(text) = event.data.get("data").and_then(Value::as_str) {
+                    if let Some(scrubbed) = redact_header_lines(text) {
+                        event.data["data"] = Value::String(scrubbed);
+                    }
+                }
+            }
             event
         })))
     }
+}
+
+/// Every credential header name we know of, for scrubbing raw wire text.
+const ALL_CREDENTIAL_HEADERS: [&str; 12] = [
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "x-auth-token",
+    "x-access-token",
+    "x-session-token",
+    "cookie",
+    "set-cookie",
+    "token",
+    "bearer",
+];
+
+/// Replace the value of any credential header in a raw HTTP message, keeping
+/// the line so the shape of the request is still visible. Returns None when
+/// there was nothing to redact, so the common case allocates nothing.
+fn redact_header_lines(text: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    // Past the blank line is the body, where a colon is not a header
+    // separator. Tracked as a flag rather than by slicing the remainder: an
+    // earlier version resumed with `&text[out.len()..]`, and once a line has
+    // been rewritten the output length no longer matches the input offset, so
+    // it spliced original bytes back in — including the very Authorization
+    // header it had just redacted.
+    let mut in_headers = true;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if in_headers && trimmed.is_empty() {
+            in_headers = false;
+        }
+        if in_headers {
+            if let Some((name, _)) = trimmed.split_once(':') {
+                if ALL_CREDENTIAL_HEADERS
+                    .iter()
+                    .any(|h| name.trim().eq_ignore_ascii_case(h))
+                {
+                    out.push_str(name);
+                    out.push_str(": [REDACTED]");
+                    out.push_str(&line[trimmed.len()..]);
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    changed.then_some(out)
 }
 
 /// Spawn the probe and return a stream of analyzed events, plus a handle to the
@@ -384,12 +451,21 @@ impl Pairer {
                 let pending = self.pending.get_mut(&key)?.pop_front()?;
                 let latency_ms = epoch_ms.checked_sub(pending.epoch_ms).map(|d| d as f64);
 
+                // Rail Center requires `method` and `path` when a `request`
+                // object is present, but accepts an interaction with no request
+                // at all. An HTTP/2 stream whose HEADERS frame was never
+                // decoded — normal for a connection already open at attach
+                // time — has neither, and one of those rejects the entire
+                // batch. Drop the unusable request rather than lose every good
+                // interaction beside it.
+                let request = usable_request(pending.request);
+
                 Some(json!({
                     "timestamp": ms_to_rfc3339(pending.epoch_ms),
                     "timestamp_ns": pending.epoch_ms.saturating_mul(1_000_000),
                     "pid": pid,
                     "tid": pending.tid,
-                    "request": pending.request,
+                    "request": request,
                     "response": message_body(data),
                     "request_size": pending.size,
                     "response_size": body_len(data),
@@ -440,14 +516,36 @@ fn message_body(data: &Value) -> Value {
     out
 }
 
+/// A request is only usable to Rail Center if it carries both a method and a
+/// path; the schema types them as required strings. Returning null for the
+/// whole object is valid there and the router substitutes `UNKNOWN` and `/`.
+fn usable_request(request: Value) -> Value {
+    let has = |key: &str| {
+        request
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    };
+    if has("method") && has("path") {
+        request
+    } else {
+        log::debug!("dropping a request with no method/path (undecoded HTTP/2 headers)");
+        Value::Null
+    }
+}
+
 /// Rail Center types `body` as an object (`HttpRequestPayload.body: dict | None`),
 /// but the HTTP parser hands it over as a string. Left as a string, every
 /// interaction is rejected with a 422 — verified against rail-center's own
-/// Pydantic model. The Python parsed it with `json.loads` for the same reason.
+/// Pydantic model.
 ///
-/// A body that is not a JSON object — plain text, or a top-level array — is
-/// dropped rather than coerced, because the schema has nowhere to put it and a
-/// rejected batch costs more than a missing body.
+/// Anything that is not a JSON object is wrapped as `{"raw": "…"}` rather than
+/// dropped. Dropping it looked reasonable and was not: an SSE response, a
+/// form-encoded request, an HTML error page and a top-level JSON array are all
+/// non-objects, so the body of most streaming traffic would vanish silently
+/// while `response_size` went on reporting the bytes that were there. The
+/// Python kept the raw string on a parse failure; this keeps it too, in the one
+/// shape the schema can hold.
 fn parse_json_body(message: &mut Value) {
     let Some(obj) = message.as_object_mut() else {
         return;
@@ -455,14 +553,11 @@ fn parse_json_body(message: &mut Value) {
     let Some(text) = obj.get("body").and_then(Value::as_str) else {
         return;
     };
-    match serde_json::from_str::<Value>(text) {
-        Ok(parsed @ Value::Object(_)) => {
-            obj.insert("body".into(), parsed);
-        }
-        _ => {
-            obj.remove("body");
-        }
-    }
+    let wrapped = match serde_json::from_str::<Value>(text) {
+        Ok(parsed @ Value::Object(_)) => parsed,
+        _ => json!({ "raw": text }),
+    };
+    obj.insert("body".into(), wrapped);
 }
 
 /// Rail Center stores the interaction in a Postgres TEXT column, and Postgres
@@ -643,16 +738,49 @@ mod tests {
     }
 
     #[test]
+    fn raw_wire_text_has_every_credential_header_redacted() {
+        let text = "CONNECT api.anthropic.com:443 HTTP/1.1\r\n\
+                    Proxy-Authorization: Basic UFJPWFk=\r\n\
+                    api-key: AZURE-SECRET\r\n\
+                    Authorization: Bearer sk-ant-SECRET\r\n\
+                    Host: api.anthropic.com\r\n\r\n";
+        let out = redact_header_lines(text).expect("something was redacted");
+        for secret in ["UFJPWFk=", "AZURE-SECRET", "sk-ant-SECRET"] {
+            assert!(!out.contains(secret), "{secret} survived: {out}");
+        }
+        // Structure is kept, so the request is still readable.
+        assert!(out.contains("CONNECT api.anthropic.com:443"));
+        assert!(out.contains("Host: api.anthropic.com"));
+        assert_eq!(out.matches("[REDACTED]").count(), 3);
+    }
+
+    #[test]
+    fn a_colon_in_the_body_is_not_mistaken_for_a_header() {
+        let text = "POST /x HTTP/1.1\r\nHost: h\r\n\r\ntoken: not-a-header\r\n";
+        // Nothing in the headers is a credential, so no rewrite at all.
+        assert!(redact_header_lines(text).is_none());
+    }
+
+    #[test]
     fn nul_bytes_never_reach_the_sink() {
         // Rail Center stores `raw` in a Postgres TEXT column, which rejects
         // NUL outright — one binary body would fail the insert and take its
         // whole batch with it.
         let mut p = Pairer::new();
         p.accept(1, &req(7, 1_000_000_000), 1000);
+        // A *parseable* object carrying a NUL, so parse_json_body keeps it and
+        // strip_nul is genuinely exercised. The earlier version used a
+        // non-JSON body, which parse_json_body removed outright — the
+        // assertion held vacuously and tested nothing.
         let mut r = resp(7, 1_100_000_000, 200);
-        r["body"] = json!("ok\u{0}binary");
+        r["body"] = json!("{\"note\":\"ok\u{0}binary\"}");
         let out = p.accept(1, &r, 1100).unwrap();
-        assert!(!serde_json::to_string(&out).unwrap().contains("\\u0000"));
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("\\u0000"), "NUL survived: {text}");
+        assert!(
+            text.contains("\u{fffd}"),
+            "body was dropped instead of sanitised: {text}"
+        );
     }
 
     #[tokio::test]

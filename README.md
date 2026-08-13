@@ -43,7 +43,12 @@ Capture requires root or equivalent eBPF capabilities:
 sudo railmon --mode http --output captured.jsonl
 ```
 
-Emit Rail Center's runtime interaction format:
+The default `legacy-http` format is the one Rail Center ingests: `POST
+/v1/interactions` accepts `HttpInteractionPayload`, and RailMon sends it inside
+the `InteractionBatchRequest` envelope the endpoint requires.
+
+There is also `--output-format runtime-interaction`, which emits the shape
+`docs/rc-58` describes:
 
 ```bash
 sudo railmon \
@@ -51,6 +56,13 @@ sudo railmon \
   --output-format runtime-interaction \
   --output runtime-interactions.jsonl
 ```
+
+**It has no consumer today.** Rail Center exposes no RuntimeInteraction
+endpoint, and posting this shape to `/v1/interactions` returns 202 while
+storing a row with no headers — so `agent_id` is never resolved from `x-rail`
+and the interaction is attributed to nobody. Use it for a local file if you
+want the richer shape; do not point it at a webhook until the control-plane
+side is settled.
 
 `railmon --help` has the full surface. The flags are unchanged from the Python
 implementation, so existing compose files and run scripts keep working.
