@@ -22,7 +22,7 @@ Code:
 | `collector/runtime_interaction.py` | Converts captured RailMon HTTP interactions into Rail Center RuntimeInteraction events. |
 | `collector/collector.py` | Adds `--output-format runtime-interaction` and writes RuntimeInteraction JSONL. |
 | `rail-guardian/rail-collector/rail_collector.py` | Reads RuntimeInteraction JSONL, durably spools events, and POSTs them to Rail Center `/v1/interactions`. |
-| `rail-guardian/entrypoint.sh` | Starts RailMon and RailCollector together in the monitor sidecar/all-in-one container when `DATRAIL_CENTER_URL` is set. |
+| `rail-guardian/entrypoint.sh` | Starts RailMon and RailCollector together in the monitor sidecar/all-in-one container when `RAIL_CENTER_URL` is set. |
 
 Related docs:
 
@@ -96,7 +96,7 @@ Start Rail Center from the `rail-center` repository with the runtime ingestion
 API available:
 
 ```bash
-cd /home/yunwei37/workspace/datrail/rail-center/api
+cd $RAIL_WORKSPACE_HOME/rail-center/api
 docker compose up -d --build db api
 PYTHONPATH=src .venv/bin/alembic -c migrations/alembic.ini upgrade head
 curl -fsS http://localhost:23001/health
@@ -105,7 +105,7 @@ curl -fsS http://localhost:23001/health
 Run RailMon in RuntimeInteraction mode:
 
 ```bash
-cd /home/yunwei37/workspace/datrail/datrail-agent-monitor
+cd $RAIL_WORKSPACE_HOME/datrail-agent-monitor
 python3 collector/collector.py \
   --mode http \
   --sslsniff /usr/local/bin/sslsniff \
@@ -116,7 +116,7 @@ python3 collector/collector.py \
 Run RailCollector against that output file:
 
 ```bash
-DATRAIL_CENTER_URL=http://localhost:23001 \
+RAIL_CENTER_URL=http://localhost:23001 \
 python3 rail-guardian/rail-collector/rail_collector.py \
   --input output/runtime-interactions.jsonl \
   --follow \
@@ -132,11 +132,11 @@ curl -fsS "http://localhost:23001/v1/interactions?limit=10" | python3 -m json.to
 ## Run As Monitor Sidecar
 
 The sidecar/all-in-one container starts RailMon and RailCollector together. Set
-`DATRAIL_CENTER_URL` to enable forwarding:
+`RAIL_CENTER_URL` to enable forwarding:
 
 ```bash
-cd /home/yunwei37/workspace/datrail/datrail-agent-monitor/examples/openclaw-monitoring
-DATRAIL_CENTER_URL=http://localhost:23001 \
+cd $RAIL_WORKSPACE_HOME/datrail-agent-monitor/examples/openclaw-monitoring
+RAIL_CENTER_URL=http://localhost:23001 \
 OPENAI_BASE_URL=https://host.docker.internal:8443/v1 \
 OPENAI_API_KEY=sk-local \
 NODE_TLS_REJECT_UNAUTHORIZED=0 \
