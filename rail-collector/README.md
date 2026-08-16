@@ -69,8 +69,10 @@ This avoids data loss when Rail Center is temporarily unreachable. Re-run with
 
 Start Rail Center and apply migrations from the `rail-center/api` checkout:
 
+`$RAIL_WORKSPACE_HOME` is where `dev-toolkits/dev-setup.sh` clones the repositories as flat siblings; it defaults to `~/workspace`.
+
 ```bash
-cd /home/yunwei37/workspace/datrail/rail-center/api
+cd $RAIL_WORKSPACE_HOME/rail-center/api
 docker compose up -d db api
 PYTHONPATH=src uv run --python 3.13 alembic -c migrations/alembic.ini upgrade head
 ```
@@ -80,7 +82,7 @@ Then run RailMon and RailCollector from the `datrail-agent-monitor` checkout.
 OpenClaw:
 
 ```bash
-cd /home/yunwei37/workspace/datrail/datrail-agent-monitor
+cd $RAIL_WORKSPACE_HOME/datrail-agent-monitor
 mkdir -p examples/openclaw-monitoring/output
 
 sudo python3 collector/collector.py \
@@ -98,7 +100,7 @@ python3 rail-collector/rail_collector.py \
 NemoClaw:
 
 ```bash
-cd /home/yunwei37/workspace/datrail/datrail-agent-monitor
+cd $RAIL_WORKSPACE_HOME/datrail-agent-monitor
 mkdir -p examples/nemoclaw-monitoring/output
 
 sudo python3 collector/collector.py \

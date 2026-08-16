@@ -80,8 +80,10 @@ current contract.
 
 From the Rail Center API repository:
 
+`$RAIL_WORKSPACE_HOME` is where `dev-toolkits/dev-setup.sh` clones the repositories as flat siblings; it defaults to `~/workspace`.
+
 ```bash
-cd /home/yunwei37/workspace/datrail/rail-center/api
+cd $RAIL_WORKSPACE_HOME/rail-center/api
 docker compose up -d db api
 ```
 
@@ -176,7 +178,7 @@ with the path passed to `--registration-output`.
 From the `datrail-agent-monitor` repository root:
 
 ```bash
-cd /home/yunwei37/workspace/datrail/datrail-agent-monitor
+cd $RAIL_WORKSPACE_HOME/datrail-agent-monitor
 rail-guardian/tools/skills-scanner/run-openclaw.sh
 ```
 
@@ -209,7 +211,7 @@ python3 rail-guardian/tools/skills-scanner/skill_scanner.py \
 From the `datrail-agent-monitor` repository root:
 
 ```bash
-cd /home/yunwei37/workspace/datrail/datrail-agent-monitor
+cd $RAIL_WORKSPACE_HOME/datrail-agent-monitor
 rail-guardian/tools/skills-scanner/run-nemoclaw.sh
 ```
 
