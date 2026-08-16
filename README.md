@@ -1,10 +1,20 @@
 # RailMon
 
-RailMon captures decrypted TLS traffic from AI-agent processes, pairs HTTP
-requests with their responses, attributes each interaction to an agent, and
-emits JSON Lines or Rail Center `RuntimeInteraction` events.
+RailMon is DatRail's agent-observability component. One image, four jobs:
 
-Where RailScan sees an agent's static setup, RailMon sees what it actually did.
+| command | what it does |
+| --- | --- |
+| `collect` *(default)* | capture decrypted TLS traffic, pair requests with responses, attribute each to an agent, emit JSONL or Rail Center events |
+| `scan` | inventory an agent's host, model configuration, skills and MCP tools into a local feature file |
+| `skills` | inventory OpenClaw / NemoClaw `SKILL.md` files |
+| `forward` | send captured interactions on to Rail Center |
+
+`collect` sees what an agent actually did; `scan` sees how it was set up.
+
+The scanner and the forwarder moved here from `datrail/railscan` under DR-84 so
+a deployment pulls one container instead of two. RailScan's command names are
+still accepted as aliases, and `railmon --mode http …` — the collector invoked
+with a flag first, as the previous image expected — still means what it did.
 
 ## What is ours and what is AgentSight's
 
@@ -39,8 +49,28 @@ make fetch-agentsight   # only to run outside the container
 
 Capture requires root or equivalent eBPF capabilities:
 
+The four commands are dispatched by the image's entrypoint, so they are how you
+drive the **container**:
+
 ```bash
-sudo railmon --mode http --output captured.jsonl
+docker run --rm --privileged --pid=host railmon collect --mode http
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  railmon scan --mode docker --container openclaw-1
+docker run --rm railmon                       # lists the four commands
+```
+
+Built from source you get the collector binary alone — `cargo build` produces
+`target/release/railmon`, which takes the collector's flags and knows nothing
+about `scan` or `skills`:
+
+```bash
+sudo ./target/release/railmon --mode http --output captured.jsonl
+```
+
+The scanner and forwarder are plain Python and run directly:
+
+```bash
+python3 tools/agent-environment-scanner/scan_agent_environment.py --mode self
 ```
 
 The default `legacy-http` format is the one Rail Center ingests: `POST
@@ -64,8 +94,9 @@ and the interaction is attributed to nobody. Use it for a local file if you
 want the richer shape; do not point it at a webhook until the control-plane
 side is settled.
 
-`railmon --help` has the full surface. The flags are unchanged from the Python
-implementation, so existing compose files and run scripts keep working.
+`railmon help` lists the four commands; `railmon --help` shows the collector's
+flags, which are unchanged from the Python implementation, so existing compose
+files and run scripts keep working.
 
 ## Docker
 
@@ -85,7 +116,9 @@ Images are published to `ghcr.io/datrail/railmon` on a release tag, by CI —
 ## Validation
 
 ```bash
-make test    # cargo fmt --check, clippy -D warnings, cargo test
+make test          # everything below
+make test-rust     # cargo fmt --check, clippy -D warnings, cargo test
+make test-python   # py_compile, each subcommand's --help, the scanner's 80 tests
 ```
 
 `interaction_id` is a content hash, so the test suite pins it against the value

@@ -95,6 +95,8 @@ Required field mapping:
 Start Rail Center from the `rail-center` repository with the runtime ingestion
 API available:
 
+`$RAIL_WORKSPACE_HOME` is where `dev-toolkits/dev-setup.sh` clones the repositories as flat siblings; it defaults to `~/workspace`.
+
 ```bash
 cd $RAIL_WORKSPACE_HOME/rail-center/api
 docker compose up -d --build db api

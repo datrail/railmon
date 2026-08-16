@@ -73,11 +73,21 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # `make test` has a Python half since DR-84 folded RailScan's scanner and
+      # forwarder in. Pinned rather than relying on whatever the runner ships,
+      # so a runner image bump cannot quietly change what the scanner is tested
+      # against.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+
       # Cache the registry and the build tree. agentsight-capture pulls hyper,
       # tokio and rusqlite, so a cold build is minutes and a warm one is not.
       - uses: Swatinem/rust-cache@v2
 
-      # `make test` runs fmt, clippy with warnings denied, and the unit tests.
+      # `make test` runs fmt, clippy with warnings denied, the Rust tests, and
+      # the Python scanner's 80 tests.
       - run: make test
 
   image:
