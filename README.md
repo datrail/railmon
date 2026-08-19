@@ -110,6 +110,20 @@ The exact PID namespace, target binary path, and mounts depend on the monitored
 agent deployment. Reference deployment configuration belongs in
 `agent-hardening`, not in this component repository.
 
+## Environment
+
+[`.env.example`](.env.example) is the complete inventory of environment
+variables RailMon uses for its own configuration and the well-known agent
+settings its scanner recognizes. Every value is blank: copy only the settings
+the deployment owns. RailMon does not load the file implicitly; export selected
+values for a source run or pass it explicitly with `docker run --env-file`.
+
+Ambient process identity such as `HOME`, `USER` and `LOGNAME` is intentionally
+not repeated there. The scanner records those as observations of its subject;
+they are not RailMon configuration. Likewise, `RAIL_SANDBOX_NAME` is not an
+environment input: set `scan --sandbox-name` or the `rail.sandbox_name`
+container label so an unconfigured agent can still be discovered honestly.
+
 Images are published to `ghcr.io/datrail/railmon` on a release tag, by CI —
 `git tag v0.1.0 && git push origin v0.1.0`.
 
