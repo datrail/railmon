@@ -115,8 +115,9 @@ agent deployment. Reference deployment configuration belongs in
 [`.env.example`](.env.example) is the complete inventory of environment
 variables RailMon uses for its own configuration and the well-known agent
 settings its scanner recognizes. Every value is blank: copy only the settings
-the deployment owns. RailMon does not load the file implicitly; export selected
-values for a source run or pass it explicitly with `docker run --env-file`.
+the deployment owns into `.env`, which Git ignores. RailMon does not load the
+file implicitly; export selected values for a source run or pass it explicitly
+with `docker run --env-file .env`.
 
 Ambient process identity such as `HOME`, `USER` and `LOGNAME` is intentionally
 not repeated there. The scanner records those as observations of its subject;

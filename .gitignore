@@ -4,5 +4,11 @@ __pycache__/
 captured.json
 bin/
 
+# Local configuration may carry Rail Center and provider credentials. Keep the
+# blank inventory tracked, but never let a filled copy ride through `git add -A`.
+.env
+.env.*
+!.env.example
+
 # Rust
 target/
