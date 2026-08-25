@@ -27,9 +27,12 @@ RUN touch src/main.rs && cargo build --release --locked
 FROM python:3.13-slim
 
 # libelf and zlib are AgentSight's, not ours: it loads eBPF objects at runtime.
-# No pip: the scanner and forwarder are deliberately standard-library only.
+# openssl is `railmon demo`'s (tools/local-demo): it generates a throwaway
+# self-signed cert for its own local HTTPS pair, nothing else in the image
+# touches it. No pip: the scanner and forwarder are deliberately
+# standard-library only.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl libelf1 zlib1g \
+      ca-certificates curl libelf1 zlib1g openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Tracked, not pinned. AgentSight moves with us and a stale tap sees nothing —
@@ -78,7 +81,7 @@ COPY --from=build /src/target/release/railmon /usr/local/bin/railmon-collector
 COPY tools/ /opt/railmon/tools/
 COPY rail-collector/ /opt/railmon/rail-collector/
 COPY entrypoint.sh /usr/local/bin/railmon
-RUN chmod +x /usr/local/bin/railmon
+RUN chmod +x /usr/local/bin/railmon /opt/railmon/tools/local-demo/run_local_demo.sh
 
 ENV AGENTSIGHT_PATH=/usr/local/bin/agentsight \
     RAILMON_ROOT=/opt/railmon

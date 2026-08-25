@@ -46,6 +46,11 @@ case "$command_name" in
     forward|rail-collector)
         exec python3 "$root/rail-collector/rail_collector.py" "$@"
         ;;
+    demo)
+        # BDL-F4's local quickstart: self-scan plus a real, offline, local
+        # capture, from this one container. See tools/local-demo/README.md.
+        exec sh "$root/tools/local-demo/run_local_demo.sh" "$@"
+        ;;
     help|-h|--help)
         cat <<'EOF'
 Usage: railmon COMMAND [ARGS...]
@@ -56,6 +61,7 @@ Commands:
   scan       inspect and optionally register an agent
   skills     inventory OpenClaw/NemoClaw SKILL.md files
   forward    send captured interactions on to Rail Center
+  demo       self-scan + a local offline capture, for a clean-checkout first run
 
 Called with no command, or with a flag first, RailMon runs the collector —
 so `railmon --mode http --output x.jsonl` still means what it used to.
