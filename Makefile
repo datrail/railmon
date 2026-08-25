@@ -1,4 +1,4 @@
-.PHONY: build test test-rust test-python fmt clippy docker clean fetch-agentsight build-ebpf
+.PHONY: build test test-rust test-python fmt clippy docker demo clean fetch-agentsight build-ebpf
 
 AGENTSIGHT_URL ?= https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight
 AGENTSIGHT_BIN := bin/agentsight
@@ -22,7 +22,10 @@ test-python:
 	python3 -m py_compile \
 		tools/agent-environment-scanner/scan_agent_environment.py \
 		tools/skills-scanner/skill_scanner.py \
-		rail-collector/rail_collector.py
+		rail-collector/rail_collector.py \
+		tools/local-demo/demo_server.py \
+		tools/local-demo/demo_client.py
+	sh -n tools/local-demo/run_local_demo.sh
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh scan --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh forward --help >/dev/null
@@ -47,6 +50,14 @@ build-ebpf: fetch-agentsight
 
 docker:
 	docker build -t railmon .
+
+# BDL-F4's local quickstart: one image, one privileged container, both a
+# non-empty inventory and a non-empty capture. Needs what `collect` always
+# needs — a Linux kernel with BTF/CO-RE — so this does not run in CI; see
+# README.md's "Quick start" and "Platforms" sections.
+demo: docker
+	mkdir -p out
+	docker run --rm --privileged --pid=host -v $(CURDIR)/out:/out railmon demo
 
 clean:
 	cargo clean
