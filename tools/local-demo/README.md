@@ -25,6 +25,15 @@ only accepts one PID and the demo has two. In the few seconds the demo runs,
 this is a reasonable trade for simplicity; it is not a pattern to copy for a
 real deployment, which should filter by the actual agent's identity.
 
+**This is why three requests produce six interactions.** Both ends of each
+exchange are `python3` — `demo_server.py` and `demo_client.py` — so the tap
+records each request twice, once as the client wrote it and once as the
+server read it. The two rows carry different `pid`s and share a timestamp to
+the millisecond. That is two honest observations of one exchange, not a
+duplicate: a real deployment filtering on the agent's own identity would see
+each exchange once. Worth knowing before reading `capture.jsonl`, and worth
+not mistaking for a double-write bug.
+
 ## DR-81's two extra knobs
 
 `railmon demo` alone (DR-48) never sets these, and a bare `make demo` behaves
