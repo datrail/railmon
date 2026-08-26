@@ -230,12 +230,33 @@ fn redact_header_lines(text: &str) -> Option<String> {
     // it spliced original bytes back in — including the very Authorization
     // header it had just redacted.
     let mut in_headers = true;
+    let mut redacting_continuation = false;
 
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
+        if !in_headers && is_http_start_line(trimmed) {
+            // One SSL read may coalesce multiple HTTP messages. The blank line
+            // ended the previous header block; this request/status line opens
+            // the next one.
+            in_headers = true;
+        }
         if in_headers && trimmed.is_empty() {
             in_headers = false;
+            redacting_continuation = false;
         }
+        if in_headers && (trimmed.starts_with(' ') || trimmed.starts_with('\t')) {
+            if redacting_continuation {
+                let indentation_len = trimmed.len() - trimmed.trim_start_matches([' ', '\t']).len();
+                out.push_str(&trimmed[..indentation_len]);
+                out.push_str("[REDACTED]");
+                out.push_str(&line[trimmed.len()..]);
+                changed = true;
+                continue;
+            }
+            out.push_str(line);
+            continue;
+        }
+        redacting_continuation = false;
         if in_headers {
             if let Some((name, _)) = trimmed.split_once(':') {
                 if ALL_CREDENTIAL_HEADERS
@@ -246,6 +267,7 @@ fn redact_header_lines(text: &str) -> Option<String> {
                     out.push_str(": [REDACTED]");
                     out.push_str(&line[trimmed.len()..]);
                     changed = true;
+                    redacting_continuation = true;
                     continue;
                 }
             }
@@ -253,6 +275,31 @@ fn redact_header_lines(text: &str) -> Option<String> {
         out.push_str(line);
     }
     changed.then_some(out)
+}
+
+fn is_http_start_line(line: &str) -> bool {
+    // Content-Length bodies need not end in CR/LF. A coalesced response can
+    // therefore begin mid-line, e.g. `{}HTTP/1.1 200 OK`.
+    if let Some(status_at) = line.rfind("HTTP/") {
+        let mut status_parts = line[status_at..].split_whitespace();
+        let _version = status_parts.next();
+        if status_parts
+            .next()
+            .is_some_and(|status| status.len() == 3 && status.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return true;
+        }
+    }
+    // Likewise, a pipelined request may start directly after body bytes. Be
+    // conservative: a trailing HTTP version plus a method/target separator is
+    // enough to reopen header mode in raw capture data.
+    let Some(request_version_at) = line.rfind(" HTTP/") else {
+        return false;
+    };
+    line[..request_version_at]
+        .trim_end()
+        .chars()
+        .any(char::is_whitespace)
 }
 
 /// Spawn the probe and return a stream of analyzed events, plus a handle to the
@@ -759,6 +806,35 @@ mod tests {
         let text = "POST /x HTTP/1.1\r\nHost: h\r\n\r\ntoken: not-a-header\r\n";
         // Nothing in the headers is a credential, so no rewrite at all.
         assert!(redact_header_lines(text).is_none());
+    }
+
+    #[test]
+    fn folded_and_coalesced_credential_headers_are_fully_scrubbed() {
+        let text = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Authorization: Bearer\r\n",
+            " FOLDED-SECRET\r\n",
+            "Content-Length: 2\r\n\r\n",
+            "{}HTTP/1.1 200 OK\r\n",
+            "Set-Cookie: SECOND-SECRET\r\n",
+            "Content-Length: 2\r\n\r\n",
+            "hello worldPOST /three HTTP/1.1\r\n",
+            "Cookie: THIRD-SECRET\r\n\r\n",
+        );
+        let out = redact_header_lines(text).expect("credentials are present");
+        assert!(
+            !out.contains("FOLDED-SECRET"),
+            "folded value survived: {out}"
+        );
+        assert!(
+            !out.contains("SECOND-SECRET"),
+            "second message survived: {out}"
+        );
+        assert!(
+            !out.contains("THIRD-SECRET"),
+            "third message survived: {out}"
+        );
+        assert_eq!(out.matches("[REDACTED]").count(), 4);
     }
 
     #[test]
