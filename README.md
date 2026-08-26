@@ -76,7 +76,7 @@ What remains RailMon's own is the part AgentSight has no opinion about:
 | **Pairing** | a FIFO per `(pid, tid)`, so concurrent threads do not steal each other's responses and latency is measured against the right request |
 | **Attribution** | reads the `x-rail` ticket and resolves an `agent_id`, so an interaction can be tied to a registered agent |
 | **Rail Center schema** | `RuntimeInteraction`, including the content-hashed `interaction_id` |
-| **Delivery** | JSONL file and/or batched webhook |
+| **Delivery** | JSONL file and/or batched webhook; payloads split at 16 MiB after JSON escaping and at RailDash's structure bound |
 
 The dependency is a caret requirement and the image downloads the AgentSight
 binary unpinned, both deliberate: we track upstream rather than freeze it.

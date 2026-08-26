@@ -11,6 +11,14 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+// RailDash accepts 16 MiB per request.  Count the JSON after escaping rather
+// than the captured body size: one control byte can become six wire bytes.
+// Rail Center also benefits from avoiding an unexpectedly huge batch.
+const MAX_WEBHOOK_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WEBHOOK_STRUCTURE_TOKENS: usize = 2_200_000;
+const MAX_WEBHOOK_ITEMS: usize = 1_000;
+const WEBHOOK_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
+
 pub struct Sink {
     file: Option<std::fs::File>,
     webhook: Option<Webhook>,
@@ -140,37 +148,145 @@ impl Webhook {
             return;
         }
         let interactions = std::mem::take(&mut self.batch);
-        let count = interactions.len();
+        let batches = split_webhook_batches(
+            interactions,
+            session_id,
+            capture_start,
+            MAX_WEBHOOK_PAYLOAD_BYTES,
+            MAX_WEBHOOK_STRUCTURE_TOKENS,
+            MAX_WEBHOOK_ITEMS,
+        );
+        let batch_count = batches.len();
+        let deadline = tokio::time::Instant::now() + WEBHOOK_FLUSH_DEADLINE;
 
-        // Rail Center's POST /v1/interactions takes an envelope —
-        // InteractionBatchRequest, with session_id required — not a bare array.
-        // Validated against its own Pydantic model: an array is rejected
-        // outright. The Python sent the same envelope.
-        let payload = serde_json::json!({
-            "session_id": session_id,
-            "agent": "railmon",
-            "capture_start": capture_start,
-            "interactions": interactions,
-        });
-
-        match self.client.post(&self.url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                log::debug!("delivered {count} interaction(s)");
-            }
-            Ok(resp) => {
-                self.failures += 1;
+        for (batch_index, interactions) in batches.into_iter().enumerate() {
+            let count = interactions.len();
+            let body = webhook_body(interactions, session_id, capture_start);
+            if body.len() > MAX_WEBHOOK_PAYLOAD_BYTES {
+                // A single interaction cannot be split without changing its
+                // meaning. AgentSight's body caps keep normal interactions
+                // below this; make an upstream contract violation visible.
                 log::warn!(
-                    "webhook returned {} for {count} interaction(s)",
-                    resp.status()
+                    "single webhook interaction is {} bytes (limit {})",
+                    body.len(),
+                    MAX_WEBHOOK_PAYLOAD_BYTES
                 );
             }
-            Err(error) => {
-                self.failures += 1;
-                log::warn!("webhook POST failed for {count} interaction(s): {error}");
+
+            let request = self
+                .client
+                .post(&self.url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send();
+            match tokio::time::timeout_at(deadline, request).await {
+                Ok(Ok(resp)) if resp.status().is_success() => {
+                    log::debug!("delivered {count} interaction(s)");
+                }
+                Ok(Ok(resp)) => {
+                    self.failures += 1;
+                    log::warn!(
+                        "webhook returned {} for {count} interaction(s)",
+                        resp.status()
+                    );
+                }
+                Ok(Err(error)) => {
+                    self.failures += 1;
+                    log::warn!("webhook POST failed for {count} interaction(s): {error}");
+                }
+                Err(_) => {
+                    let dropped = batch_count - batch_index;
+                    self.failures += dropped as u64;
+                    log::warn!(
+                        "webhook flush exceeded {}s; dropping {dropped} remaining batch(es)",
+                        WEBHOOK_FLUSH_DEADLINE.as_secs()
+                    );
+                    break;
+                }
             }
         }
         self.last_flush = Instant::now();
     }
+}
+
+/// Split on the bytes serde will actually send, including JSON escaping.
+fn split_webhook_batches(
+    interactions: Vec<Value>,
+    session_id: &str,
+    capture_start: &str,
+    max_bytes: usize,
+    max_tokens: usize,
+    max_items: usize,
+) -> Vec<Vec<Value>> {
+    let envelope_bytes = webhook_body(Vec::new(), session_id, capture_start).len();
+    let envelope_tokens = value_structure_tokens(&serde_json::json!({
+        "session_id": session_id,
+        "agent": "railmon",
+        "capture_start": capture_start,
+        "interactions": [],
+    }));
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = envelope_bytes;
+    let mut current_tokens = envelope_tokens;
+
+    for interaction in interactions {
+        let item_bytes = serde_json::to_vec(&interaction)
+            .expect("serializing a serde_json::Value cannot fail")
+            .len();
+        let item_tokens = value_structure_tokens(&interaction);
+        let comma = usize::from(!current.is_empty());
+        if !current.is_empty()
+            && (current.len() >= max_items
+                || current_bytes + comma + item_bytes > max_bytes
+                || current_tokens + comma + item_tokens > max_tokens)
+        {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = envelope_bytes;
+            current_tokens = envelope_tokens;
+        }
+        current_bytes += usize::from(!current.is_empty()) + item_bytes;
+        current_tokens += usize::from(!current.is_empty()) + item_tokens;
+        current.push(interaction);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// JSON punctuation outside strings, matching RailDash's allocation guard.
+fn value_structure_tokens(value: &Value) -> usize {
+    let mut tokens = 0;
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Array(items) => {
+                tokens += 2 + items.len().saturating_sub(1);
+                stack.extend(items);
+            }
+            Value::Object(map) => {
+                // Braces, one colon per member, and commas between members.
+                tokens += 2 + map.len() + map.len().saturating_sub(1);
+                stack.extend(map.values());
+            }
+            _ => {}
+        }
+    }
+    tokens
+}
+
+fn webhook_body(interactions: Vec<Value>, session_id: &str, capture_start: &str) -> Vec<u8> {
+    // Rail Center's POST /v1/interactions takes an envelope —
+    // InteractionBatchRequest, with session_id required — not a bare array.
+    // RailDash accepts the same envelope for both paired and raw modes.
+    serde_json::to_vec(&serde_json::json!({
+        "session_id": session_id,
+        "agent": "railmon",
+        "capture_start": capture_start,
+        "interactions": interactions,
+    }))
+    .expect("serializing a serde_json::Value cannot fail")
 }
 
 #[cfg(test)]
@@ -240,5 +356,72 @@ mod tests {
         s.emit(&json!({"ok": true})).await.unwrap();
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn webhook_batches_split_on_serialized_bytes_and_preserve_order() {
+        let interactions = vec![
+            json!({"id": 1, "body": "\u{0001}".repeat(40)}),
+            json!({"id": 2, "body": "\u{0001}".repeat(40)}),
+            json!({"id": 3, "body": "\u{0001}".repeat(40)}),
+        ];
+        let one_item_limit =
+            webhook_body(vec![interactions[0].clone()], "s-1", "2026-08-13T00:00:00Z").len();
+
+        let batches = split_webhook_batches(
+            interactions,
+            "s-1",
+            "2026-08-13T00:00:00Z",
+            one_item_limit,
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(batches.len(), 3);
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.iter().map(|item| item["id"].as_u64().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(batches.into_iter().all(|batch| {
+            webhook_body(batch, "s-1", "2026-08-13T00:00:00Z").len() <= one_item_limit
+        }));
+    }
+
+    #[test]
+    fn webhook_batches_also_split_before_raildashs_structure_limit() {
+        let interactions = vec![
+            json!({"id": 1, "body": [{}, {}, {}]}),
+            json!({"id": 2, "body": [{}, {}, {}]}),
+        ];
+        let one_item_tokens = value_structure_tokens(&serde_json::json!({
+            "session_id": "s-1",
+            "agent": "railmon",
+            "capture_start": "start",
+            "interactions": [interactions[0].clone()],
+        }));
+        let batches = split_webhook_batches(
+            interactions,
+            "s-1",
+            "start",
+            usize::MAX,
+            one_item_tokens,
+            usize::MAX,
+        );
+        assert_eq!(batches.len(), 2);
+        assert!(batches.into_iter().all(|batch| {
+            value_structure_tokens(
+                &serde_json::from_slice::<Value>(&webhook_body(batch, "s-1", "start")).unwrap(),
+            ) <= one_item_tokens
+        }));
+    }
+
+    #[test]
+    fn webhook_batches_never_exceed_raildashs_item_limit() {
+        let interactions = (0..1_001).map(|id| json!({"id": id})).collect();
+        let batches =
+            split_webhook_batches(interactions, "s-1", "start", usize::MAX, usize::MAX, 1_000);
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [1_000, 1]);
     }
 }
