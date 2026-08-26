@@ -54,7 +54,19 @@ until python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.2); sys.e
 done
 
 echo "railmon demo: 3/3 capturing -> $out_dir/capture.jsonl"
-"$collector" --output "$out_dir/capture.jsonl" --comm python3 \
+# RAILMON_SESSION_ID / RAILMON_WEBHOOK_URL are unset for a bare `railmon
+# demo` (DR-48) — this stays file-only with a random session id, exactly as
+# before. DR-81's compose bundle sets both, so the same demo capture also
+# posts to RailDash's webhook, under a session id the bundle's file-import
+# step reuses on purpose — see tools/local-demo/README.md.
+set -- --output "$out_dir/capture.jsonl" --comm python3
+if [ -n "${RAILMON_SESSION_ID:-}" ]; then
+    set -- "$@" --session-id "$RAILMON_SESSION_ID"
+fi
+if [ -n "${RAILMON_WEBHOOK_URL:-}" ]; then
+    set -- "$@" --webhook "$RAILMON_WEBHOOK_URL"
+fi
+"$collector" "$@" \
     >"$out_dir/.collector.log" 2>&1 &
 collector_pid=$!
 
