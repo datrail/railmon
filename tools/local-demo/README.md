@@ -37,9 +37,10 @@ not mistaking for a double-write bug.
 ## DR-81's two extra knobs
 
 `railmon demo` alone (DR-48) never sets these, and a bare `make demo` behaves
-exactly as before. DR-81's compose bundle (in the `datrail/bundle` repo, not
-this one) sets both so the same demo run wires both of RailDash's ingestion
-paths at once instead of just the file:
+exactly as before. DR-81's compose bundle (owned by
+[`datrail/raildash`](https://github.com/datrail/raildash), not this repo) sets
+both so the same demo run wires both of RailDash's ingestion paths at once
+instead of just the file:
 
 - `RAILMON_SESSION_ID` — passed to the collector as `--session-id`. Unset,
   the collector generates a random one per run (`main.rs`).
@@ -55,6 +56,4 @@ not `interaction_id` alone. So the bundle's file-import step (`raildash load
 can't recover it from the file. Passing `RAILMON_SESSION_ID` here is what
 gives the bundle a value to pass to both sides. Set only
 `RAILMON_WEBHOOK_URL` without also fixing the session id and the two paths
-land in different sessions and are never recognized as the same interaction —
-see the bundle repo's README for the full "why both paths don't double-count"
-explanation.
+land in different sessions and are never recognized as the same interaction.
