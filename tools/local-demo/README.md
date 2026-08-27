@@ -56,6 +56,4 @@ not `interaction_id` alone. So the bundle's file-import step (`raildash load
 can't recover it from the file. Passing `RAILMON_SESSION_ID` here is what
 gives the bundle a value to pass to both sides. Set only
 `RAILMON_WEBHOOK_URL` without also fixing the session id and the two paths
-land in different sessions and are never recognized as the same interaction —
-see RailDash's README for the full "why both paths don't double-count"
-explanation.
+land in different sessions and are never recognized as the same interaction.
