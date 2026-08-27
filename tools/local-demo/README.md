@@ -24,3 +24,37 @@ not scoped to just these two processes, because the collector's `--pid` flag
 only accepts one PID and the demo has two. In the few seconds the demo runs,
 this is a reasonable trade for simplicity; it is not a pattern to copy for a
 real deployment, which should filter by the actual agent's identity.
+
+**This is why three requests produce six interactions.** Both ends of each
+exchange are `python3` — `demo_server.py` and `demo_client.py` — so the tap
+records each request twice, once as the client wrote it and once as the
+server read it. The two rows carry different `pid`s and share a timestamp to
+the millisecond. That is two honest observations of one exchange, not a
+duplicate: a real deployment filtering on the agent's own identity would see
+each exchange once. Worth knowing before reading `capture.jsonl`, and worth
+not mistaking for a double-write bug.
+
+## DR-81's two extra knobs
+
+`railmon demo` alone (DR-48) never sets these, and a bare `make demo` behaves
+exactly as before. DR-81's compose bundle (in the `datrail/bundle` repo, not
+this one) sets both so the same demo run wires both of RailDash's ingestion
+paths at once instead of just the file:
+
+- `RAILMON_SESSION_ID` — passed to the collector as `--session-id`. Unset,
+  the collector generates a random one per run (`main.rs`).
+- `RAILMON_WEBHOOK_URL` — passed to the collector as `--webhook`. Unset, the
+  collector only writes the file, same as today.
+
+Both matter together, not separately: RailMon's legacy-http JSONL lines carry
+no `session_id` field of their own (only the `RuntimeInteraction` output
+format embeds one, and that format has no consumer — see the main README's
+"Run" section), and RailDash's dedup index is `(session_id, interaction_id)`,
+not `interaction_id` alone. So the bundle's file-import step (`raildash load
+... --session-id <same value>`) has to be told the session id explicitly — it
+can't recover it from the file. Passing `RAILMON_SESSION_ID` here is what
+gives the bundle a value to pass to both sides. Set only
+`RAILMON_WEBHOOK_URL` without also fixing the session id and the two paths
+land in different sessions and are never recognized as the same interaction —
+see the bundle repo's README for the full "why both paths don't double-count"
+explanation.
