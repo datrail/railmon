@@ -1,0 +1,9 @@
+.git
+tests
+docs
+
+# Anchored patterns match root only — without ** these miss
+# tools/*/__pycache__, which `make test-python` creates and which then ends
+# up inside the image as bytecode for the wrong interpreter.
+**/__pycache__
+**/*.py[cod]

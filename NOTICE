@@ -1,0 +1,36 @@
+RailMon
+Copyright (c) 2026 DatRail
+
+This product is part of the DatRail open-source agent-security toolchain
+(https://github.com/datrail) and is distributed under the terms in LICENSE.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+AgentSight — https://github.com/eunomia-bpf/agentsight
+    RailMon depends on AgentSight twice over, and both are deliberate:
+
+    * as a library — the `agentsight-capture` crate supplies the whole capture
+      pipeline: SSL event filtering, HTTP reconstruction, SSE reassembly,
+      decompression and credential-header redaction. RailMon composes those
+      analyzers rather than reimplementing them.
+    * as a binary — the container image downloads the AgentSight release and
+      spawns it as the probe.
+
+    Both track upstream rather than pinning to an exact version: a caret
+    requirement in Cargo.toml, and releases/latest in the Dockerfile. The
+    amd64 image carries the probe; the arm64 image does not, because upstream
+    publishes no arm64 build.
+
+    AgentSight is a project of the eunomia-bpf organisation and is licensed
+    under its own terms; see the upstream repository.
+
+Rust crates
+    Build and runtime dependencies are declared in Cargo.toml and pinned in
+    Cargo.lock, each under its own licence.
+
+--------------------------------------------------------------------------------
+
+The DatRail split (2026-07-20) separated this component from the pre-split
+`datrail-agent-monitor` repository; earlier history here derives from that work.
