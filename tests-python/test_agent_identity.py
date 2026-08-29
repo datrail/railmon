@@ -466,7 +466,7 @@ class SecretMarkerGateTest(unittest.TestCase):
 
     def test_the_shells_own_pwd_is_not_a_secret(self):
         """PWD earns its marker through DB_PWD, but every shell sets PWD and OLDPWD."""
-        env = {"PWD": "/home/agent", "OLDPWD": "/tmp", "DB_PWD": "hunter2"}
+        env = {"PWD": "/home/agent/project", "OLDPWD": "/tmp", "DB_PWD": "hunter2"}
         keys = {entry["key"] for entry in scanner.collect_secret_hygiene(env)}
         self.assertEqual(keys, {"DB_PWD"})
         self.assertIn("PWD", scanner.safe_env_keys(env))
