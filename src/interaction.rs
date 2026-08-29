@@ -324,8 +324,7 @@ mod tests {
     #[test]
     fn an_absolute_target_supplies_its_own_authority() {
         let mut v = sample();
-        v["request"]["path"] =
-            json!("https://proxy.internal.example.com/v1/messages?beta=true");
+        v["request"]["path"] = json!("https://proxy.internal.example.com/v1/messages?beta=true");
         let out = to_runtime_interaction(&v, None, None, "railmon");
         assert_eq!(out["request"]["destination"], "proxy.internal.example.com");
         assert_eq!(out["request"]["path"], "/v1/messages?beta=true");
