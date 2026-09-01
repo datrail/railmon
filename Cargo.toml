@@ -1,0 +1,33 @@
+[package]
+name = "railmon"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Runtime-interaction collector for DatRail — pairs agent HTTP traffic from AgentSight and forwards it with an agent_id."
+
+[dependencies]
+# The pairing pipeline itself. AgentSight already reconstructs HTTP from raw SSL
+# events and handles SSE, gzip, chunked and truncation; this crate is that
+# pipeline published as a library. A caret requirement rather than an exact pin,
+# so we keep tracking upstream — the same decision the Dockerfile makes for the
+# binary.
+agentsight-capture = "1.0"
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+sha2 = "0.10"
+base64 = "0.22"
+uuid = "1"
+chrono = "0.4"
+anyhow = "1"
+async-trait = "0.1"
+log = "0.4"
+env_logger = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[[bin]]
+name = "railmon"
+path = "src/main.rs"
