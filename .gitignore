@@ -13,3 +13,7 @@ bin/
 # Rust
 target/
 out/
+
+# Scanner default output (feature file, evidence bundle): local per-machine
+# runs only, never a deliverable.
+.rail/

@@ -151,6 +151,40 @@ the one the operator has to act on.
 the value refers to: in `--mode docker` that is the scanned container's, so a
 secret mounted into the container is not reported as a dangling pointer.
 
+## Evidence bundle
+
+The evidence bundle is the scanner's second output and the security-profile
+brain's input. Where the feature file is the operator's inventory, the bundle
+is the scorer's: every attribute carries one of the six closed status values
+(`ANSWERED`, `ABSENT`, `TEMPLATED`, `PARTIAL`, `BLIND`, `FAILED`), a tier
+(`declared` / `interrogated` / `observed`) and, for what it did not answer, a
+reason from the closed reason-code set — so a consumer can judge every field
+instead of guessing what an empty one means. Honesty over completeness: an
+attribute this pack cannot collect is emitted `BLIND` with the reason why,
+never an empty `ANSWERED` that reads as "none exists".
+
+It is written to `.rail/railscan/evidence-bundle.json` (override with
+`--evidence-bundle-output` or `RAIL_EVIDENCE_BUNDLE_OUTPUT`; skip with
+`--no-evidence-bundle`), like the feature file it is created `0600`, and it
+rides the same guarantee: the bundle is written from the same `finally`, so it
+lands even when the registration fails. A write failure is reported without
+changing the exit code — the feature file owns that.
+
+The envelope names the container the bundle was collected from with
+`host_id` and `sandbox_name` — the pair the scan registers the container
+under (`RAIL_HOST_ID`, and the `rail.sandbox_name` label or the container
+name when there isn't one). Rail Center files the bundle under that
+registered agent, so the bundle lines up with the interactions Rail Center
+already matches from the x-rail ticket. The `agent_id` the registration
+returns is not in the envelope: the control plane looks the pair up, which
+keeps the builder decoupled from the scan job's output.
+
+Attributes that are *absent* from the bundle rather than absent *on the
+agent* carry `method`: where the pack looked. The `deployment` attribute is
+the operator-set compose project/service labels when they are on the
+container — the deployment name, exactly — and `ABSENT` otherwise, since K8s
+pod labels do not reach `Config.Labels` and two agents can share an image.
+
 ## Observed reach (optional)
 
 The other dimensions describe what an agent is *configured* to reach.

@@ -1684,6 +1684,16 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip writing the feature file (it is the scanner's primary output).",
     )
+    parser.add_argument(
+        "--evidence-bundle-output",
+        help="Write the evidence bundle (the profile brain's input) here. "
+        "Defaults to .rail/railscan/evidence-bundle.json; RAIL_EVIDENCE_BUNDLE_OUTPUT also works.",
+    )
+    parser.add_argument(
+        "--no-evidence-bundle",
+        action="store_true",
+        help="Skip writing the evidence bundle.",
+    )
     parser.add_argument("--register", action="store_true", help="POST the generated payload to rail-center.")
     parser.add_argument("--center-url", help="rail-center base URL or /v1/agents/register URL.")
     parser.add_argument(
@@ -1769,6 +1779,14 @@ def main(argv: list[str] | None = None) -> int:
             # never reached the control plane would be reading a lie.
             if not args.no_feature_file:
                 feature_file_written = write_feature_file(args, context, payload, identity)
+            # The evidence bundle rides the same guarantee: the brain's input,
+            # written even on a failed registration. A write failure is
+            # reported without changing the exit code - the feature file owns
+            # that.
+            if not args.no_evidence_bundle:
+                import evidence_bundle  # lazy: breaks the import cycle
+
+                evidence_bundle.write_evidence_bundle(args, context, payload, identity)
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         return 2
