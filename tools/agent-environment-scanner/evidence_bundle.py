@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -95,6 +96,30 @@ DEPLOYMENT_LABEL_KEYS = frozenset(
         "com.docker.compose.service",
     }
 )
+
+# Credential-carrying value shapes: a DSN/URL embedding user:pass@ and a
+# base64 Basic-auth header. Caught on the value alone, independent of the key
+# name, because the marker-key check misses keys with no marker (a key named
+# "auth" under "security", a "DATABASE_URL" that carries no marker). Both
+# shapes can never be a legitimate declarative value: a harness permission
+# block is allow/deny/approval-shaped, never a connection string or an
+# encoded credential.
+_DSN_WITH_CREDENTIALS = re.compile(
+    r"^[a-z][a-z0-9+.\-]*://[^/\s:@]+:[^@\s]+@", re.IGNORECASE
+)
+_BASIC_AUTH_HEADER = re.compile(r"^basic\s+[a-z0-9+/=]+$", re.IGNORECASE)
+
+
+def _credential_carrying_value(value: Any) -> bool:
+    """True when the value's shape carries credentials regardless of key.
+
+    Two shapes, both impossible in a declarative permission block:
+    - a URL/DSN embedding userinfo with a password (postgres://user:pass@…),
+    - a base64-encoded Basic auth header.
+    """
+    if not isinstance(value, str):
+        return False
+    return bool(_DSN_WITH_CREDENTIALS.match(value) or _BASIC_AUTH_HEADER.match(value))
 
 
 # ── the contract check ──────────────────────────────────────────────────────
@@ -185,6 +210,33 @@ def _permission_keys(data: Any, found: dict[str, Any]) -> None:
             _permission_keys(item, found)
 
 
+# The shape sets a captured permission block is judged against: what counts
+# as a declared approval gate vs. a declared tool allow/deny. Named once,
+# shared by the two attributes, so the two cannot drift apart.
+_APPROVAL_SHAPES = ("approval",)
+_ALLOW_DENY_SHAPES = ("allow", "deny", "security", "permission")
+
+
+def _block_shaped(block_key: str, value: Any, shapes: tuple[str, ...]) -> bool:
+    """Whether a captured permission block is shaped material for `shapes`.
+
+    Judging on the outer key name alone misses the dominant shape: a
+    "permissions" block carrying its allow/deny lists nested. The block
+    counts when the key says so, or when a nested key says so — one level in,
+    including under a list of blocks.
+    """
+    if any(tok in block_key.lower() for tok in shapes):
+        return True
+    blocks = value if isinstance(value, list) else [value]
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        for nested in block:
+            if any(tok in str(nested).lower() for tok in shapes):
+                return True
+    return False
+
+
 def read_harness_permission_config(config_paths: list[Path]) -> dict[str, dict[str, Any]]:
     """Permission-shaped keys, read out of the harness config files.
 
@@ -205,8 +257,7 @@ def read_harness_permission_config(config_paths: list[Path]) -> dict[str, dict[s
         for file in files:
             data: Any = None
             try:
-                text = file.read_text(encoding="utf-8", errors="replace")
-                data = json.loads(text) if text else None
+                data = json.loads(_capped_read_text(file))
             except (OSError, json.JSONDecodeError):
                 continue
             if not isinstance(data, dict):
@@ -224,12 +275,15 @@ def _redact_harness_values(value: Any, key: str | None = None) -> Any:
     The harness config is the agent's own file, and the security block next
     to a `permissions` block is where an operator pastes the key. The
     scanner's own classifier is the single source of what counts as secret
-    material: a value under a key the scanner names as secret, or a string
-    in a vendor token shape. A key the scanner names secret is never
-    carried - not even plainly-shaped - the same call the env scanner makes
-    when it reports the class of a variable and not its value. A reference
-    (a vault pointer) stays: what the profile should see is that the
-    security block points somewhere, and where.
+    material: a value under a key the scanner names as secret, a string in
+    a vendor token shape, or a string in a credential-carrying value shape
+    (a DSN/URL embedding user:pass@, a base64 Basic-auth header) - the last
+    two caught on the value alone, because an operator's DSN or auth header
+    sits under a key with no marker. A key the scanner names secret is
+    never carried - not even plainly-shaped - the same call the env scanner
+    makes when it reports the class of a variable and not its value. A
+    reference (a vault pointer) stays: what the profile should see is that
+    the security block points somewhere, and where.
     """
     import scan_agent_environment as scanner  # the classifier is the scanner's
 
@@ -238,9 +292,27 @@ def _redact_harness_values(value: Any, key: str | None = None) -> Any:
     if isinstance(value, list):
         return [_redact_harness_values(item, key) for item in value]
     if isinstance(value, str):
-        if scanner.is_secret_token(value) or (key is not None and scanner.looks_secret(key)):
+        if (
+            scanner.is_secret_token(value)
+            or (key is not None and scanner.looks_secret(key))
+            or _credential_carrying_value(value)
+        ):
             return "[redacted]"
     return value
+
+
+def _capped_read_text(path: Path) -> str:
+    """The scanner's own 64KB read cap, inlined.
+
+    The scanner's `load_json_file` reads with this same cap before parsing -
+    a harness config over the cap is truncated and fails the parse like any
+    unreadable file, so it simply does not appear in the result.
+    """
+    try:
+        with path.open("rb") as f:
+            return f.read(64_000).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 # ── the builder ──────────────────────────────────────────────────────────────
@@ -547,53 +619,61 @@ def build_evidence_bundle(
 
     # The declared-tier harness permission/approval attribute — the one that
     # moves containment from INSUFFICIENT_EVIDENCE to evaluable in the brain.
-    # Value shape: privileged flag, Linux caps, and the declared
-    # approval/security settings, in one object the caps and the containment
-    # category can judge.
+    # The value carries exactly what was read: docker mode joins the
+    # container HostConfig part (privileged flag, Linux caps) with the
+    # declared permission blocks; self mode carries the declared blocks
+    # alone, because a bare process has no HostConfig to read and an
+    # invented unprivileged one would read as "no container privilege".
     harness = {
         source: _redact_harness_values(keys)
         for source, keys in read_harness_permission_config(config_paths).items()
     }
-    permission_value: dict[str, Any] = {
-        "privileged": bool(host_config.get("Privileged")),
-        "cap_add": [str(c) for c in host_config.get("CapAdd") or []],
-        "cap_drop": [str(c) for c in host_config.get("CapDrop") or []],
-        "security_opt": [str(o) for o in host_config.get("SecurityOpt") or []],
-    }
-    harness_config_note = (
-        "no permission-shaped keys in the harness config at the scanned roots"
-        if mode == "docker"
-        else "harness config files not reachable in self mode"
-    )
-    if harness:
-        for source, keys in harness.items():
-            for key, value in keys.items():
-                permission_value.setdefault("harness", {})[f"{Path(source).name}:{key}"] = value
+    harness_block: dict[str, Any] = {}
+    for source, keys in harness.items():
+        for key, value in keys.items():
+            harness_block[f"{Path(source).name}:{key}"] = value
+    harness_note = "no permission-shaped keys in the harness config at the scanned roots"
+    if mode == "docker":
+        hostconfig_value: dict[str, Any] = {
+            "privileged": bool(host_config.get("Privileged")),
+            "cap_add": [str(c) for c in host_config.get("CapAdd") or []],
+            "cap_drop": [str(c) for c in host_config.get("CapDrop") or []],
+            "security_opt": [str(o) for o in host_config.get("SecurityOpt") or []],
+        }
+        if harness_block:
+            attributes["permissions"] = _answered(
+                {**hostconfig_value, "harness": harness_block}, "declared",
+                authored_by="platform",
+                method="container HostConfig (docker inspect) + harness config permission keys",
+            )
+        else:
+            attributes["permissions"] = _answered(
+                hostconfig_value, "declared", authored_by="platform",
+                method="docker inspect: HostConfig",
+                note=harness_note,
+            )
+    elif harness_block:
         attributes["permissions"] = _answered(
-            permission_value, "declared", authored_by="platform",
-            method="container HostConfig (docker inspect) + harness config permission keys",
-        )
-    elif mode == "docker":
-        attributes["permissions"] = _answered(
-            permission_value, "declared", authored_by="platform",
-            method="docker inspect: HostConfig",
-            note=harness_config_note,
+            {"harness": harness_block}, "declared", authored_by="platform",
+            method="harness config permission keys",
         )
     else:
         attributes["permissions"] = _blind(
             "NO_SOURCE_ACCESS", "declared",
             note="privileged flag / Linux caps / RBAC are not readable from a bare process; "
-                  + harness_config_note,
+                 + harness_note,
         )
 
     harness_flat: dict[str, Any] = {
         key: value for keys in harness.values() for key, value in keys.items()
     }
-    approval = {k: v for k, v in harness_flat.items() if "approval" in k.lower()}
+    approval = {
+        k: v for k, v in harness_flat.items() if _block_shaped(k, v, _APPROVAL_SHAPES)
+    }
     allow_deny = {
         k: v
         for k, v in harness_flat.items()
-        if any(tok in k.lower() for tok in ("allow", "deny", "security"))
+        if _block_shaped(k, v, _ALLOW_DENY_SHAPES)
     }
     if approval:
         attributes["approval_policy"] = _answered(
