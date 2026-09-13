@@ -126,6 +126,8 @@ class BundleContractTest(unittest.TestCase):
             self.assertIn(field.get("reason"), (*evidence_bundle.REASONS, None), name)
             if field["status"] == "ABSENT":
                 self.assertTrue(field.get("method"), f"{name}: ABSENT without method")
+        runtime = bundle["inputs_attempted"]["runtime"]
+        self.assertEqual(set(runtime), {"attempted", "reached"})
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
     def test_an_unknown_status_is_a_problem(self):
@@ -236,7 +238,7 @@ class BundlePermissionsTest(unittest.TestCase):
             )
             field = bundle["attributes"]["approval_policy"]
             self.assertEqual(field["status"], "ANSWERED")
-            self.assertEqual(field["value"], {"approvalPolicy": {"requireApproval": True}})
+            self.assertEqual(field["value"], {"approval-config.json:approvalPolicy": {"requireApproval": True}})
 
     def test_self_mode_is_blind_with_a_reason(self):
         bundle = build_bundle(mode="self")
@@ -245,7 +247,7 @@ class BundlePermissionsTest(unittest.TestCase):
         self.assertEqual(field["reason"], "NO_SOURCE_ACCESS")
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
-    def test_a_malformed_config_does_not_crash_the_scan(self):
+    def test_a_malformed_config_records_a_failure(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -256,9 +258,60 @@ class BundlePermissionsTest(unittest.TestCase):
                 args, docker_context(), {"host_id": "h-1", "sandbox_name": "agent-container"}, identity()
             )
             field = bundle["attributes"]["permissions"]
-            self.assertEqual(field["status"], "ANSWERED")
+            self.assertEqual(field["status"], "PARTIAL")
+            self.assertEqual(field["reason"], "PARSE_FAILED")
             self.assertFalse(field["value"].get("harness"))
-            self.assertIn("no permission-shaped keys", field.get("note") or "")
+            self.assertIn("harness-config.json", field.get("note") or "")
+            self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
+    def test_a_misnamed_root_is_a_no_source_access_failure(self):
+        args = build_args(config_path=["/tmp/missing-config-dir-dl08.json"])
+        bundle = evidence_bundle.build_evidence_bundle(
+            args, docker_context(), {"host_id": "h-1", "sandbox_name": "agent-container"}, identity()
+        )
+        field = bundle["attributes"]["permissions"]
+        self.assertEqual(field["status"], "PARTIAL")
+        self.assertEqual(field["reason"], "NO_SOURCE_ACCESS")
+        self.assertIn("missing-config-dir-dl08.json", field.get("note") or "")
+
+    def test_an_oversized_config_is_a_size_cap_failure(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "harness-config.json"
+            payload = json.dumps({"permissions": {"allow": ["read"]}, "pad": "x" * 65_000})
+            config.write_text(payload, encoding="utf-8")
+            args = build_args(config_path=[str(config)])
+            bundle = evidence_bundle.build_evidence_bundle(
+                args, docker_context(), {"host_id": "h-1", "sandbox_name": "agent-container"}, identity()
+            )
+            field = bundle["attributes"]["permissions"]
+            self.assertEqual(field["status"], "PARTIAL")
+            self.assertEqual(field["reason"], "SIZE_CAP_EXCEEDED")
+            self.assertIn("harness-config.json", field.get("note") or "")
+
+    def test_two_roots_with_a_shared_basename_keep_both(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = Path(tmp) / "dirA"
+            root_b = Path(tmp) / "dirB"
+            root_a.mkdir()
+            root_b.mkdir()
+            (root_a / "agent.json").write_text(
+                json.dumps({"permissions": {"allow": ["read"]}}), encoding="utf-8"
+            )
+            (root_b / "agent.json").write_text(
+                json.dumps({"permissions": {"allow": ["write"]}}), encoding="utf-8"
+            )
+            args = build_args(config_path=[str(root_a), str(root_b)])
+            bundle = evidence_bundle.build_evidence_bundle(
+                args, docker_context(), {"host_id": "h-1", "sandbox_name": "agent-container"}, identity()
+            )
+            harness = bundle["attributes"]["permissions"]["value"]["harness"]
+            self.assertEqual(harness[f"{root_a}/agent.json:permissions"], {"allow": ["read"]})
+            self.assertEqual(harness[f"{root_b}/agent.json:permissions"], {"allow": ["write"]})
+            self.assertEqual(len(harness), 2)
 
     def test_a_directory_root_reads_its_json_children(self):
         import tempfile

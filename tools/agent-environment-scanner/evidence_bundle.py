@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,39 @@ def _blind(reason: str, tier: str, **extra: Any) -> dict[str, Any]:
     field.update(extra)
     return field
 
+def _partial(value: Any, tier: str, reason: str, **extra: Any) -> dict[str, Any]:
+    field: dict[str, Any] = {
+        "value": value,
+        "status": "PARTIAL",
+        "tier": tier,
+        "reason": reason,
+    }
+    field.update(extra)
+    return field
+
+
+def _failure_note(failures: dict[str, str]) -> str:
+    """One line per unreadable config file; the status's reason is the worst of them."""
+    if not failures:
+        return ""
+    parts = []
+    for path, reason in sorted(failures.items()):
+        if reason == "NO_SOURCE_ACCESS":
+            parts.append(f"{Path(path).name} is not readable")
+        elif reason == "SIZE_CAP_EXCEEDED":
+            parts.append(f"{Path(path).name} exceeds the 64KB read cap")
+        else:
+            parts.append(f"{Path(path).name} is not valid JSON")
+    return "some config files were not read: " + "; ".join(parts)
+
+
+def _worst_failure_reason(failures: dict[str, str]) -> str:
+    """The worst closed-set reason among several; names the attribute's floor."""
+    return max(
+        failures.values(),
+        key=lambda r: FAILURE_SEVERITY.get(r, 0),
+    )
+
 
 def _permission_keys(data: Any, found: dict[str, Any]) -> None:
     """Permission-shaped keys, found at any depth, under their original case.
@@ -237,36 +271,52 @@ def _block_shaped(block_key: str, value: Any, shapes: tuple[str, ...]) -> bool:
     return False
 
 
-def read_harness_permission_config(config_paths: list[Path]) -> dict[str, dict[str, Any]]:
+def read_harness_permission_config(
+    config_paths: list[Path], named: set[str] | None = None
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Permission-shaped keys, read out of the harness config files.
 
-    Returns `{str(file): {key: value}}`, keyed by the file actually read: a
-    file root by its own path, a directory root by each `*.json` child it
-    holds - mirroring the scanner's `find_models_in_openclaw_config`, which
-    is what a `--config-path` directory means on the model-detection side.
-    The value the brain's containment category reads as the declared
-    permission/approval setting: the `permissions` / `approvalPolicy` /
-    `security` blocks, and nothing else from the file. An unreadable or
-    non-JSON file simply does not appear in the result - "we looked" is the
-    caller's ABSENT/BLIND call, made with the full list of roots in the
-    method string.
+    Returns `({str(file): {key: value}}, failures)`, keyed by the file
+    actually read: a file root by its own path, a directory root by each
+    `*.json` child it holds - mirroring the scanner's
+    `find_models_in_openclaw_config`, which is what a `--config-path`
+    directory means on the model-detection side. The second return is
+    `{str(file): reason}` for the files we looked at and could not turn
+    into a value: a missing or unreadable file records NO_SOURCE_ACCESS and
+    a file that does not parse records PARSE_FAILED. The builder turns that
+    set into the attribute's status - a PARTIAL when some of it was read
+    and some failed, a BLIND when nothing was - with the reasons in the
+    note, so a failure is evidence of where it failed, not a silent
+    "nothing there".
     """
-    result: dict[str, dict[str, Any]] = {}
+    named = named or set()
+    found: dict[str, dict[str, Any]] = {}
+    failures: dict[str, str] = {}
     for path in config_paths:
-        files = sorted(path.glob("*.json")) if path.is_dir() else [path]
-        for file in files:
-            data: Any = None
-            try:
-                data = json.loads(_capped_read_text(file))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            found: dict[str, Any] = {}
-            _permission_keys(data, found)
-            if found:
-                result[str(file)] = found
-    return result
+        if path.is_dir():
+            for file in sorted(path.glob("*.json")):
+                _read_permission_file(file, found, failures)
+        elif path.exists():
+            _read_permission_file(path, found, failures)
+        elif str(path) in named:
+            failures[str(path)] = "NO_SOURCE_ACCESS"
+    return found, failures
+
+
+def _read_permission_file(
+    file: Path, found: dict[str, dict[str, Any]], failures: dict[str, str]
+) -> None:
+    """One config file into `found`; its closed-set failure reason into `failures`."""
+    data, reason = _read_json_capped(file)
+    if data is None:
+        failures[str(file)] = reason
+        return
+    if not isinstance(data, dict):
+        return
+    keys: dict[str, Any] = {}
+    _permission_keys(data, keys)
+    if keys:
+        found[str(file)] = keys
 
 
 def _redact_harness_values(value: Any, key: str | None = None) -> Any:
@@ -301,18 +351,35 @@ def _redact_harness_values(value: Any, key: str | None = None) -> Any:
     return value
 
 
-def _capped_read_text(path: Path) -> str:
-    """The scanner's own 64KB read cap, inlined.
+def _read_json_capped(path: Path) -> tuple[Any, str]:
+    """Parse a config file under the scanner's 64KB read cap, classifying failure.
 
-    The scanner's `load_json_file` reads with this same cap before parsing -
-    a harness config over the cap is truncated and fails the parse like any
-    unreadable file, so it simply does not appear in the result.
+    Returns `(data, reason)`: on success `reason` is `""`; on failure `data`
+    is None and `reason` is the closed-set code for what failed —
+    NO_SOURCE_ACCESS for a file that cannot be read, SIZE_CAP_EXCEEDED for a
+    read truncated at the cap whose tail no longer parses, and PARSE_FAILED
+    for a read that parsed nothing. The scanner's own `load_json_file` reads
+    with this same cap; the classification is what the caller's note names,
+    so "we looked" says what it actually found.
     """
     try:
         with path.open("rb") as f:
-            return f.read(64_000).decode("utf-8", errors="replace")
+            raw = f.read(64_000)
+        text = raw.decode("utf-8", errors="replace")
     except OSError:
-        return ""
+        return None, "NO_SOURCE_ACCESS"
+    try:
+        return json.loads(text), ""
+    except json.JSONDecodeError:
+        if len(raw) == 64_000:
+            return None, "SIZE_CAP_EXCEEDED"
+        return None, "PARSE_FAILED"
+
+
+# The closed-set reason codes' severity, for the builder's floor: when one
+# attribute carries several failure reasons, the worst one names the
+# attribute; the rest still ride in the note.
+FAILURE_SEVERITY = {"NO_SOURCE_ACCESS": 0, "PARSE_FAILED": 1, "SIZE_CAP_EXCEEDED": 2}
 
 
 # ── the builder ──────────────────────────────────────────────────────────────
@@ -345,8 +412,14 @@ def build_evidence_bundle(
     egress_host = scanner.url_host(base_url) if base_url else None
     mcp: list[dict[str, Any]] = identity.get("mcp_servers") or []
     reach: dict[str, Any] = identity.get("observed_reach") or {}
-    config_paths = [Path(p).expanduser() for p in (getattr(args, "config_path", []) or [])] \
+    raw_named = getattr(args, "config_path", []) or []
+    config_paths = [Path(p).expanduser() for p in raw_named] \
         or scanner.default_config_paths(env)
+    # Roots the operator named are a promise: one that does not exist is a
+    # failure the bundle names, unlike the pack's own default directory
+    # guesses, whose absence is just "we looked and nothing was there". The
+    # set holds the same expansion the reader compares against.
+    named = {str(Path(p).expanduser()) for p in raw_named}
     mcp_paths = [Path(p).expanduser() for p in (getattr(args, "mcp_config", []) or [])] \
         or scanner.default_mcp_paths(env)
     scanned_roots = list(dict.fromkeys([str(p) for p in mcp_paths] + [str(p) for p in config_paths]))
@@ -357,11 +430,7 @@ def build_evidence_bundle(
     inputs: dict[str, Any] = {
         # We are the runtime observation source when the scan happens inside
         # the runtime; a docker-mode scan reads its container, not itself.
-        "runtime": {
-            "attempted": True,
-            "reached": mode == "self" or bool(reach),
-            "window_seconds": (reach.get("summary") or {}).get("duration_seconds") if reach else None,
-        },
+        "runtime": {"attempted": True, "reached": mode == "self" or bool(reach)},
         "config": {
             "attempted": True,
             "reached": bool(config_files_present),
@@ -617,22 +686,28 @@ def build_evidence_bundle(
             note="container labels are not readable from inside a bare process",
         )
 
-    # The declared-tier harness permission/approval attribute — the one that
+    # The declared-tier harness permission/approval attribute - the one that
     # moves containment from INSUFFICIENT_EVIDENCE to evaluable in the brain.
     # The value carries exactly what was read: docker mode joins the
     # container HostConfig part (privileged flag, Linux caps) with the
     # declared permission blocks; self mode carries the declared blocks
     # alone, because a bare process has no HostConfig to read and an
     # invented unprivileged one would read as "no container privilege".
-    harness = {
-        source: _redact_harness_values(keys)
-        for source, keys in read_harness_permission_config(config_paths).items()
-    }
+    found, failures = read_harness_permission_config(config_paths, named)
+    # Qualifier the value keys a block by: the source it was read from, so
+    # two roots holding a same-named file cannot overwrite each other. A
+    # unique basename stays short; a basename shared across sources takes
+    # the full path, and every source under the collision keeps its entry
+    # - there is no last-wins.
+    stems = Counter(Path(s).name for s in found)
     harness_block: dict[str, Any] = {}
-    for source, keys in harness.items():
+    for source, keys in found.items():
         for key, value in keys.items():
-            harness_block[f"{Path(source).name}:{key}"] = value
+            qualifier = source if stems[Path(source).name] > 1 else Path(source).name
+            harness_block[f"{qualifier}:{key}"] = _redact_harness_values(value, key)
     harness_note = "no permission-shaped keys in the harness config at the scanned roots"
+    failure_note = _failure_note(failures)
+    worst = _worst_failure_reason(failures) if failures else None
     if mode == "docker":
         hostconfig_value: dict[str, Any] = {
             "privileged": bool(host_config.get("Privileged")),
@@ -640,7 +715,20 @@ def build_evidence_bundle(
             "cap_drop": [str(c) for c in host_config.get("CapDrop") or []],
             "security_opt": [str(o) for o in host_config.get("SecurityOpt") or []],
         }
-        if harness_block:
+        # The HostConfig is the floor of what a bare process could not say:
+        # the attribute is a PARTIAL with the floor when some config failed,
+        # an ANSWERED on the floor alone when nothing was there.
+        if failures:
+            value = {**hostconfig_value}
+            if harness_block:
+                value["harness"] = harness_block
+            attributes["permissions"] = _partial(
+                value, "declared", worst, authored_by="platform",
+                method="container HostConfig (docker inspect)"
+                       + (" + harness config permission keys" if harness_block else ""),
+                note=failure_note,
+            )
+        elif harness_block:
             attributes["permissions"] = _answered(
                 {**hostconfig_value, "harness": harness_block}, "declared",
                 authored_by="platform",
@@ -653,31 +741,47 @@ def build_evidence_bundle(
                 note=harness_note,
             )
     elif harness_block:
-        attributes["permissions"] = _answered(
-            {"harness": harness_block}, "declared", authored_by="platform",
-            method="harness config permission keys",
-        )
+        # A bare process reads only its own files: what was read is the
+        # whole value, and a failure in it makes the read partial, not blind
+        # - a blind is "there is nothing to read here at all".
+        if failures:
+            attributes["permissions"] = _partial(
+                {"harness": harness_block}, "declared", worst,
+                authored_by="platform",
+                method="harness config permission keys",
+                note=failure_note,
+            )
+        else:
+            attributes["permissions"] = _answered(
+                {"harness": harness_block}, "declared", authored_by="platform",
+                method="harness config permission keys",
+            )
     else:
         attributes["permissions"] = _blind(
-            "NO_SOURCE_ACCESS", "declared",
+            worst or "NO_SOURCE_ACCESS", "declared",
             note="privileged flag / Linux caps / RBAC are not readable from a bare process; "
-                 + harness_note,
+                 + (failure_note or harness_note),
         )
 
-    harness_flat: dict[str, Any] = {
-        key: value for keys in harness.values() for key, value in keys.items()
-    }
+    # The approval and allow/deny gates are the permission-shaped keys of the
+    # same blocks, judged on the qualified key: a key whose name says the
+    # shape, or a block whose nested keys do.
     approval = {
-        k: v for k, v in harness_flat.items() if _block_shaped(k, v, _APPROVAL_SHAPES)
+        k: v for k, v in harness_block.items() if _block_shaped(k, v, _APPROVAL_SHAPES)
     }
     allow_deny = {
         k: v
-        for k, v in harness_flat.items()
+        for k, v in harness_block.items()
         if _block_shaped(k, v, _ALLOW_DENY_SHAPES)
     }
     if approval:
         attributes["approval_policy"] = _answered(
             approval, "declared", authored_by="platform", method="harness config permission keys",
+        )
+    elif failures:
+        attributes["approval_policy"] = _blind(
+            worst, "declared",
+            note=failure_note,
         )
     else:
         attributes["approval_policy"] = _blind(
@@ -687,6 +791,11 @@ def build_evidence_bundle(
     if allow_deny:
         attributes["tool_allow_deny"] = _answered(
             allow_deny, "declared", authored_by="platform", method="harness config permission keys",
+        )
+    elif failures:
+        attributes["tool_allow_deny"] = _blind(
+            worst, "declared",
+            note=failure_note,
         )
     else:
         attributes["tool_allow_deny"] = _blind("GATEWAY_MANAGED", "declared")
