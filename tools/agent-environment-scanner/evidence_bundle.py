@@ -450,10 +450,10 @@ def _read_permission_file(
     if reason:
         failures[str(file)] = reason
         return
-    if not isinstance(data, dict):
-        # A parseable file that is not an object (a JSON `null`, a bare list
-        # or scalar) holds no permission keys; that is not a read failure.
-        return
+    # Anything that parsed is handed to the extractor, including a bare list or
+    # scalar: `_permission_keys` walks lists at any depth, so a top-level JSON
+    # array of permission blocks holds keys like any object does. Dropping the
+    # value here would be a silent hole in the attribute, not a safe default.
     keys: dict[str, Any] = {}
     _permission_keys(data, keys)
     if keys:

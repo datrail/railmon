@@ -302,10 +302,12 @@ class BundleContractTest(unittest.TestCase):
         self.assertTrue(any("att-1" in p for p in problems), problems)
 
     def test_every_contract_branch_rejects_what_it_must(self):
-        # One row per rule in `contract_problems`, each proved by mutation:
-        # the bundle is broken in exactly that way and the check must name it.
-        # A branch that stops firing is the guard failing open, which is why
-        # each assertion also demands the problem text names the field.
+        # Every branch of `contract_problems` has at least one row, each proved
+        # by mutation: the bundle is broken in exactly that way and the check
+        # must name it. A branch that stops firing is the guard failing open,
+        # which is why each assertion also demands the problem text names the
+        # field. Mutation-verified by neutralizing each `problems.append` in
+        # turn: with the table as written, none stays green.
 
         def envelope(bundle, key, value):
             if value is _DROP:
@@ -375,10 +377,30 @@ class BundleContractTest(unittest.TestCase):
                 "window_seconds",
             ),
             "source: not an object": (lambda b: b.__setitem__("inputs_attempted", []), "inputs_attempted"),
+            "source: an entry that is not an object": (
+                lambda b: b["inputs_attempted"].__setitem__("manifest", "yes"),
+                "entry is not an object",
+            ),
+            "source: an entry field that is not a source field": (
+                lambda b: source(b, "manifest", "count", 3),
+                "count",
+            ),
             "attribute: unknown field": (lambda b: attribute(b, "user", "score", 1), "score"),
             "attribute: value missing": (lambda b: attribute(b, "user", "value", _DROP), "value"),
             "attribute: unknown tier": (lambda b: attribute(b, "user", "tier", "guessed"), "tier"),
             "attribute: unknown authored_by": (lambda b: attribute(b, "user", "authored_by", "vendor"), "vendor"),
+            "attribute: unknown status": (
+                lambda b: replace_user("NOT_A_STATUS")(b),
+                "unknown status",
+            ),
+            "attribute: unknown reason": (
+                lambda b: replace_user("BLIND", reason="WHY_NOT", authored_by=_DROP)(b),
+                "unknown reason",
+            ),
+            "attribute: attestation_ref pointing at nothing": (
+                lambda b: replace_user("ANSWERED", authored_by="none", attestation_ref="att-missing")(b),
+                "attestation_ref",
+            ),
             "attribute: ANSWERED without authored_by": (
                 lambda b: replace_user("ANSWERED", authored_by=_DROP)(b),
                 "authored_by",
@@ -749,6 +771,19 @@ class BundleWritePathTest(unittest.TestCase):
             found, failures = evidence_bundle.read_harness_permission_config([null_file])
             self.assertEqual(failures, {})
             self.assertEqual(found, {})
+
+    def test_a_top_level_list_config_is_read_like_an_object(self):
+        # `_permission_keys` walks lists at any depth, so a JSON array of
+        # permission blocks holds keys: a bare-list config must land in the
+        # attribute, not be silently dropped as a non-object.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            list_file = Path(tmp, "list.json")
+            list_file.write_text(json.dumps([{"permissions": {"deny": ["write"]}}, {"note": "x"}]))
+            found, failures = evidence_bundle.read_harness_permission_config([list_file])
+            self.assertEqual(failures, {})
+            self.assertEqual(found, {str(list_file): {"permissions": {"deny": ["write"]}}})
 
     def test_a_deeply_nested_config_is_a_parse_failure_not_a_crash(self):
         import tempfile
