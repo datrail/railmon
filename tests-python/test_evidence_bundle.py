@@ -754,6 +754,11 @@ class BundleWritePathTest(unittest.TestCase):
             "postgres://admin:@db.internal/db",
             "https://token@api.internal/v1",
             "Basic dXNlcjpwYXNz",
+            # A password may contain the URL separators. These are the shapes
+            # a narrower password class silently stopped redacting.
+            "postgres://svc:aB3/xY9+q@db.internal/prod",
+            "https://svc:a?b@api.internal/v1",
+            "redis://u:a#b@cache.internal:6379",
         ):
             with self.subTest(value=value):
                 self.assertEqual(evidence_bundle._redact_harness_values(value, "auth"), redacted)

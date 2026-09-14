@@ -120,7 +120,7 @@ DEPLOYMENT_LABEL_KEYS = frozenset(
 # A bare userinfo with no colon (`https://token@api.internal/v1`) is a token
 # in the user position, also impossible in a declarative block.
 _DSN_WITH_CREDENTIALS = re.compile(
-    r"^[a-z][a-z0-9+.\-]*://[^/?#\s:@]*:[^/?#\s@]*@", re.IGNORECASE
+    r"^[a-z][a-z0-9+.\-]*://[^/?#\s:@]*:[^@\s]*@", re.IGNORECASE
 )
 _URL_USERINFO_WITHOUT_PASSWORD = re.compile(
     r"^[a-z][a-z0-9+.\-]*://[^/?#\s:@]+@", re.IGNORECASE
