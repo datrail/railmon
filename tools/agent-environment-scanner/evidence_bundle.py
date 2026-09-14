@@ -119,6 +119,8 @@ DEPLOYMENT_LABEL_KEYS = frozenset(
 # both credentials, and the original both-sides-required form missed them.
 # A bare userinfo with no colon (`https://token@api.internal/v1`) is a token
 # in the user position, also impossible in a declarative block.
+# The value is stripped before matching, so a leading space or tab on an
+# otherwise credential-shaped value is not what decides whether it is redacted.
 _DSN_WITH_CREDENTIALS = re.compile(
     r"^[a-z][a-z0-9+.\-]*://[^/?#\s:@]*:[^@\s]*@", re.IGNORECASE
 )
@@ -136,9 +138,12 @@ def _credential_carrying_value(value: Any) -> bool:
       including the empty-user and empty-password forms),
     - a URL embedding a bare token as userinfo (https://token@…),
     - a base64-encoded Basic auth header.
+
+    Surrounding whitespace is ignored, so a padded credential is still caught.
     """
     if not isinstance(value, str):
         return False
+    value = value.strip()
     return bool(
         _DSN_WITH_CREDENTIALS.match(value)
         or _URL_USERINFO_WITHOUT_PASSWORD.match(value)

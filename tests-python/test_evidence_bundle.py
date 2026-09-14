@@ -759,6 +759,9 @@ class BundleWritePathTest(unittest.TestCase):
             "postgres://svc:aB3/xY9+q@db.internal/prod",
             "https://svc:a?b@api.internal/v1",
             "redis://u:a#b@cache.internal:6379",
+            # Surrounding whitespace is not a way past the shape check.
+            " redis://:hunter2@cache.internal",
+            "\tpostgres://u:p@db.internal\n",
         ):
             with self.subTest(value=value):
                 self.assertEqual(evidence_bundle._redact_harness_values(value, "auth"), redacted)
