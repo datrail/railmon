@@ -762,6 +762,9 @@ class BundleWritePathTest(unittest.TestCase):
             # Surrounding whitespace is not a way past the shape check.
             " redis://:hunter2@cache.internal",
             "\tpostgres://u:p@db.internal\n",
+            # An Authorization header value, under a key the scanner does not
+            # name secret ("authorization" carries no marker it recognizes).
+            "Bearer eyJhbGciOiJIUzI1NiJ9.abc.def",
         ):
             with self.subTest(value=value):
                 self.assertEqual(evidence_bundle._redact_harness_values(value, "auth"), redacted)

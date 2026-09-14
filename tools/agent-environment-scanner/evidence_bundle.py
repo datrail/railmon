@@ -128,16 +128,18 @@ _URL_USERINFO_WITHOUT_PASSWORD = re.compile(
     r"^[a-z][a-z0-9+.\-]*://[^/?#\s:@]+@", re.IGNORECASE
 )
 _BASIC_AUTH_HEADER = re.compile(r"^basic\s+[a-z0-9+/=]+$", re.IGNORECASE)
+_BEARER_AUTH_HEADER = re.compile(r"^bearer\s+\S+$", re.IGNORECASE)
 
 
 def _credential_carrying_value(value: Any) -> bool:
     """True when the value's shape carries credentials regardless of key.
 
-    Three shapes, none legitimate in a declarative permission block:
+    Four shapes, none legitimate in a declarative permission block:
     - a URL/DSN embedding userinfo with a password (postgres://user:pass@…,
       including the empty-user and empty-password forms),
     - a URL embedding a bare token as userinfo (https://token@…),
-    - a base64-encoded Basic auth header.
+    - a base64-encoded Basic auth header,
+    - a bearer token in an Authorization header.
 
     Surrounding whitespace is ignored, so a padded credential is still caught.
     """
@@ -148,6 +150,7 @@ def _credential_carrying_value(value: Any) -> bool:
         _DSN_WITH_CREDENTIALS.match(value)
         or _URL_USERINFO_WITHOUT_PASSWORD.match(value)
         or _BASIC_AUTH_HEADER.match(value)
+        or _BEARER_AUTH_HEADER.match(value)
     )
 
 
@@ -473,9 +476,9 @@ def _redact_harness_values(value: Any, key: str | None = None) -> Any:
     scanner's own classifier is the single source of what counts as secret
     material: a value under a key the scanner names as secret, a string in
     a vendor token shape, or a string in a credential-carrying value shape
-    (a DSN/URL embedding user:pass@, a base64 Basic-auth header) - the last
-    two caught on the value alone, because an operator's DSN or auth header
-    sits under a key with no marker. A key the scanner names secret is
+    (a DSN/URL embedding user:pass@, a Basic or Bearer auth header) - the
+    last two caught on the value alone, because an operator's DSN or auth
+    header sits under a key with no marker. A key the scanner names secret is
     never carried - not even plainly-shaped - the same call the env scanner
     makes when it reports the class of a variable and not its value. A
     reference (a vault pointer) stays: what the profile should see is that
