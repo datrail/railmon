@@ -56,6 +56,10 @@ REASONS = frozenset(
 )
 TIERS = frozenset({"declared", "interrogated", "observed"})
 AUTHORED_BY = frozenset({"subject", "platform", "external", "none"})
+# Mirrored from the published schema's maxLength, which is what the consumer
+# validates against; the scanner truncates to the same numbers.
+HOST_ID_MAX = 64
+SANDBOX_NAME_MAX = 255
 
 # The shared version is 1: Eason reset the mock's 2 back to 1, because the
 # first version was never published ("let's call this version version 1").
@@ -126,37 +130,136 @@ def _credential_carrying_value(value: Any) -> bool:
 # ── the contract check ──────────────────────────────────────────────────────
 
 
-def contract_problems(bundle: dict[str, Any]) -> list[str]:
-    """Everything in a bundle that breaks the closed sets or the method rule.
+# The envelope the published schema closes: exactly these keys, plus the
+# optional attestations array. `inputs_attempted` always holds exactly the
+# four sources, and an attribute holds exactly the fields below.
+ENVELOPE_KEYS = (
+    "bundle_version",
+    "bundle_id",
+    "host_id",
+    "sandbox_name",
+    "collected_at",
+    "rule_pack_version",
+    "inputs_attempted",
+    "attributes",
+)
+OPTIONAL_ENVELOPE_KEYS = ("attestations",)
+INPUT_SOURCES = ("runtime", "image", "manifest", "repo")
+SOURCE_FIELDS = frozenset({"attempted", "reached", "reason", "window_seconds"})
+ATTRIBUTE_FIELDS = frozenset(
+    {"value", "status", "reason", "tier", "authored_by", "method", "note", "attestation_ref"}
+)
+# The statuses that carry authored_by, and the ones the schema forbids it on.
+AUTHORED_STATUSES = ("ANSWERED", "PARTIAL", "TEMPLATED")
+UNAUTHORED_STATUSES = ("ABSENT", "BLIND", "FAILED")
 
-    Mirrors the consumer's `contract_problems` (the brain's load gate): the
-    same walk, the same findings, kept in step.
+
+def _envelope_problems(bundle: dict[str, Any]) -> list[str]:
+    """The envelope's required keys, its closed set, and the naming pair.
+
+    The pair is not optional in the schema, so a bundle carries no `None`
+    here: a scan that could not derive one is a problem the caller reports,
+    never a bundle the control plane has to guess an owner for.
     """
     problems: list[str] = []
-    for src, entry in (bundle.get("inputs_attempted") or {}).items():
+    for key in ENVELOPE_KEYS:
+        if key not in bundle:
+            problems.append(f"{key}: required envelope field is missing")
+    for key in bundle:
+        if key not in ENVELOPE_KEYS and key not in OPTIONAL_ENVELOPE_KEYS:
+            problems.append(f"{key}: not a field of the envelope")
+    if bundle.get("bundle_version") != BUNDLE_VERSION:
+        problems.append(f"bundle_version: {bundle.get('bundle_version')!r} is not {BUNDLE_VERSION}")
+    for key, limit in (("host_id", HOST_ID_MAX), ("sandbox_name", SANDBOX_NAME_MAX)):
+        value = bundle.get(key)
+        if not isinstance(value, str) or not value.strip():
+            problems.append(f"{key}: must be a non-empty string, not {value!r}")
+        elif len(value) > limit:
+            problems.append(f"{key}: {len(value)} characters is past the {limit} cap")
+    return problems
+
+
+def _source_problems(sources: Any) -> list[str]:
+    """The four sources, and the reachable reason rules."""
+    problems: list[str] = []
+    if not isinstance(sources, dict):
+        return ["inputs_attempted: not an object"]
+    for src in INPUT_SOURCES:
+        if src not in sources:
+            problems.append(f"inputs_attempted.{src}: source is missing")
+    for src, entry in sources.items():
+        if src not in INPUT_SOURCES:
+            problems.append(f"inputs_attempted.{src}: not one of the four sources")
+            continue
         if not isinstance(entry, dict):
             problems.append(f"inputs_attempted.{src}: entry is not an object")
             continue
+        for key in entry:
+            if key not in SOURCE_FIELDS:
+                problems.append(f"inputs_attempted.{src}: {key!r} is not a field of a source")
+        if not isinstance(entry.get("attempted"), bool):
+            problems.append(f"inputs_attempted.{src}: attempted must be a boolean")
         if entry.get("reason") not in (None, *REASONS):
             problems.append(f"inputs_attempted.{src}: unknown reason {entry.get('reason')!r}")
+        if entry.get("attempted") and "reached" not in entry:
+            problems.append(f"inputs_attempted.{src}: attempted without reached")
+        if entry.get("attempted") is False and not entry.get("reason"):
+            problems.append(f"inputs_attempted.{src}: not attempted without a reason")
+        if entry.get("reached") is False and not entry.get("reason"):
+            problems.append(f"inputs_attempted.{src}: not reached without a reason")
+        if "window_seconds" in entry and src != "runtime":
+            problems.append(f"inputs_attempted.{src}: window_seconds is only on runtime")
+    return problems
+
+
+def contract_problems(bundle: dict[str, Any]) -> list[str]:
+    """Everything in a bundle the published v1 schema would reject.
+
+    The schema's rules, in code: the envelope's required keys and closed set,
+    the four sources with a reason whenever one was not attempted or not
+    reached, and each attribute's closed sets, method-on-ABSENT and
+    authored_by placement. It is the whole contract, not the consumer's
+    lenient load gate, on purpose: `verify_bundle` is the guard that keeps a
+    broken bundle from reaching a scorer, and a check that passes what the
+    consumer rejects is worse than none. The one rule the schema cannot
+    express - every attestation_ref names an attestation - is checked here.
+    """
+    problems = _envelope_problems(bundle)
+    problems += _source_problems(bundle.get("inputs_attempted"))
     attestations = {a.get("id") for a in (bundle.get("attestations") or [])}
     for name, f in (bundle.get("attributes") or {}).items():
         where = f"attributes.{name}"
         if not isinstance(f, dict):
             problems.append(f"{where}: not an object")
             continue
-        if f.get("status") not in STATUSES:
-            problems.append(f"{where}: unknown status {f.get('status')!r}")
+        for key in f:
+            if key not in ATTRIBUTE_FIELDS:
+                problems.append(f"{where}: {key!r} is not a field of an attribute")
+        if "value" not in f:
+            problems.append(f"{where}: value is required")
+        status = f.get("status")
+        if status not in STATUSES:
+            problems.append(f"{where}: unknown status {status!r}")
         if f.get("reason") not in (None, *REASONS):
             problems.append(f"{where}: unknown reason {f.get('reason')!r}")
-        if f.get("tier") not in (None, *TIERS):
+        if f.get("tier") not in TIERS:
             problems.append(f"{where}: unknown tier {f.get('tier')!r}")
         if f.get("authored_by") not in (None, *AUTHORED_BY):
             problems.append(f"{where}: unknown authored_by {f.get('authored_by')!r}")
         # A "we looked and it is not there" claim is only as good as where it
-        # looked.
-        if f.get("status") == "ABSENT" and not f.get("method"):
+        # looked; a blind or errored one has to say why it could not answer.
+        if status == "ABSENT" and not f.get("method"):
             problems.append(f"{where}: ABSENT without method")
+        if status in ("BLIND", "FAILED") and not f.get("reason"):
+            problems.append(f"{where}: {status} without reason")
+        if status == "ANSWERED" and f.get("reason"):
+            problems.append(f"{where}: ANSWERED carries a reason")
+        # authored_by describes a value, so it is stated exactly when there is
+        # one to attribute, and nowhere else.
+        if status in AUTHORED_STATUSES and not f.get("authored_by"):
+            problems.append(f"{where}: {status} without authored_by")
+        if status in UNAUTHORED_STATUSES and "authored_by" in f:
+            problems.append(f"{where}: {status} is not an authored value")
         if f.get("attestation_ref") not in (None, *attestations):
             problems.append(f"{where}: attestation_ref {f.get('attestation_ref')!r} points at nothing")
     return problems
@@ -201,6 +304,18 @@ def _partial(value: Any, tier: str, reason: str, **extra: Any) -> dict[str, Any]
     }
     field.update(extra)
     return field
+
+
+def _source(attempted: bool, reached: bool, reason: str) -> dict[str, Any]:
+    """One `inputs_attempted` entry, with `reached` and a `reason` exactly
+    where the schema wants them: `reached` on anything attempted, and the
+    reason whenever the source was not attempted or not reached."""
+    entry: dict[str, Any] = {"attempted": attempted}
+    if attempted:
+        entry["reached"] = reached
+    if not attempted or not reached:
+        entry["reason"] = reason
+    return entry
 
 
 def _failure_note(failures: dict[str, str]) -> str:
@@ -412,6 +527,7 @@ def build_evidence_bundle(
     egress_host = scanner.url_host(base_url) if base_url else None
     mcp: list[dict[str, Any]] = identity.get("mcp_servers") or []
     reach: dict[str, Any] = identity.get("observed_reach") or {}
+    # ── inputs_attempted: the sources, and whether each was reached ──────
     raw_named = getattr(args, "config_path", []) or []
     config_paths = [Path(p).expanduser() for p in raw_named] \
         or scanner.default_config_paths(env)
@@ -424,25 +540,36 @@ def build_evidence_bundle(
         or scanner.default_mcp_paths(env)
     scanned_roots = list(dict.fromkeys([str(p) for p in mcp_paths] + [str(p) for p in config_paths]))
 
-    # ── inputs_attempted: the sources, and whether each was reached ──────
-    config_files_present = [p for p in config_paths if p.exists() and p.is_file()] \
-        + [p for p in config_paths if p.is_dir() and any(p.glob("*.json"))]
+    # The object is closed to runtime / image / manifest / repo. An entry holds
+    # `reached` whenever it was attempted and a closed-set `reason` whenever it
+    # was not attempted or not reached; the free-text `method` that used to ride
+    # here has no home in the schema - what was looked at belongs to the
+    # attribute that makes the claim, not to the source. A source has no
+    # "reached but empty" spelling, so an empty source is simply reached: the
+    # detail of what it held is the attribute's to state.
+    #
+    # Read the roots once, here, because the manifest source's reason and the
+    # permissions attribute below both need the same result.
+    found, failures = read_harness_permission_config(config_paths, named)
     inputs: dict[str, Any] = {
-        # We are the runtime observation source when the scan happens inside
-        # the runtime; a docker-mode scan reads its container, not itself.
-        "runtime": {"attempted": True, "reached": mode == "self" or bool(reach)},
-        "config": {
-            "attempted": True,
-            "reached": bool(config_files_present),
-            "method": f"scanned {', '.join(scanned_roots) or 'no config roots'}",
-        },
-        "image": (
-            {"attempted": True, "reached": bool(docker.get("Image") or docker.get("Id")),
-             "method": "docker inspect"}
-            if mode == "docker"
-            else {"attempted": False, "reason": "NO_SOURCE_ACCESS"}
+        # We are the runtime observation source when the scan happens inside the
+        # runtime; a docker-mode scan reads its container, not itself, so its
+        # runtime source is the wire - and this pack ships without a tap.
+        "runtime": _source(True, mode == "self" or bool(reach), "NO_SOURCE_ACCESS"),
+        # A root the operator named and we could not read is the failure the
+        # permissions attribute names precisely; any failure means this source
+        # was not fully reached, so the source's reason is the worst of them.
+        "manifest": _source(
+            True,
+            not failures,
+            _worst_failure_reason(failures) if failures else "NO_SOURCE_ACCESS",
         ),
-        "repo": {"attempted": False, "reason": "NOT_FIRST_PARTY"},
+        "image": (
+            _source(True, bool(docker.get("Image") or docker.get("Id")), "NO_SOURCE_ACCESS")
+            if mode == "docker"
+            else _source(False, False, "NO_SOURCE_ACCESS")
+        ),
+        "repo": _source(False, False, "NOT_FIRST_PARTY"),
     }
 
     attributes: dict[str, Any] = {}
@@ -468,7 +595,7 @@ def build_evidence_bundle(
 
     image_id = docker.get("Image") if mode == "docker" else None
     if isinstance(image_id, str) and image_id.startswith("sha256:"):
-        attributes["image_digest"] = _answered(image_id, "observed",
+        attributes["image_digest"] = _answered(image_id, "observed", authored_by="none",
                                                method="docker inspect: the image identity")
     elif isinstance(image_id, str):
         attributes["image_digest"] = _blind(
@@ -497,6 +624,8 @@ def build_evidence_bundle(
     if runtimes:
         attributes["framework_identity"] = _answered(
             {name: str(version) for name, version in sorted(runtimes.items())}, "observed",
+            authored_by="subject",
+            method="the runtime versions the harness reports for itself",
             note="the runtime versions observed; the framework build identity is not collected",
         )
     else:
@@ -504,14 +633,23 @@ def build_evidence_bundle(
 
     llm_model = str(environment.get("llm_model") or "").strip()
     if llm_model and llm_model != "unknown":
-        attributes["model_name"] = _answered(llm_model, "observed",
-                                             note="the model name as configured; observed, not declared")
+        # The agent's own env or config is the agent's to write, so a name read
+        # there is subject; a name recovered from a captured session was measured
+        # off the wire, so none.
+        model_source = system_info.get("model_source")
+        attributes["model_name"] = _answered(
+            llm_model, "observed",
+            authored_by="none" if model_source == "capture_file" else "subject",
+            method=f"model detection source: {model_source or 'unset'}",
+            note="the model name as configured; observed, not declared",
+        )
     else:
         attributes["model_name"] = _absent("model not detected in env, config or capture files", "observed")
 
     if base_url:
         attributes["inference_endpoint"] = _answered(
-            base_url, "observed",
+            base_url, "observed", authored_by="subject",
+            method="the base URL the scanned environment declares",
             note="the one hop the model calls go to; where prompts go past this hop is not established by this bundle",
         )
     else:
@@ -548,8 +686,8 @@ def build_evidence_bundle(
     tools_used = sorted(reach.get("tools_used") or [])
     if reach:
         attributes["tool_names"] = (
-            _answered(tools_used, "observed",
-                     note="floor, not a count — tools not exercised in the window are absent here")
+            _answered(tools_used, "observed", authored_by="none",
+                      note="floor, not a count — tools not exercised in the window are absent here")
             if tools_used
             else _absent("the snapshot carried no tool calls in the window", "observed")
         )
@@ -565,7 +703,7 @@ def build_evidence_bundle(
     )
     if mcp or base_url:
         attributes["declared_destinations"] = _answered(
-            declared_hosts, "declared",
+            declared_hosts, "declared", authored_by="subject",
             method="hosts from the MCP server URLs and the model egress base URL",
         )
     else:
@@ -573,7 +711,7 @@ def build_evidence_bundle(
 
     if reach:
         attributes["observed_destinations"] = _answered(
-            reach.get("destinations") or [], "observed",
+            reach.get("destinations") or [], "observed", authored_by="none",
             method="AgentSight snapshot, names and counts only",
             note="a finite window; destinations unseen in it are not destinations that do not exist",
         )
@@ -583,7 +721,8 @@ def build_evidence_bundle(
     if reach:
         undeclared = sorted(set(reach.get("undeclared_destinations") or []))
         attributes["undeclared_destinations"] = (
-            _answered(undeclared, "observed", method="observed hosts minus declared hosts")
+            _answered(undeclared, "observed", authored_by="none",
+                      method="observed hosts minus declared hosts")
             if undeclared
             else _absent("no observed host fell outside the declared set", "observed")
         )
@@ -601,11 +740,12 @@ def build_evidence_bundle(
     attributes["credential_inventory"] = (
         _answered(
             [{"name": s["key"], "class": s["secret_class"], "type": s["secret_type"]} for s in secrets],
-            "observed",
+            "observed", authored_by="none",
             note="name + class + type only; values never collected",
         )
         if secrets
-        else _answered([], "observed", method="env scan; no secret-looking variables",
+        else _answered([], "observed", authored_by="none",
+                       method="env scan; no secret-looking variables",
                        note="an empty list that means 'none', not 'unobserved'")
     )
     attributes["credential_provenance"] = _blind(
@@ -635,11 +775,11 @@ def build_evidence_bundle(
     for volume in host_config.get("Volumes") or []:
         mounts.append({"source": None, "target": str(volume), "mode": "rw"})
     if mounts:
-        attributes["mounts"] = _answered(mounts, "declared",
+        attributes["mounts"] = _answered(mounts, "declared", authored_by="none",
                                          method="docker inspect: HostConfig binds and volumes")
     else:
         attributes["mounts"] = (
-            _answered([], "declared", method="docker inspect: HostConfig",
+            _answered([], "declared", authored_by="none", method="docker inspect: HostConfig",
                       note="no bind or volume mounts declared")
             if mode == "docker"
             else _blind("NO_SOURCE_ACCESS", "declared",
@@ -649,7 +789,7 @@ def build_evidence_bundle(
     if mode == "docker":
         user = host_config.get("User") or "root"
         attributes["user"] = _answered(
-            user, "observed", method="docker inspect: HostConfig.User",
+            user, "observed", authored_by="none", method="docker inspect: HostConfig.User",
             note="root is the docker default when User is unset",
         )
     else:
@@ -668,10 +808,10 @@ def build_evidence_bundle(
     # agents can share an image.
     if mode == "docker":
         labels = scanner.container_labels(context)
-        found = {k: v for k, v in labels.items() if k in DEPLOYMENT_LABEL_KEYS}
-        if found:
+        deployment_labels = {k: v for k, v in labels.items() if k in DEPLOYMENT_LABEL_KEYS}
+        if deployment_labels:
             attributes["deployment"] = _answered(
-                found, "declared", authored_by="platform",
+                deployment_labels, "declared", authored_by="platform",
                 method="docker inspect: Config.Labels",
                 note="operator-set deployment signal; copies carrying these labels are one deployment",
             )
@@ -693,7 +833,7 @@ def build_evidence_bundle(
     # declared permission blocks; self mode carries the declared blocks
     # alone, because a bare process has no HostConfig to read and an
     # invented unprivileged one would read as "no container privilege".
-    found, failures = read_harness_permission_config(config_paths, named)
+    # (`found, failures` were read once, above, for the manifest source.)
     # Qualifier the value keys a block by: the source it was read from, so
     # two roots holding a same-named file cannot overwrite each other. A
     # unique basename stays short; a basename shared across sources takes
@@ -803,7 +943,8 @@ def build_evidence_bundle(
     network_mode = host_config.get("NetworkMode")
     if mode == "docker" and network_mode:
         attributes["sandbox_network_policy"] = _answered(
-            network_mode, "observed", method="docker inspect: HostConfig.NetworkMode",
+            network_mode, "observed", authored_by="none",
+            method="docker inspect: HostConfig.NetworkMode",
         )
     else:
         attributes["sandbox_network_policy"] = _absent(

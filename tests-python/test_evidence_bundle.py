@@ -90,6 +90,11 @@ def self_context(**overrides) -> dict:
     return base
 
 
+# The pair the schema requires in the envelope; a scan that cannot derive one
+# is a refused write, not a bundle with a null owner.
+HOST_PAIR = {"host_id": "h-1", "sandbox_name": "agent-container"}
+
+
 def identity(**overrides) -> dict:
     base = {
         "host_id": "h-1",
@@ -108,7 +113,7 @@ def identity(**overrides) -> dict:
 def build_bundle(**overrides):
     mode = overrides.pop("mode", "docker")
     context = docker_context() if mode == "docker" else self_context()
-    payload = {"host_id": "h-1", "sandbox_name": "agent-container"}
+    payload = dict(HOST_PAIR)
     return evidence_bundle.build_evidence_bundle(build_args(), context, payload, identity())
 
 
@@ -120,14 +125,20 @@ class BundleContractTest(unittest.TestCase):
         for name, field in bundle["attributes"].items():
             self.assertIn(field.get("status"), evidence_bundle.STATUSES, name)
             self.assertIn(field.get("tier"), evidence_bundle.TIERS, name)
-            self.assertIn(
-                field.get("authored_by"), (*evidence_bundle.AUTHORED_BY, None), name
-            )
             self.assertIn(field.get("reason"), (*evidence_bundle.REASONS, None), name)
+            # authored_by is stated exactly when there is a value to attribute.
+            if field["status"] in ("ANSWERED", "PARTIAL", "TEMPLATED"):
+                self.assertIn(field.get("authored_by"), evidence_bundle.AUTHORED_BY, name)
+            else:
+                self.assertNotIn("authored_by", field, name)
             if field["status"] == "ABSENT":
                 self.assertTrue(field.get("method"), f"{name}: ABSENT without method")
+        # Docker mode with an empty reach cannot reach its runtime source, so
+        # that entry carries the reason the schema demands with it.
         runtime = bundle["inputs_attempted"]["runtime"]
-        self.assertEqual(set(runtime), {"attempted", "reached"})
+        self.assertEqual(set(runtime), {"attempted", "reached", "reason"})
+        # The envelope names exactly the four sources, never the `config` key.
+        self.assertEqual(set(bundle["inputs_attempted"]), set(evidence_bundle.INPUT_SOURCES))
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
     def test_an_unknown_status_is_a_problem(self):
@@ -180,7 +191,7 @@ class BundlePermissionsTest(unittest.TestCase):
             }
         )
         bundle = evidence_bundle.build_evidence_bundle(
-            build_args(), context, {"host_id": None, "sandbox_name": None}, identity(host_id=None, sandbox_name=None)
+            build_args(), context, {"host_id": "h-1", "sandbox_name": "agent-container"}, identity()
         )
         field = bundle["attributes"]["permissions"]
         self.assertEqual(field["status"], "ANSWERED")
@@ -424,12 +435,12 @@ class BundleWritePathTest(unittest.TestCase):
         with mock.patch.object(
             scanner, "store_json", side_effect=scanner.ScannerError("could not write x: blocked")
         ):
-            self.assertFalse(evidence_bundle.write_evidence_bundle(build_args(), docker_context(), {}, identity()))
+            self.assertFalse(evidence_bundle.write_evidence_bundle(build_args(), docker_context(), HOST_PAIR, identity()))
 
     def test_a_clean_build_verifies_and_stores(self):
         with mock.patch.object(scanner, "store_json") as store:
             self.assertTrue(
-                evidence_bundle.write_evidence_bundle(build_args(), docker_context(), {}, identity())
+                evidence_bundle.write_evidence_bundle(build_args(), docker_context(), HOST_PAIR, identity())
             )
             bundle = store.call_args.args[1]
             self.assertEqual(bundle["bundle_version"], 1)
@@ -468,6 +479,7 @@ class ScannerWiringTest(unittest.TestCase):
                 [
                     "--mode", "self",
                     "--feature-output", f"{tmp}/features.json",
+                    "--host-id", "h-1",
                     "--register",
                     "--center-url", "http://127.0.0.1:1",
                     "--evidence-bundle-output", f"{tmp}/bundle.json",
@@ -510,6 +522,7 @@ class ScannerWiringTest(unittest.TestCase):
                 [
                     "--mode", "self",
                     "--feature-output", f"{tmp}/features.json",
+                    "--host-id", "h-1",
                 ],
                 tmp,
             )
