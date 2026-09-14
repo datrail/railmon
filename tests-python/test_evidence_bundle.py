@@ -14,7 +14,9 @@ with no dependencies to install.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -43,6 +45,26 @@ _bundle_spec = importlib.util.spec_from_file_location(
 evidence_bundle = importlib.util.module_from_spec(_bundle_spec)
 assert _bundle_spec.loader is not None
 _bundle_spec.loader.exec_module(evidence_bundle)
+
+# The published v1 schema, vendored verbatim from Confluence "Evidence Bundle
+# Schema" so the assertions below anchor on the contract itself rather than on
+# the module's own mirrored constants: a closed set that drifts from the
+# schema must fail here, which is exactly the defect this branch fixes.
+SCHEMA = json.loads((Path(__file__).resolve().parent / "evidence-bundle-v1.schema.json").read_text())
+_ATTR = SCHEMA["$defs"]["attribute"]
+_SOURCE = SCHEMA["$defs"]["source"]
+
+
+def schema_enum(*path) -> frozenset:
+    """The literal enum at a dotted path inside the vendored schema."""
+    node = SCHEMA
+    for key in path:
+        node = node[key]
+    return frozenset(node["enum"])
+
+
+# "remove this key" in the mutation table, distinct from a legitimate None.
+_DROP = object()
 
 
 def build_args(**overrides) -> Namespace:
@@ -120,19 +142,63 @@ def build_bundle(**overrides):
 class BundleContractTest(unittest.TestCase):
     """The emitted bundle stays inside the closed sets, and the check rejects a broken one."""
 
+    def test_the_module_constants_are_the_schema_literals(self):
+        # The module calls its sets "mirrored, not re-derived, from the
+        # published contract". This is the mirror under test: a member added
+        # or dropped on either side fails here, which the self-referential
+        # assertions below (producer vs the module's own constants) cannot
+        # see. It is the exact drift this branch exists to fix.
+        self.assertEqual(set(evidence_bundle.STATUSES), schema_enum("$defs", "attribute", "properties", "status"))
+        self.assertEqual(set(evidence_bundle.REASONS), schema_enum("$defs", "reason"))
+        self.assertEqual(set(evidence_bundle.TIERS), schema_enum("$defs", "attribute", "properties", "tier"))
+        self.assertEqual(set(evidence_bundle.AUTHORED_BY), schema_enum("$defs", "attribute", "properties", "authored_by"))
+        self.assertEqual(set(evidence_bundle.ATTRIBUTE_FIELDS), set(_ATTR["properties"]))
+        self.assertEqual(set(evidence_bundle.SOURCE_FIELDS), set(_SOURCE["properties"]))
+        self.assertEqual(set(evidence_bundle.ENVELOPE_KEYS), set(SCHEMA["required"]))
+        self.assertEqual(
+            set(evidence_bundle.OPTIONAL_ENVELOPE_KEYS),
+            set(SCHEMA["properties"]) - set(SCHEMA["required"]),
+        )
+        self.assertEqual(
+            set(evidence_bundle.INPUT_SOURCES), set(SCHEMA["properties"]["inputs_attempted"]["required"])
+        )
+        # The authored/un-authored split is the schema's allOf, not a free
+        # tuple: the statuses its `if` names must be authored, the rest must
+        # not. Anchoring it here catches a member dropped from either tuple.
+        authored_rule = [
+            rule
+            for rule in _ATTR["allOf"]
+            if rule.get("then", {}).get("required") == ["authored_by"]
+        ][0]
+        self.assertEqual(
+            set(evidence_bundle.AUTHORED_STATUSES),
+            frozenset(authored_rule["if"]["properties"]["status"]["enum"]),
+        )
+        self.assertEqual(
+            set(evidence_bundle.UNAUTHORED_STATUSES),
+            schema_enum("$defs", "attribute", "properties", "status")
+            - frozenset(evidence_bundle.AUTHORED_STATUSES),
+        )
+        self.assertEqual(evidence_bundle.BUNDLE_VERSION, SCHEMA["properties"]["bundle_version"]["const"])
+        self.assertEqual(evidence_bundle.HOST_ID_MAX, SCHEMA["properties"]["host_id"]["maxLength"])
+        self.assertEqual(evidence_bundle.SANDBOX_NAME_MAX, SCHEMA["properties"]["sandbox_name"]["maxLength"])
+
     def test_every_emitted_field_is_inside_the_closed_sets(self):
         bundle = build_bundle()
         for name, field in bundle["attributes"].items():
-            self.assertIn(field.get("status"), evidence_bundle.STATUSES, name)
-            self.assertIn(field.get("tier"), evidence_bundle.TIERS, name)
-            self.assertIn(field.get("reason"), (*evidence_bundle.REASONS, None), name)
+            self.assertIn(field.get("status"), schema_enum("$defs", "attribute", "properties", "status"), name)
+            self.assertIn(field.get("tier"), schema_enum("$defs", "attribute", "properties", "tier"), name)
+            self.assertIn(field.get("reason"), (*schema_enum("$defs", "reason"), None), name)
             # authored_by is stated exactly when there is a value to attribute.
             if field["status"] in ("ANSWERED", "PARTIAL", "TEMPLATED"):
-                self.assertIn(field.get("authored_by"), evidence_bundle.AUTHORED_BY, name)
+                self.assertIn(field.get("authored_by"), schema_enum("$defs", "attribute", "properties", "authored_by"), name)
             else:
                 self.assertNotIn("authored_by", field, name)
             if field["status"] == "ABSENT":
                 self.assertTrue(field.get("method"), f"{name}: ABSENT without method")
+            # The attribute is closed to the schema's field set, so a stray
+            # key is a consumer-visible contract break, not a harmless extra.
+            self.assertLessEqual(set(field), set(_ATTR["properties"]), name)
         # Docker mode with an empty reach cannot reach its runtime source, so
         # that entry carries the reason the schema demands with it.
         runtime = bundle["inputs_attempted"]["runtime"]
@@ -140,6 +206,71 @@ class BundleContractTest(unittest.TestCase):
         # The envelope names exactly the four sources, never the `config` key.
         self.assertEqual(set(bundle["inputs_attempted"]), set(evidence_bundle.INPUT_SOURCES))
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
+    def test_every_emitted_bundle_passes_the_vendored_schema(self):
+        # The point of the branch: the emitted envelope is one the published
+        # schema accepts. This is a stdlib check of the schema's own rules
+        # (required keys, closed sets, the conditional allOf rules, the
+        # envelope's closed property set) applied to a real build.
+        for mode in ("docker", "self"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.schema_errors(build_bundle(mode=mode)), [])
+
+    def schema_errors(self, bundle: dict) -> list[str]:
+        """The vendored schema's rules, checked without a JSON-Schema library."""
+        problems: list[str] = []
+        for key in SCHEMA["required"]:
+            if key not in bundle:
+                problems.append(f"{key}: missing required envelope field")
+        if SCHEMA.get("additionalProperties") is False:
+            for key in bundle:
+                if key not in SCHEMA["properties"]:
+                    problems.append(f"{key}: not a property of the envelope")
+        if bundle.get("bundle_version") != SCHEMA["properties"]["bundle_version"]["const"]:
+            problems.append("bundle_version is not the schema const")
+        for key in ("host_id", "sandbox_name"):
+            spec = SCHEMA["properties"][key]
+            value = bundle.get(key)
+            if not isinstance(value, str) or not (spec["minLength"] <= len(value) <= spec["maxLength"]):
+                problems.append(f"{key}: not a string within {spec['minLength']}..{spec['maxLength']}")
+        for src, entry in bundle["inputs_attempted"].items():
+            if src not in SCHEMA["properties"]["inputs_attempted"]["properties"]:
+                problems.append(f"inputs_attempted.{src}: not a source")
+                continue
+            if set(entry) - set(_SOURCE["properties"]):
+                problems.append(f"inputs_attempted.{src}: extra field")
+            if not isinstance(entry.get("attempted"), bool):
+                problems.append(f"inputs_attempted.{src}: attempted is not boolean")
+            if entry.get("attempted") is False and "reason" not in entry:
+                problems.append(f"inputs_attempted.{src}: not attempted without reason")
+            if entry.get("attempted") is True and "reached" not in entry:
+                problems.append(f"inputs_attempted.{src}: attempted without reached")
+            if entry.get("reached") is False and "reason" not in entry:
+                problems.append(f"inputs_attempted.{src}: not reached without reason")
+            if entry.get("reason") is not None and entry["reason"] not in schema_enum("$defs", "reason"):
+                problems.append(f"inputs_attempted.{src}: reason outside the enum")
+        for name, field in bundle["attributes"].items():
+            if set(field) - set(_ATTR["properties"]):
+                problems.append(f"attributes.{name}: extra field")
+            for required in _ATTR["required"]:
+                if required not in field:
+                    problems.append(f"attributes.{name}: {required} is required")
+            status = field.get("status")
+            if status not in schema_enum("$defs", "attribute", "properties", "status"):
+                problems.append(f"attributes.{name}: status outside the enum")
+            if field.get("tier") not in schema_enum("$defs", "attribute", "properties", "tier"):
+                problems.append(f"attributes.{name}: tier outside the enum")
+            if status == "ABSENT" and "method" not in field:
+                problems.append(f"attributes.{name}: ABSENT requires method")
+            if status in ("BLIND", "FAILED") and "reason" not in field:
+                problems.append(f"attributes.{name}: {status} requires reason")
+            if status == "ANSWERED" and "reason" in field:
+                problems.append(f"attributes.{name}: ANSWERED forbids reason")
+            if status in ("ANSWERED", "PARTIAL", "TEMPLATED") and "authored_by" not in field:
+                problems.append(f"attributes.{name}: {status} requires authored_by")
+            if status not in ("ANSWERED", "PARTIAL", "TEMPLATED") and "authored_by" in field:
+                problems.append(f"attributes.{name}: {status} forbids authored_by")
+        return problems
 
     def test_an_unknown_status_is_a_problem(self):
         bundle = build_bundle()
@@ -169,6 +300,118 @@ class BundleContractTest(unittest.TestCase):
         }
         problems = evidence_bundle.contract_problems(bundle)
         self.assertTrue(any("att-1" in p for p in problems), problems)
+
+    def test_every_contract_branch_rejects_what_it_must(self):
+        # One row per rule in `contract_problems`, each proved by mutation:
+        # the bundle is broken in exactly that way and the check must name it.
+        # A branch that stops firing is the guard failing open, which is why
+        # each assertion also demands the problem text names the field.
+
+        def envelope(bundle, key, value):
+            if value is _DROP:
+                bundle.pop(key, None)
+            else:
+                bundle[key] = value
+
+        def source(bundle, name, key, value):
+            entry = bundle["inputs_attempted"][name]
+            if value is _DROP:
+                entry.pop(key, None)
+            else:
+                entry[key] = value
+
+        def attribute(bundle, name, key, value):
+            field = bundle["attributes"]["user"]
+            if value is _DROP:
+                field.pop(key, None)
+            else:
+                field[key] = value
+
+        def replace_user(status=None, **fields):
+            def mutate(bundle):
+                field = {"value": "root", "status": status or "ANSWERED", "tier": "observed"}
+                if status is None:
+                    field["authored_by"] = "none"
+                field.update(fields)
+                for key, value in list(field.items()):
+                    if value is _DROP:
+                        del field[key]
+                bundle["attributes"]["user"] = field
+
+            return mutate
+
+        cases = {
+            "envelope: required key missing": (lambda b: envelope(b, "collected_at", _DROP), "collected_at"),
+            "envelope: unknown key": (lambda b: envelope(b, "agent_id", "a"), "agent_id"),
+            "envelope: wrong bundle_version": (lambda b: envelope(b, "bundle_version", 2), "bundle_version"),
+            "envelope: empty host_id": (lambda b: envelope(b, "host_id", "  "), "host_id"),
+            "envelope: null sandbox_name": (lambda b: envelope(b, "sandbox_name", None), "sandbox_name"),
+            "envelope: host_id past its cap": (
+                lambda b: envelope(b, "host_id", "h" * (evidence_bundle.HOST_ID_MAX + 1)),
+                "host_id",
+            ),
+            "envelope: sandbox_name past its cap": (
+                lambda b: envelope(b, "sandbox_name", "s" * (evidence_bundle.SANDBOX_NAME_MAX + 1)),
+                "sandbox_name",
+            ),
+            "source: one of the four missing": (
+                lambda b: b["inputs_attempted"].pop("manifest"),
+                "manifest",
+            ),
+            "source: an extra key": (lambda b: b["inputs_attempted"].__setitem__("config", {"attempted": False, "reason": "NO_SOURCE_ACCESS"}), "config"),
+            "source: attempted not boolean": (lambda b: source(b, "manifest", "attempted", "yes"), "attempted"),
+            "source: unknown reason": (lambda b: source(b, "manifest", "reason", "WHY_NOT"), "WHY_NOT"),
+            "source: attempted without reached": (lambda b: source(b, "manifest", "reached", _DROP), "reached"),
+            "source: not attempted without reason": (
+                lambda b: (source(b, "manifest", "attempted", False), source(b, "manifest", "reason", _DROP)),
+                "reason",
+            ),
+            "source: not reached without reason": (
+                lambda b: (source(b, "manifest", "reached", False), source(b, "manifest", "reason", _DROP)),
+                "reason",
+            ),
+            "source: window_seconds off runtime": (
+                lambda b: source(b, "manifest", "window_seconds", 60),
+                "window_seconds",
+            ),
+            "source: not an object": (lambda b: b.__setitem__("inputs_attempted", []), "inputs_attempted"),
+            "attribute: unknown field": (lambda b: attribute(b, "user", "score", 1), "score"),
+            "attribute: value missing": (lambda b: attribute(b, "user", "value", _DROP), "value"),
+            "attribute: unknown tier": (lambda b: attribute(b, "user", "tier", "guessed"), "tier"),
+            "attribute: unknown authored_by": (lambda b: attribute(b, "user", "authored_by", "vendor"), "vendor"),
+            "attribute: ANSWERED without authored_by": (
+                lambda b: replace_user("ANSWERED", authored_by=_DROP)(b),
+                "authored_by",
+            ),
+            "attribute: PARTIAL without authored_by": (
+                lambda b: replace_user("PARTIAL", authored_by=_DROP)(b),
+                "authored_by",
+            ),
+            "attribute: BLIND carrying authored_by": (
+                lambda b: replace_user("BLIND", reason="NO_SOURCE_ACCESS", authored_by="none")(b),
+                "not an authored value",
+            ),
+            "attribute: BLIND without reason": (lambda b: replace_user("BLIND", authored_by=_DROP)(b), "BLIND"),
+            "attribute: FAILED without reason": (lambda b: replace_user("FAILED", authored_by=_DROP)(b), "FAILED"),
+            "attribute: ANSWERED with a reason": (
+                lambda b: replace_user("ANSWERED", authored_by="none", reason="NO_SOURCE_ACCESS")(b),
+                "carries a reason",
+            ),
+            "attribute: ABSENT without method": (lambda b: replace_user("ABSENT")(b), "ABSENT"),
+            "attribute: not an object": (lambda b: b["attributes"].__setitem__("user", "root"), "user"),
+        }
+        for name, (mutate, needle) in cases.items():
+            with self.subTest(case=name):
+                bundle = build_bundle()
+                mutate(bundle)
+                problems = evidence_bundle.contract_problems(bundle)
+                self.assertTrue(
+                    any(needle in problem for problem in problems),
+                    f"{name}: expected a problem naming {needle!r}, got {problems}",
+                )
+        # The unmutated bundle is the control: no branch fires on a clean one.
+        self.assertEqual(evidence_bundle.contract_problems(build_bundle()), [])
+
 
     def test_verify_rejects_a_broken_bundle(self):
         bundle = build_bundle()
@@ -452,6 +695,113 @@ class BundleWritePathTest(unittest.TestCase):
             self.assertEqual(evidence_bundle.evidence_bundle_output_path(args), Path("/tmp/env-bundle.json"))
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(evidence_bundle.evidence_bundle_output_path(args), evidence_bundle.DEFAULT_EVIDENCE_BUNDLE_OUTPUT)
+
+    def test_a_null_host_pair_refuses_the_write_without_a_file(self):
+        # A scan with no host identity produces no bundle at all: the write is
+        # refused and the reason is reported, never a bundle with a null owner.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_args()
+            args.evidence_bundle_output = f"{tmp}/bundle.json"
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stderr(stderr):
+                self.assertFalse(
+                    evidence_bundle.write_evidence_bundle(
+                        args, docker_context(), {"host_id": None, "sandbox_name": None}, identity()
+                    )
+                )
+            self.assertFalse(Path(tmp, "bundle.json").exists())
+            self.assertIn("host_id", stderr.getvalue())
+
+    def test_the_flag_beats_the_env_var_for_the_output_path(self):
+        # Precedence, not just each side alone: a stale RAIL_EVIDENCE_BUNDLE_OUTPUT
+        # must not redirect a run that named its output explicitly.
+        args = build_args()
+        args.evidence_bundle_output = "/tmp/flag-bundle.json"
+        with mock.patch.dict(os.environ, {"RAIL_EVIDENCE_BUNDLE_OUTPUT": "/tmp/env-bundle.json"}):
+            self.assertEqual(evidence_bundle.evidence_bundle_output_path(args), Path("/tmp/flag-bundle.json"))
+
+    def test_a_credential_carrying_value_is_redacted(self):
+        # Every credential shape the key-name check cannot see, including the
+        # empty-side DSN forms and a bare-token userinfo.
+        redacted = "[redacted]"
+        for value in (
+            "postgres://u:p@h/db",
+            "redis://:hunter2@cache.internal:6379/0",
+            "postgres://admin:@db.internal/db",
+            "https://token@api.internal/v1",
+            "Basic dXNlcjpwYXNz",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(evidence_bundle._redact_harness_values(value, "auth"), redacted)
+        # And it stays off a plain declarative value under a neutral key.
+        self.assertEqual(evidence_bundle._redact_harness_values("read-only", "mode"), "read-only")
+
+    def test_a_nested_but_parseable_config_is_read_not_a_failure(self):
+        # A JSON `null` is valid: it must read as "nothing here", not as a
+        # failure whose empty reason poisons the whole bundle's contract.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            null_file = Path(tmp, "null.json")
+            null_file.write_text("null")
+            found, failures = evidence_bundle.read_harness_permission_config([null_file])
+            self.assertEqual(failures, {})
+            self.assertEqual(found, {})
+
+    def test_a_deeply_nested_config_is_a_parse_failure_not_a_crash(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = Path(tmp, "nested.json")
+            nested.write_text("[" * 20_000)
+            data, reason = evidence_bundle._read_json_capped(nested)
+            self.assertIsNone(data)
+            self.assertEqual(reason, "PARSE_FAILED")
+
+    def test_the_source_filename_does_not_shape_the_block(self):
+        # A block's shape is its own key's, never the file it was read from:
+        # `permissions.json` must not turn an approval block into allow/deny.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp, "permissions.json")
+            conf.write_text(json.dumps({"approvalPolicy": {"requireApproval": True}}))
+            args = build_args()
+            args.config_path = [Path(tmp)]
+            bundle = evidence_bundle.build_evidence_bundle(
+                args, self_context(), dict(HOST_PAIR), identity()
+            )
+            attrs = bundle["attributes"]
+            # The approval block is the approval gate and only that.
+            self.assertEqual(attrs["approval_policy"]["status"], "ANSWERED")
+            # And the allow/deny gate stays unanswered: nothing in this file
+            # is shaped like it, so it must not inherit the approval block.
+            self.assertEqual(attrs["tool_allow_deny"]["status"], "BLIND")
+            # The control: a neutral filename with the same content lands the
+            # same way, which is the behaviour the filename was overriding.
+            neutral = Path(tmp, "settings.json")
+            neutral.write_text(json.dumps({"approvalPolicy": {"requireApproval": True}}))
+            control_args = build_args()
+            control_args.config_path = [neutral]
+            control = evidence_bundle.build_evidence_bundle(
+                control_args, self_context(), dict(HOST_PAIR), identity()
+            )
+            self.assertEqual(control["attributes"]["approval_policy"]["status"], "ANSWERED")
+            self.assertEqual(control["attributes"]["tool_allow_deny"]["status"], "BLIND")
+            # The symmetric direction: a filename carrying the *approval*
+            # token must not turn an allow/deny block into an approval gate.
+            notes = Path(tmp, "my-approval-notes.json")
+            notes.write_text(json.dumps({"permissions": {"allow": ["read"], "deny": ["write"]}}))
+            notes_args = build_args()
+            notes_args.config_path = [notes]
+            notes_bundle = evidence_bundle.build_evidence_bundle(
+                notes_args, self_context(), dict(HOST_PAIR), identity()
+            )
+            notes_attrs = notes_bundle["attributes"]
+            self.assertEqual(notes_attrs["tool_allow_deny"]["status"], "ANSWERED")
+            self.assertEqual(notes_attrs["approval_policy"]["status"], "BLIND")
 
 
 class ScannerWiringTest(unittest.TestCase):

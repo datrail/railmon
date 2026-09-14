@@ -1,0 +1,328 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:railxia:asp:evidence-bundle:1",
+  "title": "Evidence bundle, bundle_version 1",
+  "$comment": "One rule is not expressible here and must be checked in code: every attestation_ref names the id of an entry in attestations.",
+  "type": "object",
+  "required": [
+    "bundle_version",
+    "bundle_id",
+    "host_id",
+    "sandbox_name",
+    "collected_at",
+    "rule_pack_version",
+    "inputs_attempted",
+    "attributes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "bundle_version": {
+      "const": 1
+    },
+    "bundle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "sandbox_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "collected_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "rule_pack_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "inputs_attempted": {
+      "type": "object",
+      "required": [
+        "runtime",
+        "image",
+        "manifest",
+        "repo"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runtime": {
+          "$ref": "#/$defs/source"
+        },
+        "image": {
+          "$ref": "#/$defs/source"
+        },
+        "manifest": {
+          "$ref": "#/$defs/source"
+        },
+        "repo": {
+          "$ref": "#/$defs/source"
+        }
+      }
+    },
+    "attestations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/attestation"
+      }
+    },
+    "attributes": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/attribute"
+      }
+    }
+  },
+  "$defs": {
+    "reason": {
+      "enum": [
+        "NO_SOURCE_ACCESS",
+        "NOT_FIRST_PARTY",
+        "SOURCE_OK_NOT_PRESENT",
+        "UNKNOWN_HARNESS",
+        "NOT_COLLECTED_BY_PACK",
+        "PRIVATE_STORE",
+        "CODE_CONSTRUCTED",
+        "GATEWAY_MANAGED",
+        "ORCHESTRATOR_MANAGED",
+        "PROVIDER_HOSTED",
+        "TEMPLATE_UNRESOLVED",
+        "PARSE_FAILED",
+        "SIZE_CAP_EXCEEDED"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "attempted"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "reached": {
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/reason"
+        },
+        "window_seconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "attempted": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "attempted": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reached"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "reached"
+            ],
+            "properties": {
+              "reached": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        }
+      ]
+    },
+    "attestation": {
+      "type": "object",
+      "required": [
+        "id",
+        "root",
+        "claim",
+        "subject",
+        "verified_at",
+        "verifier_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root": {
+          "type": "string"
+        },
+        "claim": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "verified_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "verifier_version": {
+          "type": "string"
+        }
+      }
+    },
+    "attribute": {
+      "type": "object",
+      "required": [
+        "value",
+        "status",
+        "tier"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "value": true,
+        "status": {
+          "enum": [
+            "ANSWERED",
+            "ABSENT",
+            "TEMPLATED",
+            "PARTIAL",
+            "BLIND",
+            "FAILED"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/reason"
+        },
+        "tier": {
+          "enum": [
+            "declared",
+            "interrogated",
+            "observed"
+          ]
+        },
+        "authored_by": {
+          "enum": [
+            "subject",
+            "platform",
+            "external",
+            "none"
+          ]
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "note": {
+          "type": "string"
+        },
+        "attestation_ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ABSENT"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "method"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "BLIND",
+                  "FAILED"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ANSWERED"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "ANSWERED",
+                  "PARTIAL",
+                  "TEMPLATED"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "authored_by"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "authored_by"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
