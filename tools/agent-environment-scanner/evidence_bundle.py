@@ -12,11 +12,16 @@ mirrored from that published contract; `verify_bundle` is this module's check
 of an emitted bundle - the guard a guard needs, so a broken bundle is a
 ScannerError rather than a file a scorer reads.
 
-Import direction: the scanner imports this module, never the other way
-around, so the closed sets have one home. The builder is a pure
-data-to-bundle transform: the scanner passes it pre-computed inputs, which is
-also why a test can build and verify a bundle without a container, a network
-or a clone of the consumer.
+Import direction: mutual and deliberately lazy on both sides, so the closed
+sets have one home here. The scanner imports this module inside its `finally`
+block; this module imports the scanner inside the few functions that need it
+(`verify_bundle`, `_redact_harness_values`, `build_evidence_bundle`,
+`write_evidence_bundle`) - the function-local imports are what break the
+cycle. The builder is therefore not a pure transform of pre-computed inputs:
+it calls the scanner's own collectors and classifiers, which is what keeps a
+signal's meaning identical on both paths. Everything else it needs is passed
+in, which is why a test can build and verify a bundle without a container, a
+network or a clone of the consumer.
 """
 
 from __future__ import annotations
@@ -109,8 +114,16 @@ DEPLOYMENT_LABEL_KEYS = frozenset(
 # shapes can never be a legitimate declarative value: a harness permission
 # block is allow/deny/approval-shaped, never a connection string or an
 # encoded credential.
+# Either side of the colon may be empty: `redis://:hunter2@…` (empty user,
+# real password) and `postgres://admin:@…` (real user, empty password) are
+# both credentials, and the original both-sides-required form missed them.
+# A bare userinfo with no colon (`https://token@api.internal/v1`) is a token
+# in the user position, also impossible in a declarative block.
 _DSN_WITH_CREDENTIALS = re.compile(
-    r"^[a-z][a-z0-9+.\-]*://[^/\s:@]+:[^@\s]+@", re.IGNORECASE
+    r"^[a-z][a-z0-9+.\-]*://[^/?#\s:@]*:[^/?#\s@]*@", re.IGNORECASE
+)
+_URL_USERINFO_WITHOUT_PASSWORD = re.compile(
+    r"^[a-z][a-z0-9+.\-]*://[^/?#\s:@]+@", re.IGNORECASE
 )
 _BASIC_AUTH_HEADER = re.compile(r"^basic\s+[a-z0-9+/=]+$", re.IGNORECASE)
 
@@ -118,13 +131,19 @@ _BASIC_AUTH_HEADER = re.compile(r"^basic\s+[a-z0-9+/=]+$", re.IGNORECASE)
 def _credential_carrying_value(value: Any) -> bool:
     """True when the value's shape carries credentials regardless of key.
 
-    Two shapes, both impossible in a declarative permission block:
-    - a URL/DSN embedding userinfo with a password (postgres://user:pass@…),
+    Three shapes, none legitimate in a declarative permission block:
+    - a URL/DSN embedding userinfo with a password (postgres://user:pass@…,
+      including the empty-user and empty-password forms),
+    - a URL embedding a bare token as userinfo (https://token@…),
     - a base64-encoded Basic auth header.
     """
     if not isinstance(value, str):
         return False
-    return bool(_DSN_WITH_CREDENTIALS.match(value) or _BASIC_AUTH_HEADER.match(value))
+    return bool(
+        _DSN_WITH_CREDENTIALS.match(value)
+        or _URL_USERINFO_WITHOUT_PASSWORD.match(value)
+        or _BASIC_AUTH_HEADER.match(value)
+    )
 
 
 # ── the contract check ──────────────────────────────────────────────────────
@@ -371,8 +390,13 @@ def _block_shaped(block_key: str, value: Any, shapes: tuple[str, ...]) -> bool:
 
     Judging on the outer key name alone misses the dominant shape: a
     "permissions" block carrying its allow/deny lists nested. The block
-    counts when the key says so, or when a nested key says so — one level in,
-    including under a list of blocks.
+    counts when its own key says so, or when a nested key says so — one level
+    in, including under a list of blocks.
+
+    `block_key` must be the block's own key, never the `<source>:<key>` form
+    the captured value is stored under: the source filename is not part of the
+    block, and letting it in would make every permission block in
+    `permissions.json` match the allow/deny shapes regardless of its content.
     """
     if any(tok in block_key.lower() for tok in shapes):
         return True
@@ -423,10 +447,12 @@ def _read_permission_file(
 ) -> None:
     """One config file into `found`; its closed-set failure reason into `failures`."""
     data, reason = _read_json_capped(file)
-    if data is None:
+    if reason:
         failures[str(file)] = reason
         return
     if not isinstance(data, dict):
+        # A parseable file that is not an object (a JSON `null`, a bare list
+        # or scalar) holds no permission keys; that is not a read failure.
         return
     keys: dict[str, Any] = {}
     _permission_keys(data, keys)
@@ -488,6 +514,11 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
     except json.JSONDecodeError:
         if len(raw) == 64_000:
             return None, "SIZE_CAP_EXCEEDED"
+        return None, "PARSE_FAILED"
+    except RecursionError:
+        # Deeply nested but under the cap: the reader raises, the document
+        # never parses. It is a parse failure like any other, and catching it
+        # here keeps it inside the writer's report-failure-don't-raise path.
         return None, "PARSE_FAILED"
 
 
@@ -841,10 +872,16 @@ def build_evidence_bundle(
     # - there is no last-wins.
     stems = Counter(Path(s).name for s in found)
     harness_block: dict[str, Any] = {}
+    # The block's own key, kept beside the qualified one: shape classification
+    # reads the key, and the qualifier is the source filename, which must not
+    # drive it (a `permissions.json` would otherwise match every shape).
+    block_own_key: dict[str, str] = {}
     for source, keys in found.items():
         for key, value in keys.items():
             qualifier = source if stems[Path(source).name] > 1 else Path(source).name
-            harness_block[f"{qualifier}:{key}"] = _redact_harness_values(value, key)
+            qualified = f"{qualifier}:{key}"
+            harness_block[qualified] = _redact_harness_values(value, key)
+            block_own_key[qualified] = key
     harness_note = "no permission-shaped keys in the harness config at the scanned roots"
     failure_note = _failure_note(failures)
     worst = _worst_failure_reason(failures) if failures else None
@@ -902,17 +939,18 @@ def build_evidence_bundle(
             note="privileged flag / Linux caps / RBAC are not readable from a bare process; "
                  + (failure_note or harness_note),
         )
-
     # The approval and allow/deny gates are the permission-shaped keys of the
-    # same blocks, judged on the qualified key: a key whose name says the
-    # shape, or a block whose nested keys do.
+    # same blocks, judged on each block's own key (never the source-qualified
+    # form): a key whose name says the shape, or a block whose nested keys do.
     approval = {
-        k: v for k, v in harness_block.items() if _block_shaped(k, v, _APPROVAL_SHAPES)
+        k: v
+        for k, v in harness_block.items()
+        if _block_shaped(block_own_key[k], v, _APPROVAL_SHAPES)
     }
     allow_deny = {
         k: v
         for k, v in harness_block.items()
-        if _block_shaped(k, v, _ALLOW_DENY_SHAPES)
+        if _block_shaped(block_own_key[k], v, _ALLOW_DENY_SHAPES)
     }
     if approval:
         attributes["approval_policy"] = _answered(
