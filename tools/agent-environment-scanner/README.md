@@ -185,6 +185,11 @@ the operator-set compose project/service labels when they are on the
 container — the deployment name, exactly — and `ABSENT` otherwise, since K8s
 pod labels do not reach `Config.Labels` and two agents can share an image.
 
+`credential_inventory` uses the profiler's closed credential classes:
+`secret_plaintext`, `secret_ref`, and `mount`. Empty secret-shaped environment
+variables are omitted because they contain no credential. Values are never
+collected or written to the bundle.
+
 ## Observed reach (optional)
 
 The other dimensions describe what an agent is *configured* to reach.

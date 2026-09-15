@@ -692,6 +692,44 @@ class BundlePermissionsTest(unittest.TestCase):
             {"com.docker.compose.project": "rail", "com.docker.compose.service": "agent"},
         )
 
+    def test_credential_classes_match_the_profiler_contract(self):
+        with mock.patch.object(
+            scanner,
+            "collect_secret_hygiene",
+            return_value=[
+                {"key": "API_TOKEN", "secret_class": "plaintext", "secret_type": "token"},
+                {"key": "CLIENT_SECRET_FILE", "secret_class": "mount", "secret_type": "secret"},
+                {"key": "REMOTE_KEY", "secret_class": "reference", "secret_type": "key"},
+                {"key": "EMPTY_PASSWORD", "secret_class": "empty", "secret_type": "password"},
+            ],
+        ):
+            bundle = build_bundle()
+
+        credentials = bundle["attributes"]["credential_inventory"]["value"]
+        self.assertEqual(
+            credentials,
+            [
+                {"name": "API_TOKEN", "class": "secret_plaintext", "type": "token"},
+                {"name": "CLIENT_SECRET_FILE", "class": "mount", "type": "secret"},
+                {"name": "REMOTE_KEY", "class": "secret_ref", "type": "key"},
+            ],
+        )
+
+    def test_empty_secret_markers_do_not_become_credentials(self):
+        with mock.patch.object(
+            scanner,
+            "collect_secret_hygiene",
+            return_value=[
+                {"key": "EMPTY_PASSWORD", "secret_class": "empty", "secret_type": "password"}
+            ],
+        ):
+            bundle = build_bundle()
+
+        field = bundle["attributes"]["credential_inventory"]
+        self.assertEqual(field["status"], "ANSWERED")
+        self.assertEqual(field["value"], [])
+        self.assertEqual(field["method"], "env scan; no credential material found")
+
 
 class BundleWritePathTest(unittest.TestCase):
     """The write path reports failures rather than raising, and honours the output location."""

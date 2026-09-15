@@ -74,6 +74,16 @@ BUNDLE_VERSION = 1
 # applies when the set grows.
 RULE_PACK_VERSION = 1
 
+# Rail Center's profiler vocabulary is intentionally narrower than the
+# scanner's inventory vocabulary. An empty secret-shaped environment variable
+# is not a credential, while a reference is represented as `secret_ref` so the
+# baked-secret cap can distinguish a pointer from readable secret material.
+CREDENTIAL_CLASSES = {
+    "plaintext": "secret_plaintext",
+    "reference": "secret_ref",
+    "mount": "mount",
+}
+
 # The keys whose presence in a harness config counts as a declared permission
 # / approval setting, under their common case. `model`, `mcpServers` and
 # friends are deliberately absent: the value the containment category reads
@@ -776,15 +786,24 @@ def build_evidence_bundle(
         env,
         scanner.container_path_checker(str(context["container_name"])) if mode == "docker" else None,
     )
+    credentials = [
+        {
+            "name": secret["key"],
+            "class": CREDENTIAL_CLASSES[secret["secret_class"]],
+            "type": secret["secret_type"],
+        }
+        for secret in secrets
+        if secret.get("secret_class") in CREDENTIAL_CLASSES
+    ]
     attributes["credential_inventory"] = (
         _answered(
-            [{"name": s["key"], "class": s["secret_class"], "type": s["secret_type"]} for s in secrets],
+            credentials,
             "observed", authored_by="none",
             note="name + class + type only; values never collected",
         )
-        if secrets
+        if credentials
         else _answered([], "observed", authored_by="none",
-                       method="env scan; no secret-looking variables",
+                       method="env scan; no credential material found",
                        note="an empty list that means 'none', not 'unobserved'")
     )
     attributes["credential_provenance"] = _blind(
