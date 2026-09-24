@@ -55,13 +55,13 @@
           "$ref": "#/$defs/source"
         },
         "image": {
-          "$ref": "#/$defs/source"
+          "$ref": "#/$defs/non_runtime_source"
         },
         "manifest": {
-          "$ref": "#/$defs/source"
+          "$ref": "#/$defs/non_runtime_source"
         },
         "repo": {
-          "$ref": "#/$defs/source"
+          "$ref": "#/$defs/non_runtime_source"
         }
       }
     },
@@ -160,6 +160,20 @@
           "then": {
             "required": [
               "reason"
+            ]
+          }
+        }
+      ]
+    },
+    "non_runtime_source": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/source"
+        },
+        {
+          "not": {
+            "required": [
+              "window_seconds"
             ]
           }
         }

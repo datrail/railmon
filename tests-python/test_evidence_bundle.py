@@ -162,6 +162,7 @@ class BundleContractTest(unittest.TestCase):
         self.assertEqual(
             set(evidence_bundle.INPUT_SOURCES), set(SCHEMA["properties"]["inputs_attempted"]["required"])
         )
+
         # The authored/un-authored split is the schema's allOf, not a free
         # tuple: the statuses its `if` names must be authored, the rest must
         # not. Anchoring it here catches a member dropped from either tuple.
@@ -182,6 +183,19 @@ class BundleContractTest(unittest.TestCase):
         self.assertEqual(evidence_bundle.BUNDLE_VERSION, SCHEMA["properties"]["bundle_version"]["const"])
         self.assertEqual(evidence_bundle.HOST_ID_MAX, SCHEMA["properties"]["host_id"]["maxLength"])
         self.assertEqual(evidence_bundle.SANDBOX_NAME_MAX, SCHEMA["properties"]["sandbox_name"]["maxLength"])
+
+    def test_schema_restricts_window_seconds_to_runtime(self):
+        source_schemas = SCHEMA["properties"]["inputs_attempted"]["properties"]
+        self.assertEqual(source_schemas["runtime"], {"$ref": "#/$defs/source"})
+        for source_name in ("image", "manifest", "repo"):
+            self.assertEqual(
+                source_schemas[source_name],
+                {"$ref": "#/$defs/non_runtime_source"},
+            )
+        self.assertIn(
+            {"not": {"required": ["window_seconds"]}},
+            SCHEMA["$defs"]["non_runtime_source"]["allOf"],
+        )
 
     def test_every_emitted_field_is_inside_the_closed_sets(self):
         bundle = build_bundle()
