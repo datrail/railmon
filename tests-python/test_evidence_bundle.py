@@ -692,6 +692,109 @@ class BundlePermissionsTest(unittest.TestCase):
             {"com.docker.compose.project": "rail", "com.docker.compose.service": "agent"},
         )
 
+    def test_deployment_environment_pair_is_emitted_before_compose_fallback(self):
+        context = docker_context(
+            env={
+                "RAIL_DEPLOYMENT": "payments-agent",
+                "RAIL_NAMESPACE": "production",
+                "IGNORED_DEPLOYMENT_KEY": "not-in-the-contract",
+            }
+        )
+        bundle = evidence_bundle.build_evidence_bundle(
+            build_args(), context, dict(HOST_PAIR), identity()
+        )
+
+        field = bundle["attributes"]["deployment"]
+        self.assertEqual(field["status"], "ANSWERED")
+        self.assertEqual(
+            field["value"],
+            {
+                "RAIL_DEPLOYMENT": "payments-agent",
+                "RAIL_NAMESPACE": "production",
+                "com.docker.compose.project": "rail",
+                "com.docker.compose.service": "agent",
+            },
+        )
+        self.assertIn("environment pair takes precedence", field["note"])
+
+    def test_half_environment_pair_does_not_hide_complete_compose_pair(self):
+        context = docker_context(env={"RAIL_DEPLOYMENT": "payments-agent"})
+        bundle = evidence_bundle.build_evidence_bundle(
+            build_args(), context, dict(HOST_PAIR), identity()
+        )
+
+        field = bundle["attributes"]["deployment"]
+        self.assertEqual(
+            field["value"],
+            {
+                "RAIL_DEPLOYMENT": "payments-agent",
+                "com.docker.compose.project": "rail",
+                "com.docker.compose.service": "agent",
+            },
+        )
+        self.assertIn("half-pair supplies no deployment key", field["note"])
+
+    def test_self_mode_emits_environment_deployment_pair(self):
+        context = self_context(
+            env={"RAIL_DEPLOYMENT": "local-agent", "RAIL_NAMESPACE": "developer"}
+        )
+        bundle = evidence_bundle.build_evidence_bundle(
+            build_args(), context, dict(HOST_PAIR), identity()
+        )
+
+        field = bundle["attributes"]["deployment"]
+        self.assertEqual(field["status"], "ANSWERED")
+        self.assertEqual(
+            field["value"],
+            {"RAIL_DEPLOYMENT": "local-agent", "RAIL_NAMESPACE": "developer"},
+        )
+        self.assertEqual(field["authored_by"], "subject")
+
+    def test_readable_environment_without_deployment_keys_is_absent(self):
+        bundle = build_bundle(mode="self")
+
+        field = bundle["attributes"]["deployment"]
+        self.assertEqual(field["status"], "ABSENT")
+        self.assertIn("environment", field["method"])
+
+    def test_deployment_values_follow_the_published_byte_bound(self):
+        bundle = build_bundle()
+        bundle["attributes"]["deployment"]["value"] = {
+            "RAIL_DEPLOYMENT": "é" * 126 + "a",
+            "RAIL_NAMESPACE": "é" * 126 + "a",
+        }
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
+        bundle["attributes"]["deployment"]["value"]["RAIL_DEPLOYMENT"] += "a"
+        problems = evidence_bundle.contract_problems(bundle)
+        self.assertTrue(
+            any(
+                "RAIL_DEPLOYMENT" in problem and "253-byte" in problem
+                for problem in problems
+            )
+        )
+
+    def test_deployment_contract_rejects_unknown_or_empty_keys(self):
+        bundle = build_bundle()
+        bundle["attributes"]["deployment"]["value"] = {
+            "RAIL_DEPLOYMENT": "",
+            "unexpected": "agent",
+        }
+
+        problems = evidence_bundle.contract_problems(bundle)
+        self.assertTrue(
+            any(
+                "RAIL_DEPLOYMENT" in problem and "non-empty" in problem
+                for problem in problems
+            )
+        )
+        self.assertTrue(
+            any(
+                "unexpected" in problem and "not a deployment key" in problem
+                for problem in problems
+            )
+        )
+
     def test_credential_classes_match_the_profiler_contract(self):
         with mock.patch.object(
             scanner,

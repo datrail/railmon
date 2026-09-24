@@ -180,10 +180,15 @@ returns is not in the envelope: the control plane looks the pair up, which
 keeps the builder decoupled from the scan job's output.
 
 Attributes that are *absent* from the bundle rather than absent *on the
-agent* carry `method`: where the pack looked. The `deployment` attribute is
-the operator-set compose project/service labels when they are on the
-container — the deployment name, exactly — and `ABSENT` otherwise, since K8s
-pod labels do not reach `Config.Labels` and two agents can share an image.
+agent* carry `method`: where the pack looked. The `deployment` attribute
+retains the closed set of non-empty deployment fields the scanner can read:
+`RAIL_DEPLOYMENT` plus `RAIL_NAMESPACE` from the scanned subject environment,
+and the Compose project/service pair from container labels. Consumers use a
+complete environment pair first, then a complete Compose pair; a half-pair is
+evidence of an incomplete operator setting, not a deployment key. This makes
+the Kubernetes path work through the downward API even though pod labels do
+not reach Docker `Config.Labels`. With none of those fields set, the attribute
+is `ABSENT`; arbitrary labels and image names are never grouping signals.
 
 `credential_inventory` uses the profiler's closed credential classes:
 `secret_plaintext`, `secret_ref`, and `mount`. Empty secret-shaped environment

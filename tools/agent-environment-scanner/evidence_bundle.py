@@ -107,15 +107,18 @@ PERMISSION_KEY_ALIASES = frozenset(
     }
 )
 
-# Labels that identify a deployment. The compose project/service pair is a
-# deployment name exactly; K8s pod labels do not reach Config.Labels, and
-# the image name alone is not a candidate - two agents can share an image.
-DEPLOYMENT_LABEL_KEYS = frozenset(
-    {
-        "com.docker.compose.project",
-        "com.docker.compose.service",
-    }
+# The published deployment attribute's closed key set. Kubernetes supplies the
+# environment pair (the namespace normally through the downward API); Compose
+# supplies its labels. Rail Center reads a complete environment pair first,
+# then a complete Compose pair. A half-pair is retained as evidence but is not
+# a logical deployment key.
+DEPLOYMENT_ENV_KEYS = ("RAIL_DEPLOYMENT", "RAIL_NAMESPACE")
+DEPLOYMENT_LABEL_KEYS = (
+    "com.docker.compose.project",
+    "com.docker.compose.service",
 )
+DEPLOYMENT_KEYS = frozenset((*DEPLOYMENT_ENV_KEYS, *DEPLOYMENT_LABEL_KEYS))
+DEPLOYMENT_VALUE_MAX_BYTES = 253
 
 # Credential-carrying value shapes: a DSN/URL embedding user:pass@ and a
 # base64 Basic-auth header. Caught on the value alone, independent of the key
@@ -299,6 +302,23 @@ def contract_problems(bundle: dict[str, Any]) -> list[str]:
             problems.append(f"{where}: {status} is not an authored value")
         if f.get("attestation_ref") not in (None, *attestations):
             problems.append(f"{where}: attestation_ref {f.get('attestation_ref')!r} points at nothing")
+    deployment = (bundle.get("attributes") or {}).get("deployment")
+    if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
+        value = deployment.get("value")
+        if not isinstance(value, dict) or not value:
+            problems.append("attributes.deployment.value: ANSWERED deployment must be a non-empty object")
+        else:
+            for key, item in value.items():
+                where = f"attributes.deployment.value.{key}"
+                if key not in DEPLOYMENT_KEYS:
+                    problems.append(f"{where}: not a deployment key")
+                    continue
+                if not isinstance(item, str) or not item.strip():
+                    problems.append(f"{where}: must be a non-empty string")
+                elif len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
+                    problems.append(
+                        f"{where}: exceeds the {DEPLOYMENT_VALUE_MAX_BYTES}-byte bound"
+                    )
     return problems
 
 
@@ -858,30 +878,60 @@ def build_evidence_bundle(
         )
 
     # ── deployment: the signal that groups copies of the same agent ─────
-    # What RailMon can see: operator-set labels the runtime carries on the
-    # container. In the compose world the project/service pair is the
-    # deployment name exactly. On K8s the pod labels do not reach
-    # Config.Labels, so the attribute stays ABSENT until an operator sets
-    # a label this pack can read; the image name is not a candidate - two
-    # agents can share an image.
-    if mode == "docker":
-        labels = scanner.container_labels(context)
-        deployment_labels = {k: v for k, v in labels.items() if k in DEPLOYMENT_LABEL_KEYS}
-        if deployment_labels:
-            attributes["deployment"] = _answered(
-                deployment_labels, "declared", authored_by="platform",
-                method="docker inspect: Config.Labels",
-                note="operator-set deployment signal; copies carrying these labels are one deployment",
-            )
+    # Preserve every non-empty key in the published closed set. The consumer
+    # applies the semantic precedence: complete environment pair, then complete
+    # Compose pair. Retaining a half-pair is deliberate — it lets Rail Center
+    # log the operator's incomplete grouping attempt without treating it as a
+    # key. The image name and arbitrary labels are never candidates.
+    deployment_env = {
+        key: env[key].strip()
+        for key in DEPLOYMENT_ENV_KEYS
+        if isinstance(env.get(key), str) and env[key].strip()
+    }
+    labels = scanner.container_labels(context) if mode == "docker" else {}
+    deployment_labels = {
+        key: labels[key].strip()
+        for key in DEPLOYMENT_LABEL_KEYS
+        if isinstance(labels.get(key), str) and labels[key].strip()
+    }
+    deployment = {**deployment_env, **deployment_labels}
+    if deployment:
+        env_complete = all(key in deployment_env for key in DEPLOYMENT_ENV_KEYS)
+        compose_complete = all(key in deployment_labels for key in DEPLOYMENT_LABEL_KEYS)
+        if env_complete:
+            precedence = "complete environment pair takes precedence over any Compose pair"
+        elif compose_complete:
+            precedence = "complete Compose pair is the deployment key"
         else:
-            attributes["deployment"] = _absent(
-                "docker inspect: Config.Labels", "declared",
-                note="no deployment-identifying labels on the container; K8s pod labels are not visible via the docker API",
-            )
+            precedence = "half-pair supplies no deployment key"
+        if (deployment_env and not env_complete) or (
+            deployment_labels and not compose_complete
+        ):
+            precedence += "; an incomplete half-pair supplies no deployment key"
+        attributes["deployment"] = _answered(
+            deployment,
+            "declared",
+            # A sibling-container scan reads deployment configuration from
+            # Docker metadata the subject process cannot rewrite. In self
+            # mode the scanner inherits the subject process environment, so
+            # it must not overstate that claim as platform-authored.
+            authored_by="platform" if mode == "docker" else "subject",
+            method=(
+                "scanned subject environment plus docker inspect: Config.Labels"
+                if mode == "docker"
+                else "scanned subject environment"
+            ),
+            note=f"operator-set deployment signal; {precedence}",
+        )
     else:
-        attributes["deployment"] = _blind(
-            "NO_SOURCE_ACCESS", "declared",
-            note="container labels are not readable from inside a bare process",
+        attributes["deployment"] = _absent(
+            (
+                "scanned subject environment plus docker inspect: Config.Labels"
+                if mode == "docker"
+                else "scanned subject environment"
+            ),
+            "declared",
+            note="no deployment key from the published closed set was present",
         )
 
     # The declared-tier harness permission/approval attribute - the one that
