@@ -1,0 +1,1 @@
+{"runtime_identity_version":1,"agent_ref":{"host_id":"host-01","sandbox_name":"shared-agents","agent_key":"planner"},"attribution":{"state":"attributed","method":"process_target","reason":null,"target_id":"planner","process":{"pid":42,"start_time_ticks":123456}}}

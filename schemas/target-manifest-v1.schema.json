@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datrail.io/schema/target-manifest-v1.schema.json",
+  "title": "DatRail multi-agent target manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "sandbox", "agents"],
+  "properties": {
+    "manifest_version": {"const": 1},
+    "sandbox": {"type": "object", "additionalProperties": false, "required": ["host_id", "sandbox_name", "access"], "properties": {"host_id": {"type": "string", "minLength": 1}, "sandbox_name": {"type": "string", "minLength": 1}, "access": {"type": "object", "additionalProperties": false, "required": ["kind", "container"], "properties": {"kind": {"const": "docker"}, "container": {"type": "string", "minLength": 1}}}}},
+    "agents": {"type": "array", "minItems": 1, "x-datrail-unique-by": "agent_key", "items": {"type": "object", "additionalProperties": false, "required": ["agent_key", "discovery"], "properties": {"agent_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "not": {"const": "default"}}, "display_name": {"type": "string"}, "discovery": {"type": "object", "additionalProperties": false, "required": ["pid_file"], "properties": {"pid_file": {"type": "string", "pattern": "^/.+"}}}, "scan": {"type": "object", "additionalProperties": false, "properties": {"config_roots": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^/.+"}}}}, "capture": {"type": "object", "additionalProperties": false, "properties": {"binary_path": {"type": "string", "pattern": "^/.+"}}}}}}
+  }
+}

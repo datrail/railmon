@@ -64,7 +64,9 @@ pub fn to_attributed_runtime_interaction(
     });
     if let Some(agent_ref) = agent_ref {
         output["runtime_identity_version"] = json!(1);
-        let start_time = interaction.get("process_start_time_ticks").and_then(Value::as_u64);
+        let start_time = interaction
+            .get("process_start_time_ticks")
+            .and_then(Value::as_u64);
         if let Some(start_time) = start_time {
             output["agent_ref"] = serde_json::to_value(agent_ref).unwrap_or(Value::Null);
             output["attribution"] = json!({
@@ -73,7 +75,7 @@ pub fn to_attributed_runtime_interaction(
                 "reason": null,
                 "target_id": agent_ref.agent_key,
                 "process": {
-                    "pid": interaction.get("pid").cloned().unwrap_or(Value::Null),
+                "pid": interaction.get("target_pid").or_else(|| interaction.get("pid")).cloned().unwrap_or(Value::Null),
                     "start_time_ticks": start_time
                 }
             });
@@ -292,7 +294,11 @@ mod tests {
     use super::*;
 
     fn agent_ref() -> AgentRef {
-        AgentRef { host_id: "h".into(), sandbox_name: "s".into(), agent_key: "planner".into() }
+        AgentRef {
+            host_id: "h".into(),
+            sandbox_name: "s".into(),
+            agent_key: "planner".into(),
+        }
     }
 
     fn sample() -> Value {
@@ -324,14 +330,16 @@ mod tests {
 
     #[test]
     fn keyed_output_requires_a_pinned_process_incarnation() {
-        let out = to_attributed_runtime_interaction(&sample(), None, None, "railmon", Some(&agent_ref()));
+        let out =
+            to_attributed_runtime_interaction(&sample(), None, None, "railmon", Some(&agent_ref()));
         assert_eq!(out["runtime_identity_version"], 1);
         assert_eq!(out["attribution"]["state"], "unknown");
         assert!(out["agent_ref"].is_null());
 
         let mut pinned = sample();
         pinned["process_start_time_ticks"] = json!(1234);
-        let out = to_attributed_runtime_interaction(&pinned, None, None, "railmon", Some(&agent_ref()));
+        let out =
+            to_attributed_runtime_interaction(&pinned, None, None, "railmon", Some(&agent_ref()));
         assert_eq!(out["attribution"]["state"], "attributed");
         assert_eq!(out["agent_ref"]["agent_key"], "planner");
         assert_eq!(out["attribution"]["process"]["start_time_ticks"], 1234);
