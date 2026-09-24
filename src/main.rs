@@ -7,6 +7,7 @@
 //! compose files, run scripts and the container entrypoint pass these flags,
 //! and a port that quietly renamed them would break every caller for no gain.
 
+mod identity;
 mod interaction;
 mod pipeline;
 mod sink;
@@ -41,6 +42,10 @@ enum OutputFormat {
     about = "Capture and forward an agent's HTTP traffic"
 )]
 struct Args {
+    /// Operator-owned multi-agent target manifest. Its absence preserves the
+    /// exact legacy single-target path.
+    #[arg(long)]
+    target_manifest: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "http")]
     mode: Mode,
 
@@ -111,6 +116,26 @@ fn resolve_probe_path(explicit: Option<String>) -> String {
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+
+    let keyed_agent_ref = if let Some(path) = args.target_manifest.as_deref() {
+        let manifest = identity::TargetManifest::load(path)?;
+        log::info!(
+            "validated {} keyed targets for {}/{}",
+            manifest.agents.len(),
+            manifest.sandbox.host_id,
+            manifest.sandbox.sandbox_name
+        );
+        // Parsing is deliberately wired before probe/sink startup so an invalid
+        // manifest can never degrade into the unkeyed compatibility path.
+        if manifest.agents.len() > 1 {
+            anyhow::bail!(
+                "multi-target capture requires the DR-109 supervisor; refusing unkeyed fallback"
+            );
+        }
+        Some(manifest.agent_ref(&manifest.agents[0]))
+    } else {
+        None
+    };
 
     // Fail on a missing binary before opening sinks or claiming to capture:
     // the old failure mode was a collector that looked alive and produced
@@ -196,11 +221,12 @@ async fn main() -> Result<()> {
                         .accept(event.pid, &event.data, event.timestamp)
                         .map(|paired| match args.output_format {
                             OutputFormat::LegacyHttp => paired,
-                            OutputFormat::RuntimeInteraction => interaction::to_runtime_interaction(
+                            OutputFormat::RuntimeInteraction => interaction::to_attributed_runtime_interaction(
                                 &paired,
                                 Some(&session_id),
                                 Some(&capture_start),
                                 "railmon",
+                                keyed_agent_ref.as_ref(),
                             ),
                         }),
                 };

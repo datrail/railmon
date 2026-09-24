@@ -6,6 +6,7 @@
 //! id and breaks correlation against interactions already stored. The tests at
 //! the bottom pin the two values that travel — the id and the agent_id.
 
+use crate::identity::AgentRef;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,16 @@ pub fn to_runtime_interaction(
     session_id: Option<&str>,
     capture_start: Option<&str>,
     capture_source: &str,
+) -> Value {
+    to_attributed_runtime_interaction(interaction, session_id, capture_start, capture_source, None)
+}
+
+pub fn to_attributed_runtime_interaction(
+    interaction: &Value,
+    session_id: Option<&str>,
+    capture_start: Option<&str>,
+    capture_source: &str,
+    agent_ref: Option<&AgentRef>,
 ) -> Value {
     let request = interaction.get("request").filter(|v| v.is_object());
     let response = interaction.get("response").filter(|v| v.is_object());
@@ -40,7 +51,7 @@ pub fn to_runtime_interaction(
         obj.insert("railmon_capture_start".into(), opt_str(capture_start));
     }
 
-    json!({
+    let mut output = json!({
         "interaction_id": interaction_id(interaction, session_id, &method, &path, &destination, status.as_ref()),
         "agent_id": opt_string(agent_id),
         "x_rail_header": opt_string(x_rail_header),
@@ -50,7 +61,34 @@ pub fn to_runtime_interaction(
         "latency_ms": latency_ms(interaction.get("latency_ms")),
         "capture_source": capture_source,
         "raw": raw,
-    })
+    });
+    if let Some(agent_ref) = agent_ref {
+        output["runtime_identity_version"] = json!(1);
+        let start_time = interaction.get("process_start_time_ticks").and_then(Value::as_u64);
+        if let Some(start_time) = start_time {
+            output["agent_ref"] = serde_json::to_value(agent_ref).unwrap_or(Value::Null);
+            output["attribution"] = json!({
+                "state": "attributed",
+                "method": "process_target",
+                "reason": null,
+                "target_id": agent_ref.agent_key,
+                "process": {
+                    "pid": interaction.get("pid").cloned().unwrap_or(Value::Null),
+                    "start_time_ticks": start_time
+                }
+            });
+        } else {
+            output["agent_ref"] = Value::Null;
+            output["attribution"] = json!({
+                "state": "unknown",
+                "method": null,
+                "reason": "PROCESS_INCARNATION_UNPINNED",
+                "target_id": agent_ref.agent_key,
+                "process": null
+            });
+        }
+    }
+    output
 }
 
 fn opt_str(v: Option<&str>) -> Value {
@@ -253,6 +291,10 @@ fn latency_ms(value: Option<&Value>) -> Value {
 mod tests {
     use super::*;
 
+    fn agent_ref() -> AgentRef {
+        AgentRef { host_id: "h".into(), sandbox_name: "s".into(), agent_key: "planner".into() }
+    }
+
     fn sample() -> Value {
         json!({
             "timestamp": "2026-08-12T00:00:00+00:00",
@@ -278,6 +320,21 @@ mod tests {
         assert_eq!(out["request"]["destination"], "api.anthropic.com");
         assert_eq!(out["request"]["path"], "/v1/messages");
         assert_eq!(out["response"]["status"], 200);
+    }
+
+    #[test]
+    fn keyed_output_requires_a_pinned_process_incarnation() {
+        let out = to_attributed_runtime_interaction(&sample(), None, None, "railmon", Some(&agent_ref()));
+        assert_eq!(out["runtime_identity_version"], 1);
+        assert_eq!(out["attribution"]["state"], "unknown");
+        assert!(out["agent_ref"].is_null());
+
+        let mut pinned = sample();
+        pinned["process_start_time_ticks"] = json!(1234);
+        let out = to_attributed_runtime_interaction(&pinned, None, None, "railmon", Some(&agent_ref()));
+        assert_eq!(out["attribution"]["state"], "attributed");
+        assert_eq!(out["agent_ref"]["agent_key"], "planner");
+        assert_eq!(out["attribution"]["process"]["start_time_ticks"], 1234);
     }
 
     #[test]
