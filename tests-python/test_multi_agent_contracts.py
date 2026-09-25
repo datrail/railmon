@@ -116,6 +116,28 @@ class MultiAgentContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(fixture, schema)
 
+    def test_runtime_conditional_requires_identity_on_attributed_event(self):
+        # The published fixture is already `attributed` with every identity
+        # field populated, so none of these mutations is exercised by the
+        # fixture-conformance test above. Deleting the schema's `allOf`
+        # entirely still passes every other test in this file.
+        schema, base = self.load("runtime-identity-v1")
+        mutations = {
+            "agent_ref": lambda f: f.__setitem__("agent_ref", None),
+            "method": lambda f: f["attribution"].__setitem__("method", None),
+            "reason": lambda f: f["attribution"].__setitem__(
+                "reason", "should be null when attributed"
+            ),
+            "target_id": lambda f: f["attribution"].__setitem__("target_id", None),
+            "process": lambda f: f["attribution"].__setitem__("process", None),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field):
+                fixture = json.loads(json.dumps(base))
+                mutate(fixture)
+                with self.assertRaises(ValidationError):
+                    validate(fixture, schema)
+
     def test_manifest_semantic_unique_key_annotation_is_enforced(self):
         schema, fixture = self.load("target-manifest-v1")
         fixture["agents"][1]["agent_key"] = fixture["agents"][0]["agent_key"]
