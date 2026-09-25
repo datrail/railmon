@@ -725,26 +725,170 @@ def read_mcp_config(path: Path) -> list[dict[str, Any]]:
 
     skills: list[dict[str, Any]] = []
     for name, spec in servers.items():
-        if not isinstance(spec, dict):
-            continue
-        endpoints = []
-        for value in collect_strings(spec):
-            if value.startswith(("http://", "https://")):
-                # Redacted for the same reason the MCP inventory is: a hosted
-                # endpoint carries its key in the URL, and unlike the feature
-                # file these skills are also POSTed to the control plane.
-                endpoints.append(redact_url(value) or "[unparseable]")
-        command = spec.get("command")
-        reached = command_basename(command) or redact_url(spec.get("url"))
-        skills.append(
-            {
-                "name": str(name),
-                "description": f"MCP server configured via {path.name}: {reached or 'unknown'}",
-                "destination_endpoints": dedupe(endpoints),
-                "source_type": "mcp_config",
-            }
-        )
+        if isinstance(spec, dict):
+            skills.extend(mcp_server_skills(str(name), spec, path))
     return skills
+
+
+def mcp_server_skills(name: str, spec: dict[str, Any], path: Path) -> list[dict[str, Any]]:
+    """One skill per tool a reachable MCP server declares.
+
+    The scanner never asked a server what it exposes before this; it
+    synthesized one skill per *configured* server instead. That makes the
+    comparison DSC.G2 exists for impossible later without re-scanning an
+    estate that has already changed, so a server that declares three tools
+    now arrives as three skills, each carrying the tool's own description —
+    and a server this cannot reach or authenticate to is still recorded, as
+    unreachable, rather than dropped from the inventory silently.
+    """
+    endpoints = dedupe(
+        redact_url(value) or "[unparseable]" for value in collect_strings(spec) if value.startswith(("http://", "https://"))
+    )
+    url = spec.get("url")
+    if isinstance(url, str) and url:
+        headers = spec.get("headers")
+        headers = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else None
+        tools = probe_mcp_tools(url, headers)
+        if tools is None:
+            return [unreachable_mcp_skill(name, path, endpoints, "unreachable")]
+        result: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_name = first_nonempty(str(tool.get("name") or ""))
+            if not tool_name:
+                continue
+            description = first_nonempty(redact_text(str(tool.get("description") or "")))
+            result.append(
+                {
+                    "name": tool_name,
+                    "description": description or f"tool declared by {name} ({path.name})",
+                    "destination_endpoints": endpoints,
+                    "source_type": "mcp_config",
+                }
+            )
+        return result or [unreachable_mcp_skill(name, path, endpoints, "reachable, declares no tools")]
+
+    command = spec.get("command")
+    reached = command_basename(command)
+    if not reached:
+        return [unreachable_mcp_skill(name, path, endpoints, "unreachable")]
+    return [
+        {
+            "name": name,
+            "description": f"MCP server configured via {path.name}: {reached}",
+            "destination_endpoints": endpoints,
+            "source_type": "mcp_config",
+        }
+    ]
+
+
+def unreachable_mcp_skill(name: str, path: Path, endpoints: list[str], reason: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": f"MCP server configured via {path.name}: {reason}",
+        "destination_endpoints": endpoints,
+        "source_type": "mcp_config",
+    }
+
+
+MCP_PROBE_TIMEOUT_SECONDS = 3.0
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+
+def probe_mcp_tools(
+    url: str, headers: dict[str, str] | None, timeout: float = MCP_PROBE_TIMEOUT_SECONDS
+) -> list[dict[str, Any]] | None:
+    """Every tool a live MCP server declares, or `None` if it could not be asked.
+
+    Speaks only the two Streamable HTTP messages this needs: `initialize` to
+    open a session (some servers require the session id it returns on every
+    later call; stateless ones ignore it either way), then `tools/list`. Never
+    raises — an agent's configured MCP server is untrusted input the scan must
+    survive, and a probe failure is recorded as unreachable, not fatal to the
+    rest of the scan.
+
+    Only ever `http(s)://`. `urllib` also has a handler for `file://`, and it
+    does not care that this sends a POST body: a config entry of
+    `"url": "file:///etc/shadow"` would otherwise make the scanner read it and
+    try to parse it as a tools/list response, which is a local file read this
+    function must never become.
+    """
+    if not url.startswith(("http://", "https://")):
+        return None
+    base_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        **(headers or {}),
+    }
+    init_result, response_headers = mcp_rpc_call(
+        url,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "datrail-railmon-scanner", "version": "1"},
+            },
+        },
+        base_headers,
+        timeout,
+    )
+    if init_result is None:
+        return None
+
+    call_headers = dict(base_headers)
+    session_id = response_headers.get("Mcp-Session-Id")
+    if session_id:
+        call_headers["Mcp-Session-Id"] = session_id
+
+    list_result, _ = mcp_rpc_call(
+        url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, call_headers, timeout
+    )
+    if list_result is None:
+        return None
+    tools = list_result.get("tools")
+    return tools if isinstance(tools, list) else None
+
+
+def mcp_rpc_call(
+    url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
+) -> tuple[dict[str, Any] | None, Any]:
+    """One JSON-RPC round trip to an MCP endpoint.
+
+    Returns the response's `result` object and its headers, or `(None, {})` on
+    any failure: refused connection, timeout, a non-2xx status, a body that
+    isn't JSON or SSE-framed JSON, or a response with no `result`.
+    """
+    req = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            raw = resp.read().decode("utf-8", errors="replace")
+            response_headers = resp.headers
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        return None, {}
+
+    payload = parse_mcp_body(raw, content_type)
+    if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+        return None, {}
+    return payload["result"], response_headers
+
+
+def parse_mcp_body(raw: str, content_type: str) -> Any:
+    if "text/event-stream" in content_type:
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                raw = line[len("data:") :].strip()
+                break
+        else:
+            return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 def collect_strings(value: Any) -> list[str]:
@@ -764,19 +908,22 @@ def collect_strings(value: Any) -> list[str]:
 
 
 def collect_skills(mcp_configs: list[Path]) -> list[dict[str, Any]]:
+    """Every mcp_config skill across every config path, same-name collisions merged.
+
+    Used to dedupe on name alone and drop the second match outright — safe
+    while `name` was an operator-chosen server nickname, but this now reads
+    one skill per *tool*, and two independent servers commonly expose a tool
+    of the same name (`search`, `list_files`). Discarding the second would
+    silently drop that server's reachability from the inventory. Reuses
+    `merge_skill_lists`'s union of `destination_endpoints`, the same merge the
+    final registration payload already relies on for the analogous collision
+    between mcp- and skills-file-derived skills.
+    """
     skills: list[dict[str, Any]] = []
     for path in mcp_configs:
         if path.exists():
             skills.extend(read_mcp_config(path))
-    seen: set[str] = set()
-    result: list[dict[str, Any]] = []
-    for skill in skills:
-        key = skill["name"]
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(skill)
-    return result
+    return merge_skill_lists(skills)
 
 
 def normalize_skill(value: Any, source_hint: str) -> dict[str, Any]:

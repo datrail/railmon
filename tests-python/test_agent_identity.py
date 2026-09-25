@@ -496,13 +496,20 @@ class McpInventoryTest(unittest.TestCase):
         self.assertNotIn("sk-live-abc123def456ghi789", repr(inventory))
 
     def test_the_skills_view_of_the_same_file_is_redacted_too(self):
-        """These skills are POSTed to the control plane, not just written locally."""
+        """These skills are POSTed to the control plane, not just written locally.
+
+        `hosted` points at a loopback port nothing listens on — connection
+        refused immediately, no real network or timeout wait — so this stays
+        the redaction test it always was rather than becoming a live probe of
+        a real third party. `test_mcp_tool_discovery.py` covers the probe
+        itself against a real local server.
+        """
         import json
         import tempfile
 
         config = {
             "mcpServers": {
-                "hosted": {"url": "https://actions.zapier.com/mcp/sk-live-abc123def456ghi789/sse"},
+                "hosted": {"url": "http://127.0.0.1:1/mcp/sk-live-abc123def456ghi789/sse"},
                 "local": {"command": "/usr/local/bin/mcp-server", "args": ["--token", "sk-secret"]},
             }
         }
@@ -514,7 +521,9 @@ class McpInventoryTest(unittest.TestCase):
         rendered = repr(skills)
         self.assertNotIn("sk-live-abc123def456ghi789", rendered)
         self.assertNotIn("sk-secret", rendered)
-        self.assertIn("https://actions.zapier.com/mcp/[redacted]/sse", rendered)
+        self.assertIn("http://127.0.0.1:1/mcp/[redacted]/sse", rendered)
+        hosted = next(skill for skill in skills if skill["name"] == "hosted")
+        self.assertEqual(hosted["description"], "MCP server configured via .mcp.json: unreachable")
 
 
 class AuthModeTest(unittest.TestCase):
