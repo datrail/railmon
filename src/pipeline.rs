@@ -29,6 +29,7 @@ pub struct CaptureFilters {
     pub pid: Option<i32>,
     pub uid: Option<i32>,
     pub comm: Option<String>,
+    pub process_session: Option<u32>,
 }
 
 /// Build the probe's command line.
@@ -62,6 +63,9 @@ pub fn build_command(agentsight_path: &str, filters: &CaptureFilters) -> Vec<Str
         if let Some(u) = filters.uid {
             cmd.extend(["--uid".into(), u.to_string()]);
         }
+        if let Some(s) = filters.process_session {
+            cmd.extend(["--session".into(), s.to_string()]);
+        }
         if let (Some(c), None) = (&filters.comm, &filters.binary_path) {
             cmd.extend(["--comm".into(), c.clone()]);
         }
@@ -79,6 +83,9 @@ pub fn build_command(agentsight_path: &str, filters: &CaptureFilters) -> Vec<Str
     }
     if let Some(u) = filters.uid {
         ssl_args.extend(["-u".into(), u.to_string()]);
+    }
+    if let Some(s) = filters.process_session {
+        ssl_args.extend(["--session".into(), s.to_string()]);
     }
     if let (Some(c), None) = (&filters.comm, &filters.binary_path) {
         ssl_args.extend(["-c".into(), c.clone()]);

@@ -7,12 +7,14 @@
 //! compose files, run scripts and the container entrypoint pass these flags,
 //! and a port that quietly renamed them would break every caller for no gain.
 
+mod identity;
 mod interaction;
 mod pipeline;
 mod sink;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use futures::stream::SelectAll;
 use futures::StreamExt;
 use pipeline::{CaptureFilters, Pairer};
 use sink::Sink;
@@ -41,6 +43,10 @@ enum OutputFormat {
     about = "Capture and forward an agent's HTTP traffic"
 )]
 struct Args {
+    /// Operator-owned multi-agent target manifest. Its absence preserves the
+    /// exact legacy single-target path.
+    #[arg(long)]
+    target_manifest: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "http")]
     mode: Mode,
 
@@ -112,6 +118,19 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
+    let target_manifest = if let Some(path) = args.target_manifest.as_deref() {
+        let manifest = identity::TargetManifest::load(path)?;
+        log::info!(
+            "validated {} keyed targets for {}/{}",
+            manifest.agents.len(),
+            manifest.sandbox.host_id,
+            manifest.sandbox.sandbox_name
+        );
+        Some(manifest)
+    } else {
+        None
+    };
+
     // Fail on a missing binary before opening sinks or claiming to capture:
     // the old failure mode was a collector that looked alive and produced
     // nothing.
@@ -166,11 +185,28 @@ async fn main() -> Result<()> {
         log::warn!("no --webhook and no --output: interactions will be counted but not stored");
     }
 
+    if let Some(manifest) = target_manifest.as_ref() {
+        let result = run_multi_target(
+            &args,
+            manifest,
+            &agentsight,
+            &session_id,
+            &capture_start,
+            &mut sink,
+            flush_interval,
+        )
+        .await;
+        sink.shutdown().await;
+        log::info!("{} interaction(s) forwarded", sink.written());
+        return result;
+    }
+
     let filters = CaptureFilters {
         binary_path: args.binary_path.clone(),
         pid: args.pid,
         uid: args.uid,
         comm: args.comm.clone(),
+        process_session: None,
     };
 
     log::info!("session {session_id}, agentsight at {}", agentsight);
@@ -264,4 +300,146 @@ async fn main() -> Result<()> {
         // ended, which is what ctrl_c does. Not a failure.
         _ => Ok(()),
     }
+}
+
+struct TargetRuntime {
+    agent_ref: identity::AgentRef,
+    process: identity::ProcessIncarnation,
+    pairer: Pairer,
+}
+
+enum TargetStreamItem {
+    Event(usize, agentsight_capture::Event),
+    Ended(
+        usize,
+        Result<Option<std::process::ExitStatus>, tokio::sync::oneshot::error::RecvError>,
+    ),
+}
+
+async fn run_multi_target(
+    args: &Args,
+    manifest: &identity::TargetManifest,
+    agentsight: &str,
+    session_id: &str,
+    capture_start: &str,
+    sink: &mut Sink,
+    flush_interval: Duration,
+) -> Result<()> {
+    if matches!(args.mode, Mode::Raw) {
+        anyhow::bail!(
+            "keyed capture requires --mode http; raw events have no attribution envelope"
+        );
+    }
+    if !matches!(args.output_format, OutputFormat::RuntimeInteraction) {
+        anyhow::bail!("keyed capture requires --output-format runtime-interaction");
+    }
+    if args.pid.is_some() || args.uid.is_some() || args.comm.is_some() {
+        anyhow::bail!("--pid, --uid and --comm cannot be combined with --target-manifest");
+    }
+
+    let processes = manifest.resolve_all()?;
+    let mut targets = Vec::with_capacity(manifest.agents.len());
+    let mut streams: SelectAll<_> = SelectAll::new();
+
+    for (index, (target, process)) in manifest.agents.iter().zip(processes).enumerate() {
+        let filters = CaptureFilters {
+            binary_path: target
+                .capture
+                .as_ref()
+                .and_then(|capture| capture.binary_path.clone())
+                .or_else(|| args.binary_path.clone()),
+            pid: None,
+            uid: None,
+            comm: None,
+            process_session: Some(process.session_id),
+        };
+        let (stream, status) = pipeline::event_stream(agentsight, &filters)
+            .await
+            .with_context(|| format!("starting tap for '{}'", target.agent_key))?;
+        let tagged = stream
+            .map(move |event| TargetStreamItem::Event(index, event))
+            .chain(futures::stream::once(async move {
+                TargetStreamItem::Ended(index, status.await)
+            }));
+        streams.push(Box::pin(tagged));
+        targets.push(TargetRuntime {
+            agent_ref: manifest.agent_ref(target),
+            process,
+            pairer: Pairer::new(),
+        });
+    }
+
+    let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut write_error = None;
+    let mut interrupted = false;
+    loop {
+        tokio::select! {
+            biased;
+            next = streams.next() => {
+                let Some(item) = next else { break };
+                let (index, event) = match item {
+                    TargetStreamItem::Event(index, event) => (index, event),
+                    TargetStreamItem::Ended(index, status) => {
+                        let detail = match status {
+                            Ok(Some(status)) => status.to_string(),
+                            Ok(None) => "unknown exit status".into(),
+                            Err(error) => error.to_string(),
+                        };
+                        anyhow::bail!(
+                            "keyed AgentSight tap {} ended while capture was active: {}",
+                            targets[index].agent_ref.agent_key,
+                            detail
+                        );
+                    }
+                };
+                let target = &mut targets[index];
+                if !target.process.is_live() {
+                    anyhow::bail!(
+                        "target '{}' exited or its PID was reused; refusing to attribute queued events",
+                        target.agent_ref.agent_key
+                    );
+                }
+                // The tap was bound to the target's process session. Stamp the
+                // already pinned root incarnation now, before the interaction
+                // enters the sink's asynchronous webhook queue.
+                if let Some(mut paired) = target.pairer.accept(event.pid, &event.data, event.timestamp) {
+                    paired["target_pid"] = serde_json::json!(target.process.pid);
+                    paired["process_start_time_ticks"] = serde_json::json!(target.process.start_time_ticks);
+                    let value = interaction::to_attributed_runtime_interaction(
+                        &paired,
+                        Some(session_id),
+                        Some(capture_start),
+                        "railmon",
+                        Some(&target.agent_ref),
+                    );
+                    if let Err(error) = sink.emit(&value).await {
+                        write_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => sink.flush_if_due().await,
+            _ = tokio::signal::ctrl_c() => {
+                interrupted = true;
+                break;
+            },
+        }
+    }
+    drop(streams);
+
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+    if !interrupted {
+        anyhow::bail!("all keyed AgentSight taps ended; capture is no longer active");
+    }
+    let outstanding: usize = targets
+        .iter()
+        .map(|target| target.pairer.outstanding())
+        .sum();
+    if outstanding > 0 {
+        log::info!("{outstanding} keyed request(s) had no response at exit");
+    }
+    Ok(())
 }

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datrail.io/schema/runtime-identity-v1.schema.json",
+  "title": "DatRail runtime attribution v1",
+  "type": "object",
+  "$defs": {
+    "agent_ref": {
+      "type": "object", "additionalProperties": false,
+      "required": ["host_id", "sandbox_name", "agent_key"],
+      "properties": {
+        "host_id": {"type": "string", "minLength": 1},
+        "sandbox_name": {"type": "string", "minLength": 1},
+        "agent_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "not": {"const": "default"}}
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": ["runtime_identity_version", "agent_ref", "attribution"],
+  "properties": {
+    "runtime_identity_version": {"const": 1},
+    "agent_ref": {"oneOf": [{"$ref": "#/$defs/agent_ref"}, {"type": "null"}]},
+    "attribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "method", "reason", "target_id", "process"],
+      "properties": {
+        "state": {"enum": ["attributed", "ambiguous", "unknown", "conflict"]},
+        "method": {"enum": ["process_target", "process_target_with_ticket_claim", null]},
+        "reason": {"type": ["string", "null"], "minLength": 1},
+        "target_id": {"type": ["string", "null"]},
+        "process": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "object", "additionalProperties": false, "required": ["pid", "start_time_ticks"], "properties": {"pid": {"type": "integer", "minimum": 1}, "start_time_ticks": {"type": "integer", "minimum": 1}}}
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"attribution": {"properties": {"state": {"const": "attributed"}}}}},
+      "then": {"properties": {
+        "agent_ref": {"$ref": "#/$defs/agent_ref"},
+        "attribution": {"properties": {"method": {"enum": ["process_target", "process_target_with_ticket_claim"]}, "reason": {"type": "null"}, "target_id": {"type": "string", "minLength": 1}, "process": {"type": "object"}}}
+      }}
+    },
+    {
+      "if": {"properties": {"attribution": {"properties": {"state": {"enum": ["ambiguous", "unknown", "conflict"]}}}}},
+      "then": {"properties": {"agent_ref": {"type": "null"}, "attribution": {"properties": {"method": {"type": "null"}, "reason": {"type": "string", "minLength": 1}}}}}
+    }
+  ]
+}
