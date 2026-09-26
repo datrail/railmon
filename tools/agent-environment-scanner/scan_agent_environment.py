@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -1677,6 +1677,87 @@ def configured_center_url(args: argparse.Namespace) -> str:
     return center_url
 
 
+EVIDENCE_BUNDLE_INGEST_PATH = "/v1/evidence-bundles"
+
+
+def configured_raildash_url(args: argparse.Namespace) -> str | None:
+    """The RailDash target, or None when this scan is not delivering there.
+
+    Unlike `--register`/`--center-url`, there is no separate boolean flag:
+    naming a URL (flag or env) is itself the request to deliver, so a single
+    invocation can target RailDash, Rail Center, both or neither by simply
+    setting or omitting each URL independently.
+    """
+    return first_nonempty(args.raildash_url, os.environ.get("RAIL_RAILDASH_URL"))
+
+
+def configured_agent_key(args: argparse.Namespace) -> str | None:
+    return first_nonempty(args.agent_key, os.environ.get("RAIL_AGENT_KEY"))
+
+
+def evidence_bundle_ingest_url(raildash_url: str, agent_key: str | None = None) -> str:
+    """RailDash's evidence-bundle ingest endpoint for this base URL.
+
+    Mirrors `registration_url`'s query-safe joining: the endpoint is appended
+    to the parsed path, never glued onto a raw string that might already
+    carry a query. `agent_key`, when given, rides as a `?agent_key=` query
+    parameter alongside (not replacing) whatever query the base URL already
+    carried.
+
+    DR-120 (RailDash's ingest route) had not landed a PR when this was
+    written, so the query-string placement — the more conventional choice —
+    is a best guess rather than a confirmed contract; if DR-120 lands with
+    `agent_key` as a header instead, this is the one place to change.
+    """
+    parts = urlsplit(raildash_url)
+    path = parts.path.rstrip("/")
+    if not path.endswith(EVIDENCE_BUNDLE_INGEST_PATH):
+        path += EVIDENCE_BUNDLE_INGEST_PATH
+    query_pairs = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "agent_key"]
+    if agent_key:
+        query_pairs.append(("agent_key", agent_key))
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query_pairs), ""))
+
+
+def post_evidence_bundle(
+    raildash_url: str,
+    data: bytes,
+    timeout: float = 15.0,
+    auth_mode: str | None = None,
+    agent_key: str | None = None,
+) -> dict[str, Any]:
+    """POST the evidence bundle's raw bytes to RailDash, unchanged.
+
+    `data` must be exactly what would be written to `--evidence-bundle-output`
+    for this scan — RailDash dedupes by the content digest of the bytes it
+    receives, so re-serializing (different key order, whitespace, or a second
+    build with a fresh `bundle_id`) here would defeat that.
+    """
+    req = Request(
+        evidence_bundle_ingest_url(raildash_url, agent_key),
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **auth_headers(auth_mode),
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            body_text = resp.read().decode("utf-8", errors="replace")
+            try:
+                body = json.loads(body_text) if body_text else None
+            except json.JSONDecodeError as exc:
+                raise ScannerError(f"raildash returned non-JSON response: {body_text[:200]}") from exc
+            return {"status": resp.status, "body": body}
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise ScannerError(f"raildash evidence-bundle delivery failed: HTTP {exc.code}: {body}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise ScannerError(f"raildash evidence-bundle delivery failed: {exc}") from exc
+
+
 def registration_output_path(args: argparse.Namespace) -> Path:
     configured = first_nonempty(
         args.registration_output,
@@ -1858,6 +1939,18 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print rail-center registration response/state instead of only storing it when --register is used.",
     )
+    parser.add_argument(
+        "--raildash-url",
+        help="RailDash base URL to POST the evidence bundle to, as raw bytes, at "
+        f"<url>{EVIDENCE_BUNDLE_INGEST_PATH}. Also read from RAIL_RAILDASH_URL. Independent of "
+        "--register/--center-url: use either, both, or neither in one scan.",
+    )
+    parser.add_argument(
+        "--agent-key",
+        help="Local agent key RailDash uses to resolve identity when the evidence bundle carries no "
+        "deployment pair (mirrors `raildash asp load --agent-key`). Sent as the RailDash delivery's "
+        "?agent_key= query parameter. Also read from RAIL_AGENT_KEY.",
+    )
     parser.add_argument("--compact", action="store_true", help="Emit compact JSON")
     return parser
 
@@ -1890,6 +1983,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
     feature_file_written = True
+    delivery_failed = False
+    raildash_url = configured_raildash_url(args)
     try:
         context, payload, identity = scan(args)
 
@@ -1904,20 +1999,27 @@ def main(argv: list[str] | None = None) -> int:
                 print(render_json(payload, args.compact))
 
             if args.register:
-                center_url = configured_center_url(args)
-                response = post_registration(center_url, payload, auth_mode=args.auth_mode)
-                state = build_registration_state(center_url, payload, response)
-                state_path = registration_output_path(args)
-                store_json(state_path, state, args.compact)
-                identity["registration_status"] = "registered"
-                if args.output_register_response:
-                    print(render_json(state, args.compact))
-                else:
-                    print(
-                        f"[agent-environment-scanner] registered with rail-center: HTTP {response['status']} "
-                        f"agent_id={state['agent_id']} state_file={state_path}",
-                        file=sys.stderr,
-                    )
+                # Caught here, not left to propagate: a --raildash-url target
+                # below must still be attempted even when --register fails, and
+                # vice versa — the two delivery targets are independent.
+                try:
+                    center_url = configured_center_url(args)
+                    response = post_registration(center_url, payload, auth_mode=args.auth_mode)
+                    state = build_registration_state(center_url, payload, response)
+                    state_path = registration_output_path(args)
+                    store_json(state_path, state, args.compact)
+                    identity["registration_status"] = "registered"
+                    if args.output_register_response:
+                        print(render_json(state, args.compact))
+                    else:
+                        print(
+                            f"[agent-environment-scanner] registered with rail-center: HTTP {response['status']} "
+                            f"agent_id={state['agent_id']} state_file={state_path}",
+                            file=sys.stderr,
+                        )
+                except ScannerError as exc:
+                    print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+                    delivery_failed = True
         finally:
             # The feature file is the primary artifact and needs no control plane,
             # so it is written even when registration fails — but only after the
@@ -1927,17 +2029,53 @@ def main(argv: list[str] | None = None) -> int:
             if not args.no_feature_file:
                 feature_file_written = write_feature_file(args, context, payload, identity)
             # The evidence bundle rides the same guarantee: the brain's input,
-            # written even on a failed registration. A write failure is
-            # reported without changing the exit code - the feature file owns
-            # that.
-            if not args.no_evidence_bundle:
+            # built even on a failed registration. Built once and shared by
+            # both consumers below — the file write and a RailDash POST both
+            # need the identical bytes, and building it twice would mint two
+            # different bundle_ids for one scan's output. A write or delivery
+            # failure is reported without changing the exit code for the file
+            # write (the feature file owns that); a RailDash delivery failure
+            # does change it, like a failed --register.
+            if not args.no_evidence_bundle or raildash_url:
                 import evidence_bundle  # lazy: breaks the import cycle
 
-                evidence_bundle.write_evidence_bundle(args, context, payload, identity)
+                bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
+
+                if not args.no_evidence_bundle and bundle is not None:
+                    bundle_path = evidence_bundle.evidence_bundle_output_path(args)
+                    try:
+                        store_json(bundle_path, bundle, args.compact)
+                        print(f"[agent-environment-scanner] evidence bundle: {bundle_path}", file=sys.stderr)
+                    except ScannerError as exc:
+                        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+
+                if raildash_url:
+                    if bundle is None:
+                        # Already reported above: the bundle failed to build
+                        # or verify, so there is nothing to deliver.
+                        delivery_failed = True
+                    else:
+                        try:
+                            data = evidence_bundle.render_bundle_bytes(bundle, args.compact)
+                            agent_key = configured_agent_key(args)
+                            response = post_evidence_bundle(
+                                raildash_url, data, auth_mode=args.auth_mode, agent_key=agent_key
+                            )
+                            body = response.get("body")
+                            body = body if isinstance(body, dict) else {}
+                            outcome = "duplicate" if body.get("duplicate") else "accepted"
+                            print(
+                                f"[agent-environment-scanner] delivered evidence bundle to raildash: "
+                                f"HTTP {response['status']} {outcome} id={body.get('id')}",
+                                file=sys.stderr,
+                            )
+                        except ScannerError as exc:
+                            print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+                            delivery_failed = True
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         return 2
-    return 0 if feature_file_written else 2
+    return 0 if feature_file_written and not delivery_failed else 2
 
 
 if __name__ == "__main__":

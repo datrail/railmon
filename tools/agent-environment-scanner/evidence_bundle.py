@@ -1093,6 +1093,66 @@ def evidence_bundle_output_path(args: Any) -> Path:
     return Path(configured).expanduser() if configured else DEFAULT_EVIDENCE_BUNDLE_OUTPUT
 
 
+def build_verified_bundle(
+    args: Any,
+    context: dict[str, Any],
+    payload: dict[str, Any],
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Build and verify once — the one bundle every consumer in a run must share.
+
+    Building this twice (once for `--evidence-bundle-output`, again for a
+    RailDash POST) would mint two different `bundle_id`s, and so two
+    different content digests, for what is conceptually one scan's output.
+    RailDash dedupes evidence bundles by exact-bytes digest, so every
+    consumer in a single `main()` run is handed this same dict rather than
+    calling `build_evidence_bundle` again. May raise `ScannerError` from
+    `verify_bundle`; callers decide whether that is fatal.
+    """
+    bundle = build_evidence_bundle(args, context, payload, identity)
+    verify_bundle(bundle)
+    return bundle
+
+
+def try_build_verified_bundle(
+    args: Any,
+    context: dict[str, Any],
+    payload: dict[str, Any],
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    """`build_verified_bundle`, reporting failure rather than raising.
+
+    `scan_agent_environment.main()` has two independent consumers of this one
+    bundle (the `--evidence-bundle-output` file, a RailDash POST) and needs to
+    catch a build/verify failure once for both — but a `ScannerError` raised
+    here is this module's own lazily re-imported `scan_agent_environment`
+    class, not the identical-looking class the `__main__` script defines when
+    run directly, so `main()`'s own `except ScannerError` cannot catch it
+    reliably across that boundary. Caught here instead, symmetrically with
+    `write_evidence_bundle`.
+    """
+    from scan_agent_environment import ScannerError  # lazy: no cycle at load
+
+    try:
+        return build_verified_bundle(args, context, payload, identity)
+    except ScannerError as exc:
+        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        return None
+
+
+def render_bundle_bytes(bundle: dict[str, Any], compact: bool) -> bytes:
+    """The exact bytes `store_json` would write for this bundle.
+
+    Shared here so a RailDash delivery POSTs precisely the bytes that would
+    land in `--evidence-bundle-output` — the identical content digest
+    RailDash's dedup-by-digest keys off, for the same `bundle` dict and
+    `compact` flag.
+    """
+    from scan_agent_environment import render_json  # lazy: no cycle at load
+
+    return (render_json(bundle, compact) + "\n").encode("utf-8")
+
+
 def write_evidence_bundle(
     args: Any,
     context: dict[str, Any],
@@ -1107,10 +1167,9 @@ def write_evidence_bundle(
     """
     from scan_agent_environment import ScannerError, store_json  # lazy: no cycle at load
 
-    bundle = build_evidence_bundle(args, context, payload, identity)
     path = evidence_bundle_output_path(args)
     try:
-        verify_bundle(bundle)
+        bundle = build_verified_bundle(args, context, payload, identity)
         store_json(path, bundle, args.compact)
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)

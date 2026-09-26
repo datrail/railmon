@@ -195,6 +195,47 @@ is `ABSENT`; arbitrary labels and image names are never grouping signals.
 variables are omitted because they contain no credential. Values are never
 collected or written to the bundle.
 
+## RailDash delivery
+
+A user should never have to run a CLI command to get an evidence bundle into
+RailDash (standing decision: ASP must not depend on the CLI). `--raildash-url`
+POSTs the bundle's exact bytes — the same bytes `--evidence-bundle-output`
+would write — straight to a RailDash instance:
+
+```bash
+python3 tools/agent-environment-scanner/scan_agent_environment.py \
+  --raildash-url http://localhost:8000
+```
+
+This POSTs to `<raildash-url>/v1/evidence-bundles`, which RailDash dedupes by
+the content digest of the bytes it receives. Use `RAIL_RAILDASH_URL` instead
+of `--raildash-url` when running as a service.
+
+It is independent of `--register`/`--center-url`: name either URL, both, or
+neither in one invocation, and each target is attempted and reported on its
+own — a failed `--register` does not skip the RailDash delivery, and vice
+versa. It is also independent of `--no-evidence-bundle`: the bundle is built
+for delivery even when the local file write is skipped.
+
+`--agent-key` (or `RAIL_AGENT_KEY`) is forwarded as the request's
+`?agent_key=` query parameter, for RailDash to resolve identity when the
+bundle carries no deployment pair — the same key `raildash asp load
+--agent-key` takes today. (This is a best guess at DR-120's exact contract,
+made before that route's PR existed; if DR-120 lands with `agent_key` as a
+header instead, this is the one place to change.)
+
+RailDash is expected to run localhost-only, so no auth header is sent by
+default. `--auth-mode`/`RAIL_AUTH_MODE` (see [Authentication](#authentication))
+applies to this target too, for the rare deployment that fronts RailDash with
+its own auth.
+
+A non-2xx response, an unreachable RailDash, or an evidence bundle that fails
+its own contract are all reported as scanner errors with exit code `2` —
+mirroring `--register`'s existing failure handling — without stopping the
+rest of the scan: the feature file, the local evidence bundle (if
+`--evidence-bundle-output` was also requested), and any `--register` attempt
+still happen.
+
 ## Observed reach (optional)
 
 The other dimensions describe what an agent is *configured* to reach.

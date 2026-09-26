@@ -1044,5 +1044,187 @@ class ScannerWiringTest(unittest.TestCase):
             self.assertTrue(default.exists())
             self.assertEqual(json.loads(default.read_text())["bundle_version"], 1)
 
+
+class RaildashDeliveryWiringTest(unittest.TestCase):
+    """DR-121: `--raildash-url` POSTs the exact evidence-bundle bytes, and is
+    independent of `--register`/`--center-url`.
+
+    A real loopback server, not a mock of `post_evidence_bundle`'s internals —
+    the acceptance criterion is the actual bytes over the wire and the two
+    delivery targets' independence, both wire-level claims a mocked poster
+    could not verify. No live RailDash is required: `FakeRaildash` is a tiny
+    stand-in, the same pattern `test_mcp_tool_discovery.py` already uses for
+    a fake MCP server.
+    """
+
+    def run_scan(self, tmp: str, extra: list[str], env_cwd: str):
+        import subprocess
+
+        argv = ["python3", str(SCANNER)] + extra
+        return subprocess.run(
+            argv,
+            cwd=env_cwd,
+            capture_output=True,
+            text=True,
+            env={k: v for k, v in os.environ.items() if not k.startswith("RAIL_")},
+            timeout=120,
+        )
+
+    def start_fake_raildash(self, responses: list[tuple[int, dict]]):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        captured: dict = {}
+        remaining = list(responses)
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                captured["path"] = self.path
+                length = int(self.headers.get("Content-Length", 0))
+                captured["body"] = self.rfile.read(length)
+                captured["content_type"] = self.headers.get("Content-Type")
+                status, body = remaining.pop(0)
+                payload = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address
+        return server, thread, f"http://{host}:{port}", captured
+
+    def stop_fake_raildash(self, server, thread):
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    def test_the_posted_bytes_match_the_local_evidence_bundle_file(self):
+        import tempfile
+
+        server, thread, url, captured = self.start_fake_raildash([(202, {"id": "asp-1", "duplicate": False})])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = self.run_scan(
+                    tmp,
+                    [
+                        "--mode", "self",
+                        "--no-feature-file",
+                        "--host-id", "h-1",
+                        "--evidence-bundle-output", f"{tmp}/bundle.json",
+                        "--raildash-url", url,
+                    ],
+                    tmp,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                on_disk = Path(tmp, "bundle.json").read_bytes()
+        finally:
+            self.stop_fake_raildash(server, thread)
+
+        self.assertEqual(captured["path"], "/v1/evidence-bundles")
+        self.assertEqual(captured["content_type"], "application/json")
+        # The identical bytes, not just an equivalent re-serialization: the
+        # POST body and the file on disk share one `build_verified_bundle`
+        # call, so their bundle_id (and every other byte) must match exactly.
+        self.assertEqual(captured["body"], on_disk)
+        self.assertIn("accepted", proc.stderr)
+        self.assertIn("id=asp-1", proc.stderr)
+
+    def test_a_duplicate_response_is_reported_as_such(self):
+        """--no-evidence-bundle still allows raildash delivery: the two are
+        independent controls over the same underlying bundle."""
+        import tempfile
+
+        server, thread, url, captured = self.start_fake_raildash([(202, {"id": "asp-1", "duplicate": True})])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = self.run_scan(
+                    tmp,
+                    [
+                        "--mode", "self",
+                        "--no-feature-file",
+                        "--host-id", "h-1",
+                        "--no-evidence-bundle",
+                        "--raildash-url", url,
+                    ],
+                    tmp,
+                )
+        finally:
+            self.stop_fake_raildash(server, thread)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("duplicate", proc.stderr)
+        self.assertIn("path", captured)
+
+    def test_raildash_delivery_is_independent_of_a_failed_registration(self):
+        """--register (pointed at an unreachable port) and --raildash-url (a
+        real local server) in one invocation: each target's own outcome, not
+        the other's."""
+        import tempfile
+
+        server, thread, url, captured = self.start_fake_raildash([(202, {"id": "asp-2", "duplicate": False})])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = self.run_scan(
+                    tmp,
+                    [
+                        "--mode", "self",
+                        "--feature-output", f"{tmp}/features.json",
+                        "--host-id", "h-1",
+                        "--evidence-bundle-output", f"{tmp}/bundle.json",
+                        "--register",
+                        "--center-url", "http://127.0.0.1:1",
+                        "--raildash-url", url,
+                    ],
+                    tmp,
+                )
+                feature = json.loads(Path(tmp, "features.json").read_text())
+        finally:
+            self.stop_fake_raildash(server, thread)
+
+        # The failed --register still sets the exit code (matching its own
+        # existing behaviour), but must not prevent the RailDash delivery.
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("rail-center registration failed", proc.stderr)
+        self.assertIn("delivered evidence bundle to raildash", proc.stderr)
+        self.assertIn("accepted", proc.stderr)
+        self.assertEqual(feature["scan"]["registration_status"], "registration_failed")
+        self.assertEqual(captured["path"], "/v1/evidence-bundles")
+
+    def test_a_non_2xx_response_is_reported_not_fatal_to_the_bundle_write(self):
+        """The local bundle is still on disk, and the run does not crash — the
+        failure is reported and reflected in the exit code, mirroring
+        --register's existing failure handling."""
+        import tempfile
+
+        server, thread, url, captured = self.start_fake_raildash([(400, {"error": "bundle too large"})])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = self.run_scan(
+                    tmp,
+                    [
+                        "--mode", "self",
+                        "--no-feature-file",
+                        "--host-id", "h-1",
+                        "--evidence-bundle-output", f"{tmp}/bundle.json",
+                        "--raildash-url", url,
+                    ],
+                    tmp,
+                )
+                bundle_exists = Path(tmp, "bundle.json").exists()
+        finally:
+            self.stop_fake_raildash(server, thread)
+
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertTrue(bundle_exists, "the local bundle must survive a rejected delivery")
+        self.assertIn("HTTP 400", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
