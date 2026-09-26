@@ -739,6 +739,17 @@ class BundlePermissionsTest(unittest.TestCase):
             )
         )
 
+    def test_deployment_contract_rejects_whitespace_only_values(self):
+        # A blank host_id/sandbox_name is rejected by a `pattern` rule, not
+        # just `minLength` (a whitespace-only string still has length >= 1).
+        # The four deployment keys feed the same "no blank claims" rule.
+        bundle = build_bundle()
+        bundle["attributes"]["deployment"]["value"] = {"RAIL_DEPLOYMENT": "   "}
+        problems = evidence_bundle.contract_problems(bundle)
+        self.assertTrue(
+            any("RAIL_DEPLOYMENT" in problem for problem in problems), problems
+        )
+
     def test_credential_classes_match_the_profiler_contract(self):
         with mock.patch.object(
             scanner,

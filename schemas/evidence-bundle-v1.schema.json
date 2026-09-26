@@ -199,19 +199,23 @@
       "properties": {
         "RAIL_DEPLOYMENT": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "RAIL_NAMESPACE": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "com.docker.compose.project": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "com.docker.compose.service": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         }
       },
       "$comment": "Each value's UTF-8 byte length must also stay under 253 bytes — checked in code, not here (see the top-level $comment)."
