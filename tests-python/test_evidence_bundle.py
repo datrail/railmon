@@ -1108,7 +1108,7 @@ class RaildashDeliveryWiringTest(unittest.TestCase):
     def test_the_posted_bytes_match_the_local_evidence_bundle_file(self):
         import tempfile
 
-        server, thread, url, captured = self.start_fake_raildash([(202, {"id": "asp-1", "duplicate": False})])
+        server, thread, url, captured = self.start_fake_raildash([(202, {"asp_id": "asp-1", "duplicate": False})])
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 proc = self.run_scan(
@@ -1141,7 +1141,7 @@ class RaildashDeliveryWiringTest(unittest.TestCase):
         independent controls over the same underlying bundle."""
         import tempfile
 
-        server, thread, url, captured = self.start_fake_raildash([(202, {"id": "asp-1", "duplicate": True})])
+        server, thread, url, captured = self.start_fake_raildash([(202, {"asp_id": "asp-1", "duplicate": True})])
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 proc = self.run_scan(
@@ -1168,7 +1168,7 @@ class RaildashDeliveryWiringTest(unittest.TestCase):
         the other's."""
         import tempfile
 
-        server, thread, url, captured = self.start_fake_raildash([(202, {"id": "asp-2", "duplicate": False})])
+        server, thread, url, captured = self.start_fake_raildash([(202, {"asp_id": "asp-2", "duplicate": False})])
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 proc = self.run_scan(
