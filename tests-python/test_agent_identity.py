@@ -551,6 +551,284 @@ class AuthModeTest(unittest.TestCase):
             scanner.auth_headers("magic")
 
 
+class EvidenceBundleIngestUrlTest(unittest.TestCase):
+    """DR-121: RailDash's `/v1/evidence-bundles` URL, mirroring RegistrationUrlTest."""
+
+    def test_a_base_url_gains_the_endpoint(self):
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash"), "https://raildash/v1/evidence-bundles"
+        )
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash/"), "https://raildash/v1/evidence-bundles"
+        )
+
+    def test_a_url_that_already_names_the_endpoint_is_left_alone(self):
+        full = "https://raildash/v1/evidence-bundles"
+        self.assertEqual(scanner.evidence_bundle_ingest_url(full), full)
+
+    def test_no_agent_key_means_no_query_string(self):
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash", agent_key=None),
+            "https://raildash/v1/evidence-bundles",
+        )
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash", agent_key=""),
+            "https://raildash/v1/evidence-bundles",
+        )
+
+    def test_agent_key_is_appended_as_a_query_param(self):
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash", agent_key="agent-7"),
+            "https://raildash/v1/evidence-bundles?agent_key=agent-7",
+        )
+
+    def test_a_query_string_does_not_get_the_endpoint_glued_after_it(self):
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash/api?tenant=acme"),
+            "https://raildash/api/v1/evidence-bundles?tenant=acme",
+        )
+
+    def test_an_existing_query_string_is_preserved_alongside_agent_key(self):
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash/api?tenant=acme", agent_key="agent-7"),
+            "https://raildash/api/v1/evidence-bundles?tenant=acme&agent_key=agent-7",
+        )
+
+    def test_a_stale_agent_key_in_the_url_is_replaced_not_duplicated(self):
+        self.assertEqual(
+            scanner.evidence_bundle_ingest_url("https://raildash?agent_key=old", agent_key="new"),
+            "https://raildash/v1/evidence-bundles?agent_key=new",
+        )
+
+
+class ConfiguredRaildashTargetTest(unittest.TestCase):
+    """`--raildash-url`/`--agent-key` follow the exact `--center-url` convention:
+    flag, then env, then unset — and unlike `--register`, an unset target is not
+    an error: it just means this scan is not delivering to RailDash."""
+
+    def setUp(self):
+        for key in ("RAIL_RAILDASH_URL", "RAIL_AGENT_KEY"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key in ("RAIL_RAILDASH_URL", "RAIL_AGENT_KEY"):
+            os.environ.pop(key, None)
+
+    def test_absent_by_default(self):
+        args = argparse.Namespace(raildash_url=None, agent_key=None)
+        self.assertIsNone(scanner.configured_raildash_url(args))
+        self.assertIsNone(scanner.configured_agent_key(args))
+
+    def test_env_fallback(self):
+        os.environ["RAIL_RAILDASH_URL"] = "http://raildash.local"
+        os.environ["RAIL_AGENT_KEY"] = "agent-env"
+        args = argparse.Namespace(raildash_url=None, agent_key=None)
+        self.assertEqual(scanner.configured_raildash_url(args), "http://raildash.local")
+        self.assertEqual(scanner.configured_agent_key(args), "agent-env")
+
+    def test_flag_beats_env(self):
+        os.environ["RAIL_RAILDASH_URL"] = "http://env"
+        os.environ["RAIL_AGENT_KEY"] = "env-key"
+        args = argparse.Namespace(raildash_url="http://flag", agent_key="flag-key")
+        self.assertEqual(scanner.configured_raildash_url(args), "http://flag")
+        self.assertEqual(scanner.configured_agent_key(args), "flag-key")
+
+
+class ConfiguredScanIntervalTest(unittest.TestCase):
+    """DR-83: absent by default (existing single-shot callers unaffected);
+    `--interval` beats `RAIL_SCAN_INTERVAL_IN_SECONDS`; a malformed env value
+    falls back to the 3600s default rather than failing the scan."""
+
+    def setUp(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def tearDown(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def test_absent_by_default(self):
+        args = argparse.Namespace(interval=None)
+        self.assertIsNone(scanner.configured_scan_interval(args))
+
+    def test_flag_enables_and_sets_it(self):
+        args = argparse.Namespace(interval=90.0)
+        self.assertEqual(scanner.configured_scan_interval(args), 90.0)
+
+    def test_env_var_enables_and_sets_it(self):
+        os.environ["RAIL_SCAN_INTERVAL_IN_SECONDS"] = "120"
+        args = argparse.Namespace(interval=None)
+        self.assertEqual(scanner.configured_scan_interval(args), 120.0)
+
+    def test_flag_beats_env(self):
+        os.environ["RAIL_SCAN_INTERVAL_IN_SECONDS"] = "120"
+        args = argparse.Namespace(interval=5.0)
+        self.assertEqual(scanner.configured_scan_interval(args), 5.0)
+
+    def test_malformed_env_value_falls_back_to_the_default(self):
+        os.environ["RAIL_SCAN_INTERVAL_IN_SECONDS"] = "soon"
+        args = argparse.Namespace(interval=None)
+        self.assertEqual(scanner.configured_scan_interval(args), scanner.DEFAULT_SCAN_INTERVAL_SECONDS)
+
+
+class MainIntervalLoopTest(unittest.TestCase):
+    """DR-83: `main` stays running and scans again on the interval, an
+    existing invocation without `--interval` still runs once and returns, and
+    the loop's exit code is whatever the most recent scan returned (so a
+    supervisor watching the process still sees a failing scan as a failure)."""
+
+    def setUp(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def tearDown(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def test_no_interval_runs_once(self):
+        from unittest import mock
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0) as run_once, mock.patch.object(
+            scanner, "time"
+        ) as fake_time:
+            code = scanner.main(["--no-feature-file", "--no-evidence-bundle"])
+        run_once.assert_called_once()
+        fake_time.sleep.assert_not_called()
+        self.assertEqual(code, 0)
+
+    def test_interval_scans_repeatedly_until_interrupted(self):
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def fake_scan(args):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                raise KeyboardInterrupt
+            return 0
+
+        with mock.patch.object(scanner, "run_one_scan", side_effect=fake_scan), mock.patch.object(
+            scanner, "time"
+        ) as fake_time:
+            code = scanner.main(["--interval", "5", "--no-feature-file", "--no-evidence-bundle"])
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(fake_time.sleep.call_count, 2)
+        fake_time.sleep.assert_called_with(5.0)
+        self.assertEqual(code, 0)
+
+    def test_loop_exit_code_is_the_most_recent_scan_s(self):
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def fake_scan(args):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise KeyboardInterrupt
+            return 2
+
+        with mock.patch.object(scanner, "run_one_scan", side_effect=fake_scan), mock.patch.object(
+            scanner, "time"
+        ) as fake_time:
+            code = scanner.main(["--interval", "1"])
+        self.assertEqual(code, 2)
+
+
+class _FakeHttpResponse:
+    """A minimal stand-in for `http.client.HTTPResponse` as a context manager."""
+
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class PostEvidenceBundleTest(unittest.TestCase):
+    """POST construction and response handling, with `urlopen` mocked out —
+    no live RailDash required."""
+
+    def setUp(self):
+        for key in ("RAIL_AUTH_MODE", "RAIL_AUTH_TOKEN"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key in ("RAIL_AUTH_MODE", "RAIL_AUTH_TOKEN"):
+            os.environ.pop(key, None)
+
+    def test_the_raw_bytes_are_sent_unchanged(self):
+        from unittest import mock
+
+        data = b'{"bundle_id":"bnd-1","attributes":{}}'
+        with mock.patch.object(
+            scanner, "urlopen", return_value=_FakeHttpResponse(202, b'{"id":"asp-1","duplicate":false}')
+        ) as mocked:
+            result = scanner.post_evidence_bundle("http://raildash.local", data)
+
+        req = mocked.call_args.args[0]
+        self.assertEqual(req.full_url, "http://raildash.local/v1/evidence-bundles")
+        self.assertEqual(req.data, data)
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.headers.get("Content-type"), "application/json")
+        self.assertNotIn("Authorization", req.headers)
+        self.assertEqual(result, {"status": 202, "body": {"id": "asp-1", "duplicate": False}})
+
+    def test_no_auth_header_by_default(self):
+        """RailDash is localhost-only; an auth header is never forced on it."""
+        from unittest import mock
+
+        with mock.patch.object(scanner, "urlopen", return_value=_FakeHttpResponse(202, b"{}")) as mocked:
+            scanner.post_evidence_bundle("http://raildash.local", b"{}")
+        self.assertNotIn("Authorization", mocked.call_args.args[0].headers)
+
+    def test_bearer_auth_mode_is_forwarded_when_explicitly_set(self):
+        from unittest import mock
+
+        os.environ["RAIL_AUTH_TOKEN"] = "t-1"
+        with mock.patch.object(scanner, "urlopen", return_value=_FakeHttpResponse(202, b"{}")) as mocked:
+            scanner.post_evidence_bundle("http://raildash.local", b"{}", auth_mode="bearer")
+        self.assertEqual(mocked.call_args.args[0].headers.get("Authorization"), "Bearer t-1")
+
+    def test_agent_key_rides_the_request_url(self):
+        from unittest import mock
+
+        with mock.patch.object(scanner, "urlopen", return_value=_FakeHttpResponse(202, b"{}")) as mocked:
+            scanner.post_evidence_bundle("http://raildash.local", b"{}", agent_key="agent-7")
+        self.assertTrue(mocked.call_args.args[0].full_url.endswith("?agent_key=agent-7"))
+
+    def test_an_http_error_becomes_a_scanner_error_with_the_body(self):
+        import io
+        from unittest import mock
+        from urllib.error import HTTPError
+
+        def raise_it(req, timeout=None):
+            raise HTTPError(req.full_url, 400, "Bad Request", None, io.BytesIO(b"bundle too large"))
+
+        with mock.patch.object(scanner, "urlopen", side_effect=raise_it):
+            with self.assertRaises(scanner.ScannerError) as ctx:
+                scanner.post_evidence_bundle("http://raildash.local", b"{}")
+        self.assertIn("HTTP 400", str(ctx.exception))
+        self.assertIn("bundle too large", str(ctx.exception))
+
+    def test_connection_refused_becomes_a_scanner_error_not_a_crash(self):
+        from unittest import mock
+        from urllib.error import URLError
+
+        with mock.patch.object(scanner, "urlopen", side_effect=URLError("connection refused")):
+            with self.assertRaises(scanner.ScannerError):
+                scanner.post_evidence_bundle("http://127.0.0.1:1", b"{}")
+
+    def test_a_non_json_response_body_is_a_scanner_error(self):
+        from unittest import mock
+
+        with mock.patch.object(scanner, "urlopen", return_value=_FakeHttpResponse(202, b"not json")):
+            with self.assertRaises(scanner.ScannerError):
+                scanner.post_evidence_bundle("http://raildash.local", b"{}")
+
+
 class FeatureFileTest(unittest.TestCase):
     def test_covers_the_five_dimensions(self):
         args = argparse.Namespace(container=None, register=False, mcp_config=[])
