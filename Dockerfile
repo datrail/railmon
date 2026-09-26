@@ -80,6 +80,11 @@ COPY --from=build /src/target/release/railmon /usr/local/bin/railmon-collector
 
 COPY tools/ /opt/railmon/tools/
 COPY rail-collector/ /opt/railmon/rail-collector/
+# The evidence-bundle schema is the scanner's own contract, read (not merely
+# tested against) at import time by tools/agent-environment-scanner/
+# evidence_bundle.py — it has to ship, unlike schemas/'s other, test-only
+# copies.
+COPY schemas/evidence-bundle-v1.schema.json /opt/railmon/schemas/evidence-bundle-v1.schema.json
 COPY entrypoint.sh /usr/local/bin/railmon
 RUN chmod +x /usr/local/bin/railmon /opt/railmon/tools/local-demo/run_local_demo.sh
 

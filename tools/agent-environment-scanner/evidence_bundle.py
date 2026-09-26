@@ -36,42 +36,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# ── closed sets ─────────────────────────────────────────────────────────────
-# Mirrored, not re-derived, from the published contract: Confluence
-# "Evidence Bundle Reason Codes" (the 13-code enum) and DR-107. A divergence
-# between the two is a bug, not a choice — update both sides of the mirror
-# (the consumer's `contract_problems` is the other half).
-STATUSES = frozenset({"ANSWERED", "ABSENT", "TEMPLATED", "PARTIAL", "BLIND", "FAILED"})
-REASONS = frozenset(
-    {
-        "NO_SOURCE_ACCESS",
-        "NOT_FIRST_PARTY",
-        "SOURCE_OK_NOT_PRESENT",
-        "UNKNOWN_HARNESS",
-        "NOT_COLLECTED_BY_PACK",
-        "PRIVATE_STORE",
-        "CODE_CONSTRUCTED",
-        "GATEWAY_MANAGED",
-        "ORCHESTRATOR_MANAGED",
-        "PROVIDER_HOSTED",
-        "TEMPLATE_UNRESOLVED",
-        "PARSE_FAILED",
-        "SIZE_CAP_EXCEEDED",
-    }
-)
-TIERS = frozenset({"declared", "interrogated", "observed"})
-AUTHORED_BY = frozenset({"subject", "platform", "external", "none"})
+# ── the published contract ──────────────────────────────────────────────────
+# The schema is the single source of truth, loaded once here: the closed sets
+# below are derived from it rather than hand-mirrored copies that can drift
+# from what the consumer actually enforces. RailDash vendors this same file
+# byte-for-byte, and RC-318's control plane has been asked to validate
+# against it too.
+SCHEMA_PATH = Path(__file__).resolve().parent.parent.parent / "schemas" / "evidence-bundle-v1.schema.json"
+SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
+_ATTRIBUTE_DEF = SCHEMA["$defs"]["attribute"]
+_SOURCE_DEF = SCHEMA["$defs"]["source"]
+
+STATUSES = frozenset(_ATTRIBUTE_DEF["properties"]["status"]["enum"])
+REASONS = frozenset(SCHEMA["$defs"]["reason"]["enum"])
+TIERS = frozenset(_ATTRIBUTE_DEF["properties"]["tier"]["enum"])
+AUTHORED_BY = frozenset(_ATTRIBUTE_DEF["properties"]["authored_by"]["enum"])
+ATTRIBUTE_FIELDS = frozenset(_ATTRIBUTE_DEF["properties"])
+SOURCE_FIELDS = frozenset(_SOURCE_DEF["properties"])
+ENVELOPE_KEYS = tuple(SCHEMA["required"])
+OPTIONAL_ENVELOPE_KEYS = tuple(set(SCHEMA["properties"]) - set(SCHEMA["required"]))
+INPUT_SOURCES = tuple(SCHEMA["properties"]["inputs_attempted"]["required"])
 # Mirrored from the published schema's maxLength, which is what the consumer
 # validates against; the scanner truncates to the same numbers.
-HOST_ID_MAX = 64
-SANDBOX_NAME_MAX = 255
+HOST_ID_MAX = SCHEMA["properties"]["host_id"]["maxLength"]
+SANDBOX_NAME_MAX = SCHEMA["properties"]["sandbox_name"]["maxLength"]
 
 # The shared version is 1: Eason reset the mock's 2 back to 1, because the
 # first version was never published ("let's call this version version 1").
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Ours, not the consumer's: the consumer's mock numbers its own packs; pack 1
 # is this collector's attribute set, and x-rail-spec's additions-version rule
-# applies when the set grows.
+# applies when the set grows. Not in the schema — it is only bounded there.
 RULE_PACK_VERSION = 1
 
 # Rail Center's profiler vocabulary is intentionally narrower than the
@@ -170,156 +165,133 @@ def _credential_carrying_value(value: Any) -> bool:
 # ── the contract check ──────────────────────────────────────────────────────
 
 
-# The envelope the published schema closes: exactly these keys, plus the
-# optional attestations array. `inputs_attempted` always holds exactly the
-# four sources, and an attribute holds exactly the fields below.
-ENVELOPE_KEYS = (
-    "bundle_version",
-    "bundle_id",
-    "host_id",
-    "sandbox_name",
-    "collected_at",
-    "rule_pack_version",
-    "inputs_attempted",
-    "attributes",
-)
-OPTIONAL_ENVELOPE_KEYS = ("attestations",)
-INPUT_SOURCES = ("runtime", "image", "manifest", "repo")
-SOURCE_FIELDS = frozenset({"attempted", "reached", "reason", "window_seconds"})
-ATTRIBUTE_FIELDS = frozenset(
-    {"value", "status", "reason", "tier", "authored_by", "method", "note", "attestation_ref"}
-)
-# The statuses that carry authored_by, and the ones the schema forbids it on.
-AUTHORED_STATUSES = ("ANSWERED", "PARTIAL", "TEMPLATED")
-UNAUTHORED_STATUSES = ("ABSENT", "BLIND", "FAILED")
+_DATE_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$", re.IGNORECASE)
 
 
-def _envelope_problems(bundle: dict[str, Any]) -> list[str]:
-    """The envelope's required keys, its closed set, and the naming pair.
+def _resolve(schema: dict[str, Any]) -> dict[str, Any]:
+    """Follow a single `$ref` into `$defs`; every ref in this schema is local
+    and none carries sibling keywords, so there is nothing else to merge."""
+    if "$ref" in schema:
+        return SCHEMA["$defs"][schema["$ref"].rsplit("/", 1)[-1]]
+    return schema
 
-    The pair is not optional in the schema, so a bundle carries no `None`
-    here: a scan that could not derive one is a problem the caller reports,
-    never a bundle the control plane has to guess an owner for.
+
+def _schema_problems(instance: Any, schema: dict[str, Any], where: str) -> list[str]:
+    """A minimal, stdlib-only walker for the slice of JSON Schema this
+    contract uses: type/const/enum/required/properties/additionalProperties/
+    items/minProperties, minLength/maxLength/minimum/pattern,
+    format:date-time, and allOf/if/then/else/not/$ref, and the boolean
+    schemas `true`/`false` (`"value": true` marks an attribute's value as
+    accepting anything).
+
+    This is the one structural check, driven by `SCHEMA` itself rather than a
+    second hand-written copy of its rules: a rule added to the file takes
+    effect here with no matching code change. `jsonschema` is not a
+    dependency here on purpose — the scanner ships standard-library only
+    (see the Dockerfile) — so this walks the schema by hand instead.
     """
+    if schema is True:
+        return []
+    if schema is False:
+        return [f"{where}: no value is allowed here"]
+    schema = _resolve(schema)
     problems: list[str] = []
-    for key in ENVELOPE_KEYS:
-        if key not in bundle:
-            problems.append(f"{key}: required envelope field is missing")
-    for key in bundle:
-        if key not in ENVELOPE_KEYS and key not in OPTIONAL_ENVELOPE_KEYS:
-            problems.append(f"{key}: not a field of the envelope")
-    if bundle.get("bundle_version") != BUNDLE_VERSION:
-        problems.append(f"bundle_version: {bundle.get('bundle_version')!r} is not {BUNDLE_VERSION}")
-    for key, limit in (("host_id", HOST_ID_MAX), ("sandbox_name", SANDBOX_NAME_MAX)):
-        value = bundle.get(key)
-        if not isinstance(value, str) or not value.strip():
-            problems.append(f"{key}: must be a non-empty string, not {value!r}")
-        elif len(value) > limit:
-            problems.append(f"{key}: {len(value)} characters is past the {limit} cap")
+    if "const" in schema and instance != schema["const"]:
+        problems.append(f"{where}: {instance!r} is not {schema['const']!r}")
+    if "enum" in schema and instance not in schema["enum"]:
+        problems.append(f"{where}: {instance!r} is not one of {schema['enum']}")
+    kind = schema.get("type")
+    if kind == "object" and not isinstance(instance, dict):
+        problems.append(f"{where}: must be an object")
+    elif kind == "array" and not isinstance(instance, list):
+        problems.append(f"{where}: must be an array")
+    elif kind == "string" and not isinstance(instance, str):
+        problems.append(f"{where}: must be a string")
+    elif kind == "integer" and (not isinstance(instance, int) or isinstance(instance, bool)):
+        problems.append(f"{where}: must be an integer")
+    elif kind == "boolean" and not isinstance(instance, bool):
+        problems.append(f"{where}: must be a boolean")
+    if isinstance(instance, dict):
+        for key in schema.get("required", ()):
+            if key not in instance:
+                problems.append(f"{where}.{key}: required field is missing")
+        if "minProperties" in schema and len(instance) < schema["minProperties"]:
+            problems.append(f"{where}: must have at least {schema['minProperties']} field(s)")
+        properties = schema.get("properties", {})
+        additional = schema.get("additionalProperties", True)
+        for key, value in instance.items():
+            if key in properties:
+                problems += _schema_problems(value, properties[key], f"{where}.{key}")
+            elif additional is False:
+                problems.append(f"{where}.{key}: not a field of the schema")
+            elif isinstance(additional, dict):
+                problems += _schema_problems(value, additional, f"{where}.{key}")
+    if isinstance(instance, list) and "items" in schema:
+        for index, item in enumerate(instance):
+            problems += _schema_problems(item, schema["items"], f"{where}[{index}]")
+    if isinstance(instance, str):
+        if "minLength" in schema and len(instance) < schema["minLength"]:
+            problems.append(
+                f"{where}: must be a non-empty string"
+                if schema["minLength"] == 1
+                else f"{where}: shorter than {schema['minLength']} characters"
+            )
+        if "maxLength" in schema and len(instance) > schema["maxLength"]:
+            problems.append(f"{where}: exceeds {schema['maxLength']} characters")
+        if "pattern" in schema and not re.search(schema["pattern"], instance):
+            problems.append(f"{where}: must not be blank")
+        if schema.get("format") == "date-time" and not _DATE_TIME.match(instance):
+            problems.append(f"{where}: must be an RFC 3339 date-time")
+    if isinstance(instance, int) and not isinstance(instance, bool) and "minimum" in schema:
+        if instance < schema["minimum"]:
+            problems.append(f"{where}: must be at least {schema['minimum']}")
+    for branch in schema.get("allOf", ()):
+        problems += _schema_problems(instance, branch, where)
+    if "if" in schema:
+        if not _schema_problems(instance, schema["if"], where):
+            problems += _schema_problems(instance, schema.get("then", {}), where)
+        elif "else" in schema:
+            problems += _schema_problems(instance, schema["else"], where)
+    if "not" in schema and not _schema_problems(instance, schema["not"], where):
+        named = schema["not"].get("required")
+        problems.append(
+            f"{where}: must not have {', '.join(named)}" if named else f"{where}: matches an excluded shape"
+        )
     return problems
 
 
-def _source_problems(sources: Any) -> list[str]:
-    """The four sources, and the reachable reason rules."""
+def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
+    """The two rules the published schema cannot express (see its top-level
+    $comment): every attestation_ref names a real attestation, and a
+    deployment value's byte length is measured in UTF-8 bytes, which
+    `maxLength` cannot — it counts Unicode code points."""
     problems: list[str] = []
-    if not isinstance(sources, dict):
-        return ["inputs_attempted: not an object"]
-    for src in INPUT_SOURCES:
-        if src not in sources:
-            problems.append(f"inputs_attempted.{src}: source is missing")
-    for src, entry in sources.items():
-        if src not in INPUT_SOURCES:
-            problems.append(f"inputs_attempted.{src}: not one of the four sources")
-            continue
-        if not isinstance(entry, dict):
-            problems.append(f"inputs_attempted.{src}: entry is not an object")
-            continue
-        for key in entry:
-            if key not in SOURCE_FIELDS:
-                problems.append(f"inputs_attempted.{src}: {key!r} is not a field of a source")
-        if not isinstance(entry.get("attempted"), bool):
-            problems.append(f"inputs_attempted.{src}: attempted must be a boolean")
-        if entry.get("reason") not in (None, *REASONS):
-            problems.append(f"inputs_attempted.{src}: unknown reason {entry.get('reason')!r}")
-        if entry.get("attempted") and "reached" not in entry:
-            problems.append(f"inputs_attempted.{src}: attempted without reached")
-        if entry.get("attempted") is False and not entry.get("reason"):
-            problems.append(f"inputs_attempted.{src}: not attempted without a reason")
-        if entry.get("reached") is False and not entry.get("reason"):
-            problems.append(f"inputs_attempted.{src}: not reached without a reason")
-        if "window_seconds" in entry and src != "runtime":
-            problems.append(f"inputs_attempted.{src}: window_seconds is only on runtime")
+    attestations = {a.get("id") for a in (bundle.get("attestations") or [])}
+    for name, field in (bundle.get("attributes") or {}).items():
+        if isinstance(field, dict) and field.get("attestation_ref") not in (None, *attestations):
+            problems.append(
+                f"attributes.{name}.attestation_ref: {field['attestation_ref']!r} points at nothing"
+            )
+    deployment = (bundle.get("attributes") or {}).get("deployment")
+    if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
+        for key, item in (deployment.get("value") or {}).items():
+            if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
+                problems.append(
+                    f"attributes.deployment.value.{key}: exceeds the {DEPLOYMENT_VALUE_MAX_BYTES}-byte bound"
+                )
     return problems
 
 
 def contract_problems(bundle: dict[str, Any]) -> list[str]:
-    """Everything in a bundle the published v1 schema would reject.
+    """Everything in a bundle the published v1 schema would reject, plus the
+    two rules the schema itself cannot express.
 
-    The schema's rules, in code: the envelope's required keys and closed set,
-    the four sources with a reason whenever one was not attempted or not
-    reached, and each attribute's closed sets, method-on-ABSENT and
-    authored_by placement. It is the whole contract, not the consumer's
-    lenient load gate, on purpose: `verify_bundle` is the guard that keeps a
-    broken bundle from reaching a scorer, and a check that passes what the
-    consumer rejects is worse than none. The one rule the schema cannot
-    express - every attestation_ref names an attestation - is checked here.
+    It is the whole contract, not the consumer's lenient load gate, on
+    purpose: `verify_bundle` is the guard that keeps a broken bundle from
+    reaching a scorer, and a check that passes what the consumer rejects is
+    worse than none.
     """
-    problems = _envelope_problems(bundle)
-    problems += _source_problems(bundle.get("inputs_attempted"))
-    attestations = {a.get("id") for a in (bundle.get("attestations") or [])}
-    for name, f in (bundle.get("attributes") or {}).items():
-        where = f"attributes.{name}"
-        if not isinstance(f, dict):
-            problems.append(f"{where}: not an object")
-            continue
-        for key in f:
-            if key not in ATTRIBUTE_FIELDS:
-                problems.append(f"{where}: {key!r} is not a field of an attribute")
-        if "value" not in f:
-            problems.append(f"{where}: value is required")
-        status = f.get("status")
-        if status not in STATUSES:
-            problems.append(f"{where}: unknown status {status!r}")
-        if f.get("reason") not in (None, *REASONS):
-            problems.append(f"{where}: unknown reason {f.get('reason')!r}")
-        if f.get("tier") not in TIERS:
-            problems.append(f"{where}: unknown tier {f.get('tier')!r}")
-        if f.get("authored_by") not in (None, *AUTHORED_BY):
-            problems.append(f"{where}: unknown authored_by {f.get('authored_by')!r}")
-        # A "we looked and it is not there" claim is only as good as where it
-        # looked; a blind or errored one has to say why it could not answer.
-        if status == "ABSENT" and not f.get("method"):
-            problems.append(f"{where}: ABSENT without method")
-        if status in ("BLIND", "FAILED") and not f.get("reason"):
-            problems.append(f"{where}: {status} without reason")
-        if status == "ANSWERED" and f.get("reason"):
-            problems.append(f"{where}: ANSWERED carries a reason")
-        # authored_by describes a value, so it is stated exactly when there is
-        # one to attribute, and nowhere else.
-        if status in AUTHORED_STATUSES and not f.get("authored_by"):
-            problems.append(f"{where}: {status} without authored_by")
-        if status in UNAUTHORED_STATUSES and "authored_by" in f:
-            problems.append(f"{where}: {status} is not an authored value")
-        if f.get("attestation_ref") not in (None, *attestations):
-            problems.append(f"{where}: attestation_ref {f.get('attestation_ref')!r} points at nothing")
-    deployment = (bundle.get("attributes") or {}).get("deployment")
-    if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
-        value = deployment.get("value")
-        if not isinstance(value, dict) or not value:
-            problems.append("attributes.deployment.value: ANSWERED deployment must be a non-empty object")
-        else:
-            for key, item in value.items():
-                where = f"attributes.deployment.value.{key}"
-                if key not in DEPLOYMENT_KEYS:
-                    problems.append(f"{where}: not a deployment key")
-                    continue
-                if not isinstance(item, str) or not item.strip():
-                    problems.append(f"{where}: must be a non-empty string")
-                elif len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
-                    problems.append(
-                        f"{where}: exceeds the {DEPLOYMENT_VALUE_MAX_BYTES}-byte bound"
-                    )
-    return problems
+    return _schema_problems(bundle, SCHEMA, "bundle") + _semantic_problems(bundle)
 
 
 def verify_bundle(bundle: dict[str, Any]) -> None:

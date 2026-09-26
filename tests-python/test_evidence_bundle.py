@@ -46,11 +46,10 @@ evidence_bundle = importlib.util.module_from_spec(_bundle_spec)
 assert _bundle_spec.loader is not None
 _bundle_spec.loader.exec_module(evidence_bundle)
 
-# The published v1 schema, vendored verbatim from Confluence "Evidence Bundle
-# Schema" so the assertions below anchor on the contract itself rather than on
-# the module's own mirrored constants: a closed set that drifts from the
-# schema must fail here, which is exactly the defect this branch fixes.
-SCHEMA = json.loads((Path(__file__).resolve().parent / "evidence-bundle-v1.schema.json").read_text())
+# The published v1 schema, RailMon's single canonical copy — loaded here
+# independently of `evidence_bundle` itself, so the assertions below anchor on
+# the file, not on whatever the module happens to compute from it.
+SCHEMA = json.loads((ROOT / "schemas" / "evidence-bundle-v1.schema.json").read_text())
 _ATTR = SCHEMA["$defs"]["attribute"]
 _SOURCE = SCHEMA["$defs"]["source"]
 
@@ -142,47 +141,15 @@ def build_bundle(**overrides):
 class BundleContractTest(unittest.TestCase):
     """The emitted bundle stays inside the closed sets, and the check rejects a broken one."""
 
-    def test_the_module_constants_are_the_schema_literals(self):
-        # The module calls its sets "mirrored, not re-derived, from the
-        # published contract". This is the mirror under test: a member added
-        # or dropped on either side fails here, which the self-referential
-        # assertions below (producer vs the module's own constants) cannot
-        # see. It is the exact drift this branch exists to fix.
-        self.assertEqual(set(evidence_bundle.STATUSES), schema_enum("$defs", "attribute", "properties", "status"))
-        self.assertEqual(set(evidence_bundle.REASONS), schema_enum("$defs", "reason"))
-        self.assertEqual(set(evidence_bundle.TIERS), schema_enum("$defs", "attribute", "properties", "tier"))
-        self.assertEqual(set(evidence_bundle.AUTHORED_BY), schema_enum("$defs", "attribute", "properties", "authored_by"))
-        self.assertEqual(set(evidence_bundle.ATTRIBUTE_FIELDS), set(_ATTR["properties"]))
-        self.assertEqual(set(evidence_bundle.SOURCE_FIELDS), set(_SOURCE["properties"]))
-        self.assertEqual(set(evidence_bundle.ENVELOPE_KEYS), set(SCHEMA["required"]))
-        self.assertEqual(
-            set(evidence_bundle.OPTIONAL_ENVELOPE_KEYS),
-            set(SCHEMA["properties"]) - set(SCHEMA["required"]),
-        )
-        self.assertEqual(
-            set(evidence_bundle.INPUT_SOURCES), set(SCHEMA["properties"]["inputs_attempted"]["required"])
-        )
-
-        # The authored/un-authored split is the schema's allOf, not a free
-        # tuple: the statuses its `if` names must be authored, the rest must
-        # not. Anchoring it here catches a member dropped from either tuple.
-        authored_rule = [
-            rule
-            for rule in _ATTR["allOf"]
-            if rule.get("then", {}).get("required") == ["authored_by"]
-        ][0]
-        self.assertEqual(
-            set(evidence_bundle.AUTHORED_STATUSES),
-            frozenset(authored_rule["if"]["properties"]["status"]["enum"]),
-        )
-        self.assertEqual(
-            set(evidence_bundle.UNAUTHORED_STATUSES),
-            schema_enum("$defs", "attribute", "properties", "status")
-            - frozenset(evidence_bundle.AUTHORED_STATUSES),
-        )
-        self.assertEqual(evidence_bundle.BUNDLE_VERSION, SCHEMA["properties"]["bundle_version"]["const"])
-        self.assertEqual(evidence_bundle.HOST_ID_MAX, SCHEMA["properties"]["host_id"]["maxLength"])
-        self.assertEqual(evidence_bundle.SANDBOX_NAME_MAX, SCHEMA["properties"]["sandbox_name"]["maxLength"])
+    def test_the_module_loads_the_one_canonical_schema_file(self):
+        # There is one copy of this contract now, not a mirror of it: the
+        # module reads `schemas/evidence-bundle-v1.schema.json` at import
+        # time, and every closed set below (STATUSES, TIERS, ...) is derived
+        # from that object rather than a second hand-typed copy that could
+        # drift from it. This just confirms it is the same file this test
+        # loads independently.
+        self.assertEqual(evidence_bundle.SCHEMA_PATH, ROOT / "schemas" / "evidence-bundle-v1.schema.json")
+        self.assertEqual(evidence_bundle.SCHEMA, SCHEMA)
 
     def test_schema_restricts_window_seconds_to_runtime(self):
         source_schemas = SCHEMA["properties"]["inputs_attempted"]["properties"]
@@ -223,68 +190,12 @@ class BundleContractTest(unittest.TestCase):
 
     def test_every_emitted_bundle_passes_the_vendored_schema(self):
         # The point of the branch: the emitted envelope is one the published
-        # schema accepts. This is a stdlib check of the schema's own rules
-        # (required keys, closed sets, the conditional allOf rules, the
-        # envelope's closed property set) applied to a real build.
+        # schema accepts. `contract_problems` is now the schema walked
+        # directly (see evidence_bundle.py), so this exercises the real
+        # production check rather than a second copy of it.
         for mode in ("docker", "self"):
             with self.subTest(mode=mode):
-                self.assertEqual(self.schema_errors(build_bundle(mode=mode)), [])
-
-    def schema_errors(self, bundle: dict) -> list[str]:
-        """The vendored schema's rules, checked without a JSON-Schema library."""
-        problems: list[str] = []
-        for key in SCHEMA["required"]:
-            if key not in bundle:
-                problems.append(f"{key}: missing required envelope field")
-        if SCHEMA.get("additionalProperties") is False:
-            for key in bundle:
-                if key not in SCHEMA["properties"]:
-                    problems.append(f"{key}: not a property of the envelope")
-        if bundle.get("bundle_version") != SCHEMA["properties"]["bundle_version"]["const"]:
-            problems.append("bundle_version is not the schema const")
-        for key in ("host_id", "sandbox_name"):
-            spec = SCHEMA["properties"][key]
-            value = bundle.get(key)
-            if not isinstance(value, str) or not (spec["minLength"] <= len(value) <= spec["maxLength"]):
-                problems.append(f"{key}: not a string within {spec['minLength']}..{spec['maxLength']}")
-        for src, entry in bundle["inputs_attempted"].items():
-            if src not in SCHEMA["properties"]["inputs_attempted"]["properties"]:
-                problems.append(f"inputs_attempted.{src}: not a source")
-                continue
-            if set(entry) - set(_SOURCE["properties"]):
-                problems.append(f"inputs_attempted.{src}: extra field")
-            if not isinstance(entry.get("attempted"), bool):
-                problems.append(f"inputs_attempted.{src}: attempted is not boolean")
-            if entry.get("attempted") is False and "reason" not in entry:
-                problems.append(f"inputs_attempted.{src}: not attempted without reason")
-            if entry.get("attempted") is True and "reached" not in entry:
-                problems.append(f"inputs_attempted.{src}: attempted without reached")
-            if entry.get("reached") is False and "reason" not in entry:
-                problems.append(f"inputs_attempted.{src}: not reached without reason")
-            if entry.get("reason") is not None and entry["reason"] not in schema_enum("$defs", "reason"):
-                problems.append(f"inputs_attempted.{src}: reason outside the enum")
-        for name, field in bundle["attributes"].items():
-            if set(field) - set(_ATTR["properties"]):
-                problems.append(f"attributes.{name}: extra field")
-            for required in _ATTR["required"]:
-                if required not in field:
-                    problems.append(f"attributes.{name}: {required} is required")
-            status = field.get("status")
-            if status not in schema_enum("$defs", "attribute", "properties", "status"):
-                problems.append(f"attributes.{name}: status outside the enum")
-            if field.get("tier") not in schema_enum("$defs", "attribute", "properties", "tier"):
-                problems.append(f"attributes.{name}: tier outside the enum")
-            if status == "ABSENT" and "method" not in field:
-                problems.append(f"attributes.{name}: ABSENT requires method")
-            if status in ("BLIND", "FAILED") and "reason" not in field:
-                problems.append(f"attributes.{name}: {status} requires reason")
-            if status == "ANSWERED" and "reason" in field:
-                problems.append(f"attributes.{name}: ANSWERED forbids reason")
-            if status in ("ANSWERED", "PARTIAL", "TEMPLATED") and "authored_by" not in field:
-                problems.append(f"attributes.{name}: {status} requires authored_by")
-            if status not in ("ANSWERED", "PARTIAL", "TEMPLATED") and "authored_by" in field:
-                problems.append(f"attributes.{name}: {status} forbids authored_by")
-        return problems
+                self.assertEqual(evidence_bundle.contract_problems(build_bundle(mode=mode)), [])
 
     def test_an_unknown_status_is_a_problem(self):
         bundle = build_bundle()
@@ -302,7 +213,7 @@ class BundleContractTest(unittest.TestCase):
         bundle = build_bundle()
         bundle["attributes"]["user"] = {"value": None, "status": "ABSENT", "tier": "observed"}
         problems = evidence_bundle.contract_problems(bundle)
-        self.assertTrue(any("ABSENT without method" in p for p in problems), problems)
+        self.assertTrue(any("user.method" in p for p in problems), problems)
 
     def test_an_attestation_ref_pointing_at_nothing_is_a_problem(self):
         bundle = build_bundle()
@@ -393,7 +304,7 @@ class BundleContractTest(unittest.TestCase):
             "source: not an object": (lambda b: b.__setitem__("inputs_attempted", []), "inputs_attempted"),
             "source: an entry that is not an object": (
                 lambda b: b["inputs_attempted"].__setitem__("manifest", "yes"),
-                "entry is not an object",
+                "must be an object",
             ),
             "source: an entry field that is not a source field": (
                 lambda b: source(b, "manifest", "count", 3),
@@ -405,11 +316,11 @@ class BundleContractTest(unittest.TestCase):
             "attribute: unknown authored_by": (lambda b: attribute(b, "user", "authored_by", "vendor"), "vendor"),
             "attribute: unknown status": (
                 lambda b: replace_user("NOT_A_STATUS")(b),
-                "unknown status",
+                "NOT_A_STATUS",
             ),
             "attribute: unknown reason": (
                 lambda b: replace_user("BLIND", reason="WHY_NOT", authored_by=_DROP)(b),
-                "unknown reason",
+                "WHY_NOT",
             ),
             "attribute: attestation_ref pointing at nothing": (
                 lambda b: replace_user("ANSWERED", authored_by="none", attestation_ref="att-missing")(b),
@@ -425,15 +336,21 @@ class BundleContractTest(unittest.TestCase):
             ),
             "attribute: BLIND carrying authored_by": (
                 lambda b: replace_user("BLIND", reason="NO_SOURCE_ACCESS", authored_by="none")(b),
-                "not an authored value",
+                "must not have authored_by",
             ),
-            "attribute: BLIND without reason": (lambda b: replace_user("BLIND", authored_by=_DROP)(b), "BLIND"),
-            "attribute: FAILED without reason": (lambda b: replace_user("FAILED", authored_by=_DROP)(b), "FAILED"),
+            "attribute: BLIND without reason": (
+                lambda b: replace_user("BLIND", authored_by=_DROP)(b),
+                "user.reason",
+            ),
+            "attribute: FAILED without reason": (
+                lambda b: replace_user("FAILED", authored_by=_DROP)(b),
+                "user.reason",
+            ),
             "attribute: ANSWERED with a reason": (
                 lambda b: replace_user("ANSWERED", authored_by="none", reason="NO_SOURCE_ACCESS")(b),
-                "carries a reason",
+                "must not have reason",
             ),
-            "attribute: ABSENT without method": (lambda b: replace_user("ABSENT")(b), "ABSENT"),
+            "attribute: ABSENT without method": (lambda b: replace_user("ABSENT")(b), "user.method"),
             "attribute: not an object": (lambda b: b["attributes"].__setitem__("user", "root"), "user"),
         }
         for name, (mutate, needle) in cases.items():
@@ -804,7 +721,7 @@ class BundlePermissionsTest(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "unexpected" in problem and "not a deployment key" in problem
+                "unexpected" in problem and "not a field of the schema" in problem
                 for problem in problems
             )
         )

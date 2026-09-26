@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:railxia:asp:evidence-bundle:1",
   "title": "Evidence bundle, bundle_version 1",
-  "$comment": "One rule is not expressible here and must be checked in code: every attestation_ref names the id of an entry in attestations.",
+  "$comment": "Two rules are not expressible here and are checked in code instead: every attestation_ref names the id of an entry in attestations, and a deployment value's byte length is measured in UTF-8 bytes, not the Unicode code points maxLength counts.",
   "type": "object",
   "required": [
     "bundle_version",
@@ -26,12 +26,14 @@
     "host_id": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 64
+      "maxLength": 64,
+      "pattern": "\\S"
     },
     "sandbox_name": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 255
+      "maxLength": 255,
+      "pattern": "\\S"
     },
     "collected_at": {
       "type": "string",
@@ -73,6 +75,31 @@
     },
     "attributes": {
       "type": "object",
+      "properties": {
+        "deployment": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/attribute"
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "ANSWERED"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "$ref": "#/$defs/deployment_value"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
       "additionalProperties": {
         "$ref": "#/$defs/attribute"
       }
@@ -164,6 +191,30 @@
           }
         }
       ]
+    },
+    "deployment_value": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "RAIL_DEPLOYMENT": {
+          "type": "string",
+          "minLength": 1
+        },
+        "RAIL_NAMESPACE": {
+          "type": "string",
+          "minLength": 1
+        },
+        "com.docker.compose.project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "com.docker.compose.service": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "$comment": "Each value's UTF-8 byte length must also stay under 253 bytes — checked in code, not here (see the top-level $comment)."
     },
     "non_runtime_source": {
       "allOf": [
