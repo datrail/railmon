@@ -1696,6 +1696,16 @@ def configured_agent_key(args: argparse.Namespace) -> str | None:
     return first_nonempty(args.agent_key, os.environ.get("RAIL_AGENT_KEY"))
 
 
+def configured_raildash_token(args: argparse.Namespace) -> str | None:
+    """`RAIL_RAILDASH_TOKEN` only, deliberately no `--raildash-token` flag —
+
+    same reasoning as `RAIL_AUTH_TOKEN`: a CLI flag lands in `ps` output on a
+    shared host, an env var does not.
+    """
+    del args  # kept for call-site symmetry with the other `configured_*` helpers
+    return os.environ.get("RAIL_RAILDASH_TOKEN")
+
+
 def evidence_bundle_ingest_url(raildash_url: str, agent_key: str | None = None) -> str:
     """RailDash's evidence-bundle ingest endpoint for this base URL.
 
@@ -1724,7 +1734,7 @@ def post_evidence_bundle(
     raildash_url: str,
     data: bytes,
     timeout: float = 15.0,
-    auth_mode: str | None = None,
+    raildash_token: str | None = None,
     agent_key: str | None = None,
 ) -> dict[str, Any]:
     """POST the evidence bundle's raw bytes to RailDash, unchanged.
@@ -1733,15 +1743,24 @@ def post_evidence_bundle(
     for this scan — RailDash dedupes by the content digest of the bytes it
     receives, so re-serializing (different key order, whitespace, or a second
     build with a fresh `bundle_id`) here would defeat that.
+
+    RailDash's own write-route guard (DR-120) rejects this endpoint without a
+    valid `X-RailDash-Token`, regardless of loopback — this is not rail-center's
+    `RAIL_AUTH_MODE`/bearer scheme (`auth_headers`), which RailDash does not
+    understand at all. Delivery silently 403ing here was the actual, discovered
+    failure mode DR-110's runtime acceptance ran into (see needs-yusheng history):
+    the two features landed in the order that made this codepath dead on arrival.
     """
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if raildash_token:
+        headers["X-RailDash-Token"] = raildash_token
     req = Request(
         evidence_bundle_ingest_url(raildash_url, agent_key),
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            **auth_headers(auth_mode),
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -2091,15 +2110,16 @@ def run_one_scan(args: argparse.Namespace) -> int:
                         try:
                             data = evidence_bundle.render_bundle_bytes(bundle, args.compact)
                             agent_key = configured_agent_key(args)
+                            raildash_token = configured_raildash_token(args)
                             response = post_evidence_bundle(
-                                raildash_url, data, auth_mode=args.auth_mode, agent_key=agent_key
+                                raildash_url, data, raildash_token=raildash_token, agent_key=agent_key
                             )
                             body = response.get("body")
                             body = body if isinstance(body, dict) else {}
                             outcome = "duplicate" if body.get("duplicate") else "accepted"
                             print(
                                 f"[agent-environment-scanner] delivered evidence bundle to raildash: "
-                                f"HTTP {response['status']} {outcome} id={body.get('id')}",
+                                f"HTTP {response['status']} {outcome} id={body.get('asp_id')}",
                                 file=sys.stderr,
                             )
                         except ScannerError as exc:
