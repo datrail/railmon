@@ -18,6 +18,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -1951,8 +1952,39 @@ def make_parser() -> argparse.ArgumentParser:
         "deployment pair (mirrors `raildash asp load --agent-key`). Sent as the RailDash delivery's "
         "?agent_key= query parameter. Also read from RAIL_AGENT_KEY.",
     )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="DR-83: seconds between scans. When set (or RAIL_SCAN_INTERVAL_IN_SECONDS is), the scanner "
+        "stays running and scans again on this interval instead of exiting after one scan. Omit both for "
+        "the existing single-scan-and-exit behavior.",
+    )
     parser.add_argument("--compact", action="store_true", help="Emit compact JSON")
     return parser
+
+
+DEFAULT_SCAN_INTERVAL_SECONDS = 3600.0
+
+
+def configured_scan_interval(args: argparse.Namespace) -> float | None:
+    """DR-83: `None` means the existing single-scan-and-exit behavior — an
+    existing invocation that names neither `--interval` nor the env var is
+    unaffected. Naming either (a bare `RAIL_SCAN_INTERVAL_IN_SECONDS=1`, say)
+    opts in to interval mode; `--interval`'s own value, when given, wins over
+    the env var's. `RAIL_SCAN_INTERVAL_IN_SECONDS` set to something that isn't
+    a number falls back to the 3600s default rather than failing the scan —
+    a malformed interval should not be worse than the default one.
+    """
+    if args.interval is not None:
+        return args.interval
+    raw = os.environ.get("RAIL_SCAN_INTERVAL_IN_SECONDS")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_SCAN_INTERVAL_SECONDS
 
 
 def write_feature_file(
@@ -1979,9 +2011,10 @@ def write_feature_file(
     return True
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = make_parser()
-    args = parser.parse_args(argv)
+def run_one_scan(args: argparse.Namespace) -> int:
+    """One scan, exactly as `main` always ran it before DR-83 — the loop in
+    `main` below is the only new caller; every existing single-shot caller
+    (including this module's own tests) goes through this unchanged."""
     feature_file_written = True
     delivery_failed = False
     raildash_url = configured_raildash_url(args)
@@ -2076,6 +2109,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         return 2
     return 0 if feature_file_written and not delivery_failed else 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    interval = configured_scan_interval(args)
+    if interval is None:
+        return run_one_scan(args)
+
+    # DR-83: stays running, scanning again on the interval. An agent that
+    # first appears after scan N reaches the control plane on scan N+1
+    # without the scanner being re-run by hand; one that changes or
+    # disappears between scans is reflected the same way, because every
+    # iteration re-delivers (to rail-center and/or RailDash) rather than only
+    # diffing locally. The last exit code is what the process exits with, so
+    # a deployment supervisor (systemd, a container restart policy) still
+    # sees a failing scan as a failure rather than this loop swallowing it.
+    exit_code = 0
+    try:
+        while True:
+            exit_code = run_one_scan(args)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    return exit_code
 
 
 if __name__ == "__main__":

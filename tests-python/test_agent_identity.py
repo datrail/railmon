@@ -634,6 +634,102 @@ class ConfiguredRaildashTargetTest(unittest.TestCase):
         self.assertEqual(scanner.configured_agent_key(args), "flag-key")
 
 
+class ConfiguredScanIntervalTest(unittest.TestCase):
+    """DR-83: absent by default (existing single-shot callers unaffected);
+    `--interval` beats `RAIL_SCAN_INTERVAL_IN_SECONDS`; a malformed env value
+    falls back to the 3600s default rather than failing the scan."""
+
+    def setUp(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def tearDown(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def test_absent_by_default(self):
+        args = argparse.Namespace(interval=None)
+        self.assertIsNone(scanner.configured_scan_interval(args))
+
+    def test_flag_enables_and_sets_it(self):
+        args = argparse.Namespace(interval=90.0)
+        self.assertEqual(scanner.configured_scan_interval(args), 90.0)
+
+    def test_env_var_enables_and_sets_it(self):
+        os.environ["RAIL_SCAN_INTERVAL_IN_SECONDS"] = "120"
+        args = argparse.Namespace(interval=None)
+        self.assertEqual(scanner.configured_scan_interval(args), 120.0)
+
+    def test_flag_beats_env(self):
+        os.environ["RAIL_SCAN_INTERVAL_IN_SECONDS"] = "120"
+        args = argparse.Namespace(interval=5.0)
+        self.assertEqual(scanner.configured_scan_interval(args), 5.0)
+
+    def test_malformed_env_value_falls_back_to_the_default(self):
+        os.environ["RAIL_SCAN_INTERVAL_IN_SECONDS"] = "soon"
+        args = argparse.Namespace(interval=None)
+        self.assertEqual(scanner.configured_scan_interval(args), scanner.DEFAULT_SCAN_INTERVAL_SECONDS)
+
+
+class MainIntervalLoopTest(unittest.TestCase):
+    """DR-83: `main` stays running and scans again on the interval, an
+    existing invocation without `--interval` still runs once and returns, and
+    the loop's exit code is whatever the most recent scan returned (so a
+    supervisor watching the process still sees a failing scan as a failure)."""
+
+    def setUp(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def tearDown(self):
+        os.environ.pop("RAIL_SCAN_INTERVAL_IN_SECONDS", None)
+
+    def test_no_interval_runs_once(self):
+        from unittest import mock
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0) as run_once, mock.patch.object(
+            scanner, "time"
+        ) as fake_time:
+            code = scanner.main(["--no-feature-file", "--no-evidence-bundle"])
+        run_once.assert_called_once()
+        fake_time.sleep.assert_not_called()
+        self.assertEqual(code, 0)
+
+    def test_interval_scans_repeatedly_until_interrupted(self):
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def fake_scan(args):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                raise KeyboardInterrupt
+            return 0
+
+        with mock.patch.object(scanner, "run_one_scan", side_effect=fake_scan), mock.patch.object(
+            scanner, "time"
+        ) as fake_time:
+            code = scanner.main(["--interval", "5", "--no-feature-file", "--no-evidence-bundle"])
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(fake_time.sleep.call_count, 2)
+        fake_time.sleep.assert_called_with(5.0)
+        self.assertEqual(code, 0)
+
+    def test_loop_exit_code_is_the_most_recent_scan_s(self):
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def fake_scan(args):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise KeyboardInterrupt
+            return 2
+
+        with mock.patch.object(scanner, "run_one_scan", side_effect=fake_scan), mock.patch.object(
+            scanner, "time"
+        ) as fake_time:
+            code = scanner.main(["--interval", "1"])
+        self.assertEqual(code, 2)
+
+
 class _FakeHttpResponse:
     """A minimal stand-in for `http.client.HTTPResponse` as a context manager."""
 
