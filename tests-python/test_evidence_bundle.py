@@ -210,6 +210,18 @@ class BundleContractTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(evidence_bundle.contract_problems(build_bundle(mode=mode)), [])
 
+    def test_walker_handles_a_boolean_not_schema(self):
+        # `_schema_problems` supports boolean schemas (`true`/`false`) for
+        # `"value": true` in $defs/attribute. A `"not"` keyword can just as
+        # legally hold a bare boolean instead of an object — `{"not": true}`
+        # rejects everything — and the message branch must not assume
+        # `schema["not"]` is a dict when it isn't.
+        self.assertEqual(
+            evidence_bundle._schema_problems("x", {"not": True}, "bundle"),
+            ["bundle: matches an excluded shape"],
+        )
+        self.assertEqual(evidence_bundle._schema_problems("x", {"not": False}, "bundle"), [])
+
     def test_an_unknown_status_is_a_problem(self):
         bundle = build_bundle()
         bundle["attributes"]["tool_names"] = {"value": None, "status": "MAYBE", "tier": "observed"}
@@ -749,6 +761,15 @@ class BundlePermissionsTest(unittest.TestCase):
         self.assertTrue(
             any("RAIL_DEPLOYMENT" in problem for problem in problems), problems
         )
+
+    def test_deployment_contract_reports_a_non_object_value_instead_of_crashing(self):
+        # `_semantic_problems`'s byte-cap loop iterates `.value.items()`; a
+        # non-dict ANSWERED value must be reported by the schema walker, not
+        # reach that loop and raise.
+        bundle = build_bundle()
+        bundle["attributes"]["deployment"]["value"] = "not-a-dict"
+        problems = evidence_bundle.contract_problems(bundle)
+        self.assertTrue(any("deployment.value" in p for p in problems), problems)
 
     def test_credential_classes_match_the_profiler_contract(self):
         with mock.patch.object(

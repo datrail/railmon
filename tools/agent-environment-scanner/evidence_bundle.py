@@ -253,7 +253,7 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str) -> list[
         elif "else" in schema:
             problems += _schema_problems(instance, schema["else"], where)
     if "not" in schema and not _schema_problems(instance, schema["not"], where):
-        named = schema["not"].get("required")
+        named = schema["not"].get("required") if isinstance(schema["not"], dict) else None
         problems.append(
             f"{where}: must not have {', '.join(named)}" if named else f"{where}: matches an excluded shape"
         )
@@ -274,11 +274,13 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
             )
     deployment = (bundle.get("attributes") or {}).get("deployment")
     if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
-        for key, item in (deployment.get("value") or {}).items():
-            if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
-                problems.append(
-                    f"attributes.deployment.value.{key}: exceeds the {DEPLOYMENT_VALUE_MAX_BYTES}-byte bound"
-                )
+        value = deployment.get("value")
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
+                    problems.append(
+                        f"attributes.deployment.value.{key}: exceeds the {DEPLOYMENT_VALUE_MAX_BYTES}-byte bound"
+                    )
     return problems
 
 
