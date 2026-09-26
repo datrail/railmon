@@ -151,6 +151,19 @@ class BundleContractTest(unittest.TestCase):
         self.assertEqual(evidence_bundle.SCHEMA_PATH, ROOT / "schemas" / "evidence-bundle-v1.schema.json")
         self.assertEqual(evidence_bundle.SCHEMA, SCHEMA)
 
+    def test_deployment_keys_match_the_schemas_closed_set(self):
+        # DEPLOYMENT_ENV_KEYS/DEPLOYMENT_LABEL_KEYS are the builder's own
+        # source of truth (they also carry the env-over-Compose precedence
+        # order, so they stay hand-written tuples, not schema-derived). The
+        # schema's `deployment_value` closed set is a separate, hand-written
+        # copy of the same four names for exactly the reason this branch
+        # exists to fix elsewhere — so it gets the cross-check the others get
+        # for free from being schema-derived.
+        self.assertEqual(
+            set(evidence_bundle.DEPLOYMENT_KEYS),
+            set(SCHEMA["$defs"]["deployment_value"]["properties"]),
+        )
+
     def test_schema_restricts_window_seconds_to_runtime(self):
         source_schemas = SCHEMA["properties"]["inputs_attempted"]["properties"]
         self.assertEqual(source_schemas["runtime"], {"$ref": "#/$defs/source"})
