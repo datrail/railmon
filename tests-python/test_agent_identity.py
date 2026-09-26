@@ -776,21 +776,36 @@ class PostEvidenceBundleTest(unittest.TestCase):
         self.assertNotIn("Authorization", req.headers)
         self.assertEqual(result, {"status": 202, "body": {"id": "asp-1", "duplicate": False}})
 
-    def test_no_auth_header_by_default(self):
-        """RailDash is localhost-only; an auth header is never forced on it."""
+    def test_no_raildash_token_header_without_one_configured(self):
+        """No token configured -- no header, not an empty one."""
         from unittest import mock
 
         with mock.patch.object(scanner, "urlopen", return_value=_FakeHttpResponse(202, b"{}")) as mocked:
             scanner.post_evidence_bundle("http://raildash.local", b"{}")
-        self.assertNotIn("Authorization", mocked.call_args.args[0].headers)
+        self.assertNotIn("X-raildash-token", mocked.call_args.args[0].headers)
 
-    def test_bearer_auth_mode_is_forwarded_when_explicitly_set(self):
+    def test_raildash_token_is_forwarded_when_given(self):
+        """RailDash's write-route guard (DR-120) requires this even on loopback --
+        unlike rail-center's registration call, an `Authorization` header means
+        nothing to RailDash and must never be sent here instead."""
         from unittest import mock
 
-        os.environ["RAIL_AUTH_TOKEN"] = "t-1"
         with mock.patch.object(scanner, "urlopen", return_value=_FakeHttpResponse(202, b"{}")) as mocked:
-            scanner.post_evidence_bundle("http://raildash.local", b"{}", auth_mode="bearer")
-        self.assertEqual(mocked.call_args.args[0].headers.get("Authorization"), "Bearer t-1")
+            scanner.post_evidence_bundle("http://raildash.local", b"{}", raildash_token="t-1")
+        headers = mocked.call_args.args[0].headers
+        self.assertEqual(headers.get("X-raildash-token"), "t-1")
+        self.assertNotIn("Authorization", headers)
+
+    def test_configured_raildash_token_reads_the_env_var_only(self):
+        """No `--raildash-token` CLI flag, deliberately (ps visibility) -- see
+        the identical `RAIL_AUTH_TOKEN` convention."""
+        args = argparse.Namespace()
+        self.assertIsNone(scanner.configured_raildash_token(args))
+        os.environ["RAIL_RAILDASH_TOKEN"] = "t-2"
+        try:
+            self.assertEqual(scanner.configured_raildash_token(args), "t-2")
+        finally:
+            os.environ.pop("RAIL_RAILDASH_TOKEN", None)
 
     def test_agent_key_rides_the_request_url(self):
         from unittest import mock
