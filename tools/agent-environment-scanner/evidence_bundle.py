@@ -168,33 +168,41 @@ def _credential_carrying_value(value: Any) -> bool:
 _DATE_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$", re.IGNORECASE)
 
 
-def _resolve(schema: dict[str, Any]) -> dict[str, Any]:
-    """Follow a single `$ref` into `$defs`; every ref in this schema is local
-    and none carries sibling keywords, so there is nothing else to merge."""
+def _resolve(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
+    """Follow a single `$ref` into `root`'s `$defs`; every ref in this schema is
+    local and none carries sibling keywords, so there is nothing else to
+    merge."""
     if "$ref" in schema:
-        return SCHEMA["$defs"][schema["$ref"].rsplit("/", 1)[-1]]
+        return root["$defs"][schema["$ref"].rsplit("/", 1)[-1]]
     return schema
 
 
-def _schema_problems(instance: Any, schema: dict[str, Any], where: str) -> list[str]:
+def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: dict[str, Any] | None = None) -> list[str]:
     """A minimal, stdlib-only walker for the slice of JSON Schema this
     contract uses: type/const/enum/required/properties/additionalProperties/
-    items/minProperties, minLength/maxLength/minimum/pattern,
+    items/minProperties/minItems, minLength/maxLength/minimum/pattern,
     format:date-time, and allOf/if/then/else/not/$ref, and the boolean
     schemas `true`/`false` (`"value": true` marks an attribute's value as
     accepting anything).
 
-    This is the one structural check, driven by `SCHEMA` itself rather than a
-    second hand-written copy of its rules: a rule added to the file takes
-    effect here with no matching code change. `jsonschema` is not a
+    This is the one structural check, driven by a schema document itself
+    rather than a second hand-written copy of its rules: a rule added to the
+    file takes effect here with no matching code change. `jsonschema` is not a
     dependency here on purpose — the scanner ships standard-library only
     (see the Dockerfile) — so this walks the schema by hand instead.
+
+    `root` is the document `$ref` resolves against — the published v1
+    `SCHEMA` by default, so every existing caller (`contract_problems`) is
+    unaffected — but any closed schema built the same way (evidence bundle v2
+    included) can walk itself by passing its own document.
     """
+    if root is None:
+        root = SCHEMA
     if schema is True:
         return []
     if schema is False:
         return [f"{where}: no value is allowed here"]
-    schema = _resolve(schema)
+    schema = _resolve(schema, root)
     problems: list[str] = []
     if "const" in schema and instance != schema["const"]:
         problems.append(f"{where}: {instance!r} is not {schema['const']!r}")
@@ -221,14 +229,17 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str) -> list[
         additional = schema.get("additionalProperties", True)
         for key, value in instance.items():
             if key in properties:
-                problems += _schema_problems(value, properties[key], f"{where}.{key}")
+                problems += _schema_problems(value, properties[key], f"{where}.{key}", root)
             elif additional is False:
                 problems.append(f"{where}.{key}: not a field of the schema")
             elif isinstance(additional, dict):
-                problems += _schema_problems(value, additional, f"{where}.{key}")
-    if isinstance(instance, list) and "items" in schema:
-        for index, item in enumerate(instance):
-            problems += _schema_problems(item, schema["items"], f"{where}[{index}]")
+                problems += _schema_problems(value, additional, f"{where}.{key}", root)
+    if isinstance(instance, list):
+        if "minItems" in schema and len(instance) < schema["minItems"]:
+            problems.append(f"{where}: must have at least {schema['minItems']} item(s)")
+        if "items" in schema:
+            for index, item in enumerate(instance):
+                problems += _schema_problems(item, schema["items"], f"{where}[{index}]", root)
     if isinstance(instance, str):
         if "minLength" in schema and len(instance) < schema["minLength"]:
             problems.append(
@@ -246,13 +257,13 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str) -> list[
         if instance < schema["minimum"]:
             problems.append(f"{where}: must be at least {schema['minimum']}")
     for branch in schema.get("allOf", ()):
-        problems += _schema_problems(instance, branch, where)
+        problems += _schema_problems(instance, branch, where, root)
     if "if" in schema:
-        if not _schema_problems(instance, schema["if"], where):
-            problems += _schema_problems(instance, schema.get("then", {}), where)
+        if not _schema_problems(instance, schema["if"], where, root):
+            problems += _schema_problems(instance, schema.get("then", {}), where, root)
         elif "else" in schema:
-            problems += _schema_problems(instance, schema["else"], where)
-    if "not" in schema and not _schema_problems(instance, schema["not"], where):
+            problems += _schema_problems(instance, schema["else"], where, root)
+    if "not" in schema and not _schema_problems(instance, schema["not"], where, root):
         named = schema["not"].get("required") if isinstance(schema["not"], dict) else None
         problems.append(
             f"{where}: must not have {', '.join(named)}" if named else f"{where}: matches an excluded shape"
