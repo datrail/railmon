@@ -30,6 +30,9 @@ log = "0.4"
 env_logger = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "railmon"
 path = "src/main.rs"
