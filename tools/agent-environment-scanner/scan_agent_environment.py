@@ -689,7 +689,10 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
         command = spec.get("command")
         inventory.append(
             {
-                "name": str(name),
+                # An operator-chosen nickname, but this file is persisted and
+                # shipped to a scorer the same as a skill's name/description —
+                # same redact_text() treatment `normalize_skill` gives those.
+                "name": redact_text(str(name)),
                 # The executable, not its arguments: an MCP server is routinely
                 # launched with `--token …` on the command line, and this file is
                 # persisted and shipped to a scorer.
@@ -722,7 +725,7 @@ def read_mcp_inventory_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
         return []
     return [
         {
-            "name": name,
+            "name": redact_text(name),
             "command": None,
             "url": redact_url(url),
             "transport": "http",
@@ -732,20 +735,33 @@ def read_mcp_inventory_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
 
 
 def collect_mcp_inventory(mcp_configs: list[Path], env: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Every declared MCP server, config-file and env sources combined.
+
+    Deduped on (name, url) rather than name alone: DR-106 already fixed a
+    silent-drop-on-name-collision bug one function over (`collect_skills`,
+    where two independent servers commonly share a tool name) by merging
+    instead of dropping. An inventory entry has no comparable merge — but
+    keying on (name, url) means a real duplicate (same server, same URL,
+    seen twice — e.g. an onboarded agent whose env vars and `.mcp.json` both
+    describe it) still collapses to one entry, while two servers that only
+    happen to share a name keep both, instead of one silently vanishing.
+    """
     inventory: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str | None]] = set()
     for path in mcp_configs:
         if not path.exists():
             continue
         for entry in read_mcp_inventory(path):
-            if entry["name"] in seen:
+            key = (entry["name"], entry["url"])
+            if key in seen:
                 continue
-            seen.add(entry["name"])
+            seen.add(key)
             inventory.append(entry)
     for entry in read_mcp_inventory_from_env(env or {}):
-        if entry["name"] in seen:
+        key = (entry["name"], entry["url"])
+        if key in seen:
             continue
-        seen.add(entry["name"])
+        seen.add(key)
         inventory.append(entry)
     return inventory
 
