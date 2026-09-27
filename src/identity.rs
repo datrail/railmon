@@ -72,6 +72,27 @@ pub struct ProcessIncarnation {
     pub uid: u32,
 }
 
+/// Per-target discovery result. A manifest declares an agent whether or not
+/// its process is live right now, so resolving one target's locator never
+/// aborts resolution of the others — each gets exactly one of these outcomes
+/// (design doc §4.2: discovery "never drops a declared agent just because
+/// its process is down").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiscoveryOutcome {
+    /// The locator names exactly one live, trustworthy, unambiguous process.
+    Available(ProcessIncarnation),
+    /// The locator could not be resolved to a live, trustworthy process
+    /// right now — a missing or unreadable pid_file, a dead PID, or a
+    /// locator/process that failed an ownership or writability check
+    /// (including the same-owner-UID case). Retryable in principle; the
+    /// reason names exactly why.
+    NotFound(String),
+    /// The locator resolved to a process, but that process (or its session,
+    /// or its uid) is also claimed by another declared agent, so capture
+    /// could not be attributed to one key over the other.
+    Ambiguous(String),
+}
+
 impl ProcessIncarnation {
     pub fn is_live(self) -> bool {
         let stat = fs::read_to_string(format!("/proc/{}/stat", self.pid));
@@ -149,43 +170,82 @@ impl TargetManifest {
         }
     }
 
-    pub fn resolve_all(&self) -> Result<Vec<ProcessIncarnation>> {
+    /// One outcome per declared agent, in manifest order. A target that
+    /// fails to resolve on its own never prevents the others from being
+    /// tried; a target that resolves but collides with another (same
+    /// process incarnation, session, or uid) is downgraded from `Available`
+    /// to `Ambiguous` for every colliding key, not just dropped.
+    pub fn resolve_all(&self) -> Vec<DiscoveryOutcome> {
         let supervisor_uid = unsafe { libc::geteuid() };
-        let mut seen = HashSet::new();
-        let mut sessions = HashSet::new();
-        let mut agent_uids = HashSet::new();
-        let mut out = Vec::with_capacity(self.agents.len());
-        for target in &self.agents {
-            let process = resolve_target(target, supervisor_uid)?;
-            if process.uid == supervisor_uid {
-                bail!(
-                    "target '{}' runs as supervisor uid {}",
-                    target.agent_key,
-                    supervisor_uid
-                );
-            }
-            if !seen.insert((process.pid, process.start_time_ticks)) {
-                bail!("one process incarnation is claimed by multiple agent keys");
-            }
-            if !sessions.insert(process.session_id) {
-                bail!(
-                    "agents share process session {}; capture would be ambiguous",
-                    process.session_id
-                );
-            }
-            if !agent_uids.insert(process.uid) {
-                bail!(
-                    "agents share uid {}; same-UID processes are not an attribution boundary",
-                    process.uid
-                );
-            }
-            out.push(process);
-        }
-        Ok(out)
+        let mut outcomes: Vec<DiscoveryOutcome> = self
+            .agents
+            .iter()
+            .map(|target| resolve_target(target, supervisor_uid))
+            .collect();
+        mark_collisions(&mut outcomes);
+        outcomes
     }
 }
 
-fn resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessIncarnation> {
+/// Downgrades every `Available` outcome that shares a process incarnation,
+/// session, or uid with another `Available` outcome to `Ambiguous`, in
+/// place. Pure and free of I/O so it can be exercised directly with
+/// synthetic `ProcessIncarnation`s, without needing a second real uid.
+fn mark_collisions(outcomes: &mut [DiscoveryOutcome]) {
+    use std::collections::HashMap;
+
+    let mut by_incarnation: HashMap<(u32, u64), Vec<usize>> = HashMap::new();
+    let mut by_session: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut by_uid: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, outcome) in outcomes.iter().enumerate() {
+        if let DiscoveryOutcome::Available(process) = outcome {
+            by_incarnation
+                .entry((process.pid, process.start_time_ticks))
+                .or_default()
+                .push(index);
+            by_session
+                .entry(process.session_id)
+                .or_default()
+                .push(index);
+            by_uid.entry(process.uid).or_default().push(index);
+        }
+    }
+
+    let mut ambiguous: HashMap<usize, String> = HashMap::new();
+    for indices in by_incarnation.values().filter(|indices| indices.len() > 1) {
+        for &index in indices {
+            ambiguous.entry(index).or_insert_with(|| {
+                "one process incarnation is claimed by multiple agent keys".to_string()
+            });
+        }
+    }
+    for indices in by_session.values().filter(|indices| indices.len() > 1) {
+        for &index in indices {
+            ambiguous.entry(index).or_insert_with(|| {
+                "agents share a process session; capture would be ambiguous".to_string()
+            });
+        }
+    }
+    for indices in by_uid.values().filter(|indices| indices.len() > 1) {
+        for &index in indices {
+            ambiguous.entry(index).or_insert_with(|| {
+                "agents share a uid; same-uid processes are not an attribution boundary".to_string()
+            });
+        }
+    }
+    for (index, reason) in ambiguous {
+        outcomes[index] = DiscoveryOutcome::Ambiguous(reason);
+    }
+}
+
+fn resolve_target(target: &Target, supervisor_uid: u32) -> DiscoveryOutcome {
+    match try_resolve_target(target, supervisor_uid) {
+        Ok(process) => DiscoveryOutcome::Available(process),
+        Err(error) => DiscoveryOutcome::NotFound(error.to_string()),
+    }
+}
+
+fn try_resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessIncarnation> {
     validate_control_path(&target.discovery.pid_file, None)?;
     let text = fs::read_to_string(&target.discovery.pid_file)
         .with_context(|| format!("reading locator for '{}'", target.agent_key))?;
@@ -549,39 +609,139 @@ mod tests {
         );
     }
 
+    fn not_found_reason(outcome: &DiscoveryOutcome) -> &str {
+        match outcome {
+            DiscoveryOutcome::NotFound(reason) => reason,
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
     // A single-uid test process can only ever create a pid_file it owns
     // itself, and can only ever point it at a live PID it also owns (itself,
     // or a child it spawned) — so `resolve_target`'s own supervisor-uid and
-    // session-leader checks, and `resolve_all`'s cross-target collision
-    // checks, are unreachable here: `validate_control_path`'s "owned by
-    // monitored uid" rejection always fires first, for any locator this test
-    // can construct. That is itself the fail-closed same-owner-UID property
-    // the design calls out explicitly ("must not be writable by any
-    // monitored UID... including same-owner UID cases") — assert it directly.
-    // The checks beyond it need genuinely distinct UIDs, which only the
-    // root-only `tests/two_agent_acceptance.py` can provide.
+    // session-leader checks are unreachable here: `validate_control_path`'s
+    // "owned by monitored uid" rejection always fires first, for any locator
+    // this test can construct. That is itself the fail-closed same-owner-UID
+    // property the design calls out explicitly ("must not be writable by any
+    // monitored UID... including same-owner UID cases") — assert it
+    // directly. The checks beyond it need genuinely distinct UIDs, which
+    // only the root-only `tests/two_agent_acceptance.py` can provide; the
+    // cross-target collision logic itself (`mark_collisions`) is pure and
+    // gets exercised directly below with synthetic incarnations instead.
     #[test]
-    fn resolve_target_rejects_a_self_owned_pid_file_even_when_it_names_a_live_pid() {
+    fn resolve_target_reports_not_found_for_a_self_owned_pid_file_even_when_it_names_a_live_pid() {
         let dir = test_dir();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let pid_file = dir.path().join("self.pid");
         fs::write(&pid_file, std::process::id().to_string()).unwrap();
         fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600)).unwrap();
         let t = target("planner", pid_file.to_str().unwrap());
-        assert!(
-            error_message(resolve_target(&t, unsafe { libc::geteuid() } + 1))
-                .contains("owned by monitored uid")
-        );
+        let outcome = resolve_target(&t, unsafe { libc::geteuid() } + 1);
+        assert!(not_found_reason(&outcome).contains("owned by monitored uid"));
     }
 
     #[test]
-    fn resolve_all_rejects_a_self_owned_pid_file_even_when_it_names_a_live_pid() {
+    fn resolve_all_reports_not_found_for_a_self_owned_pid_file_even_when_it_names_a_live_pid() {
         let dir = test_dir();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let pid_file = dir.path().join("self.pid");
         fs::write(&pid_file, std::process::id().to_string()).unwrap();
         fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600)).unwrap();
         let m = manifest(vec![target("planner", pid_file.to_str().unwrap())]);
-        assert!(error_message(m.resolve_all()).contains("owned by monitored uid"));
+        let outcomes = m.resolve_all();
+        assert_eq!(outcomes.len(), 1);
+        assert!(not_found_reason(&outcomes[0]).contains("owned by monitored uid"));
+    }
+
+    #[test]
+    fn resolve_all_keeps_resolving_later_targets_after_an_earlier_one_fails() {
+        // The first agent's locator doesn't exist at all; the second agent's
+        // locator exists but is (like every locator this single-uid test can
+        // construct) self-owned. Both fail, for different reasons — proving
+        // `resolve_all` tries every declared agent rather than stopping at
+        // the first failure (design §4.2: never drop a declared agent just
+        // because its process is down).
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let missing_pid_file = dir.path().join("missing.pid");
+        let present_pid_file = dir.path().join("present.pid");
+        fs::write(&present_pid_file, std::process::id().to_string()).unwrap();
+        fs::set_permissions(&present_pid_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let m = manifest(vec![
+            target("planner", missing_pid_file.to_str().unwrap()),
+            target("executor", present_pid_file.to_str().unwrap()),
+        ]);
+        let outcomes = m.resolve_all();
+        assert_eq!(outcomes.len(), 2);
+        assert!(not_found_reason(&outcomes[0]).contains("inspecting control path"));
+        assert!(not_found_reason(&outcomes[1]).contains("owned by monitored uid"));
+    }
+
+    fn available(pid: u32, start_time_ticks: u64, session_id: u32, uid: u32) -> DiscoveryOutcome {
+        DiscoveryOutcome::Available(ProcessIncarnation {
+            pid,
+            start_time_ticks,
+            session_id,
+            uid,
+        })
+    }
+
+    #[test]
+    fn mark_collisions_leaves_distinct_available_targets_alone() {
+        let mut outcomes = vec![available(10, 100, 10, 1000), available(20, 200, 20, 2000)];
+        mark_collisions(&mut outcomes);
+        assert!(matches!(outcomes[0], DiscoveryOutcome::Available(_)));
+        assert!(matches!(outcomes[1], DiscoveryOutcome::Available(_)));
+    }
+
+    #[test]
+    fn mark_collisions_downgrades_both_sides_of_a_shared_incarnation() {
+        let mut outcomes = vec![available(10, 100, 10, 1000), available(10, 100, 10, 1000)];
+        mark_collisions(&mut outcomes);
+        for outcome in &outcomes {
+            match outcome {
+                DiscoveryOutcome::Ambiguous(reason) => {
+                    assert!(reason.contains("claimed by multiple agent keys"))
+                }
+                other => panic!("expected Ambiguous, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mark_collisions_downgrades_a_shared_session_even_with_distinct_pids() {
+        let mut outcomes = vec![available(10, 100, 99, 1000), available(20, 200, 99, 2000)];
+        mark_collisions(&mut outcomes);
+        for outcome in &outcomes {
+            match outcome {
+                DiscoveryOutcome::Ambiguous(reason) => assert!(reason.contains("process session")),
+                other => panic!("expected Ambiguous, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mark_collisions_downgrades_a_shared_uid_even_with_distinct_sessions() {
+        let mut outcomes = vec![available(10, 100, 10, 1000), available(20, 200, 20, 1000)];
+        mark_collisions(&mut outcomes);
+        for outcome in &outcomes {
+            match outcome {
+                DiscoveryOutcome::Ambiguous(reason) => assert!(reason.contains("share a uid")),
+                other => panic!("expected Ambiguous, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mark_collisions_does_not_let_a_collision_hide_a_not_found_target() {
+        let mut outcomes = vec![
+            available(10, 100, 10, 1000),
+            available(10, 100, 10, 1000),
+            DiscoveryOutcome::NotFound("no locator".to_string()),
+        ];
+        mark_collisions(&mut outcomes);
+        assert!(matches!(outcomes[0], DiscoveryOutcome::Ambiguous(_)));
+        assert!(matches!(outcomes[1], DiscoveryOutcome::Ambiguous(_)));
+        assert_eq!(not_found_reason(&outcomes[2]), "no locator");
     }
 }
