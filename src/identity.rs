@@ -320,6 +320,7 @@ fn validate_key(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parses_comm_with_spaces_without_shifting_identity_fields() {
@@ -338,5 +339,249 @@ mod tests {
             assert!(validate_key(key).is_err());
         }
         assert!(validate_key("planner-2").is_ok());
+    }
+
+    fn target(key: &str, pid_file: &str) -> Target {
+        Target {
+            agent_key: key.to_string(),
+            display_name: None,
+            discovery: Discovery {
+                pid_file: PathBuf::from(pid_file),
+            },
+            scan: None,
+            capture: None,
+        }
+    }
+
+    fn manifest(agents: Vec<Target>) -> TargetManifest {
+        TargetManifest {
+            manifest_version: 1,
+            sandbox: Sandbox {
+                host_id: "host-1".to_string(),
+                sandbox_name: "sandbox-1".to_string(),
+                access: Access {
+                    kind: "docker".to_string(),
+                    container: "container-1".to_string(),
+                },
+            },
+            agents,
+        }
+    }
+
+    fn error_message<T: std::fmt::Debug>(result: Result<T>) -> String {
+        result
+            .expect_err("expected the call to reject its input")
+            .to_string()
+    }
+
+    /// `validate_control_path` walks every ancestor directory up to `/`, so a
+    /// fixture under the default `/tmp` (mode 1777, world-writable) fails
+    /// before the test's own assertion does. `$HOME` is owned by whichever
+    /// account runs the tests (root here, the CI runner elsewhere) with a
+    /// non-writable-by-others chain up to `/`, so it passes the same checks
+    /// prod manifests are expected to satisfy.
+    fn test_dir() -> tempfile::TempDir {
+        let home = std::env::var("HOME").expect("HOME must be set to place safe test fixtures");
+        tempfile::Builder::new()
+            .prefix("railmon-identity-test-")
+            .tempdir_in(home)
+            .expect("create temp dir under $HOME")
+    }
+
+    #[test]
+    fn accepts_a_well_formed_multi_agent_manifest() {
+        let m = manifest(vec![
+            target("planner", "/run/agents/planner.pid"),
+            target("worker-2", "/run/agents/worker-2.pid"),
+        ]);
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_manifest_version() {
+        let mut m = manifest(vec![target("planner", "/run/agents/planner.pid")]);
+        m.manifest_version = 2;
+        assert!(error_message(m.validate()).contains("unsupported target manifest version"));
+    }
+
+    #[test]
+    fn rejects_empty_host_id_or_sandbox_name() {
+        let mut m = manifest(vec![target("planner", "/run/agents/planner.pid")]);
+        m.sandbox.host_id.clear();
+        assert!(error_message(m.validate()).contains("host_id and sandbox_name"));
+
+        let mut m = manifest(vec![target("planner", "/run/agents/planner.pid")]);
+        m.sandbox.sandbox_name.clear();
+        assert!(error_message(m.validate()).contains("host_id and sandbox_name"));
+    }
+
+    #[test]
+    fn rejects_non_docker_or_unnamed_access() {
+        let mut m = manifest(vec![target("planner", "/run/agents/planner.pid")]);
+        m.sandbox.access.kind = "vm".to_string();
+        assert!(error_message(m.validate()).contains("docker container"));
+
+        let mut m = manifest(vec![target("planner", "/run/agents/planner.pid")]);
+        m.sandbox.access.container.clear();
+        assert!(error_message(m.validate()).contains("docker container"));
+    }
+
+    #[test]
+    fn rejects_a_manifest_with_no_agents() {
+        let m = manifest(vec![]);
+        assert!(error_message(m.validate()).contains("at least one agent"));
+    }
+
+    #[test]
+    fn rejects_the_reserved_default_key_even_alone() {
+        let m = manifest(vec![target("default", "/run/agents/default.pid")]);
+        assert!(error_message(m.validate()).contains("reserved for the unkeyed compatibility"));
+    }
+
+    #[test]
+    fn rejects_two_agents_sharing_a_key() {
+        let m = manifest(vec![
+            target("planner", "/run/agents/a.pid"),
+            target("planner", "/run/agents/b.pid"),
+        ]);
+        assert!(error_message(m.validate()).contains("duplicate agent_key"));
+    }
+
+    #[test]
+    fn rejects_an_invalid_key_inside_a_manifest() {
+        let m = manifest(vec![target("Planner", "/run/agents/planner.pid")]);
+        assert!(error_message(m.validate()).contains("invalid agent_key"));
+    }
+
+    #[test]
+    fn rejects_a_relative_pid_file() {
+        let m = manifest(vec![target("planner", "agents/planner.pid")]);
+        assert!(error_message(m.validate()).contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn rejects_an_empty_display_name() {
+        let mut t = target("planner", "/run/agents/planner.pid");
+        t.display_name = Some(String::new());
+        let m = manifest(vec![t]);
+        assert!(error_message(m.validate()).contains("display_name"));
+    }
+
+    #[test]
+    fn rejects_a_relative_config_root() {
+        let mut t = target("planner", "/run/agents/planner.pid");
+        t.scan = Some(Scan {
+            config_roots: vec![PathBuf::from("relative/path")],
+        });
+        let m = manifest(vec![t]);
+        assert!(error_message(m.validate()).contains("config_roots"));
+    }
+
+    #[test]
+    fn accepts_a_private_self_owned_file() {
+        let dir = test_dir();
+        let path = dir.path().join("manifest.yaml");
+        fs::write(&path, b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_control_path(&path, None).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_group_writable_file() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("manifest.yaml");
+        fs::write(&path, b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(error_message(validate_control_path(&path, None)).contains("group/other writable"));
+    }
+
+    #[test]
+    fn rejects_an_other_writable_file() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("manifest.yaml");
+        fs::write(&path, b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o602)).unwrap();
+        assert!(error_message(validate_control_path(&path, None)).contains("group/other writable"));
+    }
+
+    #[test]
+    fn rejects_a_writable_parent_directory_even_with_a_private_leaf() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let path = dir.path().join("manifest.yaml");
+        fs::write(&path, b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(error_message(validate_control_path(&path, None)).contains("group/other writable"));
+    }
+
+    #[test]
+    fn rejects_a_symlinked_control_path() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let real = dir.path().join("real.yaml");
+        fs::write(&real, b"x").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("manifest.yaml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(error_message(validate_control_path(&link, None)).contains("symlink"));
+    }
+
+    #[test]
+    fn rejects_a_path_owned_by_the_monitored_uid() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("planner.pid");
+        fs::write(&path, b"1").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let self_uid = fs::metadata(&path).unwrap().uid();
+        assert!(error_message(validate_control_path(&path, Some(self_uid)))
+            .contains("owned by monitored uid"));
+        assert!(validate_control_path(&path, Some(self_uid + 1)).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_relative_control_path() {
+        assert!(
+            error_message(validate_control_path(Path::new("relative.yaml"), None))
+                .contains("not absolute")
+        );
+    }
+
+    // A single-uid test process can only ever create a pid_file it owns
+    // itself, and can only ever point it at a live PID it also owns (itself,
+    // or a child it spawned) — so `resolve_target`'s own supervisor-uid and
+    // session-leader checks, and `resolve_all`'s cross-target collision
+    // checks, are unreachable here: `validate_control_path`'s "owned by
+    // monitored uid" rejection always fires first, for any locator this test
+    // can construct. That is itself the fail-closed same-owner-UID property
+    // the design calls out explicitly ("must not be writable by any
+    // monitored UID... including same-owner UID cases") — assert it directly.
+    // The checks beyond it need genuinely distinct UIDs, which only the
+    // root-only `tests/two_agent_acceptance.py` can provide.
+    #[test]
+    fn resolve_target_rejects_a_self_owned_pid_file_even_when_it_names_a_live_pid() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_file = dir.path().join("self.pid");
+        fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let t = target("planner", pid_file.to_str().unwrap());
+        assert!(
+            error_message(resolve_target(&t, unsafe { libc::geteuid() } + 1))
+                .contains("owned by monitored uid")
+        );
+    }
+
+    #[test]
+    fn resolve_all_rejects_a_self_owned_pid_file_even_when_it_names_a_live_pid() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let pid_file = dir.path().join("self.pid");
+        fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let m = manifest(vec![target("planner", pid_file.to_str().unwrap())]);
+        assert!(error_message(m.resolve_all()).contains("owned by monitored uid"));
     }
 }
