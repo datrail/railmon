@@ -689,7 +689,10 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
         command = spec.get("command")
         inventory.append(
             {
-                "name": str(name),
+                # An operator-chosen nickname, but this file is persisted and
+                # shipped to a scorer the same as a skill's name/description —
+                # same redact_text() treatment `normalize_skill` gives those.
+                "name": redact_text(str(name)),
                 # The executable, not its arguments: an MCP server is routinely
                 # launched with `--token …` on the command line, and this file is
                 # persisted and shipped to a scorer.
@@ -702,17 +705,64 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
     return inventory
 
 
-def collect_mcp_inventory(mcp_configs: list[Path]) -> list[dict[str, Any]]:
+# The per-server env convention confirmed by Kyle Liwanag for the GCP estate
+# behind DR-123 (`compose.agent-zone.yml`): one MCP server per agent, named and
+# located by a pair of env vars rather than a `.mcp.json` on disk.
+ENV_MCP_NAME_KEY = "AGENT_MCP_NAME"
+ENV_MCP_URL_KEY = "AGENT_MCP_URL"
+
+
+def read_mcp_inventory_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
+    """The single env-declared MCP server as inventory, mirroring `read_mcp_inventory`.
+
+    An estate with no `.mcp.json` at all still declares its one server this way
+    (`AGENT_MCP_NAME`/`AGENT_MCP_URL`); without this the file-derived inventory is
+    silently empty and a scan reports the agent as having no tools.
+    """
+    name = env.get(ENV_MCP_NAME_KEY)
+    url = env.get(ENV_MCP_URL_KEY)
+    if not name or not url:
+        return []
+    return [
+        {
+            "name": redact_text(name),
+            "command": None,
+            "url": redact_url(url),
+            "transport": "http",
+            "source": "environment",
+        }
+    ]
+
+
+def collect_mcp_inventory(mcp_configs: list[Path], env: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Every declared MCP server, config-file and env sources combined.
+
+    Deduped on (name, url) rather than name alone: DR-106 already fixed a
+    silent-drop-on-name-collision bug one function over (`collect_skills`,
+    where two independent servers commonly share a tool name) by merging
+    instead of dropping. An inventory entry has no comparable merge — but
+    keying on (name, url) means a real duplicate (same server, same URL,
+    seen twice — e.g. an onboarded agent whose env vars and `.mcp.json` both
+    describe it) still collapses to one entry, while two servers that only
+    happen to share a name keep both, instead of one silently vanishing.
+    """
     inventory: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str | None]] = set()
     for path in mcp_configs:
         if not path.exists():
             continue
         for entry in read_mcp_inventory(path):
-            if entry["name"] in seen:
+            key = (entry["name"], entry["url"])
+            if key in seen:
                 continue
-            seen.add(entry["name"])
+            seen.add(key)
             inventory.append(entry)
+    for entry in read_mcp_inventory_from_env(env or {}):
+        key = (entry["name"], entry["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        inventory.append(entry)
     return inventory
 
 
@@ -727,11 +777,20 @@ def read_mcp_config(path: Path) -> list[dict[str, Any]]:
     skills: list[dict[str, Any]] = []
     for name, spec in servers.items():
         if isinstance(spec, dict):
-            skills.extend(mcp_server_skills(str(name), spec, path))
+            skills.extend(mcp_server_skills(str(name), spec, path.name))
     return skills
 
 
-def mcp_server_skills(name: str, spec: dict[str, Any], path: Path) -> list[dict[str, Any]]:
+def read_mcp_config_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
+    """Skills for the single env-declared MCP server, mirroring `read_mcp_config`."""
+    name = env.get(ENV_MCP_NAME_KEY)
+    url = env.get(ENV_MCP_URL_KEY)
+    if not name or not url:
+        return []
+    return mcp_server_skills(name, {"url": url}, "environment")
+
+
+def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> list[dict[str, Any]]:
     """One skill per tool a reachable MCP server declares.
 
     The scanner never asked a server what it exposes before this; it
@@ -751,7 +810,7 @@ def mcp_server_skills(name: str, spec: dict[str, Any], path: Path) -> list[dict[
         headers = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else None
         tools = probe_mcp_tools(url, headers)
         if tools is None:
-            return [unreachable_mcp_skill(name, path, endpoints, "unreachable")]
+            return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable")]
         result: list[dict[str, Any]] = []
         for tool in tools:
             if not isinstance(tool, dict):
@@ -763,31 +822,31 @@ def mcp_server_skills(name: str, spec: dict[str, Any], path: Path) -> list[dict[
             result.append(
                 {
                     "name": tool_name,
-                    "description": description or f"tool declared by {name} ({path.name})",
+                    "description": description or f"tool declared by {name} ({source_label})",
                     "destination_endpoints": endpoints,
                     "source_type": "mcp_config",
                 }
             )
-        return result or [unreachable_mcp_skill(name, path, endpoints, "reachable, declares no tools")]
+        return result or [unreachable_mcp_skill(name, source_label, endpoints, "reachable, declares no tools")]
 
     command = spec.get("command")
     reached = command_basename(command)
     if not reached:
-        return [unreachable_mcp_skill(name, path, endpoints, "unreachable")]
+        return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable")]
     return [
         {
             "name": name,
-            "description": f"MCP server configured via {path.name}: {reached}",
+            "description": f"MCP server configured via {source_label}: {reached}",
             "destination_endpoints": endpoints,
             "source_type": "mcp_config",
         }
     ]
 
 
-def unreachable_mcp_skill(name: str, path: Path, endpoints: list[str], reason: str) -> dict[str, Any]:
+def unreachable_mcp_skill(name: str, source_label: str, endpoints: list[str], reason: str) -> dict[str, Any]:
     return {
         "name": name,
-        "description": f"MCP server configured via {path.name}: {reason}",
+        "description": f"MCP server configured via {source_label}: {reason}",
         "destination_endpoints": endpoints,
         "source_type": "mcp_config",
     }
@@ -908,7 +967,7 @@ def collect_strings(value: Any) -> list[str]:
     return []
 
 
-def collect_skills(mcp_configs: list[Path]) -> list[dict[str, Any]]:
+def collect_skills(mcp_configs: list[Path], env: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Every mcp_config skill across every config path, same-name collisions merged.
 
     Used to dedupe on name alone and drop the second match outright — safe
@@ -924,6 +983,7 @@ def collect_skills(mcp_configs: list[Path]) -> list[dict[str, Any]]:
     for path in mcp_configs:
         if path.exists():
             skills.extend(read_mcp_config(path))
+    skills.extend(read_mcp_config_from_env(env or {}))
     return merge_skill_lists(skills)
 
 
@@ -1537,7 +1597,8 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
     identity = collect_identity(args, context)
     payload = build_registration_payload(args, context, identity)
     identity["mcp_servers"] = collect_mcp_inventory(
-        [Path(path).expanduser() for path in args.mcp_config] or default_mcp_paths(context["env"])
+        [Path(path).expanduser() for path in args.mcp_config] or default_mcp_paths(context["env"]),
+        context["env"],
     )
     if args.observed_file:
         identity["observed_reach"] = summarize_observed(
@@ -1569,7 +1630,7 @@ def build_registration_payload(
             llm_model = container_config_models[-1]
             model_source = "container_openclaw_config"
     owner, owner_source = detect_owner(env, args.owner)
-    mcp_skills = collect_skills(mcp_paths)
+    mcp_skills = collect_skills(mcp_paths, env)
     scanned_skills = collect_skills_from_files(skill_files)
     payload = {
         "type": args.agent_type,

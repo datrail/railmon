@@ -495,6 +495,21 @@ class McpInventoryTest(unittest.TestCase):
         self.assertNotIn("sk-secret", repr(inventory))
         self.assertNotIn("sk-live-abc123def456ghi789", repr(inventory))
 
+    def test_a_key_shaped_server_name_is_redacted(self):
+        """The inventory's `name` is persisted (features.json) and shipped in the
+        evidence bundle's `mcp_servers_declared` — same redact_text() treatment
+        `normalize_skill` already gives a skill's name/description."""
+        import json
+        import tempfile
+
+        config = {"mcpServers": {"sk-live-abc123def456ghi789": {"url": "http://127.0.0.1:1/mcp"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            inventory = scanner.read_mcp_inventory(path)
+
+        self.assertNotIn("sk-live-abc123def456ghi789", repr(inventory))
+
     def test_the_skills_view_of_the_same_file_is_redacted_too(self):
         """These skills are POSTed to the control plane, not just written locally.
 
@@ -524,6 +539,95 @@ class McpInventoryTest(unittest.TestCase):
         self.assertIn("http://127.0.0.1:1/mcp/[redacted]/sse", rendered)
         hosted = next(skill for skill in skills if skill["name"] == "hosted")
         self.assertEqual(hosted["description"], "MCP server configured via .mcp.json: unreachable")
+
+
+class McpEnvInventoryTest(unittest.TestCase):
+    """The per-server env convention (DR-123): `AGENT_MCP_NAME`/`AGENT_MCP_URL`, no config file."""
+
+    def test_inventory_entry_is_redacted_and_marked_environment_sourced(self):
+        env = {
+            "AGENT_MCP_NAME": "delivery",
+            "AGENT_MCP_URL": "http://proxy-delivery:8091/mcp/sk-live-abc123def456ghi789",
+        }
+        inventory = {entry["name"]: entry for entry in scanner.read_mcp_inventory_from_env(env)}
+
+        self.assertEqual(inventory["delivery"]["url"], "http://proxy-delivery:8091/mcp/[redacted]")
+        self.assertEqual(inventory["delivery"]["transport"], "http")
+        self.assertEqual(inventory["delivery"]["source"], "environment")
+        self.assertNotIn("sk-live-abc123def456ghi789", repr(inventory))
+
+    def test_a_key_shaped_server_name_is_redacted(self):
+        env = {"AGENT_MCP_NAME": "sk-live-abc123def456ghi789", "AGENT_MCP_URL": "http://127.0.0.1:1/mcp"}
+        self.assertNotIn("sk-live-abc123def456ghi789", repr(scanner.read_mcp_inventory_from_env(env)))
+
+    def test_missing_either_var_yields_nothing(self):
+        self.assertEqual(scanner.read_mcp_inventory_from_env({"AGENT_MCP_NAME": "delivery"}), [])
+        self.assertEqual(scanner.read_mcp_inventory_from_env({"AGENT_MCP_URL": "http://x:1/mcp"}), [])
+        self.assertEqual(scanner.read_mcp_inventory_from_env({}), [])
+
+    def test_collect_mcp_inventory_merges_env_with_file_derived_entries(self):
+        import json
+        import tempfile
+
+        config = {"mcpServers": {"hosted": {"url": "https://actions.zapier.com/mcp/sse"}}}
+        env = {"AGENT_MCP_NAME": "delivery", "AGENT_MCP_URL": "http://proxy-delivery:8091/mcp"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            names = {entry["name"] for entry in scanner.collect_mcp_inventory([path], env)}
+
+        self.assertEqual(names, {"hosted", "delivery"})
+
+    def test_collect_mcp_inventory_keeps_both_when_a_shared_name_has_different_urls(self):
+        """A name collision alone must not drop a genuinely different server.
+
+        DR-106 fixed exactly this class of silent loss for `collect_skills`
+        (two servers sharing one tool name) by merging instead of dropping;
+        `collect_mcp_inventory` dedupes on (name, url), so two entries that
+        only share a name — a real possibility once a name can come from
+        either a file or an operator-set env var — both survive.
+        """
+        import json
+        import tempfile
+
+        config = {"mcpServers": {"delivery": {"url": "https://file-configured.example/mcp"}}}
+        env = {"AGENT_MCP_NAME": "delivery", "AGENT_MCP_URL": "http://proxy-delivery:8091/mcp"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            inventory = scanner.collect_mcp_inventory([path], env)
+
+        sources = {entry["source"] for entry in inventory if entry["name"] == "delivery"}
+        self.assertEqual(sources, {".mcp.json", "environment"})
+
+    def test_collect_mcp_inventory_dedupes_a_true_duplicate_by_name_and_url(self):
+        """The same server declared both ways (matching name *and* URL) is one entry, not two."""
+        import json
+        import tempfile
+
+        config = {"mcpServers": {"delivery": {"url": "http://proxy-delivery:8091/mcp"}}}
+        env = {"AGENT_MCP_NAME": "delivery", "AGENT_MCP_URL": "http://proxy-delivery:8091/mcp"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".mcp.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            inventory = [entry for entry in scanner.collect_mcp_inventory([path], env) if entry["name"] == "delivery"]
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["source"], ".mcp.json")
+
+    def test_skills_view_is_redacted_and_reachability_probed_same_as_a_file(self):
+        env = {"AGENT_MCP_NAME": "delivery", "AGENT_MCP_URL": "http://127.0.0.1:1/mcp/sk-live-abc123def456ghi789"}
+        skills = scanner.read_mcp_config_from_env(env)
+
+        rendered = repr(skills)
+        self.assertNotIn("sk-live-abc123def456ghi789", rendered)
+        delivery = next(skill for skill in skills if skill["name"] == "delivery")
+        self.assertEqual(delivery["description"], "MCP server configured via environment: unreachable")
+
+    def test_collect_skills_includes_the_env_declared_server(self):
+        env = {"AGENT_MCP_NAME": "delivery", "AGENT_MCP_URL": "http://127.0.0.1:1/mcp"}
+        skills = scanner.collect_skills([], env)
+        self.assertIn("delivery", {skill["name"] for skill in skills})
 
 
 class AuthModeTest(unittest.TestCase):

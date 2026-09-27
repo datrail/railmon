@@ -410,6 +410,15 @@ python3 tools/agent-environment-scanner/scan_agent_environment.py \
   --mcp-config /path/to/.mcp.json
 ```
 
+An estate that declares its MCP server via environment variables instead of a
+config file (confirmed for one GCP estate behind DR-123, e.g.
+`compose.agent-zone.yml`: one server per agent) is still discovered — no flag
+needed. If both `AGENT_MCP_NAME` and `AGENT_MCP_URL` are set, that server is
+added to the inventory and skills list the same way a `.mcp.json` entry would
+be, merged with any file-derived servers (a file entry with the same name
+wins). Only this one name/URL pair is read; there is no env-var equivalent of
+a multi-server `mcpServers` block.
+
 Merge external skills from the skills scanner:
 
 ```bash
