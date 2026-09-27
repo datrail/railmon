@@ -337,11 +337,26 @@ async fn run_multi_target(
         anyhow::bail!("--pid, --uid and --comm cannot be combined with --target-manifest");
     }
 
-    let processes = manifest.resolve_all()?;
-    let mut targets = Vec::with_capacity(manifest.agents.len());
+    let outcomes = manifest.resolve_all();
+    let mut available = Vec::with_capacity(manifest.agents.len());
+    for (target, outcome) in manifest.agents.iter().zip(outcomes) {
+        match outcome {
+            identity::DiscoveryOutcome::Available(process) => available.push((target, process)),
+            identity::DiscoveryOutcome::NotFound(reason) => {
+                log::warn!("target '{}' not found: {reason}", target.agent_key);
+            }
+            identity::DiscoveryOutcome::Ambiguous(reason) => {
+                log::warn!("target '{}' is ambiguous: {reason}", target.agent_key);
+            }
+        }
+    }
+    if available.is_empty() {
+        anyhow::bail!("no declared agent resolved to a capturable process");
+    }
+    let mut targets = Vec::with_capacity(available.len());
     let mut streams: SelectAll<_> = SelectAll::new();
 
-    for (index, (target, process)) in manifest.agents.iter().zip(processes).enumerate() {
+    for (index, (target, process)) in available.into_iter().enumerate() {
         let filters = CaptureFilters {
             binary_path: target
                 .capture
