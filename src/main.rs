@@ -47,6 +47,16 @@ struct Args {
     /// exact legacy single-target path.
     #[arg(long)]
     target_manifest: Option<PathBuf>,
+
+    /// Resolve `--target-manifest`, print each declared agent's outcome and
+    /// scan-scoping fields (agent_key, status, config_roots, binary_path,
+    /// pid) as a JSON array on stdout, and exit without capturing. This is
+    /// the contract the Python scanner's `--target-manifest` mode reads to
+    /// run agent-scoped scanning once per key (DR-109 M2) — it exists so
+    /// that process resolution has exactly one implementation, not a second
+    /// one reimplemented in Python at the risk of diverging from it.
+    #[arg(long, requires = "target_manifest")]
+    print_resolved_targets: bool,
     #[arg(long, value_enum, default_value = "http")]
     mode: Mode,
 
@@ -130,6 +140,18 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    if args.print_resolved_targets {
+        let manifest = target_manifest
+            .as_ref()
+            .expect("clap requires --target-manifest with --print-resolved-targets");
+        println!(
+            "{}",
+            serde_json::to_string(&manifest.resolve_all_summary())
+                .context("serializing resolved targets")?
+        );
+        return Ok(());
+    }
 
     // Fail on a missing binary before opening sinks or claiming to capture:
     // the old failure mode was a collector that looked alive and produced
