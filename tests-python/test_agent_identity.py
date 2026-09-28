@@ -1767,6 +1767,132 @@ class RunOneCollectionTest(unittest.TestCase):
         self.assertTrue(planner_call.evidence_bundle_output.endswith(".planner"))
 
 
+class KeyedArtifactOwnershipTest(unittest.TestCase):
+    """DR-109 M2's last open bullet: registration state and generated
+    artifacts under owner-only keyed paths, with no registration ticket
+    retained. `build_registration_state`/`store_json` are agent-key-agnostic
+    (`TicketHandlingTest`/`ArtifactPermissionsTest` above already prove the
+    ticket-stripping and 0o600/0o700 behavior in the single-agent path) —
+    the actual gap was that nothing exercised them through a real, unmocked
+    `run_one_collection` -> `run_one_scan` call for a *keyed* target, so a
+    future change routing keyed writes around `store_json` would pass every
+    existing test. These drive the real code, mocking only `scan()` (heavy,
+    already covered elsewhere) and the network call `post_registration`."""
+
+    def fake_scan(self, args):
+        context = scanner.collect_self_context()
+        return (
+            context,
+            {"host_id": "host-01", "sandbox_name": "shared"},
+            scanner.collect_identity(args, context),
+        )
+
+    def test_a_keyed_scan_writes_its_feature_file_owner_only(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            feature_dir = os.path.join(tmp, "nested", "features.json")
+            args = scanner.make_parser().parse_args(
+                [
+                    "--target-manifest", "/manifest.yaml",
+                    "--host-id", "host-01",
+                    "--sandbox-name", "shared",
+                    "--feature-output", feature_dir,
+                    "--no-evidence-bundle",
+                    "--compact",
+                ]
+            )
+            targets = [{"agent_key": "planner", "status": "available", "config_roots": [tmp]}]
+            with mock.patch.object(scanner, "scan", side_effect=self.fake_scan), \
+                    mock.patch.object(scanner, "resolve_targets", return_value=targets):
+                code = scanner.run_one_collection(args)
+
+            self.assertEqual(code, 0)
+            keyed_feature = Path(feature_dir + ".planner")
+            self.assertTrue(keyed_feature.exists())
+            self.assertEqual(keyed_feature.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(keyed_feature.parent.stat().st_mode & 0o777, 0o700)
+            # The sandbox-wide scan's own unkeyed feature file is just as
+            # owner-only, and a distinct file from the keyed one above.
+            self.assertEqual(Path(feature_dir).stat().st_mode & 0o777, 0o600)
+
+    def test_a_keyed_v1_fallback_evidence_bundle_is_owner_only(self):
+        """Mirrors `test_agents_fall_back_to_normal_v1_path_when_no_v2_collection_possible`:
+        when no v2 collection can be composed, the agent's own evidence
+        bundle falls back to its keyed v1 path — which must land owner-only
+        exactly like every other artifact `store_json` writes."""
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = os.path.join(tmp, "nested", "evidence.json")
+            args = scanner.make_parser().parse_args(
+                [
+                    "--target-manifest", "/manifest.yaml",
+                    "--host-id", "host-01",
+                    "--sandbox-name", "shared",
+                    "--no-feature-file",
+                    "--evidence-bundle-output", bundle_dir,
+                    "--compact",
+                ]
+            )
+            targets = [{"agent_key": "planner", "status": "available", "config_roots": [tmp]}]
+            with mock.patch.object(scanner, "scan", side_effect=self.fake_scan), \
+                    mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                    mock.patch.object(scanner, "_v1_scope_from_scan_result", return_value=(None, None)):
+                code = scanner.run_one_collection(args)
+
+            self.assertEqual(code, 2)  # the forced no-v2-possible case also fails the collection
+            keyed_bundle = Path(bundle_dir + ".planner")
+            self.assertTrue(keyed_bundle.exists())
+            self.assertEqual(keyed_bundle.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(keyed_bundle.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_a_keyed_registration_is_owner_only_and_drops_the_ticket(self):
+        import json
+        import tempfile
+        from unittest import mock
+
+        response = {
+            "status": 201,
+            "body": {
+                "agent": {"id": "a-planner", "sandbox_id": "s-1", "host_id": "host-01", "sandbox_name": "shared"},
+                "token": "x-rail-placeholder-token",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            registration_path = os.path.join(tmp, "registration.json")
+            args = scanner.make_parser().parse_args(
+                [
+                    "--target-manifest", "/manifest.yaml",
+                    "--host-id", "host-01",
+                    "--sandbox-name", "shared",
+                    "--no-feature-file",
+                    "--no-evidence-bundle",
+                    "--register",
+                    "--center-url", "https://rail-center.internal",
+                    "--registration-output", registration_path,
+                    "--compact",
+                ]
+            )
+            targets = [{"agent_key": "planner", "status": "available", "config_roots": [tmp]}]
+            with mock.patch.object(scanner, "scan", side_effect=self.fake_scan), \
+                    mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                    mock.patch.object(scanner, "post_registration", return_value=response):
+                code = scanner.run_one_collection(args)
+
+            self.assertEqual(code, 0)
+            keyed_state_path = Path(registration_path + ".planner")
+            self.assertTrue(keyed_state_path.exists())
+            self.assertEqual(keyed_state_path.stat().st_mode & 0o777, 0o600)
+            written = keyed_state_path.read_text(encoding="utf-8")
+            self.assertNotIn("x-rail-placeholder-token", written)
+            state = json.loads(written)
+            self.assertEqual(state["agent_id"], "a-planner")
+            self.assertNotIn("token", state["response"])
+
+
 class MainTargetManifestDispatchTest(unittest.TestCase):
     """`--target-manifest` (or `RAIL_TARGET_MANIFEST`) switches `main` from
     the single unkeyed scan to a full collection; its absence preserves the
