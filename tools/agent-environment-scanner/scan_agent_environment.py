@@ -2066,6 +2066,18 @@ def run_one_collection(args: argparse.Namespace) -> int:
     for target in targets:
         agent_key = target["agent_key"]
         status = target.get("status")
+        self_asserted_agent_key = target.get("self_asserted_agent_key")
+        if self_asserted_agent_key and self_asserted_agent_key != agent_key:
+            # Design doc §4.1: self-asserted, diagnostic only -- this never
+            # changes discovery_status, config_roots, or which key the scan
+            # below runs under; it only tells an operator their manifest and
+            # the process's own RAIL_AGENT_KEY have drifted apart.
+            print(
+                f"[agent-environment-scanner] '{agent_key}' resolved to a process whose own "
+                f"RAIL_AGENT_KEY is '{self_asserted_agent_key}' (manifest and process disagree; "
+                "the manifest's declared key is authoritative)",
+                file=sys.stderr,
+            )
         if status != "available":
             print(
                 f"[agent-environment-scanner] skipping agent-scoped scan for '{agent_key}': "

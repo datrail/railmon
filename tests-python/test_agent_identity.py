@@ -1457,6 +1457,49 @@ class RunOneCollectionTest(unittest.TestCase):
         self.assertTrue(scoped.registration_output.endswith(".planner"))
         self.assertEqual(code, 0)
 
+    def test_a_self_asserted_agent_key_mismatch_is_logged_not_acted_on(self):
+        """DR-109 M2: the collector's `self_asserted_agent_key` (a process's
+        own RAIL_AGENT_KEY, design §4.1) is diagnostic only -- a mismatch
+        against the manifest's declared key gets a warning, never changes
+        which key the scan below runs under."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        targets = [
+            {
+                "agent_key": "planner",
+                "status": "available",
+                "config_roots": ["/srv/planner"],
+                "self_asserted_agent_key": "executor",
+            },
+        ]
+        calls = []
+        captured = io.StringIO()
+        with mock.patch.object(scanner, "run_one_scan", side_effect=lambda a: calls.append(a) or 0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                contextlib.redirect_stderr(captured):
+            code = scanner.run_one_collection(self.base_args())
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[1].agent_key, "planner")  # the manifest's key, unchanged
+        self.assertIn("'planner' resolved to a process whose own RAIL_AGENT_KEY is 'executor'", captured.getvalue())
+
+    def test_a_matching_or_absent_self_asserted_agent_key_is_silent(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        targets = [
+            {"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"], "self_asserted_agent_key": "planner"},
+            {"agent_key": "executor", "status": "not_found", "reason": "no locator"},
+        ]
+        captured = io.StringIO()
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                contextlib.redirect_stderr(captured):
+            scanner.run_one_collection(self.base_args())
+        self.assertNotIn("RAIL_AGENT_KEY", captured.getvalue())
+
     def test_worst_exit_code_across_the_collection_wins(self):
         from unittest import mock
 
