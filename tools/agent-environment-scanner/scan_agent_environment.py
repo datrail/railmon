@@ -1803,25 +1803,268 @@ def _keyed_path(path: Path, agent_key: str) -> str:
     return str(path.with_name(path.name + f".{agent_key}"))
 
 
+def _v2_collection_requested(args: argparse.Namespace) -> bool:
+    """Whether this collection needs evidence at all — the same test
+    `run_one_scan` itself uses (`not args.no_evidence_bundle or a RailDash
+    URL is configured`). When true, `run_one_collection` builds and
+    delivers exactly one evidence-bundle-v2 collection instead of letting
+    `run_one_scan` build its own (v1) bundle per scan (DR-109 M2)."""
+    return not args.no_evidence_bundle or configured_raildash_url(args) is not None
+
+
+def _v1_scope_from_scan_result(
+    target_args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Build (but do not write, verify against v1, or deliver) the raw
+    v1-shaped attribute data one scope of a v2 collection needs — either
+    the sandbox-wide scan or one agent-scoped scan.
+
+    Reads the `(context, payload, identity)` `run_one_scan` already stashed
+    on `target_args._v2_scan_result` from its own `scan()` call, rather than
+    calling `scan()` a second time. An earlier version of this function
+    called `scan()` itself, so composing a v2 collection ran a full live
+    environment read (docker inspect, MCP inventory, model detection) twice
+    per scope — once for `run_one_scan`'s feature file/registration, once
+    here — breaking `build_verified_bundle`'s own "built once and shared"
+    contract (this same file, `run_one_scan`'s docstring comment): two
+    independent scans of the same target can observe different live state
+    and disagree, exactly what that contract exists to prevent.
+
+    Returns `(bundle, context)`. `bundle` is `None` on any failure — either
+    `run_one_scan`'s own `scan()` never having run at all (`_v2_scan_result`
+    unset), or the stashed result failing v1's own contract
+    (`try_build_verified_bundle`, reporting rather than raising). `context`
+    is `run_one_scan`'s own environment/mode snapshot, returned even when
+    `bundle` is `None` as long as `scan()` got far enough to produce one —
+    the caller's sandbox-failure path needs it to still name a
+    `host_id`/`sandbox_name` for a synthetic `FAILED` sandbox scope (design
+    §5). `context` is `None` only when `scan()` failed before establishing
+    even that (so `run_one_scan` never reached its `finally` stash).
+    """
+    import evidence_bundle  # lazy: breaks the import cycle
+
+    result = getattr(target_args, "_v2_scan_result", None)
+    if result is None:
+        return None, None
+    context, payload, identity = result
+    bundle = evidence_bundle.try_build_verified_bundle(target_args, context, payload, identity)
+    return bundle, context
+
+
+def _deliver_v1_fallback(args: argparse.Namespace) -> int:
+    """This scope's v1 evidence bundle, from the scan `run_one_scan` already
+    ran — reused via `_v2_scan_result`, not a second `scan()` call — for the
+    two cases where `run_one_collection` suppressed a `_v2_collection`
+    target's own v1 write (betting on a v2 collection being produced) but
+    that bet did not pay off: the target manifest itself failed to resolve,
+    or no v2 collection could be built at all because `host_id`/
+    `sandbox_name` were never determined. Without this fallback the scan
+    that already ran leaves no artifact anywhere — worse than the
+    unkeyed-manifest single-scan path this function's docstring promises
+    never to regress. Mirrors `run_one_scan`'s own v1 evidence-bundle
+    block exactly (file write, then an optional RailDash POST), minus the
+    `scan()` call it already reused.
+    """
+    import evidence_bundle  # lazy: breaks the import cycle
+
+    result = getattr(args, "_v2_scan_result", None)
+    if result is None:
+        return 0
+    context, payload, identity = result
+    bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
+    exit_code = 0
+    if not args.no_evidence_bundle and bundle is not None:
+        bundle_path = evidence_bundle.evidence_bundle_output_path(args)
+        try:
+            store_json(bundle_path, bundle, args.compact)
+            print(f"[agent-environment-scanner] evidence bundle: {bundle_path}", file=sys.stderr)
+        except ScannerError as exc:
+            print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+    raildash_url = configured_raildash_url(args)
+    if raildash_url:
+        if bundle is None:
+            exit_code = 2
+        else:
+            try:
+                data = evidence_bundle.render_bundle_bytes(bundle, args.compact)
+                agent_key = configured_agent_key(args)
+                raildash_token = configured_raildash_token(args)
+                response = post_evidence_bundle(
+                    raildash_url, data, raildash_token=raildash_token, agent_key=agent_key
+                )
+                body = response.get("body")
+                body = body if isinstance(body, dict) else {}
+                outcome = "duplicate" if body.get("duplicate") else "accepted"
+                print(
+                    f"[agent-environment-scanner] delivered evidence bundle to raildash: "
+                    f"HTTP {response['status']} {outcome} id={body.get('asp_id')}",
+                    file=sys.stderr,
+                )
+            except ScannerError as exc:
+                print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+                exit_code = 2
+    return exit_code
+
+
+def _deliver_v2_collection(args: argparse.Namespace, sandbox_v1: dict[str, Any], agent_entries: list[dict[str, Any]]) -> int:
+    """Compose, verify, and write/deliver exactly one evidence-bundle-v2
+    collection — the shared `sandbox` scope from `sandbox_v1` plus every
+    entry in `agent_entries` (already sorted-or-not; `compose_from_scopes`
+    sorts and rejects a duplicate key). Built once as one dict and rendered
+    to bytes exactly once (`evidence_bundle.render_bundle_bytes`), then
+    that identical object/bytes are reused for both the on-disk artifact
+    and the RailDash POST — the same exact-byte idempotency contract v1's
+    own `build_verified_bundle`/`render_bundle_bytes` document. Returns 0 on
+    success, 2 if any part of composing/writing/delivering failed.
+    """
+    import compose_evidence_bundle_v2 as composer  # lazy: breaks the import cycle
+    import evidence_bundle  # lazy: breaks the import cycle
+
+    try:
+        collection = composer.compose_from_scopes(
+            host_id=sandbox_v1["host_id"],
+            sandbox_name=sandbox_v1["sandbox_name"],
+            rule_pack_version=sandbox_v1["rule_pack_version"],
+            sandbox_inputs=sandbox_v1["inputs_attempted"],
+            sandbox_attributes={
+                name: value
+                for name, value in sandbox_v1["attributes"].items()
+                if name in composer.SANDBOX_ATTRIBUTES
+            },
+            agent_entries=agent_entries,
+            attestations=sandbox_v1.get("attestations"),
+        )
+        evidence_bundle.verify_bundle_v2(collection)
+    except (ValueError, ScannerError) as exc:
+        print(f"agent-environment-scanner: evidence bundle v2 composition failed: {exc}", file=sys.stderr)
+        return 2
+
+    exit_code = 0
+    # Built once above; every consumer below shares this exact dict/bytes.
+    data = evidence_bundle.render_bundle_bytes(collection, args.compact)
+    if not args.no_evidence_bundle:
+        bundle_path = evidence_bundle.evidence_bundle_output_path(args)
+        try:
+            store_json(bundle_path, collection, args.compact)
+            print(f"[agent-environment-scanner] evidence bundle v2: {bundle_path}", file=sys.stderr)
+        except ScannerError as exc:
+            print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+            exit_code = 2
+
+    raildash_url = configured_raildash_url(args)
+    if raildash_url:
+        try:
+            raildash_token = configured_raildash_token(args)
+            response = post_evidence_bundle(raildash_url, data, raildash_token=raildash_token)
+            body = response.get("body")
+            body = body if isinstance(body, dict) else {}
+            outcome = "duplicate" if body.get("duplicate") else "accepted"
+            print(
+                f"[agent-environment-scanner] delivered evidence bundle v2 to raildash: "
+                f"HTTP {response['status']} {outcome} id={body.get('asp_id')}",
+                file=sys.stderr,
+            )
+        except ScannerError as exc:
+            print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+            exit_code = 2
+    return exit_code
+
+
 def run_one_collection(args: argparse.Namespace) -> int:
     """DR-109 M2: sandbox scanning once per collection (the existing
-    single-target scan, unchanged), plus agent-scoped scanning and
-    registration once per resolved agent key — scoped to that key's
-    `scan.config_roots` and carrying its `agent_key` into the registration
-    payload and evidence bundle. A declared agent that does not currently
-    resolve is logged and skipped rather than failing the whole collection,
-    matching the collector's own `run_multi_target` (never drop a declared
-    agent's siblings over one bad target).
+    single-target scan, unchanged for the feature file and registration),
+    plus agent-scoped scanning and registration once per resolved agent
+    key — scoped to that key's `scan.config_roots` and carrying its
+    `agent_key` into the registration payload. A declared agent that does
+    not currently resolve is logged and skipped for registration/feature-file
+    purposes, matching the collector's own `run_multi_target` (never drop a
+    declared agent's siblings over one bad target) — but it still gets an
+    `agents[]` entry in the evidence collection below, with its real
+    `discovery_status`, instead of silently vanishing from what a scorer
+    reads (design §4.3).
+
+    Evidence: when this collection is configured to build or deliver
+    evidence at all (`_v2_collection_requested`), exactly one
+    evidence-bundle-v2 collection is produced — one shared `sandbox` scope
+    from the sandbox-wide scan plus a sorted `agents[]` array — not the N
+    separate v1 bundles an earlier version of this function wrote one per
+    key. Every `run_one_scan` call this function drives is told to suppress
+    its own v1 evidence-bundle handling (`_v2_collection`) so that is the
+    only evidence artifact/delivery a manifest-scoped run produces.
     """
-    exit_code = run_one_scan(args)
+    build_v2 = _v2_collection_requested(args)
+
+    sandbox_scan_args = args
+    if build_v2:
+        sandbox_scan_args = copy.copy(args)
+        sandbox_scan_args._v2_collection = True
+    exit_code = run_one_scan(sandbox_scan_args)
+
     manifest_path = Path(configured_target_manifest(args)).expanduser()
     try:
         targets = resolve_targets(manifest_path)
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        if build_v2:
+            # The sandbox scan above already ran and had its own v1 write
+            # suppressed on the bet that a v2 collection would follow — a
+            # bet a broken manifest just lost. Delivering the v1 fallback
+            # here (reusing that same scan, not a second one) is the only
+            # way this scope's evidence reaches an artifact at all.
+            _deliver_v1_fallback(sandbox_scan_args)
         return 2
+
+    sandbox_v1: dict[str, Any] | None = None
+    if build_v2:
+        import evidence_bundle  # lazy: breaks the import cycle
+
+        sandbox_v1, sandbox_context = _v1_scope_from_scan_result(sandbox_scan_args)
+        if sandbox_v1 is None:
+            # Design §5, "Shared evidence collection fails": agent-scoped
+            # scanning/registration below still runs (never drop a sibling
+            # agent over this). A v2 collection still needs a non-empty
+            # `host_id`/`sandbox_name` (schema `minLength: 1` on both) even
+            # when nothing else about the sandbox could be collected — when
+            # `scan()` got far enough to know those, synthesize a sandbox
+            # scope whose every source is FAILED instead of omitting the
+            # sandbox scope (and so the whole collection) outright.
+            host_id = sandbox_name = None
+            if sandbox_context is not None:
+                host_id, _ = detect_host_id(sandbox_context, args.host_id)
+                sandbox_name, _ = detect_sandbox_name(sandbox_context, args.sandbox_name)
+            if host_id and sandbox_name:
+                sandbox_v1 = {
+                    "host_id": host_id,
+                    "sandbox_name": sandbox_name,
+                    "rule_pack_version": evidence_bundle.RULE_PACK_VERSION,
+                    "inputs_attempted": evidence_bundle.failed_inputs("PARSE_FAILED"),
+                    "attributes": {},
+                    "attestations": [],
+                }
+                print(
+                    "agent-environment-scanner: shared evidence collection failed; "
+                    "sandbox scope marked FAILED, agent-scoped scanning still runs",
+                    file=sys.stderr,
+                )
+            else:
+                # `scan()` failed before even a host_id/sandbox_name could be
+                # named — no schema-legal v2 collection can be built at all,
+                # since both are required non-empty fields at the bundle's
+                # top level, not just inside the sandbox scope. Deliver this
+                # scope's v1 fallback (reusing the same scan) rather than
+                # losing it outright, the same as the broken-manifest case.
+                print(
+                    "agent-environment-scanner: shared evidence collection failed before "
+                    "host_id/sandbox_name could be determined; no evidence-bundle-v2 will "
+                    "be produced for this run",
+                    file=sys.stderr,
+                )
+                _deliver_v1_fallback(sandbox_scan_args)
+            exit_code = 2
+
+    agent_entries: list[dict[str, Any]] = []
     for target in targets:
-        agent_key = target.get("agent_key") or "?"
+        agent_key = target["agent_key"]
         status = target.get("status")
         if status != "available":
             print(
@@ -1829,6 +2072,17 @@ def run_one_collection(args: argparse.Namespace) -> int:
                 f"{status} ({target.get('reason')})",
                 file=sys.stderr,
             )
+            if build_v2 and sandbox_v1 is not None:
+                import evidence_bundle  # lazy: breaks the import cycle
+
+                agent_entries.append(
+                    {
+                        "agent_key": agent_key,
+                        "discovery_status": status,
+                        "inputs_attempted": evidence_bundle.unattempted_inputs("NO_SOURCE_ACCESS"),
+                        "attributes": {},
+                    }
+                )
             continue
         config_roots = target.get("config_roots") or []
         if not config_roots:
@@ -1843,13 +2097,43 @@ def run_one_collection(args: argparse.Namespace) -> int:
                 "no scan.config_roots declared, nothing agent-specific to scope it to",
                 file=sys.stderr,
             )
+            if build_v2 and sandbox_v1 is not None:
+                import compose_evidence_bundle_v2 as composer  # lazy: breaks the import cycle
+                import evidence_bundle  # lazy: breaks the import cycle
+
+                agent_entries.append(
+                    {
+                        "agent_key": agent_key,
+                        # Discovery *did* resolve this agent to a live
+                        # process; it is the scan-scoping the collector
+                        # cannot isolate, so discovery_status stays
+                        # "available" and each would-be agent-scoped
+                        # attribute is individually BLIND instead (design
+                        # §4.3's MULTI_AGENT_SCOPE_UNRESOLVED).
+                        "discovery_status": "available",
+                        "inputs_attempted": evidence_bundle.unattempted_inputs(
+                            "MULTI_AGENT_SCOPE_UNRESOLVED"
+                        ),
+                        "attributes": evidence_bundle.scope_unresolved_attributes(
+                            sandbox_v1["attributes"], composer.SANDBOX_ATTRIBUTES
+                        ),
+                    }
+                )
             continue
         target_args = copy.copy(args)
         target_args.agent_key = agent_key
         target_args.config_path = config_roots
         target_args.feature_output = _keyed_path(feature_output_path(args), agent_key)
         target_args.registration_output = _keyed_path(registration_output_path(args), agent_key)
-        if not target_args.no_evidence_bundle or configured_raildash_url(target_args):
+        # Only suppress this agent's own v1 write when a v2 collection can
+        # actually receive its data (`sandbox_v1 is not None`) — otherwise
+        # the earlier sandbox-scope failure already means no v2 collection
+        # will ever be composed, and suppressing this agent's v1 bundle too
+        # would drop a successfully-scanned agent's evidence entirely for
+        # no gain. Falls through to the same keyed v1 path a non-v2 run uses.
+        if build_v2 and sandbox_v1 is not None:
+            target_args._v2_collection = True
+        elif not target_args.no_evidence_bundle or configured_raildash_url(target_args):
             import evidence_bundle  # lazy: breaks the import cycle
 
             target_args.evidence_bundle_output = _keyed_path(
@@ -1857,6 +2141,53 @@ def run_one_collection(args: argparse.Namespace) -> int:
             )
         target_exit = run_one_scan(target_args)
         exit_code = target_exit if target_exit != 0 else exit_code
+
+        if build_v2 and sandbox_v1 is not None:
+            agent_v1, _ = _v1_scope_from_scan_result(target_args)
+            import compose_evidence_bundle_v2 as composer  # lazy: breaks the import cycle
+            import evidence_bundle  # lazy: breaks the import cycle
+
+            if agent_v1 is None:
+                # Design §5, "One agent collector fails": other keyed agents
+                # still continue (the loop keeps going); this entry is still
+                # present in `agents[]`, with every attribute the sandbox
+                # scope's own template names marked FAILED, rather than
+                # silently missing as if the agent had never been declared.
+                exit_code = 2
+                if sandbox_v1 is not None:
+                    agent_entries.append(
+                        {
+                            "agent_key": agent_key,
+                            "discovery_status": "available",
+                            "inputs_attempted": evidence_bundle.failed_inputs("PARSE_FAILED"),
+                            "attributes": evidence_bundle.failed_attributes(
+                                sandbox_v1["attributes"], composer.SANDBOX_ATTRIBUTES
+                            ),
+                        }
+                    )
+                continue
+
+            agent_entries.append(
+                {
+                    "agent_key": agent_key,
+                    "discovery_status": "available",
+                    "inputs_attempted": agent_v1["inputs_attempted"],
+                    "attributes": composer.agent_scoped_attributes(agent_v1["attributes"]),
+                }
+            )
+
+    if build_v2 and sandbox_v1 is not None:
+        if not agent_entries:
+            print(
+                "agent-environment-scanner: no agent entries to compose into evidence bundle v2 "
+                "(the v2 schema requires at least one)",
+                file=sys.stderr,
+            )
+            exit_code = 2
+        else:
+            delivery_exit = _deliver_v2_collection(args, sandbox_v1, agent_entries)
+            exit_code = delivery_exit if delivery_exit != 0 else exit_code
+
     return exit_code
 
 
@@ -2260,7 +2591,26 @@ def run_one_scan(args: argparse.Namespace) -> int:
             # failure is reported without changing the exit code for the file
             # write (the feature file owns that); a RailDash delivery failure
             # does change it, like a failed --register.
-            if not args.no_evidence_bundle or raildash_url:
+            #
+            # DR-109 M2: `run_one_collection` sets `_v2_collection` on a
+            # target's args when it will itself compose this scan's raw
+            # attribute data into one shared evidence-bundle-v2 collection
+            # and write/deliver *that* exactly once. Without this guard a
+            # manifest-scoped run would additionally write (and, with a
+            # RailDash URL configured, separately POST) N keyed v1 bundles
+            # here — the exact "not N v1 bundles" gap this milestone closes.
+            #
+            # This scan's own `(context, payload, identity)` is stashed on
+            # `args._v2_scan_result` rather than simply skipped, so
+            # `_v1_scope_from_scan_result` (and the v1-fallback delivery for
+            # the cases where a v2 collection ultimately can't be built) can
+            # reuse this exact scan instead of calling `scan()` a second
+            # time for the same target — two independent scans of one
+            # target could observe different live state and disagree,
+            # exactly what "built once and shared" above exists to prevent.
+            if getattr(args, "_v2_collection", False):
+                args._v2_scan_result = (context, payload, identity)
+            elif not args.no_evidence_bundle or raildash_url:
                 import evidence_bundle  # lazy: breaks the import cycle
 
                 bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
