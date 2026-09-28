@@ -8,6 +8,7 @@ POST /v1/agents/register schema.
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import hashlib
 import json
@@ -1640,6 +1641,10 @@ def build_registration_payload(
         # from the container hostname.
         "host_id": identity["host_id"],
         "sandbox_name": identity["sandbox_name"],
+        # None (the unkeyed compatibility path) is dropped below by
+        # drop_none, so an invocation that never names an agent key sends
+        # exactly the payload it always has.
+        "agent_key": configured_agent_key(args),
         "environment": {
             "sandbox_type": detect_sandbox_type(context, args.sandbox_type),
             "llm_provider": detect_provider(env, llm_model, args.llm_provider),
@@ -1755,6 +1760,90 @@ def configured_raildash_url(args: argparse.Namespace) -> str | None:
 
 def configured_agent_key(args: argparse.Namespace) -> str | None:
     return first_nonempty(args.agent_key, os.environ.get("RAIL_AGENT_KEY"))
+
+
+def configured_target_manifest(args: argparse.Namespace) -> str | None:
+    return first_nonempty(args.target_manifest, os.environ.get("RAIL_TARGET_MANIFEST"))
+
+
+def configured_railmon_bin() -> str:
+    """The compiled collector binary, resolved the same way `entrypoint.sh`
+    resolves it — same env var, same fallback path — since this and the
+    collector are the two processes sharing one container image."""
+    return first_nonempty(os.environ.get("RAILMON_BIN")) or "/usr/local/bin/railmon-collector"
+
+
+def resolve_targets(manifest_path: Path) -> list[dict[str, Any]]:
+    """Every `--target-manifest` agent's discovery outcome and scan-scoping
+    fields, resolved by the compiled collector rather than reimplemented
+    here: process liveness, ownership and cross-target collision checks
+    (`identity.rs`) have exactly one implementation this way, instead of a
+    second one in Python that could silently diverge from it.
+    """
+    railmon_bin = configured_railmon_bin()
+    output = run_command(
+        [railmon_bin, "--target-manifest", str(manifest_path), "--print-resolved-targets"],
+        timeout=10.0,
+    )
+    if output is None:
+        raise ScannerError(f"failed to resolve --target-manifest via {railmon_bin} --print-resolved-targets")
+    try:
+        targets = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ScannerError(f"{railmon_bin} --print-resolved-targets returned invalid JSON") from exc
+    if not isinstance(targets, list):
+        raise ScannerError(f"{railmon_bin} --print-resolved-targets returned a non-list JSON value")
+    return targets
+
+
+def _keyed_path(path: Path, agent_key: str) -> str:
+    """The same default path, suffixed with the agent key, so a per-key scan
+    run in the same collection does not overwrite the sandbox-wide scan's
+    (or another key's) local artifact at the one un-keyed default path."""
+    return str(path.with_name(path.name + f".{agent_key}"))
+
+
+def run_one_collection(args: argparse.Namespace) -> int:
+    """DR-109 M2: sandbox scanning once per collection (the existing
+    single-target scan, unchanged), plus agent-scoped scanning and
+    registration once per resolved agent key — scoped to that key's
+    `scan.config_roots` and carrying its `agent_key` into the registration
+    payload and evidence bundle. A declared agent that does not currently
+    resolve is logged and skipped rather than failing the whole collection,
+    matching the collector's own `run_multi_target` (never drop a declared
+    agent's siblings over one bad target).
+    """
+    exit_code = run_one_scan(args)
+    manifest_path = Path(configured_target_manifest(args)).expanduser()
+    try:
+        targets = resolve_targets(manifest_path)
+    except ScannerError as exc:
+        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        return 2
+    for target in targets:
+        agent_key = target.get("agent_key") or "?"
+        status = target.get("status")
+        if status != "available":
+            print(
+                f"[agent-environment-scanner] skipping agent-scoped scan for '{agent_key}': "
+                f"{status} ({target.get('reason')})",
+                file=sys.stderr,
+            )
+            continue
+        target_args = copy.copy(args)
+        target_args.agent_key = agent_key
+        target_args.config_path = target.get("config_roots") or []
+        target_args.feature_output = _keyed_path(feature_output_path(args), agent_key)
+        target_args.registration_output = _keyed_path(registration_output_path(args), agent_key)
+        if not target_args.no_evidence_bundle or configured_raildash_url(target_args):
+            import evidence_bundle  # lazy: breaks the import cycle
+
+            target_args.evidence_bundle_output = _keyed_path(
+                evidence_bundle.evidence_bundle_output_path(args), agent_key
+            )
+        target_exit = run_one_scan(target_args)
+        exit_code = target_exit if target_exit != 0 else exit_code
+    return exit_code
 
 
 def configured_raildash_token(args: argparse.Namespace) -> str | None:
@@ -2033,6 +2122,14 @@ def make_parser() -> argparse.ArgumentParser:
         "?agent_key= query parameter. Also read from RAIL_AGENT_KEY.",
     )
     parser.add_argument(
+        "--target-manifest",
+        help="DR-109 M2: the collector's multi-agent target manifest (same schema, same file). When "
+        "given, each collection also runs one agent-scoped scan+registration per resolved agent "
+        "key, scoped to that key's scan.config_roots, in addition to (not instead of) the existing "
+        "sandbox-wide scan above. A declared agent that does not currently resolve is logged and "
+        "skipped, not treated as a failure. Also read from RAIL_TARGET_MANIFEST.",
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=None,
@@ -2196,8 +2293,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
     interval = configured_scan_interval(args)
+    # DR-109 M2: a target manifest turns each collection from one scan into
+    # the sandbox-wide scan plus one agent-scoped scan per resolved key.
+    # `configured_target_manifest`'s absence preserves the exact legacy
+    # single-target call below, for every existing caller that never names one.
+    run_collection = run_one_collection if configured_target_manifest(args) else run_one_scan
     if interval is None:
-        return run_one_scan(args)
+        return run_collection(args)
 
     # DR-83: stays running, scanning again on the interval. An agent that
     # first appears after scan N reaches the control plane on scan N+1
@@ -2210,7 +2312,7 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     try:
         while True:
-            exit_code = run_one_scan(args)
+            exit_code = run_collection(args)
             time.sleep(interval)
     except KeyboardInterrupt:
         pass

@@ -271,6 +271,34 @@ Both identity fields are optional on Rail Center's side and bounded to its
 storage width (64 and 255), so the scanner truncates rather than letting a long
 value surface as a server error.
 
+## Multi-agent target manifest (DR-109 M2)
+
+`--target-manifest` (or `RAIL_TARGET_MANIFEST`) names the same
+`target-manifest-v1` YAML the collector reads with its own `--target-manifest`
+flag. When given, a collection is no longer just the one sandbox-wide scan
+above — it becomes that same sandbox-wide scan **plus** one agent-scoped scan
+and registration per manifest agent the collector currently resolves as
+`available`, each scoped to that agent's `scan.config_roots` and carrying its
+`agent_key` into the registration payload, the RailDash delivery, and the
+local `--feature-output`/`--registration-output`/`--evidence-bundle-output`
+paths (each suffixed `.<agent_key>` so a keyed scan never overwrites the
+sandbox-wide scan's, or another key's, artifact). A declared agent the
+collector reports as `not_found` or `ambiguous` is logged and skipped, not
+treated as a failure — the same "never drop a declared agent's siblings over
+one bad target" rule the collector's own multi-target capture follows.
+
+Process resolution — liveness, ownership, and cross-target collision
+detection — has exactly one implementation, in the collector's `identity.rs`.
+This scanner shells out to it (`<collector> --target-manifest <path>
+--print-resolved-targets`, resolved via `RAILMON_BIN`, defaulting to
+`/usr/local/bin/railmon-collector` the same way `entrypoint.sh` does) rather
+than reimplementing that resolution in Python, where it could silently
+diverge from it.
+
+`--interval`/`RAIL_SCAN_INTERVAL_IN_SECONDS` applies the same way: each tick
+re-runs the full collection (sandbox scan plus every currently-available
+keyed scan), not just the sandbox-wide half.
+
 ## Authentication
 
 `RAIL_AUTH_MODE` (or `--auth-mode`) selects the credential presented when

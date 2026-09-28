@@ -1183,5 +1183,268 @@ class SecretClassFilesystemTest(unittest.TestCase):
         self.assertEqual(scanner.classify_secret_class("sk-plaintext", refuses), "plaintext")
 
 
+class RegistrationPayloadAgentKeyTest(unittest.TestCase):
+    """DR-109 M2: registration carries `agent_key` when one is configured
+    (flag or `RAIL_AGENT_KEY`), and omits it entirely — not `null` — when
+    none is, so every existing unkeyed caller's payload is byte-identical."""
+
+    def setUp(self):
+        os.environ.pop("RAIL_AGENT_KEY", None)
+
+    def tearDown(self):
+        os.environ.pop("RAIL_AGENT_KEY", None)
+
+    def args(self, **overrides):
+        base = dict(
+            agent_type="personal",
+            owner=None,
+            sandbox_type=None,
+            llm_provider=None,
+            llm_model=None,
+            capture_file=[],
+            config_path=[],
+            mcp_config=[],
+            skills_file=[],
+            agent_key=None,
+            container=None,
+        )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def identity(self):
+        return {"host_id": "h-1", "sandbox_name": "sb-1"}
+
+    def test_agent_key_absent_by_default(self):
+        payload = scanner.build_registration_payload(self.args(), context(), self.identity())
+        self.assertNotIn("agent_key", payload)
+
+    def test_agent_key_flag_rides_the_payload(self):
+        payload = scanner.build_registration_payload(self.args(agent_key="planner"), context(), self.identity())
+        self.assertEqual(payload["agent_key"], "planner")
+
+    def test_agent_key_env_fallback_rides_the_payload_too(self):
+        os.environ["RAIL_AGENT_KEY"] = "executor"
+        payload = scanner.build_registration_payload(self.args(), context(), self.identity())
+        self.assertEqual(payload["agent_key"], "executor")
+
+
+class ConfiguredTargetManifestTest(unittest.TestCase):
+    """Same flag/env/absent convention as `--raildash-url`/`--agent-key`."""
+
+    def setUp(self):
+        os.environ.pop("RAIL_TARGET_MANIFEST", None)
+
+    def tearDown(self):
+        os.environ.pop("RAIL_TARGET_MANIFEST", None)
+
+    def test_absent_by_default(self):
+        self.assertIsNone(scanner.configured_target_manifest(argparse.Namespace(target_manifest=None)))
+
+    def test_env_fallback(self):
+        os.environ["RAIL_TARGET_MANIFEST"] = "/etc/rail/manifest.yaml"
+        self.assertEqual(
+            scanner.configured_target_manifest(argparse.Namespace(target_manifest=None)),
+            "/etc/rail/manifest.yaml",
+        )
+
+    def test_flag_beats_env(self):
+        os.environ["RAIL_TARGET_MANIFEST"] = "/env/manifest.yaml"
+        self.assertEqual(
+            scanner.configured_target_manifest(argparse.Namespace(target_manifest="/flag/manifest.yaml")),
+            "/flag/manifest.yaml",
+        )
+
+
+class ConfiguredRailmonBinTest(unittest.TestCase):
+    def setUp(self):
+        os.environ.pop("RAILMON_BIN", None)
+
+    def tearDown(self):
+        os.environ.pop("RAILMON_BIN", None)
+
+    def test_default_matches_entrypoint_sh(self):
+        self.assertEqual(scanner.configured_railmon_bin(), "/usr/local/bin/railmon-collector")
+
+    def test_env_override(self):
+        os.environ["RAILMON_BIN"] = "/opt/railmon/railmon-collector"
+        self.assertEqual(scanner.configured_railmon_bin(), "/opt/railmon/railmon-collector")
+
+
+class KeyedPathTest(unittest.TestCase):
+    def test_suffixes_the_file_name_with_the_key(self):
+        self.assertEqual(
+            scanner._keyed_path(Path("/x/y/features.json"), "planner"),
+            "/x/y/features.json.planner",
+        )
+
+
+class ResolveTargetsTest(unittest.TestCase):
+    """The collector, not this file, owns process resolution and collision
+    detection — `resolve_targets` only shells out to it and parses the
+    result, so these cases are the boundary of what can go wrong doing that."""
+
+    def fake_bin(self, tmp, script: str) -> str:
+        path = Path(tmp) / "fake-railmon"
+        path.write_text(f"#!/bin/sh\n{script}\n")
+        path.chmod(0o700)
+        return str(path)
+
+    def test_parses_the_collector_s_json_array(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["RAILMON_BIN"] = self.fake_bin(
+                tmp, 'echo \'[{"agent_key": "planner", "status": "available"}]\''
+            )
+            try:
+                targets = scanner.resolve_targets(Path(tmp) / "manifest.yaml")
+            finally:
+                os.environ.pop("RAILMON_BIN", None)
+        self.assertEqual(targets, [{"agent_key": "planner", "status": "available"}])
+
+    def test_a_nonexistent_binary_raises_scanner_error(self):
+        os.environ["RAILMON_BIN"] = "/does/not/exist/railmon-collector"
+        try:
+            with self.assertRaises(scanner.ScannerError):
+                scanner.resolve_targets(Path("/tmp/manifest.yaml"))
+        finally:
+            os.environ.pop("RAILMON_BIN", None)
+
+    def test_a_failing_binary_raises_scanner_error(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["RAILMON_BIN"] = self.fake_bin(tmp, "echo bad manifest >&2; exit 1")
+            try:
+                with self.assertRaises(scanner.ScannerError):
+                    scanner.resolve_targets(Path(tmp) / "manifest.yaml")
+            finally:
+                os.environ.pop("RAILMON_BIN", None)
+
+    def test_non_json_output_raises_scanner_error(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["RAILMON_BIN"] = self.fake_bin(tmp, "echo not-json")
+            try:
+                with self.assertRaises(scanner.ScannerError):
+                    scanner.resolve_targets(Path(tmp) / "manifest.yaml")
+            finally:
+                os.environ.pop("RAILMON_BIN", None)
+
+    def test_non_list_json_raises_scanner_error(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["RAILMON_BIN"] = self.fake_bin(tmp, 'echo \'{"not": "a list"}\'')
+            try:
+                with self.assertRaises(scanner.ScannerError):
+                    scanner.resolve_targets(Path(tmp) / "manifest.yaml")
+            finally:
+                os.environ.pop("RAILMON_BIN", None)
+
+
+class RunOneCollectionTest(unittest.TestCase):
+    """DR-109 M2: one sandbox-wide scan (the existing unkeyed call, args
+    untouched) plus one agent-scoped scan per resolved `available` target,
+    scoped to that target's config_roots and carrying its agent_key —
+    `not_found`/`ambiguous` targets are skipped, not failed, and the
+    collection's exit code is the worst of every scan it ran."""
+
+    def base_args(self):
+        return argparse.Namespace(
+            target_manifest="/manifest.yaml",
+            agent_key=None,
+            config_path=[],
+            feature_output=None,
+            registration_output=None,
+            evidence_bundle_output=None,
+            no_evidence_bundle=True,
+            raildash_url=None,
+        )
+
+    def test_sandbox_wide_scan_runs_unmodified_and_first(self):
+        from unittest import mock
+
+        calls = []
+        with mock.patch.object(scanner, "run_one_scan", side_effect=lambda a: calls.append(a) or 0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=[]):
+            code = scanner.run_one_collection(self.base_args())
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0].agent_key)
+        self.assertEqual(code, 0)
+
+    def test_available_targets_each_get_a_scoped_scan(self):
+        from unittest import mock
+
+        targets = [
+            {"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]},
+            {"agent_key": "executor", "status": "not_found", "reason": "no locator"},
+        ]
+        calls = []
+        with mock.patch.object(scanner, "run_one_scan", side_effect=lambda a: calls.append(a) or 0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets):
+            code = scanner.run_one_collection(self.base_args())
+        # One sandbox-wide call plus exactly one per *available* target.
+        self.assertEqual(len(calls), 2)
+        scoped = calls[1]
+        self.assertEqual(scoped.agent_key, "planner")
+        self.assertEqual(scoped.config_path, ["/srv/planner"])
+        self.assertTrue(scoped.feature_output.endswith(".planner"))
+        self.assertTrue(scoped.registration_output.endswith(".planner"))
+        self.assertEqual(code, 0)
+
+    def test_worst_exit_code_across_the_collection_wins(self):
+        from unittest import mock
+
+        targets = [{"agent_key": "planner", "status": "available", "config_roots": []}]
+        results = iter([0, 2])
+        with mock.patch.object(scanner, "run_one_scan", side_effect=lambda a: next(results)), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets):
+            code = scanner.run_one_collection(self.base_args())
+        self.assertEqual(code, 2)
+
+    def test_a_resolve_failure_is_reported_and_does_not_raise(self):
+        from unittest import mock
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), mock.patch.object(
+            scanner, "resolve_targets", side_effect=scanner.ScannerError("boom")
+        ):
+            code = scanner.run_one_collection(self.base_args())
+        self.assertEqual(code, 2)
+
+
+class MainTargetManifestDispatchTest(unittest.TestCase):
+    """`--target-manifest` (or `RAIL_TARGET_MANIFEST`) switches `main` from
+    the single unkeyed scan to a full collection; its absence preserves the
+    exact call `MainIntervalLoopTest` already covers."""
+
+    def setUp(self):
+        os.environ.pop("RAIL_TARGET_MANIFEST", None)
+
+    def tearDown(self):
+        os.environ.pop("RAIL_TARGET_MANIFEST", None)
+
+    def test_without_target_manifest_runs_the_plain_scan(self):
+        from unittest import mock
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0) as plain, mock.patch.object(
+            scanner, "run_one_collection"
+        ) as collection:
+            scanner.main(["--no-feature-file", "--no-evidence-bundle"])
+        plain.assert_called_once()
+        collection.assert_not_called()
+
+    def test_with_target_manifest_runs_the_collection(self):
+        from unittest import mock
+
+        with mock.patch.object(scanner, "run_one_scan") as plain, mock.patch.object(
+            scanner, "run_one_collection", return_value=0
+        ) as collection:
+            scanner.main(["--target-manifest", "/manifest.yaml"])
+        collection.assert_called_once()
+        plain.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

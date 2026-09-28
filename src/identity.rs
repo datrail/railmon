@@ -109,7 +109,63 @@ impl ProcessIncarnation {
     }
 }
 
+/// One declared agent's discovery outcome, in the shape the Python scanner
+/// consumes to run agent-scoped scanning once per key (M2): whether to scan
+/// it at all, and the config roots/binary path to scope that scan to. Kept
+/// separate from `DiscoveryOutcome` because it must serialize (a stable
+/// cross-process contract) while `DiscoveryOutcome` carries a raw
+/// `ProcessIncarnation` that has no reason to leave this process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResolvedTargetSummary {
+    pub agent_key: String,
+    pub display_name: Option<String>,
+    /// "available", "not_found", or "ambiguous" — `DiscoveryOutcome`'s three
+    /// states, spelled as strings because this crosses a process boundary.
+    pub status: String,
+    pub reason: Option<String>,
+    pub pid: Option<u32>,
+    pub config_roots: Vec<String>,
+    pub binary_path: Option<String>,
+}
+
+fn summarize_target(target: &Target, outcome: &DiscoveryOutcome) -> ResolvedTargetSummary {
+    let (status, reason, pid) = match outcome {
+        DiscoveryOutcome::Available(process) => ("available", None, Some(process.pid)),
+        DiscoveryOutcome::NotFound(reason) => ("not_found", Some(reason.clone()), None),
+        DiscoveryOutcome::Ambiguous(reason) => ("ambiguous", Some(reason.clone()), None),
+    };
+    ResolvedTargetSummary {
+        agent_key: target.agent_key.clone(),
+        display_name: target.display_name.clone(),
+        status: status.to_string(),
+        reason,
+        pid,
+        config_roots: target
+            .scan
+            .as_ref()
+            .map(|scan| {
+                scan.config_roots
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        binary_path: target.capture.as_ref().and_then(|c| c.binary_path.clone()),
+    }
+}
+
 impl TargetManifest {
+    /// Every declared agent's outcome plus the scan-scoping fields the
+    /// Python scanner needs, in manifest order — the resolved-target JSON
+    /// contract `--print-resolved-targets` publishes on stdout.
+    pub fn resolve_all_summary(&self) -> Vec<ResolvedTargetSummary> {
+        self.agents
+            .iter()
+            .zip(self.resolve_all())
+            .map(|(target, outcome)| summarize_target(target, &outcome))
+            .collect()
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         validate_control_path(path, None)?;
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -743,5 +799,63 @@ mod tests {
         assert!(matches!(outcomes[0], DiscoveryOutcome::Ambiguous(_)));
         assert!(matches!(outcomes[1], DiscoveryOutcome::Ambiguous(_)));
         assert_eq!(not_found_reason(&outcomes[2]), "no locator");
+    }
+
+    #[test]
+    fn summarize_target_reports_available_with_scan_scope_and_pid() {
+        let mut t = target("planner", "/run/agents/planner.pid");
+        t.display_name = Some("Planning agent".to_string());
+        t.scan = Some(Scan {
+            config_roots: vec![PathBuf::from("/srv/planner")],
+        });
+        t.capture = Some(Capture {
+            binary_path: Some("/usr/bin/python3".to_string()),
+        });
+        let summary = summarize_target(&t, &available(42, 100, 42, 1000));
+        assert_eq!(summary.agent_key, "planner");
+        assert_eq!(summary.display_name.as_deref(), Some("Planning agent"));
+        assert_eq!(summary.status, "available");
+        assert_eq!(summary.reason, None);
+        assert_eq!(summary.pid, Some(42));
+        assert_eq!(summary.config_roots, vec!["/srv/planner".to_string()]);
+        assert_eq!(summary.binary_path.as_deref(), Some("/usr/bin/python3"));
+    }
+
+    #[test]
+    fn summarize_target_reports_not_found_and_ambiguous_with_no_pid() {
+        let t = target("executor", "/run/agents/executor.pid");
+        let not_found = summarize_target(&t, &DiscoveryOutcome::NotFound("no locator".to_string()));
+        assert_eq!(not_found.status, "not_found");
+        assert_eq!(not_found.reason.as_deref(), Some("no locator"));
+        assert_eq!(not_found.pid, None);
+
+        let ambiguous = summarize_target(
+            &t,
+            &DiscoveryOutcome::Ambiguous("shares a uid with 'planner'".to_string()),
+        );
+        assert_eq!(ambiguous.status, "ambiguous");
+        assert_eq!(ambiguous.pid, None);
+    }
+
+    #[test]
+    fn summarize_target_defaults_scan_and_capture_fields_when_absent() {
+        let t = target("executor", "/run/agents/executor.pid");
+        let summary = summarize_target(&t, &available(7, 1, 7, 1000));
+        assert!(summary.config_roots.is_empty());
+        assert_eq!(summary.binary_path, None);
+    }
+
+    #[test]
+    fn resolve_all_summary_is_one_entry_per_declared_agent_in_order() {
+        let m = manifest(vec![
+            target("planner", "/does/not/exist/planner.pid"),
+            target("executor", "/does/not/exist/executor.pid"),
+        ]);
+        let summaries = m.resolve_all_summary();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].agent_key, "planner");
+        assert_eq!(summaries[1].agent_key, "executor");
+        assert_eq!(summaries[0].status, "not_found");
+        assert_eq!(summaries[1].status, "not_found");
     }
 }
