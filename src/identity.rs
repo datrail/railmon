@@ -41,7 +41,15 @@ pub struct Target {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Discovery {
-    pub pid_file: PathBuf,
+    pub pid_file: Option<PathBuf>,
+    /// A non-delegated cgroup v2 directory: the agent's own uid has no write
+    /// access to its `cgroup.procs`, so it cannot add or remove its own
+    /// membership (design doc §4.1's "non-delegated cgroup" locator).
+    /// Resolution reads exactly that file, the same control-path/ownership
+    /// checks `pid_file` gets applied to it directly. Mutually exclusive
+    /// with `pid_file` — `validate()` and the published JSON Schema both
+    /// enforce exactly one locator per agent.
+    pub cgroup: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -203,11 +211,23 @@ impl TargetManifest {
             if !keys.insert(&target.agent_key) {
                 bail!("duplicate agent_key '{}'", target.agent_key);
             }
-            if !target.discovery.pid_file.is_absolute() {
-                bail!(
+            match (&target.discovery.pid_file, &target.discovery.cgroup) {
+                (Some(_), Some(_)) => bail!(
+                    "'{}' declares both pid_file and cgroup; exactly one locator is required",
+                    target.agent_key
+                ),
+                (None, None) => bail!(
+                    "'{}' declares no discovery locator; pid_file or cgroup is required",
+                    target.agent_key
+                ),
+                (Some(path), None) if !path.is_absolute() => bail!(
                     "pid_file for '{}' must be an absolute path",
                     target.agent_key
-                );
+                ),
+                (None, Some(path)) if !path.is_absolute() => {
+                    bail!("cgroup for '{}' must be an absolute path", target.agent_key)
+                }
+                _ => {}
             }
             if target.display_name.as_deref().is_some_and(str::is_empty) {
                 bail!("display_name for '{}' must not be empty", target.agent_key);
@@ -304,14 +324,60 @@ fn resolve_target(target: &Target, supervisor_uid: u32) -> DiscoveryOutcome {
     }
 }
 
-fn try_resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessIncarnation> {
-    validate_control_path(&target.discovery.pid_file, None)?;
-    let text = fs::read_to_string(&target.discovery.pid_file)
+/// The locator path to run every ownership/writability check against.
+/// `pid_file` names itself directly; `cgroup` names its `cgroup.procs` file —
+/// that is what delegation actually gates (a uid without write access to it
+/// cannot add or remove its own membership, the design's "non-delegated"
+/// requirement), and checking it also walks every ancestor directory
+/// (including the cgroup directory itself) via `validate_control_path`'s own
+/// upward walk.
+fn locator_path(target: &Target) -> Result<PathBuf> {
+    if let Some(pid_file) = &target.discovery.pid_file {
+        return Ok(pid_file.clone());
+    }
+    let cgroup = target
+        .discovery
+        .cgroup
+        .as_deref()
+        .context("target declares neither pid_file nor cgroup")?;
+    Ok(cgroup.join("cgroup.procs"))
+}
+
+/// The pid(s) an already-validated locator currently names. `pid_file` holds
+/// exactly one; `cgroup.procs` holds one PID per line, kernel-maintained.
+fn read_pids(target: &Target, locator_path: &Path) -> Result<Vec<u32>> {
+    let text = fs::read_to_string(locator_path)
         .with_context(|| format!("reading locator for '{}'", target.agent_key))?;
-    let pid: u32 = text
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid PID in {}", target.discovery.pid_file.display()))?;
+    if target.discovery.pid_file.is_some() {
+        let pid: u32 = text
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid PID in {}", locator_path.display()))?;
+        return Ok(vec![pid]);
+    }
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.trim()
+                .parse::<u32>()
+                .with_context(|| format!("invalid PID in {}", locator_path.display()))
+        })
+        .collect()
+}
+
+fn try_resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessIncarnation> {
+    let locator_path = locator_path(target)?;
+    validate_control_path(&locator_path, None)?;
+    let pids = read_pids(target, &locator_path)?;
+    let pid = match pids.as_slice() {
+        [] => bail!("locator {} names no process", locator_path.display()),
+        [pid] => *pid,
+        many => bail!(
+            "locator {} names {} processes; multi-process attribution is not supported yet",
+            locator_path.display(),
+            many.len()
+        ),
+    };
     if pid == 0 {
         bail!("PID zero is not a process target");
     }
@@ -322,11 +388,11 @@ fn try_resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessInc
     let uid = fs::metadata(&proc_dir)
         .with_context(|| format!("target '{}' is not live", target.agent_key))?
         .uid();
-    validate_control_path(&target.discovery.pid_file, Some(uid))?;
+    validate_control_path(&locator_path, Some(uid))?;
     if uid == supervisor_uid {
         bail!(
             "locator {} names a process owned by the supervisor",
-            target.discovery.pid_file.display()
+            locator_path.display()
         );
     }
     let stat_after = fs::read_to_string(proc_dir.join("stat"))
@@ -465,7 +531,21 @@ mod tests {
             agent_key: key.to_string(),
             display_name: None,
             discovery: Discovery {
-                pid_file: PathBuf::from(pid_file),
+                pid_file: Some(PathBuf::from(pid_file)),
+                cgroup: None,
+            },
+            scan: None,
+            capture: None,
+        }
+    }
+
+    fn target_with_cgroup(key: &str, cgroup: &str) -> Target {
+        Target {
+            agent_key: key.to_string(),
+            display_name: None,
+            discovery: Discovery {
+                pid_file: None,
+                cgroup: Some(PathBuf::from(cgroup)),
             },
             scan: None,
             capture: None,
@@ -576,6 +656,37 @@ mod tests {
     fn rejects_a_relative_pid_file() {
         let m = manifest(vec![target("planner", "agents/planner.pid")]);
         assert!(error_message(m.validate()).contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn rejects_a_target_declaring_both_pid_file_and_cgroup() {
+        let mut t = target("planner", "/run/agents/planner.pid");
+        t.discovery.cgroup = Some(PathBuf::from("/sys/fs/cgroup/agents/planner"));
+        let m = manifest(vec![t]);
+        assert!(error_message(m.validate()).contains("exactly one locator is required"));
+    }
+
+    #[test]
+    fn rejects_a_target_declaring_neither_pid_file_nor_cgroup() {
+        let mut t = target("planner", "/run/agents/planner.pid");
+        t.discovery.pid_file = None;
+        let m = manifest(vec![t]);
+        assert!(error_message(m.validate()).contains("discovery locator"));
+    }
+
+    #[test]
+    fn rejects_a_relative_cgroup() {
+        let m = manifest(vec![target_with_cgroup("planner", "agents/planner")]);
+        assert!(error_message(m.validate()).contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn accepts_a_cgroup_locator_shaped_target() {
+        let m = manifest(vec![target_with_cgroup(
+            "planner",
+            "/sys/fs/cgroup/agents/planner",
+        )]);
+        assert!(m.validate().is_ok());
     }
 
     #[test]
@@ -697,6 +808,62 @@ mod tests {
         let t = target("planner", pid_file.to_str().unwrap());
         let outcome = resolve_target(&t, unsafe { libc::geteuid() } + 1);
         assert!(not_found_reason(&outcome).contains("owned by monitored uid"));
+    }
+
+    // A cgroup locator resolves via its `cgroup.procs` file instead of a
+    // pid_file's own content, but shares every check downstream of that —
+    // same self-owned-UID fail-closed property, asserted the same way.
+    #[test]
+    fn resolve_target_reports_not_found_for_a_self_owned_cgroup_even_when_it_names_a_live_pid() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            dir.path().join("cgroup.procs"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            dir.path().join("cgroup.procs"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let t = target_with_cgroup("planner", dir.path().to_str().unwrap());
+        let outcome = resolve_target(&t, unsafe { libc::geteuid() } + 1);
+        assert!(not_found_reason(&outcome).contains("owned by monitored uid"));
+    }
+
+    #[test]
+    fn resolve_target_reports_not_found_for_a_cgroup_with_no_member_processes() {
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(dir.path().join("cgroup.procs"), "").unwrap();
+        fs::set_permissions(
+            dir.path().join("cgroup.procs"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let t = target_with_cgroup("planner", dir.path().to_str().unwrap());
+        let outcome = resolve_target(&t, unsafe { libc::geteuid() } + 1);
+        assert!(not_found_reason(&outcome).contains("names no process"));
+    }
+
+    #[test]
+    fn resolve_target_reports_not_found_for_a_cgroup_naming_multiple_processes() {
+        // M2 doesn't yet attribute a multi-process cgroup to one incarnation
+        // (that needs M3's supervisor/descendant model) — fails closed with a
+        // named reason rather than guessing which PID is the agent.
+        let dir = test_dir();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let pid = std::process::id();
+        fs::write(dir.path().join("cgroup.procs"), format!("{pid}\n{pid}")).unwrap();
+        fs::set_permissions(
+            dir.path().join("cgroup.procs"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let t = target_with_cgroup("planner", dir.path().to_str().unwrap());
+        let outcome = resolve_target(&t, unsafe { libc::geteuid() } + 1);
+        assert!(not_found_reason(&outcome).contains("multi-process attribution is not supported"));
     }
 
     #[test]

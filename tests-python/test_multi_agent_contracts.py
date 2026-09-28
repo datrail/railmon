@@ -146,6 +146,23 @@ class MultiAgentContractTests(unittest.TestCase):
         keys = [agent[unique_by] for agent in fixture["agents"]]
         self.assertNotEqual(len(keys), len(set(keys)))
 
+    def test_a_cgroup_only_discovery_locator_is_valid(self):
+        schema, fixture = self.load("target-manifest-v1")
+        fixture["agents"][0]["discovery"] = {"cgroup": "/sys/fs/cgroup/agents/planner"}
+        validate(fixture, schema)  # must not raise
+
+    def test_discovery_rejects_both_pid_file_and_cgroup(self):
+        schema, fixture = self.load("target-manifest-v1")
+        fixture["agents"][0]["discovery"]["cgroup"] = "/sys/fs/cgroup/agents/planner"
+        with self.assertRaises(ValidationError):
+            validate(fixture, schema)
+
+    def test_discovery_rejects_neither_pid_file_nor_cgroup(self):
+        schema, fixture = self.load("target-manifest-v1")
+        fixture["agents"][0]["discovery"] = {}
+        with self.assertRaises(ValidationError):
+            validate(fixture, schema)
+
 
 if __name__ == "__main__":
     unittest.main()
