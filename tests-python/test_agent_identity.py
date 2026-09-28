@@ -1526,7 +1526,7 @@ class RunOneCollectionTest(unittest.TestCase):
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
-                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", side_effect=lambda a: next(scope_calls)), \
                 mock.patch.object(scanner, "_deliver_v2_collection", side_effect=fake_deliver):
             code = scanner.run_one_collection(args)
 
@@ -1565,7 +1565,7 @@ class RunOneCollectionTest(unittest.TestCase):
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
-                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", side_effect=lambda a: next(scope_calls)), \
                 mock.patch.object(scanner, "_deliver_v2_collection", side_effect=fake_deliver):
             code = scanner.run_one_collection(args)
 
@@ -1598,7 +1598,7 @@ class RunOneCollectionTest(unittest.TestCase):
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
-                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", side_effect=lambda a: next(scope_calls)), \
                 mock.patch.object(scanner, "_deliver_v2_collection", deliver):
             code = scanner.run_one_collection(args)
 
@@ -1633,7 +1633,7 @@ class RunOneCollectionTest(unittest.TestCase):
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
-                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", side_effect=lambda a: next(scope_calls)), \
                 mock.patch.object(scanner, "_deliver_v2_collection", side_effect=fake_deliver):
             code = scanner.run_one_collection(args)
 
@@ -1649,6 +1649,122 @@ class RunOneCollectionTest(unittest.TestCase):
         for source in failed["inputs_attempted"].values():
             self.assertTrue(source["attempted"])
             self.assertFalse(source["reached"])
+
+    def test_scan_runs_exactly_once_per_scope_not_twice(self):
+        """A rail-review finding on an earlier version of this branch: v2
+        composition used to call `scan()` a second time per scope (once via
+        `run_one_scan`, again to build the v1 scope for composing), breaking
+        `build_verified_bundle`'s own "built once and shared" contract. Uses
+        the real `run_one_scan`/`_v1_scope_from_scan_result` (only `scan`
+        itself and network/registration are mocked) so this exercises the
+        real stash-and-reuse wiring, not a mock that could hide a
+        regression back to two scans."""
+        import tempfile
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def fake_scan(args):
+            calls["n"] += 1
+            return (
+                scanner.collect_self_context(),
+                {"host_id": "host-01", "sandbox_name": "shared"},
+                {"mcp_servers": []},
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = scanner.make_parser().parse_args(
+                [
+                    "--target-manifest", "/manifest.yaml",
+                    "--host-id", "host-01",
+                    "--sandbox-name", "shared",
+                    "--no-feature-file",
+                    "--evidence-bundle-output", os.path.join(tmp, "evidence.json"),
+                    "--compact",
+                ]
+            )
+            targets = [{"agent_key": "planner", "status": "available", "config_roots": [tmp]}]
+            with mock.patch.object(scanner, "scan", side_effect=fake_scan), \
+                    mock.patch.object(scanner, "resolve_targets", return_value=targets):
+                code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 0)
+        # Exactly one scan for the sandbox scope, one for the single agent —
+        # not four (two per scope), which is what the bug this test guards
+        # against would have produced.
+        self.assertEqual(calls["n"], 2)
+
+    def test_a_resolve_failure_still_delivers_the_sandbox_v1_fallback(self):
+        """A rail-review finding: suppressing the sandbox scan's own v1
+        write on the bet that a v2 collection would follow means a broken
+        manifest — caught only after that scan already ran — used to lose
+        the sandbox's evidence outright. `_deliver_v1_fallback` must run
+        with the exact args object `run_one_scan` was called with, so it
+        can reuse that same scan's stashed result."""
+        from unittest import mock
+
+        args = self.base_args()
+        args.no_evidence_bundle = False
+        fallback = mock.Mock()
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0) as run_scan, \
+                mock.patch.object(scanner, "resolve_targets", side_effect=scanner.ScannerError("boom")), \
+                mock.patch.object(scanner, "_deliver_v1_fallback", fallback):
+            code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 2)
+        fallback.assert_called_once()
+        (fallback_args,), _ = fallback.call_args
+        (scan_args,), _ = run_scan.call_args
+        self.assertIs(fallback_args, scan_args)
+
+    def test_host_id_undetermined_still_calls_v1_fallback(self):
+        """The other half of the same finding: when `scan()` fails before
+        even a `host_id`/`sandbox_name` can be named, no v2 collection is
+        schema-legal — but the scan that already ran should still fall back
+        to a v1 delivery rather than vanishing."""
+        from unittest import mock
+
+        args = self.base_args()
+        args.no_evidence_bundle = False
+        targets = [{"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]}]
+        planner_v1 = self.v1_scope({"model_name": {"value": "claude", "status": "ANSWERED", "tier": "observed"}})
+        scope_calls = iter([(None, None), (planner_v1, {"env": {}})])
+        fallback = mock.Mock()
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_deliver_v1_fallback", fallback):
+            code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 2)
+        fallback.assert_called_once()
+
+    def test_agents_fall_back_to_normal_v1_path_when_no_v2_collection_possible(self):
+        """The regression this finding named directly: when the sandbox
+        scope can't be built at all (`sandbox_v1` stays `None`), an
+        otherwise-successful agent must not have its own v1 evidence
+        bundle suppressed for a v2 collection that will never exist —
+        it gets the same keyed `evidence_bundle_output` a non-v2 run uses."""
+        from unittest import mock
+
+        args = self.base_args()
+        args.no_evidence_bundle = False
+        targets = [{"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]}]
+        calls = []
+
+        with mock.patch.object(scanner, "run_one_scan", side_effect=lambda a: calls.append(a) or 0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", return_value=(None, None)):
+            code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 2)
+        # calls[0] is the sandbox scan; calls[1] is planner's own.
+        self.assertEqual(len(calls), 2)
+        planner_call = calls[1]
+        self.assertFalse(getattr(planner_call, "_v2_collection", False))
+        self.assertTrue(planner_call.evidence_bundle_output.endswith(".planner"))
 
 
 class MainTargetManifestDispatchTest(unittest.TestCase):
