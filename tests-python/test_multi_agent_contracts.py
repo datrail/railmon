@@ -55,6 +55,7 @@ def validate(value, schema, root=None, path="$"):
             "array": isinstance(value, list),
             "string": isinstance(value, str),
             "integer": isinstance(value, int) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
         }
         if not any(checks.get(choice, False) for choice in choices):
             raise ValidationError(f"{path}: wrong type")
@@ -103,7 +104,7 @@ class MultiAgentContractTests(unittest.TestCase):
         return schema, fixture
 
     def test_every_published_fixture_conforms_to_its_complete_schema(self):
-        for name in ("agent-ref-v1", "runtime-identity-v1", "target-manifest-v1"):
+        for name in ("agent-ref-v1", "runtime-identity-v1", "target-manifest-v1", "evidence-bundle-v2"):
             with self.subTest(name=name):
                 schema, fixture = self.load(name)
                 validate(fixture, schema)

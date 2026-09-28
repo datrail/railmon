@@ -69,6 +69,16 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # applies when the set grows. Not in the schema — it is only bounded there.
 RULE_PACK_VERSION = 1
 
+# ── the v2 (DR-109 multi-agent) contract, loaded the same way ──────────────
+# A second, independent document: v2 is not v1-plus-fields, so it gets its
+# own closed sets rather than a diff against the v1 ones above.
+SCHEMA_V2_PATH = Path(__file__).resolve().parent.parent.parent / "schemas" / "evidence-bundle-v2.schema.json"
+SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
+_AGENT_SCOPE_DEF = SCHEMA_V2["$defs"]["agent_scope"]
+REASONS_V2 = frozenset(SCHEMA_V2["$defs"]["reason"]["enum"])
+DISCOVERY_STATUSES = frozenset(_AGENT_SCOPE_DEF["properties"]["discovery_status"]["enum"])
+BUNDLE_VERSION_V2 = SCHEMA_V2["properties"]["bundle_version"]["const"]
+
 # Rail Center's profiler vocabulary is intentionally narrower than the
 # scanner's inventory vocabulary. An empty secret-shaped environment variable
 # is not a credential, while a reference is represented as `secret_ref` so the
@@ -317,6 +327,50 @@ def verify_bundle(bundle: dict[str, Any]) -> None:
         raise ScannerError(f"evidence bundle failed its contract: {problems[:5]}")
 
 
+def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
+    """The v2 rules the published schema's own `$comment` names as
+    code-only: every `attestation_ref` (sandbox- or agent-scoped) names a
+    real attestation, and `agents[]` is sorted ascending by `agent_key` with
+    no duplicate — a duplicate key "make[s] the whole collection invalid"
+    (design §4.3), not just that one entry."""
+    problems: list[str] = []
+    attestations = {a.get("id") for a in (bundle.get("attestations") or [])}
+
+    def check_attribute_refs(attributes: Any, where: str) -> None:
+        for name, field in (attributes or {}).items():
+            if isinstance(field, dict) and field.get("attestation_ref") not in (None, *attestations):
+                problems.append(f"{where}.{name}.attestation_ref: {field['attestation_ref']!r} points at nothing")
+
+    check_attribute_refs((bundle.get("sandbox") or {}).get("attributes"), "sandbox.attributes")
+    agents = bundle.get("agents") or []
+    keys = [agent.get("agent_key") for agent in agents if isinstance(agent, dict)]
+    if len(set(keys)) != len(keys):
+        problems.append("agents: duplicate agent_key makes the collection invalid")
+    elif keys != sorted(keys):
+        problems.append("agents: entries must be sorted ascending by agent_key")
+    for index, agent in enumerate(agents):
+        if isinstance(agent, dict):
+            check_attribute_refs(agent.get("attributes"), f"agents[{index}].attributes")
+    return problems
+
+
+def contract_problems_v2(bundle: dict[str, Any]) -> list[str]:
+    """The v2 counterpart of `contract_problems`: everything the published
+    v2 schema would reject, plus the sort/uniqueness/attestation-ref rules
+    it cannot express."""
+    return _schema_problems(bundle, SCHEMA_V2, "bundle", SCHEMA_V2) + _semantic_problems_v2(bundle)
+
+
+def verify_bundle_v2(bundle: dict[str, Any]) -> None:
+    """`verify_bundle`'s v2 counterpart — every v2 collection this pack
+    emits goes through this before it is written or delivered."""
+    problems = contract_problems_v2(bundle)
+    if problems:
+        from scan_agent_environment import ScannerError  # lazy: no cycle at load
+
+        raise ScannerError(f"evidence bundle v2 failed its contract: {problems[:5]}")
+
+
 # ── field builders ──────────────────────────────────────────────────────────
 
 
@@ -346,6 +400,83 @@ def _partial(value: Any, tier: str, reason: str, **extra: Any) -> dict[str, Any]
     }
     field.update(extra)
     return field
+
+
+def _failed(reason: str, tier: str, **extra: Any) -> dict[str, Any]:
+    """A collection attempt that broke, as opposed to `_blind` (nothing to
+    collect) or `_absent` (collected, and there was genuinely nothing
+    there). `FAILED` has been a legal status in both bundle schemas since
+    they were published, but nothing built one — design §5's "shared
+    evidence collection fails" / "one agent collector fails" rows are the
+    first real producers of it (DR-109 M2)."""
+    field: dict[str, Any] = {"value": None, "status": "FAILED", "reason": reason, "tier": tier}
+    field.update(extra)
+    return field
+
+
+def unattempted_inputs(reason: str) -> dict[str, Any]:
+    """An `inputs_attempted` object for a scope nothing was read for at all
+    — a manifest agent that discovery could not resolve to a live process
+    (`not_found`/`ambiguous`), or a shared-evidence collection that failed
+    outright before any source was reached. Every required source (`runtime`,
+    `image`, `manifest`, `repo`) gets the same closed-set reason."""
+    return {name: _source(False, False, reason) for name in INPUT_SOURCES}
+
+
+def scope_unresolved_attributes(template_attributes: dict[str, Any], sandbox_keys: frozenset[str]) -> dict[str, Any]:
+    """`BLIND`/`MULTI_AGENT_SCOPE_UNRESOLVED` for every attribute that would
+    otherwise be agent-scoped, for a manifest agent a v2-aware collector
+    genuinely cannot isolate evidence to — e.g. `discovery_status: available`
+    but no `scan.config_roots` declared for it, so nothing agent-specific
+    exists to scope a scan to (design §4.3: "An attribute whose collector
+    cannot isolate one agent is BLIND with a closed reason such as
+    MULTI_AGENT_SCOPE_UNRESOLVED; it is not copied from the container and
+    presented as agent-specific.").
+
+    `template_attributes` is another scope's already-built attribute dict
+    (in practice, the sandbox-wide scan's own) used only as a source of
+    attribute *names* and *tiers* — never of values, which this function
+    never copies, per the rule it exists to implement.
+    """
+    return {
+        name: _blind(
+            "MULTI_AGENT_SCOPE_UNRESOLVED",
+            attribute.get("tier", "observed"),
+            note="no scan.config_roots declared for this agent under the target manifest; "
+                 "the collector cannot isolate this attribute to one agent",
+        )
+        for name, attribute in template_attributes.items()
+        if name not in sandbox_keys
+    }
+
+
+def failed_inputs(reason: str) -> dict[str, Any]:
+    """An `inputs_attempted` object for a scope this pack genuinely tried to
+    collect and could not finish — design §5's "shared evidence collection
+    fails" / "one agent collector fails" rows. Distinct from
+    `unattempted_inputs` (a target discovery never resolved, so nothing was
+    tried at all): every source here is `attempted` but not `reached`."""
+    return {name: _source(True, False, reason) for name in INPUT_SOURCES}
+
+
+def failed_attributes(template_attributes: dict[str, Any], exclude_keys: frozenset[str]) -> dict[str, Any]:
+    """`FAILED` for every attribute name a working scan of this scope would
+    have populated, sourced from another scope's already-built attributes as
+    a name/tier template — the same trick `scope_unresolved_attributes` uses
+    above, reused here for a scan that raised instead of completing (design
+    §5, "one agent collector fails"). An empty template (the sandbox scope's
+    own scan also failed, so no name list exists) honestly yields `{}`
+    rather than guessing attribute names.
+    """
+    return {
+        name: _failed(
+            "PARSE_FAILED",
+            attribute.get("tier", "observed"),
+            note="this scope's scan attempt failed before producing attribute data",
+        )
+        for name, attribute in template_attributes.items()
+        if name not in exclude_keys
+    }
 
 
 def _source(attempted: bool, reached: bool, reason: str) -> dict[str, Any]:

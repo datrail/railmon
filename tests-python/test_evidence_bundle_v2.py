@@ -149,3 +149,150 @@ class EvidenceBundleV2SchemaTest(unittest.TestCase):
         bundle["agents"] = [copy.deepcopy(bundle["agents"][0]), copy.deepcopy(bundle["agents"][0])]
         problems = evidence_bundle._schema_problems(bundle, V2_SCHEMA, "bundle", V2_SCHEMA)
         self.assertEqual(problems, [])
+
+
+class ContractProblemsV2Test(unittest.TestCase):
+    """`contract_problems_v2`/`verify_bundle_v2` catch the two rules the
+    schema itself cannot express (DR-109 M2): sorted, unique `agent_key`s,
+    and an `attestation_ref` naming a real attestation — unlike
+    `EvidenceBundleV2SchemaTest` above, which only checks the published
+    schema in isolation."""
+
+    def build(self) -> dict:
+        return composer.compose(
+            "host-01", "shared", {"planner": full_source("claude"), "executor": full_source("gpt")}
+        )
+
+    def test_a_composed_bundle_has_no_contract_problems(self):
+        self.assertEqual(evidence_bundle.contract_problems_v2(self.build()), [])
+
+    def test_duplicate_agent_key_is_a_contract_problem_not_just_a_schema_gap(self):
+        bundle = self.build()
+        bundle["agents"] = [copy.deepcopy(bundle["agents"][0]), copy.deepcopy(bundle["agents"][0])]
+        problems = evidence_bundle.contract_problems_v2(bundle)
+        self.assertTrue(any("duplicate" in p for p in problems), problems)
+
+    def test_out_of_order_agents_is_a_contract_problem(self):
+        bundle = self.build()
+        bundle["agents"] = list(reversed(bundle["agents"]))
+        problems = evidence_bundle.contract_problems_v2(bundle)
+        self.assertTrue(any("sorted" in p for p in problems), problems)
+
+    def test_an_attestation_ref_naming_nothing_is_a_contract_problem(self):
+        bundle = self.build()
+        bundle["agents"][0]["attributes"]["model_name"]["attestation_ref"] = "att-does-not-exist"
+        problems = evidence_bundle.contract_problems_v2(bundle)
+        self.assertTrue(any("attestation_ref" in p for p in problems), problems)
+
+    def test_verify_bundle_v2_raises_on_a_broken_bundle(self):
+        # Not `scanner.ScannerError` by name: this file never registers
+        # "scan_agent_environment" under `sys.modules`, so `verify_bundle_v2`'s
+        # own lazy `from scan_agent_environment import ScannerError` may
+        # resolve to a module object this file never loaded (whichever test
+        # file claimed that name first in this `unittest discover` process) —
+        # asserting the raise, not a specific class identity, is what's
+        # actually load-bearing here.
+        bundle = self.build()
+        bundle["agents"] = [copy.deepcopy(bundle["agents"][0]), copy.deepcopy(bundle["agents"][0])]
+        with self.assertRaises(Exception):
+            evidence_bundle.verify_bundle_v2(bundle)
+
+
+class ComposeFromScopesTest(unittest.TestCase):
+    """The real `--target-manifest` collection path's own composer
+    (DR-109 M2), distinct from `compose()`'s whole-bundle-merge contract:
+    the caller already scoped each piece correctly, so there is nothing left
+    to merge or agree on, only to validate, sort and wrap."""
+
+    def agent(self, key: str, status: str = "available") -> dict:
+        return {
+            "agent_key": key,
+            "discovery_status": status,
+            "inputs_attempted": {"runtime": {"attempted": True, "reached": True}},
+            "attributes": {"model_name": {"value": key, "status": "ANSWERED", "tier": "observed"}},
+        }
+
+    def test_agents_are_sorted_by_key(self):
+        bundle = composer.compose_from_scopes(
+            host_id="host-01",
+            sandbox_name="shared",
+            rule_pack_version=1,
+            sandbox_inputs={"runtime": {"attempted": True, "reached": True}},
+            sandbox_attributes={"image_digest": {"value": "sha256:abc", "status": "ANSWERED", "tier": "observed"}},
+            agent_entries=[self.agent("planner"), self.agent("executor")],
+        )
+        self.assertEqual(bundle["bundle_version"], 2)
+        self.assertEqual([a["agent_key"] for a in bundle["agents"]], ["executor", "planner"])
+        self.assertEqual(bundle["sandbox"]["attributes"]["image_digest"]["value"], "sha256:abc")
+
+    def test_at_least_one_agent_entry_is_required(self):
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            composer.compose_from_scopes(
+                host_id="host-01",
+                sandbox_name="shared",
+                rule_pack_version=1,
+                sandbox_inputs={},
+                sandbox_attributes={},
+                agent_entries=[],
+            )
+
+    def test_duplicate_agent_key_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            composer.compose_from_scopes(
+                host_id="host-01",
+                sandbox_name="shared",
+                rule_pack_version=1,
+                sandbox_inputs={},
+                sandbox_attributes={},
+                agent_entries=[self.agent("planner"), self.agent("planner")],
+            )
+
+    def test_the_default_key_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            composer.compose_from_scopes(
+                host_id="host-01",
+                sandbox_name="shared",
+                rule_pack_version=1,
+                sandbox_inputs={},
+                sandbox_attributes={},
+                agent_entries=[self.agent("default")],
+            )
+
+    def test_a_failed_or_not_found_agent_is_still_an_entry(self):
+        bundle = composer.compose_from_scopes(
+            host_id="host-01",
+            sandbox_name="shared",
+            rule_pack_version=1,
+            sandbox_inputs={},
+            sandbox_attributes={},
+            agent_entries=[self.agent("planner", status="not_found")],
+        )
+        self.assertEqual(bundle["agents"][0]["discovery_status"], "not_found")
+
+
+class FailedScopeBuildersTest(unittest.TestCase):
+    """`failed_inputs`/`failed_attributes` (DR-109 M2, design §5's "shared
+    evidence collection fails" / "one agent collector fails" rows) —
+    distinct from `unattempted_inputs`/`scope_unresolved_attributes`, which
+    describe a target that was never even tried."""
+
+    def test_failed_inputs_are_attempted_but_not_reached(self):
+        inputs = evidence_bundle.failed_inputs("PARSE_FAILED")
+        self.assertEqual(set(inputs), {"runtime", "image", "manifest", "repo"})
+        for source in inputs.values():
+            self.assertTrue(source["attempted"])
+            self.assertFalse(source["reached"])
+            self.assertEqual(source["reason"], "PARSE_FAILED")
+
+    def test_failed_attributes_cover_every_template_name_outside_the_exclusion(self):
+        template = {
+            "image_digest": {"value": "sha256:abc", "status": "ANSWERED", "tier": "observed"},
+            "model_name": {"value": "claude", "status": "ANSWERED", "tier": "declared"},
+        }
+        attrs = evidence_bundle.failed_attributes(template, frozenset({"image_digest"}))
+        self.assertEqual(set(attrs), {"model_name"})
+        self.assertEqual(attrs["model_name"]["status"], "FAILED")
+        self.assertEqual(attrs["model_name"]["tier"], "declared")
+
+    def test_an_empty_template_yields_no_attributes(self):
+        self.assertEqual(evidence_bundle.failed_attributes({}, frozenset()), {})

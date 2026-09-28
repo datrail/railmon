@@ -9,16 +9,66 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import sys
 import unittest
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-SCANNER = ROOT / "tools" / "agent-environment-scanner" / "scan_agent_environment.py"
+SCANNER_DIR = ROOT / "tools" / "agent-environment-scanner"
+SCANNER = SCANNER_DIR / "scan_agent_environment.py"
 
 _spec = importlib.util.spec_from_file_location("scan_agent_environment", SCANNER)
 scanner = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(scanner)
+_bundle_spec = importlib.util.spec_from_file_location("evidence_bundle", SCANNER_DIR / "evidence_bundle.py")
+evidence_bundle = importlib.util.module_from_spec(_bundle_spec)
+assert _bundle_spec.loader is not None
+_bundle_spec.loader.exec_module(evidence_bundle)
+
+_composer_spec = importlib.util.spec_from_file_location(
+    "compose_evidence_bundle_v2", SCANNER_DIR / "compose_evidence_bundle_v2.py"
+)
+composer = importlib.util.module_from_spec(_composer_spec)
+assert _composer_spec.loader is not None
+_composer_spec.loader.exec_module(composer)
+
+# This module's own lazy `import evidence_bundle` / `import
+# compose_evidence_bundle_v2` / `import scan_agent_environment` (inside
+# run_one_scan/run_one_collection and evidence_bundle.py's own functions)
+# need to resolve to the exact objects loaded above, not a second copy, so
+# `mock.patch.object(scanner, ...)` below actually takes effect where the
+# lazy import looks. But `unittest discover` imports every test file's
+# module-level code into one process before running any test, and
+# `test_evidence_bundle.py` claims "scan_agent_environment" under sys.modules
+# the same way — a bare unconditional/`setdefault` write here at import time
+# would win or lose that race depending on file-name alphabetical order and
+# corrupt whichever file loses it for its entire run. `setUpModule`/
+# `tearDownModule` instead scope the registration to exactly this file's own
+# test run (unittest calls them immediately before/after this module's
+# tests), saving and restoring whatever was there before.
+_PATCHED_MODULES = {
+    "scan_agent_environment": scanner,
+    "evidence_bundle": evidence_bundle,
+    "compose_evidence_bundle_v2": composer,
+}
+_saved_modules: dict[str, Any] = {}
+
+
+def setUpModule() -> None:
+    for name, module in _PATCHED_MODULES.items():
+        _saved_modules[name] = sys.modules.get(name)
+        sys.modules[name] = module
+
+
+def tearDownModule() -> None:
+    for name, original in _saved_modules.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+    _saved_modules.clear()
 
 # Rail configuration in the developer's own shell is inherited by every
 # subprocess test below, and it changes what the scanner does: RAIL_AUTH_MODE
@@ -1361,7 +1411,20 @@ class RunOneCollectionTest(unittest.TestCase):
             evidence_bundle_output=None,
             no_evidence_bundle=True,
             raildash_url=None,
+            host_id="host-01",
+            sandbox_name="shared-agents",
+            compact=True,
         )
+
+    def v1_scope(self, attributes, host_id="host-01", sandbox_name="shared-agents"):
+        return {
+            "host_id": host_id,
+            "sandbox_name": sandbox_name,
+            "rule_pack_version": 1,
+            "inputs_attempted": {"runtime": {"attempted": True, "reached": True}},
+            "attributes": attributes,
+            "attestations": [],
+        }
 
     def test_sandbox_wide_scan_runs_unmodified_and_first(self):
         from unittest import mock
@@ -1431,6 +1494,161 @@ class RunOneCollectionTest(unittest.TestCase):
         ):
             code = scanner.run_one_collection(self.base_args())
         self.assertEqual(code, 2)
+
+    def test_v2_collection_composes_one_bundle_with_every_target_scenario(self):
+        """DR-109 M2: a manifest-scoped run producing evidence composes one
+        v2 collection (not N v1 bundles) with a real per-target
+        `discovery_status`, not a hardcoded `"available"` — an available
+        scanned agent, a not_found agent, and an available agent with no
+        `scan.config_roots` (BLIND/MULTI_AGENT_SCOPE_UNRESOLVED) each land
+        their own correctly-shaped `agents[]` entry."""
+        from unittest import mock
+
+        args = self.base_args()
+        args.no_evidence_bundle = False
+        targets = [
+            {"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]},
+            {"agent_key": "executor", "status": "not_found", "reason": "no locator"},
+            {"agent_key": "reviewer", "status": "available", "config_roots": []},
+        ]
+        sandbox_v1 = self.v1_scope({
+            "image_digest": {"value": "sha256:abc", "status": "ANSWERED", "tier": "observed"},
+            "model_name": {"value": "should-not-leak-into-agents", "status": "ANSWERED", "tier": "observed"},
+        })
+        planner_v1 = self.v1_scope({"model_name": {"value": "claude", "status": "ANSWERED", "tier": "observed"}})
+        scope_calls = iter([(sandbox_v1, {"env": {}}), (planner_v1, {"env": {}})])
+        delivered = {}
+
+        def fake_deliver(args, sandbox, agent_entries):
+            delivered["sandbox"] = sandbox
+            delivered["agent_entries"] = {e["agent_key"]: e for e in agent_entries}
+            return 0
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_deliver_v2_collection", side_effect=fake_deliver):
+            code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 0)
+        entries = delivered["agent_entries"]
+        self.assertEqual(set(entries), {"planner", "executor", "reviewer"})
+        self.assertEqual(entries["planner"]["discovery_status"], "available")
+        self.assertEqual(entries["planner"]["attributes"]["model_name"]["value"], "claude")
+        self.assertEqual(entries["executor"]["discovery_status"], "not_found")
+        self.assertEqual(entries["executor"]["attributes"], {})
+        self.assertEqual(entries["reviewer"]["discovery_status"], "available")
+        self.assertEqual(
+            entries["reviewer"]["attributes"]["model_name"]["reason"], "MULTI_AGENT_SCOPE_UNRESOLVED"
+        )
+        self.assertNotIn("image_digest", entries["reviewer"]["attributes"])
+
+    def test_sandbox_collector_failure_marks_the_sandbox_scope_failed_not_omitted(self):
+        """Design §5, 'Shared evidence collection fails': agent-scoped
+        scanning still runs and the collection is still composed and
+        delivered, with the sandbox scope's every source `FAILED` rather
+        than no v2 collection at all — as long as `scan()` got far enough to
+        name a `host_id`/`sandbox_name`."""
+        from unittest import mock
+
+        args = self.base_args()
+        args.no_evidence_bundle = False
+        targets = [{"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]}]
+        planner_v1 = self.v1_scope({"model_name": {"value": "claude", "status": "ANSWERED", "tier": "observed"}})
+        scope_calls = iter([(None, {"env": {}}), (planner_v1, {"env": {}})])
+        delivered = {}
+
+        def fake_deliver(args, sandbox, agent_entries):
+            delivered["sandbox"] = sandbox
+            delivered["agent_entries"] = agent_entries
+            return 0
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_deliver_v2_collection", side_effect=fake_deliver):
+            code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 2)  # the sandbox failure itself is still a real failure
+        self.assertIn("sandbox", delivered)
+        sandbox = delivered["sandbox"]
+        self.assertEqual(sandbox["host_id"], "host-01")
+        self.assertEqual(sandbox["sandbox_name"], "shared-agents")
+        self.assertEqual(sandbox["attributes"], {})
+        for source in sandbox["inputs_attempted"].values():
+            self.assertTrue(source["attempted"])
+            self.assertFalse(source["reached"])
+        self.assertEqual(len(delivered["agent_entries"]), 1)
+
+    def test_sandbox_collector_failure_with_no_context_produces_no_v2_collection(self):
+        """When `scan()` fails before even a `host_id`/`sandbox_name` can be
+        named, no schema-legal v2 collection can be built at all (both are
+        required non-empty top-level fields) — delivery is skipped
+        entirely, same as before this scope existed."""
+        from unittest import mock
+
+        args = self.base_args()
+        args.host_id = None
+        args.sandbox_name = None
+        args.no_evidence_bundle = False
+        targets = [{"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]}]
+        planner_v1 = self.v1_scope({"model_name": {"value": "claude", "status": "ANSWERED", "tier": "observed"}})
+        scope_calls = iter([(None, None), (planner_v1, {"env": {}})])
+        deliver = mock.Mock()
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_deliver_v2_collection", deliver):
+            code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 2)
+        deliver.assert_not_called()
+
+    def test_one_agent_collector_failure_is_present_and_failed_not_omitted(self):
+        """Design §5, 'One agent collector fails': the other keyed agent
+        still gets its own entry; the failed one is present with `FAILED`
+        attributes covering the sandbox scope's own attribute template,
+        not silently missing from `agents[]`."""
+        from unittest import mock
+
+        args = self.base_args()
+        args.no_evidence_bundle = False
+        targets = [
+            {"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]},
+            {"agent_key": "executor", "status": "available", "config_roots": ["/srv/executor"]},
+        ]
+        sandbox_v1 = self.v1_scope({
+            "image_digest": {"value": "sha256:abc", "status": "ANSWERED", "tier": "observed"},
+            "model_name": {"value": "sandbox-template-only", "status": "ANSWERED", "tier": "declared"},
+        })
+        executor_v1 = self.v1_scope({"model_name": {"value": "gpt", "status": "ANSWERED", "tier": "observed"}})
+        # planner's own scan fails after context was established.
+        scope_calls = iter([(sandbox_v1, {"env": {}}), (None, {"env": {}}), (executor_v1, {"env": {}})])
+        delivered = {}
+
+        def fake_deliver(args, sandbox, agent_entries):
+            delivered["agent_entries"] = {e["agent_key"]: e for e in agent_entries}
+            return 0
+
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets), \
+                mock.patch.object(scanner, "_build_v1_scope", side_effect=lambda a: next(scope_calls)), \
+                mock.patch.object(scanner, "_deliver_v2_collection", side_effect=fake_deliver):
+            code = scanner.run_one_collection(args)
+
+        self.assertEqual(code, 2)
+        entries = delivered["agent_entries"]
+        self.assertEqual(set(entries), {"planner", "executor"})
+        self.assertEqual(entries["executor"]["attributes"]["model_name"]["value"], "gpt")
+        failed = entries["planner"]
+        self.assertEqual(failed["discovery_status"], "available")
+        self.assertEqual(failed["attributes"]["model_name"]["status"], "FAILED")
+        self.assertEqual(failed["attributes"]["model_name"]["tier"], "declared")
+        self.assertNotIn("image_digest", failed["attributes"])
+        for source in failed["inputs_attempted"].values():
+            self.assertTrue(source["attempted"])
+            self.assertFalse(source["reached"])
 
 
 class MainTargetManifestDispatchTest(unittest.TestCase):

@@ -17,20 +17,100 @@ from pathlib import Path
 from typing import Any
 
 KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
-SANDBOX_ATTRIBUTES = frozenset({"container_identity", "image_digest", "mounts", "deployment"})
+# Design §4.3: "Image identity, container labels, mounts, container network
+# policy, and deployment identity are sandbox-scoped." `container_identity`
+# carries the host_id/sandbox_name pair (the closest existing attribute to
+# "container labels"); `sandbox_network_policy` was missing here even though
+# it is named explicitly in that sentence — an omission that would have let
+# it ride into `agents[].attributes` as if it varied per agent, when a
+# container has exactly one network mode for every process inside it.
+SANDBOX_ATTRIBUTES = frozenset(
+    {"container_identity", "image_digest", "mounts", "deployment", "sandbox_network_policy"}
+)
 
 
-def compose(host_id: str, sandbox_name: str, agents: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def agent_scoped_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
+    """The subset of a v1-shaped attribute dict that belongs under one
+    agent's scope rather than the shared sandbox scope — the same filter
+    `compose()` already applied inline, factored out so the real
+    `--target-manifest` collection path (`run_one_collection`) can reuse it
+    without going through `compose()`'s whole-bundle-merge contract."""
+    return {name: value for name, value in attributes.items() if name not in SANDBOX_ATTRIBUTES}
+
+
+def validate_agent_keys(agent_keys: list[str]) -> None:
+    """The two rules the v2 schema's own `$comment` names as code-only:
+    every `agent_key` is a valid, non-`default` multi-agent key, and no key
+    repeats. Shared by `compose()` and `compose_from_scopes()` so both entry
+    points fail closed the same way."""
+    seen: set[str] = set()
+    for key in agent_keys:
+        if key == "default" or KEY.fullmatch(key) is None:
+            raise ValueError(f"invalid multi-agent key: {key!r}")
+        if key in seen:
+            raise ValueError(f"duplicate agent_key: {key!r}")
+        seen.add(key)
+
+
+def compose_from_scopes(
+    host_id: str,
+    sandbox_name: str,
+    rule_pack_version: int,
+    sandbox_inputs: dict[str, Any],
+    sandbox_attributes: dict[str, Any],
+    agent_entries: list[dict[str, Any]],
+    attestations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Assemble one v2 collection from pieces a caller already scoped
+    correctly — the real `--target-manifest` collection path (DR-109 M2).
+
+    Unlike `compose()`, which derives the sandbox scope by merging N full v1
+    bundles and failing closed on any disagreement between them, a real
+    collection already has exactly one authoritative sandbox-wide scan (this
+    function takes its `inputs_attempted`/`attributes` directly) plus zero or
+    more agent entries — some `available` with real agent-scoped attributes,
+    some `not_found`/`ambiguous`/scope-unresolved placeholders `run_one_collection`
+    builds for a declared agent it could not (yet) isolate evidence for. There
+    is nothing left to merge or agree on, only to validate, sort, and wrap.
+    """
+    if not agent_entries:
+        raise ValueError("at least one agent entry is required")
+    validate_agent_keys([entry["agent_key"] for entry in agent_entries])
+    return {
+        "bundle_version": 2,
+        "bundle_id": f"bnd-{uuid.uuid4()}",
+        "host_id": host_id,
+        "sandbox_name": sandbox_name,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "rule_pack_version": rule_pack_version,
+        "sandbox": {"inputs_attempted": sandbox_inputs, "attributes": sandbox_attributes},
+        "agents": sorted(agent_entries, key=lambda entry: entry["agent_key"]),
+        "attestations": list(attestations or []),
+    }
+
+
+def compose(
+    host_id: str,
+    sandbox_name: str,
+    agents: dict[str, dict[str, Any]],
+    discovery_status: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """`discovery_status` defaults every key to `"available"` — right for
+    this function's own contract, since every source here is a real v1
+    bundle a scan actually produced for that key, not a placeholder for a
+    target that was never resolved. A caller that does know a finer-grained
+    outcome (e.g. one recomputed after the source bundle was built) can
+    override it per key; an unnamed key still defaults to `"available"`."""
     if not agents:
         raise ValueError("at least one keyed agent bundle is required")
+    discovery_status = discovery_status or {}
     entries: list[dict[str, Any]] = []
     shared: dict[str, Any] = {}
     shared_inputs: dict[str, Any] | None = None
     rule_pack: int | None = None
     attestations: dict[str, dict[str, Any]] = {}
+    validate_agent_keys(list(agents))
     for key in sorted(agents):
-        if key == "default" or KEY.fullmatch(key) is None:
-            raise ValueError(f"invalid multi-agent key: {key!r}")
         bundle = agents[key]
         if bundle.get("bundle_version") != 1:
             raise ValueError(f"{key}: source must be an evidence bundle v1")
@@ -60,11 +140,11 @@ def compose(host_id: str, sandbox_name: str, agents: dict[str, dict[str, Any]]) 
             if attestation_id in attestations and attestations[attestation_id] != attestation:
                 raise ValueError(f"attestation {attestation_id!r} disagrees between agents")
             attestations[attestation_id] = attestation
-        agent_attributes = {name: value for name, value in attributes.items() if name not in SANDBOX_ATTRIBUTES}
+        agent_attributes = agent_scoped_attributes(attributes)
         entries.append(
             {
                 "agent_key": key,
-                "discovery_status": "available",
+                "discovery_status": discovery_status.get(key, "available"),
                 "inputs_attempted": inputs,
                 "attributes": agent_attributes,
             }
