@@ -137,6 +137,14 @@ pub struct ResolvedTargetSummary {
     pub pid: Option<u32>,
     pub config_roots: Vec<String>,
     pub binary_path: Option<String>,
+    /// A `RAIL_AGENT_KEY` value the resolved process declares in its own
+    /// environment, when the supervisor could read it (design doc §4.1).
+    /// Diagnostic only: kept out of `DiscoveryOutcome`/`ProcessIncarnation`
+    /// entirely, so it structurally cannot reach `mark_collisions` or any
+    /// attribution decision — this field exists only for a human or the
+    /// Python scanner to log a mismatch against the manifest's declared
+    /// `agent_key`, never to resolve or corroborate one.
+    pub self_asserted_agent_key: Option<String>,
 }
 
 fn summarize_target(target: &Target, outcome: &DiscoveryOutcome) -> ResolvedTargetSummary {
@@ -162,7 +170,26 @@ fn summarize_target(target: &Target, outcome: &DiscoveryOutcome) -> ResolvedTarg
             })
             .unwrap_or_default(),
         binary_path: target.capture.as_ref().and_then(|c| c.binary_path.clone()),
+        self_asserted_agent_key: pid.and_then(read_self_asserted_agent_key),
     }
+}
+
+/// Best-effort read of a live process's own `RAIL_AGENT_KEY` environment
+/// value. Reading another uid's `/proc/<pid>/environ` needs same-uid or
+/// ptrace access the supervisor may not have; any failure — permission,
+/// a process that has since exited, malformed content — is silently `None`,
+/// never an error, matching the design's "self-asserted... diagnostic hint"
+/// framing rather than a required capability.
+fn read_self_asserted_agent_key(pid: u32) -> Option<String> {
+    let raw = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    raw.split(|&byte| byte == 0)
+        .find_map(|entry| {
+            std::str::from_utf8(entry)
+                .ok()?
+                .strip_prefix("RAIL_AGENT_KEY=")
+        })
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 impl TargetManifest {
@@ -1013,6 +1040,60 @@ mod tests {
         let summary = summarize_target(&t, &available(7, 1, 7, 1000));
         assert!(summary.config_roots.is_empty());
         assert_eq!(summary.binary_path, None);
+    }
+
+    #[test]
+    fn summarize_target_reads_a_live_process_self_asserted_agent_key() {
+        // A real child process with a controlled environment, not the test
+        // binary's own `std::env::set_var` — `cargo test` runs many tests
+        // concurrently in one process, so mutating this process's own
+        // environment would race every other test reading it.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .env("RAIL_AGENT_KEY", "hinted-planner")
+            .spawn()
+            .expect("spawn a live child process");
+        let t = target("planner", "/run/agents/planner.pid");
+        let outcome = available(child.id(), 1, child.id(), 1000);
+        // Reading a just-spawned child's `/proc/<pid>/environ` is observed
+        // to occasionally race under this suite's heavy parallel test load
+        // (many `cargo test` threads forking at once) — poll briefly rather
+        // than assert on the first read, which sometimes lands before the
+        // new process's environment is visible through `/proc`.
+        let mut hint = None;
+        for _ in 0..50 {
+            hint = summarize_target(&t, &outcome).self_asserted_agent_key;
+            if hint.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(hint.as_deref(), Some("hinted-planner"));
+    }
+
+    #[test]
+    fn summarize_target_has_no_self_asserted_agent_key_when_the_process_declares_none() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn a live child process");
+        let t = target("planner", "/run/agents/planner.pid");
+        let summary = summarize_target(&t, &available(child.id(), 1, child.id(), 1000));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(summary.self_asserted_agent_key, None);
+    }
+
+    #[test]
+    fn summarize_target_has_no_self_asserted_agent_key_for_a_dead_pid() {
+        // 999999 is not a live process in this environment. A permission
+        // failure or a process that has since exited must be silent `None`,
+        // never an error -- this is a diagnostic-only field.
+        let t = target("planner", "/run/agents/planner.pid");
+        let summary = summarize_target(&t, &available(999_999, 1, 999_999, 1000));
+        assert_eq!(summary.self_asserted_agent_key, None);
     }
 
     #[test]
