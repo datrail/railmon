@@ -1397,12 +1397,31 @@ class RunOneCollectionTest(unittest.TestCase):
     def test_worst_exit_code_across_the_collection_wins(self):
         from unittest import mock
 
-        targets = [{"agent_key": "planner", "status": "available", "config_roots": []}]
+        targets = [{"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]}]
         results = iter([0, 2])
         with mock.patch.object(scanner, "run_one_scan", side_effect=lambda a: next(results)), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets):
             code = scanner.run_one_collection(self.base_args())
         self.assertEqual(code, 2)
+
+    def test_an_available_target_with_no_config_roots_is_skipped_not_defaulted(self):
+        """No declared scan.config_roots means nothing agent-specific to
+        scope this scan to. Running it anyway would fall back to the same
+        defaults the sandbox-wide scan above already covers, and register
+        that duplicate un-scoped data as if it were this agent's own —
+        exactly the fixture shape (`tests/fixtures/target-manifest-v1.valid.json`'s
+        `executor` has no `scan` field at all)."""
+        from unittest import mock
+
+        targets = [{"agent_key": "executor", "status": "available", "config_roots": []}]
+        calls = []
+        with mock.patch.object(scanner, "run_one_scan", side_effect=lambda a: calls.append(a) or 0), \
+                mock.patch.object(scanner, "resolve_targets", return_value=targets):
+            code = scanner.run_one_collection(self.base_args())
+        # Only the sandbox-wide call — the keyed scan never ran.
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0].agent_key)
+        self.assertEqual(code, 0)
 
     def test_a_resolve_failure_is_reported_and_does_not_raise(self):
         from unittest import mock

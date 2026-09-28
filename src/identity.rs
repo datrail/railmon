@@ -111,10 +111,13 @@ impl ProcessIncarnation {
 
 /// One declared agent's discovery outcome, in the shape the Python scanner
 /// consumes to run agent-scoped scanning once per key (M2): whether to scan
-/// it at all, and the config roots/binary path to scope that scan to. Kept
-/// separate from `DiscoveryOutcome` because it must serialize (a stable
-/// cross-process contract) while `DiscoveryOutcome` carries a raw
-/// `ProcessIncarnation` that has no reason to leave this process.
+/// it at all, and the config roots to scope that scan to. `binary_path`
+/// rides along for other/future consumers of this same contract (it is the
+/// collector's own capture-scoping field, not something the Python scanner
+/// reads); it is not manufactured here, only forwarded. Kept separate from
+/// `DiscoveryOutcome` because it must serialize (a stable cross-process
+/// contract) while `DiscoveryOutcome` carries a raw `ProcessIncarnation`
+/// that has no reason to leave this process.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ResolvedTargetSummary {
     pub agent_key: String,

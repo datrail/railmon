@@ -1830,9 +1830,23 @@ def run_one_collection(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             continue
+        config_roots = target.get("config_roots") or []
+        if not config_roots:
+            # No declared scan.config_roots means nothing agent-specific to
+            # scope this scan to. Running it anyway would fall through to
+            # build_registration_payload's own `or default_config_paths(env)`
+            # fallback — the same paths the sandbox-wide scan above already
+            # covers — and register that duplicate, un-scoped data under this
+            # agent's key as if it had been observed specifically for it.
+            print(
+                f"[agent-environment-scanner] skipping agent-scoped scan for '{agent_key}': "
+                "no scan.config_roots declared, nothing agent-specific to scope it to",
+                file=sys.stderr,
+            )
+            continue
         target_args = copy.copy(args)
         target_args.agent_key = agent_key
-        target_args.config_path = target.get("config_roots") or []
+        target_args.config_path = config_roots
         target_args.feature_output = _keyed_path(feature_output_path(args), agent_key)
         target_args.registration_output = _keyed_path(registration_output_path(args), agent_key)
         if not target_args.no_evidence_bundle or configured_raildash_url(target_args):

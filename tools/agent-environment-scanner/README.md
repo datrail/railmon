@@ -285,7 +285,12 @@ paths (each suffixed `.<agent_key>` so a keyed scan never overwrites the
 sandbox-wide scan's, or another key's, artifact). A declared agent the
 collector reports as `not_found` or `ambiguous` is logged and skipped, not
 treated as a failure — the same "never drop a declared agent's siblings over
-one bad target" rule the collector's own multi-target capture follows.
+one bad target" rule the collector's own multi-target capture follows. An
+`available` target with no declared `scan.config_roots` is logged and
+skipped too: there is nothing agent-specific to scope the scan to, and
+running it anyway would just re-collect the sandbox-wide scan's own default
+paths and register that duplicate, un-scoped data under the agent's key as
+if it had been observed specifically for it.
 
 Process resolution — liveness, ownership, and cross-target collision
 detection — has exactly one implementation, in the collector's `identity.rs`.
