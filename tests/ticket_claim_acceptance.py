@@ -7,9 +7,9 @@ Three real agent processes under distinct UIDs, each with its own tap:
 `executor` sends a ticket claiming planner's agent_id (conflict), and `critic`
 sends no ticket and has not registered (process target alone). Registration
 state is written where the scanner would put it and handed to RailMon with
-`--registration-state`. Root-only, like
-`two_agent_acceptance.py`; CI runs it inside the built image. Pass `--dump <path>` to keep the captured rows,
-e.g. to validate them against the consumers' schemas.
+`--registration-state`. Root-only, like `two_agent_acceptance.py`; CI runs it
+inside the built image. Pass `--dump <path>` to keep the captured rows, e.g. to
+validate them against the consumers' schemas.
 """
 
 import base64
