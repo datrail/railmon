@@ -11,7 +11,8 @@ scanner), with real processes under distinct UIDs and a stub AgentSight:
   `not_found`, and gets no tap and no row;
 - partial evidence: the scanner still writes one v2 collection holding every
   declared key, in canonical order, where only the available agent carries
-  evidence and the others record their discovery status and nothing else;
+  evidence and the others record their discovery status, every input
+  unattempted, and no attributes;
 - single agent: without `--target-manifest`, `--pid` capture keeps the legacy
   shape — the x-rail ticket names the agent and no keyed field appears.
 
@@ -44,7 +45,16 @@ def require(condition: bool, message: str) -> None:
 def spawn_agent(uid: int, seconds: int = 60) -> subprocess.Popen[bytes]:
     # Its own session, so a manifest target has a session of its own to tap.
     return subprocess.Popen(
-        ["setpriv", f"--reuid={uid}", f"--regid={uid}", "--clear-groups", "setsid", "sleep", str(seconds)]
+        [
+            "setpriv",
+            f"--reuid={uid}",
+            f"--regid={uid}",
+            "--clear-groups",
+            "--ptracer=any",
+            "setsid",
+            "sleep",
+            str(seconds),
+        ]
     )
 
 
@@ -54,8 +64,9 @@ def write_private(path: pathlib.Path, text: str) -> None:
 
 
 def railmon_root() -> pathlib.Path:
-    # The image mounts this file at /tests with no source tree beside it, so the
-    # scanner is the one the image ships; from a checkout it is the checkout's.
+    # CI mounts this file at /tests with no source tree beside it, so the scanner
+    # is the one the image ships (its RAILMON_ROOT); from a checkout it is the
+    # checkout's.
     configured = os.environ.get("RAILMON_ROOT")
     if configured:
         return pathlib.Path(configured)
@@ -235,7 +246,8 @@ agents:
             capture_output=True,
             text=True,
         )
-        require(bundle_path.exists(), f"no evidence bundle written (exit {scan.returncode}): {scan.stderr}")
+        require(scan.returncode == 0, f"scanner exited {scan.returncode}: {scan.stderr}")
+        require(bundle_path.exists(), f"no evidence bundle written: {scan.stderr}")
         bundle = json.loads(bundle_path.read_text())
         require(bundle["bundle_version"] == 2, f"bundle_version {bundle['bundle_version']}")
         require(
@@ -255,7 +267,12 @@ agents:
                 attempted and all(item["attempted"] is False for item in attempted.values()),
                 f"{key} claims inputs were attempted: {attempted}",
             )
-        require(entries["reviewer"]["attributes"], "the available agent's scoped evidence is empty")
+        # A failed agent scan still fills attributes, every one FAILED, so
+        # require an answer rather than merely a non-empty map.
+        require(
+            any(attr.get("status") == "ANSWERED" for attr in entries["reviewer"]["attributes"].values()),
+            f"the available agent's scoped evidence has no answer: {entries['reviewer']['attributes']}",
+        )
         require(
             all("image_digest" not in entry["attributes"] for entry in bundle["agents"]),
             "sandbox evidence leaked into an agent scope",
