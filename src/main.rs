@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
 
     let mut pairer = Pairer::new();
     let mut write_error: Option<anyhow::Error> = None;
+    let mut stream_ended = false;
     let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -257,7 +258,10 @@ async fn main() -> Result<()> {
             biased;
 
             maybe_event = stream.next() => {
-                let Some(event) = maybe_event else { break };
+                let Some(event) = maybe_event else {
+                    stream_ended = true;
+                    break;
+                };
 
                 let emitted = match args.mode {
                     Mode::Raw => serde_json::to_value(&event).ok(),
@@ -329,8 +333,14 @@ async fn main() -> Result<()> {
         Ok(Some(status)) if !status.success() => {
             anyhow::bail!("probe exited with {status}")
         }
-        // A dropped sender means we left the loop before the probe's output
-        // ended, which is what ctrl_c does. Not a failure.
+        // The stream ended by itself yet the probe never reported: the
+        // stream was dropped under the probe, which only the analyzer-panic
+        // guard does (DR-129). Capture has stopped, so say so in the exit code.
+        Err(_) if stream_ended => {
+            anyhow::bail!("capture stopped: an analyzer failed on captured traffic (see log)")
+        }
+        // A dropped sender otherwise means we left the loop before the probe's
+        // output ended, which is what ctrl_c does. Not a failure.
         _ => Ok(()),
     }
 }
