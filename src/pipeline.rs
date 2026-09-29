@@ -13,9 +13,10 @@ use agentsight_capture::analyzers::{
 use agentsight_capture::runners::EventStream;
 use agentsight_capture::Event;
 use anyhow::{Context, Result};
-use futures::stream;
+use futures::{stream, FutureExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -412,7 +413,48 @@ pub async fn event_stream(
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    Ok((stream, status_rx))
+    Ok((contain_analyzer_panics(stream), status_rx))
+}
+
+/// Ends the tap's stream, instead of the whole process, when an analyzer
+/// panics on captured bytes (DR-129).
+///
+/// The analyzers are lazy stream adapters, so their code runs inside our own
+/// poll: AgentSight's HTTPParser decodes HTTP/2 headers with `hpack` 0.3.0,
+/// which panics on a malformed dynamic-table-size update, and those bytes come
+/// from traffic the monitored agent — or any server it talks to — controls.
+/// On a panic the inner stream is dropped right away, not merely no longer
+/// polled: the probe child and the status sender live in its state, so
+/// dropping it kills the probe (`kill_on_drop`) and closes the status channel,
+/// which is what lets a keyed target restart through the ordinary tap-ended
+/// path. The parser's state after a panic is unknown, so nothing more is read
+/// from it.
+fn contain_analyzer_panics(stream: EventStream) -> EventStream {
+    Box::pin(
+        stream::unfold(Some(stream), |state| async move {
+            let mut inner = state?;
+            match AssertUnwindSafe(inner.next()).catch_unwind().await {
+                Ok(Some(event)) => Some((event, Some(inner))),
+                Ok(None) => None,
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|text| text.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".into());
+                    log::error!(
+                        "capture analyzer panicked on captured traffic ({message}); \
+                         stopping this tap"
+                    );
+                    drop(inner);
+                    None
+                }
+            }
+        })
+        // Fused, so a caller polling once more after the end gets `None` rather
+        // than `unfold`'s own polled-after-completion panic.
+        .fuse(),
+    )
 }
 
 /// One line of probe output becomes at most one `Event` the analyzers accept.
@@ -681,6 +723,78 @@ fn body_len(data: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_analyzer_ends_the_stream_and_drops_it_at_once() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let inner: EventStream = Box::pin(stream::iter(0..3).map(move |n| {
+            let _keep = &flag;
+            if n == 1 {
+                panic!("malformed input");
+            }
+            Event::new_with_timestamp(n, "ssl".into(), 1, "x".into(), json!({}))
+        }));
+        let mut guarded = contain_analyzer_panics(inner);
+        assert_eq!(guarded.next().await.map(|event| event.timestamp), Some(0));
+        assert!(guarded.next().await.is_none(), "a panic ends the stream");
+        // Dropped on the panic itself, while the wrapper is still alive: that
+        // is what kills the probe and closes its status channel.
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(guarded.next().await.is_none());
+    }
+
+    /// A probe that emits one HTTP/2 HEADERS frame whose HPACK block is a
+    /// dynamic-table-size update too large for hpack 0.3.0 (it unwraps a
+    /// `None`), then idles. Captured bytes like these are attacker-shaped.
+    fn malformed_hpack_probe(dir: &Path) -> String {
+        let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        let block = [0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
+        let len = block.len();
+        bytes.extend_from_slice(&[0, 0, len as u8, 0x1, 0x4, 0, 0, 0, 1]);
+        bytes.extend_from_slice(&block);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let line = json!({
+            "source": "ssl", "pid": 4242, "comm": "node",
+            "data": {"pid": 4242, "tid": 7, "timestamp_ns": 1, "function": "WRITE/SEND", "data": format!("HEX:{hex}")}
+        });
+        let path = dir.join("agentsight");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{line}'\nexec sleep 30\n"))
+            .expect("write probe");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod probe");
+        path.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn malformed_hpack_from_the_wire_stops_the_tap_not_the_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = malformed_hpack_probe(dir.path());
+        let (stream, status) = event_stream(&probe, &CaptureFilters::default())
+            .await
+            .expect("start fake probe");
+        let events: Vec<Event> =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.collect())
+                .await
+                .expect("the stream ends instead of hanging");
+        assert!(
+            events.is_empty(),
+            "nothing is trusted from a parser that panicked"
+        );
+        // The probe (sleeping 30s) was killed and its status channel closed
+        // promptly, so a keyed target's restart path is not left waiting.
+        tokio::time::timeout(std::time::Duration::from_secs(5), status)
+            .await
+            .expect("status resolves once the tap is dropped")
+            .ok();
+    }
 
     /// The envelope agentsight actually emits, pinned by the Python's deleted
     /// `test_unwrap_agentsight_envelope`. This is the seam a port can get wrong
