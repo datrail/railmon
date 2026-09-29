@@ -6,7 +6,7 @@
 //! id and breaks correlation against interactions already stored. The tests at
 //! the bottom pin the two values that travel — the id and the agent_id.
 
-use crate::identity::AgentRef;
+use crate::identity::{AgentRef, RegisteredAgents};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ pub fn to_attributed_runtime_interaction(
     session_id: Option<&str>,
     capture_start: Option<&str>,
     capture_source: &str,
-    agent_ref: Option<&AgentRef>,
+    keyed: Option<(&AgentRef, &RegisteredAgents)>,
 ) -> Value {
     let request = interaction.get("request").filter(|v| v.is_object());
     let response = interaction.get("response").filter(|v| v.is_object());
@@ -62,33 +62,59 @@ pub fn to_attributed_runtime_interaction(
         "capture_source": capture_source,
         "raw": raw,
     });
-    if let Some(agent_ref) = agent_ref {
+    if let Some((agent_ref, registered)) = keyed {
         output["runtime_identity_version"] = json!(1);
         let start_time = interaction
             .get("process_start_time_ticks")
             .and_then(Value::as_u64);
-        if let Some(start_time) = start_time {
-            output["agent_ref"] = serde_json::to_value(agent_ref).unwrap_or(Value::Null);
-            output["attribution"] = json!({
-                "state": "attributed",
-                "method": "process_target",
-                "reason": null,
-                "target_id": agent_ref.agent_key,
-                "process": {
+        let process = start_time.map(|start_time| {
+            json!({
                 "pid": interaction.get("target_pid").or_else(|| interaction.get("pid")).cloned().unwrap_or(Value::Null),
-                    "start_time_ticks": start_time
-                }
-            });
+                "start_time_ticks": start_time
+            })
+        });
+        // Design doc §4.5: the unsigned v0-alpha ticket is an unverified
+        // claim. It may corroborate the process target or contradict it, but
+        // it never names an agent on its own, so the top-level `agent_id` no
+        // longer comes straight from it for keyed output.
+        let claimed_id = output["agent_id"].as_str().map(str::to_string);
+        let claimed_key = claimed_id.as_deref().and_then(|id| registered.key_for(id));
+        let (state, method, reason, agent_id) = match (&process, claimed_key) {
+            (None, _) => ("unknown", None, Some("PROCESS_INCARNATION_UNPINNED"), None),
+            (Some(_), Some(key)) if key == agent_ref.agent_key => (
+                "attributed",
+                Some("process_target_with_ticket_claim"),
+                None,
+                claimed_id.clone(),
+            ),
+            (Some(_), Some(key)) => {
+                // The audit adds only agent keys and ids, never the ticket
+                // itself; `raw` is the record Rail Center stores verbatim.
+                // The header travels in `x_rail_header` as it always has, and
+                // consumers redact it (RailDash) the same as on any row.
+                raw_audit(&mut output, agent_ref, key, claimed_id.as_deref());
+                ("conflict", None, Some("TICKET_CLAIM_CONFLICT"), None)
+            }
+            (Some(_), None) => (
+                "attributed",
+                Some("process_target"),
+                None,
+                registered.id_for(&agent_ref.agent_key).map(str::to_string),
+            ),
+        };
+        output["agent_id"] = opt_string(agent_id);
+        output["agent_ref"] = if state == "attributed" {
+            serde_json::to_value(agent_ref).unwrap_or(Value::Null)
         } else {
-            output["agent_ref"] = Value::Null;
-            output["attribution"] = json!({
-                "state": "unknown",
-                "method": null,
-                "reason": "PROCESS_INCARNATION_UNPINNED",
-                "target_id": agent_ref.agent_key,
-                "process": null
-            });
-        }
+            Value::Null
+        };
+        output["attribution"] = json!({
+            "state": state,
+            "method": method,
+            "reason": reason,
+            "target_id": agent_ref.agent_key,
+            "process": process,
+        });
     }
     output
 }
@@ -165,6 +191,26 @@ fn header(request: Option<&Value>, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Records, inside `raw`, which process target and which ticket-claimed
+/// agent disagreed — so a `conflict` row stays diagnosable after its
+/// authoritative identity fields are cleared.
+fn raw_audit(
+    output: &mut Value,
+    agent_ref: &AgentRef,
+    claimed_key: &str,
+    claimed_id: Option<&str>,
+) {
+    if let Some(raw) = output["raw"].as_object_mut() {
+        raw.insert(
+            "railmon_attribution_audit".into(),
+            json!({
+                "process_target": agent_ref.agent_key,
+                "ticket_claim": {"agent_key": claimed_key, "agent_id": claimed_id},
+            }),
+        );
+    }
 }
 
 /// The x-rail ticket is base64url JSON. Anything that does not decode to an
@@ -330,16 +376,26 @@ mod tests {
 
     #[test]
     fn keyed_output_requires_a_pinned_process_incarnation() {
-        let out =
-            to_attributed_runtime_interaction(&sample(), None, None, "railmon", Some(&agent_ref()));
+        let out = to_attributed_runtime_interaction(
+            &sample(),
+            None,
+            None,
+            "railmon",
+            Some((&agent_ref(), &RegisteredAgents::default())),
+        );
         assert_eq!(out["runtime_identity_version"], 1);
         assert_eq!(out["attribution"]["state"], "unknown");
         assert!(out["agent_ref"].is_null());
 
         let mut pinned = sample();
         pinned["process_start_time_ticks"] = json!(1234);
-        let out =
-            to_attributed_runtime_interaction(&pinned, None, None, "railmon", Some(&agent_ref()));
+        let out = to_attributed_runtime_interaction(
+            &pinned,
+            None,
+            None,
+            "railmon",
+            Some((&agent_ref(), &RegisteredAgents::default())),
+        );
         assert_eq!(out["attribution"]["state"], "attributed");
         assert_eq!(out["agent_ref"]["agent_key"], "planner");
         assert_eq!(out["attribution"]["process"]["start_time_ticks"], 1234);
@@ -401,6 +457,124 @@ mod tests {
         v["request"]["headers"] = json!({});
         let out = to_runtime_interaction(&v, None, None, "railmon");
         assert_eq!(out["request"]["destination"], "unknown");
+    }
+
+    const PLANNER_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const WORKER_ID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    const STRANGER_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    fn registered() -> RegisteredAgents {
+        RegisteredAgents::from_pairs([
+            ("planner".to_string(), PLANNER_ID.to_string()),
+            ("worker-2".to_string(), WORKER_ID.to_string()),
+        ])
+    }
+
+    /// A pinned interaction captured from the `planner` target, optionally
+    /// carrying an unsigned ticket that claims `claimed_id`.
+    fn pinned_with_ticket(claimed_id: Option<&str>) -> Value {
+        let mut v = sample();
+        v["process_start_time_ticks"] = json!(1234);
+        v["target_pid"] = json!(4242);
+        if let Some(id) = claimed_id {
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(format!(r#"{{"agent_id": "{id}"}}"#));
+            v["request"]["headers"] = json!({"x-rail": token});
+        }
+        v
+    }
+
+    fn keyed(v: &Value, registered: &RegisteredAgents) -> Value {
+        to_attributed_runtime_interaction(
+            v,
+            None,
+            None,
+            "railmon",
+            Some((&agent_ref(), registered)),
+        )
+    }
+
+    #[test]
+    fn a_ticket_that_agrees_with_the_process_target_corroborates_it() {
+        let out = keyed(&pinned_with_ticket(Some(PLANNER_ID)), &registered());
+        assert_eq!(out["attribution"]["state"], "attributed");
+        assert_eq!(
+            out["attribution"]["method"],
+            "process_target_with_ticket_claim"
+        );
+        assert_eq!(out["attribution"]["reason"], Value::Null);
+        assert_eq!(out["agent_ref"]["agent_key"], "planner");
+        assert_eq!(out["agent_id"], PLANNER_ID);
+        assert!(out["raw"].get("railmon_attribution_audit").is_none());
+    }
+
+    #[test]
+    fn a_ticket_naming_a_sibling_is_a_conflict_with_no_identity() {
+        let out = keyed(&pinned_with_ticket(Some(WORKER_ID)), &registered());
+        assert_eq!(out["attribution"]["state"], "conflict");
+        assert_eq!(out["attribution"]["method"], Value::Null);
+        assert_eq!(out["attribution"]["reason"], "TICKET_CLAIM_CONFLICT");
+        // Neither the process target nor the forged/stale claim wins.
+        assert_eq!(out["agent_ref"], Value::Null);
+        assert_eq!(out["agent_id"], Value::Null);
+        let audit = &out["raw"]["railmon_attribution_audit"];
+        assert_eq!(audit["process_target"], "planner");
+        assert_eq!(audit["ticket_claim"]["agent_key"], "worker-2");
+        assert_eq!(audit["ticket_claim"]["agent_id"], WORKER_ID);
+        // Attribution only relabels a row; it never changes which row it is,
+        // so a conflict cannot be re-sent as a second, differently keyed copy.
+        let agreed = keyed(&pinned_with_ticket(Some(PLANNER_ID)), &registered());
+        assert_eq!(out["interaction_id"], agreed["interaction_id"]);
+    }
+
+    #[test]
+    fn an_unresolvable_ticket_never_becomes_the_agent_id() {
+        // A claim that maps to no registered key — unknown to this sandbox,
+        // or no mapping configured at all — is not authority: the process
+        // target alone attributes the row, and agent_id is this key's own
+        // registered id when known, never the claim.
+        let out = keyed(&pinned_with_ticket(Some(STRANGER_ID)), &registered());
+        assert_eq!(out["attribution"]["state"], "attributed");
+        assert_eq!(out["attribution"]["method"], "process_target");
+        assert_eq!(out["agent_id"], PLANNER_ID);
+
+        let out = keyed(
+            &pinned_with_ticket(Some(WORKER_ID)),
+            &RegisteredAgents::default(),
+        );
+        assert_eq!(out["attribution"]["state"], "attributed");
+        assert_eq!(out["attribution"]["method"], "process_target");
+        assert_eq!(out["agent_id"], Value::Null);
+    }
+
+    #[test]
+    fn no_ticket_is_attributed_by_process_target_with_the_registered_id() {
+        let out = keyed(&pinned_with_ticket(None), &registered());
+        assert_eq!(out["attribution"]["state"], "attributed");
+        assert_eq!(out["attribution"]["method"], "process_target");
+        assert_eq!(out["attribution"]["process"]["pid"], 4242);
+        assert_eq!(out["agent_id"], PLANNER_ID);
+    }
+
+    #[test]
+    fn an_unpinned_event_is_unknown_even_with_an_agreeing_ticket() {
+        let mut v = pinned_with_ticket(Some(PLANNER_ID));
+        v.as_object_mut()
+            .unwrap()
+            .remove("process_start_time_ticks");
+        let out = keyed(&v, &registered());
+        assert_eq!(out["attribution"]["state"], "unknown");
+        assert_eq!(out["attribution"]["reason"], "PROCESS_INCARNATION_UNPINNED");
+        assert_eq!(out["agent_ref"], Value::Null);
+        assert_eq!(out["agent_id"], Value::Null);
+    }
+
+    #[test]
+    fn legacy_unkeyed_output_still_reads_agent_id_from_the_ticket() {
+        let out =
+            to_runtime_interaction(&pinned_with_ticket(Some(WORKER_ID)), None, None, "railmon");
+        assert_eq!(out["agent_id"], WORKER_ID);
+        assert!(out.get("attribution").is_none());
     }
 
     #[test]

@@ -58,6 +58,16 @@ struct Args {
     /// one reimplemented in Python at the risk of diverging from it.
     #[arg(long, requires = "target_manifest")]
     print_resolved_targets: bool,
+
+    /// Absolute path of the scanner's un-keyed `--registration-output`. With
+    /// `--target-manifest`, each agent's `<path>.<agent_key>` registration
+    /// state maps the `agent_id` an unsigned `x-rail` ticket claims back to an
+    /// `agent_key`, so a ticket that agrees with the process target is
+    /// recorded as corroboration and one naming a sibling agent as a
+    /// `conflict`. Without it every claim stays unresolved and keyed rows are
+    /// attributed by process target alone.
+    #[arg(long, requires = "target_manifest")]
+    registration_state: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "http")]
     mode: Mode,
 
@@ -378,6 +388,7 @@ async fn spawn_target_tap(
 /// (design doc §4.4).
 async fn flush_target_incomplete(
     target: &mut TargetRuntime,
+    registered: &identity::RegisteredAgents,
     session_id: &str,
     capture_start: &str,
     sink: &mut Sink,
@@ -390,7 +401,7 @@ async fn flush_target_incomplete(
             Some(session_id),
             Some(capture_start),
             "railmon",
-            Some(&target.agent_ref),
+            Some((&target.agent_ref, registered)),
         );
         sink.emit(&value).await?;
     }
@@ -404,6 +415,7 @@ async fn stop_target(
     slot: &mut Option<TargetRuntime>,
     stream_map: &mut StreamMap<usize, TargetStream>,
     index: usize,
+    registered: &identity::RegisteredAgents,
     session_id: &str,
     capture_start: &str,
     sink: &mut Sink,
@@ -411,10 +423,39 @@ async fn stop_target(
     stream_map.remove(&index);
     match slot.take() {
         Some(mut target) => {
-            flush_target_incomplete(&mut target, session_id, capture_start, sink).await
+            flush_target_incomplete(&mut target, registered, session_id, capture_start, sink).await
         }
         None => Ok(()),
     }
+}
+
+/// Re-reads the keyed registration state behind `--registration-state` and
+/// logs only what changed — a new mapping size, or a new set of unusable
+/// files — so a 5s refresh does not repeat the same warning forever.
+fn refresh_registered_agents(
+    args: &Args,
+    manifest: &identity::TargetManifest,
+    registered: &mut identity::RegisteredAgents,
+    problems: &mut Vec<String>,
+) {
+    let Some(base) = args.registration_state.as_deref() else {
+        return;
+    };
+    let (next, next_problems) = identity::load_registered_agents(manifest, base);
+    if next_problems != *problems {
+        for problem in &next_problems {
+            log::warn!("ignoring registration state for ticket-claim resolution: {problem}");
+        }
+    }
+    if next != *registered {
+        log::info!(
+            "{} of {} keyed target(s) have a registered agent_id for ticket-claim resolution",
+            next.len(),
+            manifest.agents.len()
+        );
+    }
+    *registered = next;
+    *problems = next_problems;
 }
 
 /// The collector no longer exits when every target is simultaneously down
@@ -457,6 +498,25 @@ async fn run_multi_target(
     }
     if args.pid.is_some() || args.uid.is_some() || args.comm.is_some() {
         anyhow::bail!("--pid, --uid and --comm cannot be combined with --target-manifest");
+    }
+
+    if let Some(path) = args.registration_state.as_deref() {
+        if !path.is_absolute() {
+            anyhow::bail!("--registration-state {} is not absolute", path.display());
+        }
+    }
+    let mut registration_problems = Vec::new();
+    let mut registered = identity::RegisteredAgents::default();
+    refresh_registered_agents(args, manifest, &mut registered, &mut registration_problems);
+    if registered.len() == 0 {
+        if let Some(path) = args.registration_state.as_deref() {
+            // An empty mapping from a mistyped path otherwise logs nothing
+            // and looks identical to "no key has registered yet".
+            log::info!(
+                "no keyed target has registration state at {}.<agent_key> yet; ticket claims stay unresolved until one does",
+                path.display()
+            );
+        }
     }
 
     let outcomes = manifest.resolve_all();
@@ -547,7 +607,7 @@ async fn run_multi_target(
                                 target.agent_ref.agent_key
                             );
                             if let Err(error) = stop_target(
-                                &mut targets[index], &mut stream_map, index, session_id, capture_start, sink,
+                                &mut targets[index], &mut stream_map, index, &registered, session_id, capture_start, sink,
                             ).await {
                                 write_error = Some(error);
                                 break 'capture;
@@ -567,7 +627,7 @@ async fn run_multi_target(
                                 Some(session_id),
                                 Some(capture_start),
                                 "railmon",
-                                Some(&target.agent_ref),
+                                Some((&target.agent_ref, &registered)),
                             );
                             if let Err(error) = sink.emit(&value).await {
                                 write_error = Some(error);
@@ -588,7 +648,7 @@ async fn run_multi_target(
                             );
                         }
                         if let Err(error) = stop_target(
-                            &mut targets[index], &mut stream_map, index, session_id, capture_start, sink,
+                            &mut targets[index], &mut stream_map, index, &registered, session_id, capture_start, sink,
                         ).await {
                             write_error = Some(error);
                             break 'capture;
@@ -604,6 +664,10 @@ async fn run_multi_target(
             // `agent_key` and gets a new, freshly pinned incarnation (design
             // doc §4.4): none of the other running targets are disturbed.
             _ = retry_ticker.tick() => {
+                // Registration usually lands after capture starts (the scanner
+                // runs on its own interval), so the ticket-claim mapping is
+                // re-read here rather than fixed at startup.
+                refresh_registered_agents(args, manifest, &mut registered, &mut registration_problems);
                 // A target that exits quietly produces no further events, so
                 // the per-event liveness check above never fires for it and
                 // its tap would stay bound to a dead session forever. Sweep
@@ -618,7 +682,7 @@ async fn run_multi_target(
                         target.agent_ref.agent_key
                     );
                     if let Err(error) = stop_target(
-                        slot, &mut stream_map, index, session_id, capture_start, sink,
+                        slot, &mut stream_map, index, &registered, session_id, capture_start, sink,
                     ).await {
                         write_error = Some(error);
                         break 'capture;
@@ -670,7 +734,7 @@ async fn run_multi_target(
     // mid-run exit is: a pending request that never got a response before
     // the process stopped capturing is reported, not silently discarded.
     for target in targets.iter_mut().flatten() {
-        flush_target_incomplete(target, session_id, capture_start, sink).await?;
+        flush_target_incomplete(target, &registered, session_id, capture_start, sink).await?;
     }
     Ok(())
 }
