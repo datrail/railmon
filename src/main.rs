@@ -20,6 +20,7 @@ use sink::Sink;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio_stream::StreamMap;
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -112,6 +113,40 @@ struct Args {
     session_id: Option<String>,
 }
 
+/// SIGINT or SIGTERM, whichever comes first. Both mean "stop and flush": SIGTERM
+/// is what `docker stop`, Kubernetes and systemd send, and without a handler
+/// it either killed the collector outright — losing the buffered webhook batch
+/// and every pending request — or, as the image's PID 1, was ignored until the
+/// runtime's SIGKILL did the same ten seconds later (DR-130).
+///
+/// Both listeners live for the whole capture. A `ctrl_c()` future re-created on
+/// every loop iteration only sees signals delivered while it exists, so a
+/// SIGINT landing between iterations (on a flush tick, say) was swallowed and
+/// the collector ran on until its probe exited.
+struct ShutdownSignal {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl ShutdownSignal {
+    /// Installed once, before any probe starts, so a signal that lands while
+    /// taps are coming up is held for the capture loop rather than killing the
+    /// process with its probes still attached.
+    fn install() -> Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("installing the SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("installing the SIGTERM handler")?,
+        })
+    }
+
+    async fn requested(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
 /// The Python resolved AGENTSIGHT_PATH, then SSLSNIFF_PATH ("back-compat:
 /// older env name"), then a repo-relative bin/agentsight. Dropping the last two
 /// would mean `make fetch-agentsight` downloads a binary that a bare `railmon`
@@ -174,6 +209,8 @@ async fn main() -> Result<()> {
         );
     }
 
+    let mut shutdown = ShutdownSignal::install()?;
+
     // Clamped at both ends. is_finite() alone lets 1e30 through, and
     // Duration::from_secs_f64 panics above ~1.8e19; a NaN or a negative panics
     // too. An hour is well past any sensible flush cadence.
@@ -227,6 +264,7 @@ async fn main() -> Result<()> {
             &capture_start,
             &mut sink,
             flush_interval,
+            &mut shutdown,
         )
         .await;
         sink.shutdown().await;
@@ -296,7 +334,7 @@ async fn main() -> Result<()> {
 
             _ = ticker.tick() => sink.flush_if_due().await,
 
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.requested() => {
                 log::info!("interrupted");
                 break;
             }
@@ -318,7 +356,7 @@ async fn main() -> Result<()> {
 
     // Drop the stream before awaiting the probe's status. The oneshot sender
     // lives inside the stream's state and is only fired while something polls
-    // it, so leaving the loop via ctrl_c would otherwise block here for ever —
+    // it, so leaving the loop on a shutdown signal would otherwise block here for ever —
     // and `kill_on_drop` would never fire, leaving the probe running with its
     // eBPF programs attached, which is what makes the *next* run fail to
     // attach. Dropping it closes the channel; the `_` arm below treats that as
@@ -340,7 +378,7 @@ async fn main() -> Result<()> {
             anyhow::bail!("capture stopped: an analyzer failed on captured traffic (see log)")
         }
         // A dropped sender otherwise means we left the loop before the probe's
-        // output ended, which is what ctrl_c does. Not a failure.
+        // output ended, which is what a shutdown signal does. Not a failure.
         _ => Ok(()),
     }
 }
@@ -489,6 +527,9 @@ fn log_target_availability_transition(
     *all_targets_down = now;
 }
 
+// Eight, one over clippy's default: each is state main() already owns and
+// shares with the single-target path; bundling them would only rename it.
+#[allow(clippy::too_many_arguments)]
 async fn run_multi_target(
     args: &Args,
     manifest: &identity::TargetManifest,
@@ -497,6 +538,7 @@ async fn run_multi_target(
     capture_start: &str,
     sink: &mut Sink,
     flush_interval: Duration,
+    shutdown: &mut ShutdownSignal,
 ) -> Result<()> {
     if matches!(args.mode, Mode::Raw) {
         anyhow::bail!(
@@ -733,7 +775,7 @@ async fn run_multi_target(
                 }
             }
             _ = ticker.tick() => sink.flush_if_due().await,
-            _ = tokio::signal::ctrl_c() => break 'capture,
+            _ = shutdown.requested() => break 'capture,
         }
     }
 
