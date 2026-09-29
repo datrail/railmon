@@ -9,9 +9,10 @@ The design is `railxia/docs/design/2026-09-24-multi-agent-container/`.
 
 ## Writing the manifest
 
-The manifest is YAML or JSON, validated against
-[`schemas/target-manifest-v1.schema.json`](../schemas/target-manifest-v1.schema.json)
-and then by the collector itself; unknown fields are rejected everywhere.
+The manifest is YAML or JSON in the shape of
+[`schemas/target-manifest-v1.schema.json`](../schemas/target-manifest-v1.schema.json).
+The collector parses it with its own checks rather than the schema file;
+unknown fields are rejected everywhere.
 
 ```yaml
 manifest_version: 1
@@ -27,7 +28,7 @@ agents:
     discovery:
       pid_file: /run/agents/planner.pid     # exactly one of pid_file / cgroup
     scan:
-      config_roots: [/srv/planner]          # what the scanner scopes this agent to
+      config_roots: [/srv/planner]          # without it the scanner neither scans nor registers this agent
     capture:
       binary_path: /usr/local/bin/node      # overrides --binary-path for this tap
   - agent_key: executor
@@ -51,17 +52,22 @@ What the collector checks beyond the schema, and what a violation looks like:
   a symlink, owned by root or the supervisor, not group/other-writable, and
   carry no POSIX ACL. A locator an agent's own uid could rewrite is refused
   (`control path … is owned by monitored uid N`).
+- **`scan.config_roots` for a registered agent.** The scanner skips the
+  agent-scoped scan and registration of an available agent that declares none
+  (`executor` above), so its ticket claims are never corroborated.
 - `sandbox.access` is validated but not yet used by the collector; the scanner
   still reaches the container through its own `--mode docker --container`.
 
-Check a manifest without capturing anything:
+Check a manifest without capturing anything (`railmon collect …` is the
+image's entrypoint; a native build runs `./target/release/railmon …` with the
+same flags):
 
 ```bash
 railmon collect --target-manifest /etc/railmon/targets.yaml --print-resolved-targets
 ```
 
-It prints one JSON object per agent — `status` is `available`, `not_found` or
-`ambiguous`, with the `reason` — and exits. The scanner runs this same command
+It prints one JSON array with an object per agent — `status` is `available`,
+`not_found` or `ambiguous`, with the `reason` — and exits. The scanner runs this same command
 to decide which agents to scan, so it is also the first thing to run when the
 scanner skips an agent.
 
@@ -84,8 +90,11 @@ relative, so set it explicitly); the collector reads `<path>.<agent_key>`
 every 5 s and uses it to judge unsigned `x-rail` tickets. Without it every
 row is attributed by process target alone.
 
-All agents' rows go to the one `--output` file (and/or `--webhook`),
-interleaved; separate them by `agent_ref.agent_key`. The file is created with
+All agents' rows go to the one `--output` file, interleaved; separate them by
+`attribution.target_id`, which every row carries (`agent_ref` is null on a
+conflict row). `--webhook` works too, but Rail Center's `/v1/interactions`
+stores this row shape unattributed for now, and the collector warns so. The
+file is created with
 the process umask, so tighten the umask or the directory if other local users
 should not read captured traffic.
 
@@ -119,8 +128,9 @@ count them from the file, e.g.
 
 | Log line | What to check |
 | --- | --- |
-| `target '<k>' not found: <reason>` | the PID file or cgroup, the process being alive, and the control-path rules above |
+| `target '<k>' not found: <reason>` | the PID file or cgroup, the process being alive, the control-path rules above, the process running as the supervisor's uid, or not leading its own session |
 | `target '<k>' is ambiguous: <reason>` | two agents sharing a uid, session or process |
+| `target '<k>' resolved but its tap failed to start: …` | the probe for that agent (AgentSight path, `binary_path`); retried with the others |
 | `no declared agent resolved to a capturable process` (fatal, exit 1) | nothing in the manifest resolved at startup; run `--print-resolved-targets` |
 | `target '<k>' exited or its PID was reused; stopping its tap …` | expected on agent restart; pending requests are written as incomplete |
 | `target '<k>' tap ended (…); … will retry discovery` | the probe for that one agent stopped |
@@ -137,11 +147,12 @@ usage error.
 ## Rolling back to single-agent mode
 
 Drop `--target-manifest` (and `--registration-state` /
-`--print-resolved-targets`, which require it) from the collector, and unset
-`--target-manifest` / `RAIL_TARGET_MANIFEST` for the scanner. Both return to
-their previous behaviour unchanged: collector rows carry no `agent_ref` or
-`attribution` and read `agent_id` from the ticket as before; `--pid`/`--uid`/
-`--comm` work again, and `--output-format` defaults back to `legacy-http`.
+`--print-resolved-targets`, which require it) from the collector, along with
+`--output-format runtime-interaction` if the consumer expects the default
+`legacy-http` rows; unset `--target-manifest` / `RAIL_TARGET_MANIFEST` for the
+scanner. Both return to their previous behaviour unchanged: collector rows
+carry no `agent_ref` or `attribution` and read `agent_id` from the ticket as
+before, and `--pid`/`--uid`/`--comm` work again.
 
 The keyed files the scanner wrote (`….<agent_key>` next to the registration,
 feature and evidence-bundle outputs) are left on disk; delete them if the
