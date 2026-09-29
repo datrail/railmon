@@ -123,6 +123,12 @@ jobs:
           cache-from: type=gha,scope=image
           cache-to: type=gha,mode=max,scope=image
 
+      # The scanner loads its evidence-bundle schemas at import, from the
+      # image's own copy rather than the checkout, so only a scan run in the
+      # image shows whether the Dockerfile ships everything it reads.
+      - name: Scan inside the built image
+        run: docker run --rm railmon:ci scan --mode self --host-id ci --compact > /dev/null
+
       # The built-binary acceptance scripts (DR-109 M3/M4, DR-129) need root so
       # the supervisor and each agent run under distinct UIDs. The container's
       # root gives them that, and their AgentSight is a stub each script writes,
