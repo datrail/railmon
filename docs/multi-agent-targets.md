@@ -140,7 +140,11 @@ count them from the file, e.g.
 | `ignoring registration state for ticket-claim resolution: <path>: <error>` | the state file fails the control-path rules, has no UUID `agent_id`, or names a different host/sandbox than the manifest |
 | `keyed capture requires …` / `… cannot be combined with --target-manifest` | a flag combination keyed mode refuses (exit 1) |
 
-One target failing never stops the others. Exit codes: 0 on SIGINT, 1 on a
+One target failing never stops the others. SIGINT and SIGTERM (`docker stop`)
+both flush and stop cleanly; with `--webhook` the final flush can take up to
+10 s against a slow receiver, so give the container a longer stop grace
+period (`docker stop -t 30`, compose `stop_grace_period`). Exit codes: 0 on a
+stop signal, 1 on a
 startup or I/O error (message on stderr as `Error: …`), 2 on a command-line
 usage error.
 

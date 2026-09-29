@@ -356,8 +356,8 @@ async fn main() -> Result<()> {
 
     // Drop the stream before awaiting the probe's status. The oneshot sender
     // lives inside the stream's state and is only fired while something polls
-    // it, so leaving the loop on a shutdown signal would otherwise block here for ever —
-    // and `kill_on_drop` would never fire, leaving the probe running with its
+    // it, so leaving the loop on a shutdown signal would otherwise block here
+    // for ever — and `kill_on_drop` would never fire, leaving the probe running with its
     // eBPF programs attached, which is what makes the *next* run fail to
     // attach. Dropping it closes the channel; the `_` arm below treats that as
     // "no status to report", which is correct for an interrupted capture.
