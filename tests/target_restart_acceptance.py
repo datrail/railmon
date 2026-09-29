@@ -8,7 +8,7 @@ still notice and restart capture against the replacement process.
 
 Companion to `two_agent_acceptance.py`, which only covers the steady-state
 two-agent happy path. Root-only (needs `setpriv` to run the target under a
-distinct UID) and not wired into CI, matching that script.
+distinct UID), like that script; CI runs it inside the built image.
 """
 
 import json
@@ -99,7 +99,7 @@ agents:
         )
         manifest.chmod(0o600)
         output = root / "interactions.jsonl"
-        binary = pathlib.Path("target/debug/railmon").resolve()
+        binary = pathlib.Path(os.environ.get("RAILMON_BIN", "target/debug/railmon")).resolve()
         railmon = subprocess.Popen(
             [
                 str(binary),

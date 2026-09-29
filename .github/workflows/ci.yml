@@ -87,7 +87,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # `make test` runs fmt, clippy with warnings denied, the Rust tests, and
-      # the Python scanner's 80 tests.
+      # the Python scanner's tests.
       - run: make test
 
   image:
@@ -102,7 +102,8 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       # Build only — nothing is pushed from a pull request. Single-arch amd64:
-      # this is here to catch a Dockerfile that does not build, and the arm64
+      # this is here to catch a Dockerfile that does not build, or an image
+      # that builds but fails the scan and acceptance steps below, and the arm64
       # leg costs QEMU emulation for a signal the amd64 leg already gives.
       #
       # amd64 is also the arch that can fail *specifically*: the Dockerfile
@@ -116,5 +117,31 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          # Loaded into the runner's daemon so the next step can run the very
+          # image a release would publish, not a separate source build.
+          load: true
+          tags: railmon:ci
           cache-from: type=gha,scope=image
           cache-to: type=gha,mode=max,scope=image
+
+      # The scanner loads its evidence-bundle schemas at import, from the
+      # image's own copy rather than the checkout, so only a scan run in the
+      # image shows whether the Dockerfile ships everything it reads.
+      - name: Scan inside the built image
+        run: docker run --rm railmon:ci scan --mode self --host-id ci --compact > /dev/null
+
+      # The built-binary acceptance scripts (DR-109 M3/M4, DR-129) need root so
+      # the supervisor and each agent run under distinct UIDs. The container's
+      # root gives them that, and their AgentSight is a stub each script writes,
+      # so no eBPF, privilege or host PID namespace is involved. RAILMON_BIN
+      # points them at the collector the image ships.
+      - name: Acceptance against the built image
+        run: |
+          for t in two_agent target_restart ticket_claim analyzer_panic; do
+            echo "::group::${t}_acceptance"
+            docker run --rm --user 0 --entrypoint python3 \
+              -e RAILMON_BIN=/usr/local/bin/railmon-collector \
+              -v "$PWD/tests:/tests:ro" \
+              railmon:ci "/tests/${t}_acceptance.py"
+            echo "::endgroup::"
+          done

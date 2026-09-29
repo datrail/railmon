@@ -5,8 +5,8 @@ RailMon must contain it to that target's tap — still running, still capturing
 the other target, and restarting the one whose tap stopped — instead of the
 whole collector aborting.
 
-Root-only (distinct target UIDs via `setpriv`) and not wired into CI, matching
-`two_agent_acceptance.py`.
+Root-only (distinct target UIDs via `setpriv`), like `two_agent_acceptance.py`;
+CI runs it inside the built image (see `ci.yml`), `RAILMON_BIN` picks the binary.
 """
 
 import json
@@ -86,7 +86,7 @@ time.sleep(60)
         manifest.chmod(0o600)
         output = root / "interactions.jsonl"
         log = root / "railmon.log"
-        binary = pathlib.Path("target/debug/railmon").resolve()
+        binary = pathlib.Path(os.environ.get("RAILMON_BIN", "target/debug/railmon")).resolve()
         with log.open("w") as log_file:
             railmon = subprocess.Popen(
                 [
