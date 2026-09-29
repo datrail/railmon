@@ -14,12 +14,13 @@ mod sink;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use futures::stream::SelectAll;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use pipeline::{CaptureFilters, Pairer};
 use sink::Sink;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
+use tokio_stream::StreamMap;
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -331,11 +332,110 @@ struct TargetRuntime {
 }
 
 enum TargetStreamItem {
-    Event(usize, agentsight_capture::Event),
-    Ended(
-        usize,
-        Result<Option<std::process::ExitStatus>, tokio::sync::oneshot::error::RecvError>,
-    ),
+    Event(agentsight_capture::Event),
+    Ended(Result<Option<std::process::ExitStatus>, tokio::sync::oneshot::error::RecvError>),
+}
+
+type TargetStream = Pin<Box<dyn Stream<Item = TargetStreamItem> + Send>>;
+
+/// How often a target whose locator currently doesn't resolve (not_found,
+/// ambiguous, or just exited) gets another discovery attempt. Fixed rather
+/// than truly exponential — "bounded backoff" (design doc §5) mainly needs to
+/// rule out a busy-loop; a flat interval already does that.
+const TARGET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawns one target's tap, scoped to its pinned incarnation's process
+/// session, and wraps its event/exit streams into one `TargetStreamItem`
+/// stream keyed later by manifest index in a `StreamMap`. Used both at
+/// startup and to restart a target whose tap previously stopped.
+async fn spawn_target_tap(
+    agentsight: &str,
+    binary_path: Option<String>,
+    process: identity::ProcessIncarnation,
+    agent_key: &str,
+) -> Result<TargetStream> {
+    let filters = CaptureFilters {
+        binary_path,
+        pid: None,
+        uid: None,
+        comm: None,
+        process_session: Some(process.session_id),
+    };
+    let (stream, status) = pipeline::event_stream(agentsight, &filters)
+        .await
+        .with_context(|| format!("starting tap for '{agent_key}'"))?;
+    let tagged = stream
+        .map(TargetStreamItem::Event)
+        .chain(futures::stream::once(async move {
+            TargetStreamItem::Ended(status.await)
+        }));
+    Ok(Box::pin(tagged))
+}
+
+/// Drains a stopping target's still-pending requests and emits each as an
+/// incomplete interaction, so a request that was captured is never silently
+/// lost just because its response never arrived before the tap stopped
+/// (design doc §4.4).
+async fn flush_target_incomplete(
+    target: &mut TargetRuntime,
+    session_id: &str,
+    capture_start: &str,
+    sink: &mut Sink,
+) -> Result<()> {
+    for mut paired in target.pairer.flush_incomplete() {
+        paired["target_pid"] = serde_json::json!(target.process.pid);
+        paired["process_start_time_ticks"] = serde_json::json!(target.process.start_time_ticks);
+        let value = interaction::to_attributed_runtime_interaction(
+            &paired,
+            Some(session_id),
+            Some(capture_start),
+            "railmon",
+            Some(&target.agent_ref),
+        );
+        sink.emit(&value).await?;
+    }
+    Ok(())
+}
+
+/// Stops one running target: flushes its pending requests as incomplete and
+/// drops its tap stream (which kills the tap), leaving the slot `None` so the
+/// retry tick re-resolves it. A no-op for a target that is already down.
+async fn stop_target(
+    slot: &mut Option<TargetRuntime>,
+    stream_map: &mut StreamMap<usize, TargetStream>,
+    index: usize,
+    session_id: &str,
+    capture_start: &str,
+    sink: &mut Sink,
+) -> Result<()> {
+    stream_map.remove(&index);
+    match slot.take() {
+        Some(mut target) => {
+            flush_target_incomplete(&mut target, session_id, capture_start, sink).await
+        }
+        None => Ok(()),
+    }
+}
+
+/// The collector no longer exits when every target is simultaneously down
+/// (it keeps retrying discovery instead), which means an operator watching
+/// only the process's exit code would never learn that capture went fully
+/// idle. Logs the edge, not every retry tick, so this stays quiet as long as
+/// at least one target is running.
+fn log_target_availability_transition(
+    targets: &[Option<TargetRuntime>],
+    all_targets_down: &mut bool,
+) {
+    let now = targets.iter().all(Option::is_none);
+    if now && !*all_targets_down {
+        log::warn!(
+            "every declared target is currently down; capture is idle and will keep retrying discovery every {}s",
+            TARGET_RETRY_INTERVAL.as_secs()
+        );
+    } else if !now && *all_targets_down {
+        log::info!("a target resolved again; capture is no longer idle");
+    }
+    *all_targets_down = now;
 }
 
 async fn run_multi_target(
@@ -360,123 +460,217 @@ async fn run_multi_target(
     }
 
     let outcomes = manifest.resolve_all();
-    let mut available = Vec::with_capacity(manifest.agents.len());
-    for (target, outcome) in manifest.agents.iter().zip(outcomes) {
+    // Indexed by each declared agent's position in `manifest.agents`, which
+    // never changes for the life of this run. `None` means "not currently
+    // capturing" — either never resolved, or resolved and then stopped —
+    // and is retried on `retry_ticker` rather than ending the whole run.
+    let mut targets: Vec<Option<TargetRuntime>> = Vec::with_capacity(manifest.agents.len());
+    let mut stream_map: StreamMap<usize, TargetStream> = StreamMap::new();
+    let mut any_available = false;
+    for (index, (target, outcome)) in manifest.agents.iter().zip(outcomes).enumerate() {
         match outcome {
-            identity::DiscoveryOutcome::Available(process) => available.push((target, process)),
+            identity::DiscoveryOutcome::Available(process) => {
+                let binary_path = target
+                    .capture
+                    .as_ref()
+                    .and_then(|capture| capture.binary_path.clone())
+                    .or_else(|| args.binary_path.clone());
+                // A tap-spawn failure for one target (e.g. the probe binary
+                // failed to exec) is treated the same way here as it is on
+                // retry below: log and leave this target down rather than
+                // aborting every other target that resolved and started
+                // cleanly.
+                let stream =
+                    match spawn_target_tap(agentsight, binary_path, process, &target.agent_key)
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            log::warn!(
+                                "target '{}' resolved but its tap failed to start: {error:#}",
+                                target.agent_key
+                            );
+                            targets.push(None);
+                            continue;
+                        }
+                    };
+                stream_map.insert(index, stream);
+                targets.push(Some(TargetRuntime {
+                    agent_ref: manifest.agent_ref(target),
+                    process,
+                    pairer: Pairer::new(),
+                }));
+                any_available = true;
+            }
             identity::DiscoveryOutcome::NotFound(reason) => {
                 log::warn!("target '{}' not found: {reason}", target.agent_key);
+                targets.push(None);
             }
             identity::DiscoveryOutcome::Ambiguous(reason) => {
                 log::warn!("target '{}' is ambiguous: {reason}", target.agent_key);
+                targets.push(None);
             }
         }
     }
-    if available.is_empty() {
+    if !any_available {
         anyhow::bail!("no declared agent resolved to a capturable process");
-    }
-    let mut targets = Vec::with_capacity(available.len());
-    let mut streams: SelectAll<_> = SelectAll::new();
-
-    for (index, (target, process)) in available.into_iter().enumerate() {
-        let filters = CaptureFilters {
-            binary_path: target
-                .capture
-                .as_ref()
-                .and_then(|capture| capture.binary_path.clone())
-                .or_else(|| args.binary_path.clone()),
-            pid: None,
-            uid: None,
-            comm: None,
-            process_session: Some(process.session_id),
-        };
-        let (stream, status) = pipeline::event_stream(agentsight, &filters)
-            .await
-            .with_context(|| format!("starting tap for '{}'", target.agent_key))?;
-        let tagged = stream
-            .map(move |event| TargetStreamItem::Event(index, event))
-            .chain(futures::stream::once(async move {
-                TargetStreamItem::Ended(index, status.await)
-            }));
-        streams.push(Box::pin(tagged));
-        targets.push(TargetRuntime {
-            agent_ref: manifest.agent_ref(target),
-            process,
-            pairer: Pairer::new(),
-        });
     }
 
     let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut retry_ticker = tokio::time::interval(TARGET_RETRY_INTERVAL);
+    retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut write_error = None;
-    let mut interrupted = false;
-    loop {
+    let mut all_targets_down = false;
+    'capture: loop {
         tokio::select! {
             biased;
-            next = streams.next() => {
-                let Some(item) = next else { break };
-                let (index, event) = match item {
-                    TargetStreamItem::Event(index, event) => (index, event),
-                    TargetStreamItem::Ended(index, status) => {
+            // `StreamMap::poll_next` returns `Ready(None)` whenever the map
+            // is empty (every target currently down), which would otherwise
+            // make this branch always-ready and starve the other branches —
+            // hence the guard.
+            next = stream_map.next(), if !stream_map.is_empty() => {
+                let Some((index, item)) = next else { continue };
+                match item {
+                    TargetStreamItem::Event(event) => {
+                        let Some(target) = targets[index].as_mut() else { continue };
+                        if !target.process.is_live() {
+                            // The pinned incarnation is gone (exited, or its
+                            // PID/session was reused by an unrelated
+                            // process) but this stream is still bound to that
+                            // session filter, so its events are no longer
+                            // trustworthy. Never re-read /proc to relabel a
+                            // queued event (design doc §4.4/§5) — stop
+                            // trusting this stream instead of trying to.
+                            log::warn!(
+                                "target '{}' exited or its PID was reused; stopping its tap and flushing pending requests as incomplete",
+                                target.agent_ref.agent_key
+                            );
+                            if let Err(error) = stop_target(
+                                &mut targets[index], &mut stream_map, index, session_id, capture_start, sink,
+                            ).await {
+                                write_error = Some(error);
+                                break 'capture;
+                            }
+                            log_target_availability_transition(&targets, &mut all_targets_down);
+                            continue;
+                        }
+                        // The tap was bound to the target's process session.
+                        // Stamp the already pinned root incarnation now,
+                        // before the interaction enters the sink's
+                        // asynchronous webhook queue.
+                        if let Some(mut paired) = target.pairer.accept(event.pid, &event.data, event.timestamp) {
+                            paired["target_pid"] = serde_json::json!(target.process.pid);
+                            paired["process_start_time_ticks"] = serde_json::json!(target.process.start_time_ticks);
+                            let value = interaction::to_attributed_runtime_interaction(
+                                &paired,
+                                Some(session_id),
+                                Some(capture_start),
+                                "railmon",
+                                Some(&target.agent_ref),
+                            );
+                            if let Err(error) = sink.emit(&value).await {
+                                write_error = Some(error);
+                                break 'capture;
+                            }
+                        }
+                    }
+                    TargetStreamItem::Ended(status) => {
                         let detail = match status {
                             Ok(Some(status)) => status.to_string(),
                             Ok(None) => "unknown exit status".into(),
                             Err(error) => error.to_string(),
                         };
-                        anyhow::bail!(
-                            "keyed AgentSight tap {} ended while capture was active: {}",
-                            targets[index].agent_ref.agent_key,
-                            detail
-                        );
-                    }
-                };
-                let target = &mut targets[index];
-                if !target.process.is_live() {
-                    anyhow::bail!(
-                        "target '{}' exited or its PID was reused; refusing to attribute queued events",
-                        target.agent_ref.agent_key
-                    );
-                }
-                // The tap was bound to the target's process session. Stamp the
-                // already pinned root incarnation now, before the interaction
-                // enters the sink's asynchronous webhook queue.
-                if let Some(mut paired) = target.pairer.accept(event.pid, &event.data, event.timestamp) {
-                    paired["target_pid"] = serde_json::json!(target.process.pid);
-                    paired["process_start_time_ticks"] = serde_json::json!(target.process.start_time_ticks);
-                    let value = interaction::to_attributed_runtime_interaction(
-                        &paired,
-                        Some(session_id),
-                        Some(capture_start),
-                        "railmon",
-                        Some(&target.agent_ref),
-                    );
-                    if let Err(error) = sink.emit(&value).await {
-                        write_error = Some(error);
-                        break;
+                        if let Some(target) = targets[index].as_ref() {
+                            log::warn!(
+                                "target '{}' tap ended ({detail}); flushing pending requests as incomplete, will retry discovery",
+                                target.agent_ref.agent_key
+                            );
+                        }
+                        if let Err(error) = stop_target(
+                            &mut targets[index], &mut stream_map, index, session_id, capture_start, sink,
+                        ).await {
+                            write_error = Some(error);
+                            break 'capture;
+                        }
+                        log_target_availability_transition(&targets, &mut all_targets_down);
                     }
                 }
             }
+            // A target that is currently down — not_found, ambiguous, or its
+            // tap just stopped — is never dropped for good: retry its
+            // locator on a bounded interval and restart its tap the moment
+            // it resolves again. The restarted process keeps the same
+            // `agent_key` and gets a new, freshly pinned incarnation (design
+            // doc §4.4): none of the other running targets are disturbed.
+            _ = retry_ticker.tick() => {
+                // A target that exits quietly produces no further events, so
+                // the per-event liveness check above never fires for it and
+                // its tap would stay bound to a dead session forever. Sweep
+                // every running target's pinned incarnation here too.
+                for (index, slot) in targets.iter_mut().enumerate() {
+                    let Some(target) = slot.as_ref() else { continue };
+                    if target.process.is_live() {
+                        continue;
+                    }
+                    log::warn!(
+                        "target '{}' exited or its PID was reused; stopping its tap and flushing pending requests as incomplete",
+                        target.agent_ref.agent_key
+                    );
+                    if let Err(error) = stop_target(
+                        slot, &mut stream_map, index, session_id, capture_start, sink,
+                    ).await {
+                        write_error = Some(error);
+                        break 'capture;
+                    }
+                }
+                if targets.iter().any(Option::is_none) {
+                    let outcomes = manifest.resolve_all();
+                    for (index, outcome) in outcomes.into_iter().enumerate() {
+                        if targets[index].is_some() {
+                            continue;
+                        }
+                        let identity::DiscoveryOutcome::Available(process) = outcome else {
+                            continue;
+                        };
+                        let target = &manifest.agents[index];
+                        let binary_path = target
+                            .capture
+                            .as_ref()
+                            .and_then(|capture| capture.binary_path.clone())
+                            .or_else(|| args.binary_path.clone());
+                        match spawn_target_tap(agentsight, binary_path, process, &target.agent_key).await {
+                            Ok(stream) => {
+                                log::info!("target '{}' resolved again; tap restarted", target.agent_key);
+                                stream_map.insert(index, stream);
+                                targets[index] = Some(TargetRuntime {
+                                    agent_ref: manifest.agent_ref(target),
+                                    process,
+                                    pairer: Pairer::new(),
+                                });
+                            }
+                            Err(error) => log::warn!(
+                                "target '{}' resolved again but its tap failed to start: {error:#}",
+                                target.agent_key
+                            ),
+                        }
+                    }
+                    log_target_availability_transition(&targets, &mut all_targets_down);
+                }
+            }
             _ = ticker.tick() => sink.flush_if_due().await,
-            _ = tokio::signal::ctrl_c() => {
-                interrupted = true;
-                break;
-            },
+            _ = tokio::signal::ctrl_c() => break 'capture,
         }
     }
-    drop(streams);
 
     if let Some(error) = write_error {
         return Err(error);
     }
-    if !interrupted {
-        anyhow::bail!("all keyed AgentSight taps ended; capture is no longer active");
-    }
-    let outstanding: usize = targets
-        .iter()
-        .map(|target| target.pairer.outstanding())
-        .sum();
-    if outstanding > 0 {
-        log::info!("{outstanding} keyed request(s) had no response at exit");
+    // Every remaining active target's requests are flushed the same way a
+    // mid-run exit is: a pending request that never got a response before
+    // the process stopped capturing is reported, not silently discarded.
+    for target in targets.iter_mut().flatten() {
+        flush_target_incomplete(target, session_id, capture_start, sink).await?;
     }
     Ok(())
 }

@@ -535,6 +535,34 @@ impl Pairer {
     pub fn outstanding(&self) -> usize {
         self.pending.values().map(VecDeque::len).sum()
     }
+
+    /// Drains every still-pending request into a synthetic, response-less
+    /// interaction marked `"incomplete": true`, for a tap that is stopping
+    /// (target exit, PID reuse, or shutdown). A request whose response never
+    /// arrived is otherwise indistinguishable from one that just never
+    /// happened; this is what design doc §4.4 means by "pending requests are
+    /// flushed as incomplete" rather than silently dropped.
+    pub fn flush_incomplete(&mut self) -> Vec<Value> {
+        self.pending
+            .drain()
+            .flat_map(|((pid, _tid), queue)| {
+                queue.into_iter().map(move |pending| {
+                    json!({
+                        "timestamp": ms_to_rfc3339(pending.epoch_ms),
+                        "timestamp_ns": pending.epoch_ms.saturating_mul(1_000_000),
+                        "pid": pid,
+                        "tid": pending.tid,
+                        "request": usable_request(pending.request),
+                        "response": Value::Null,
+                        "request_size": pending.size,
+                        "response_size": 0,
+                        "latency_ms": Value::Null,
+                        "incomplete": true,
+                    })
+                })
+            })
+            .collect()
+    }
 }
 
 fn ms_to_rfc3339(epoch_ms: u64) -> Value {
@@ -957,6 +985,36 @@ mod tests {
         let first = p.accept(1, &resp(7, 3_000_000_000, 200), 3000).unwrap();
         assert_eq!(first["timestamp_ns"], 1_000_000_000u64);
         assert_eq!(p.outstanding(), 1);
+    }
+
+    #[test]
+    fn flush_incomplete_drains_pending_requests_with_no_response() {
+        let mut p = Pairer::new();
+        p.accept(1, &req(7, 1_000_000_000), 1000);
+        p.accept(1, &req(7, 2_000_000_000), 2000);
+        assert_eq!(p.outstanding(), 2);
+        let flushed = p.flush_incomplete();
+        assert_eq!(flushed.len(), 2);
+        for event in &flushed {
+            assert_eq!(event["incomplete"], true);
+            assert_eq!(event["response"], Value::Null);
+            assert_eq!(event["pid"], 1);
+        }
+        // Draining leaves nothing behind, and nothing left to answer later.
+        assert_eq!(p.outstanding(), 0);
+        assert!(p.flush_incomplete().is_empty());
+    }
+
+    #[test]
+    fn flush_incomplete_leaves_an_already_paired_response_alone() {
+        // A completed pair was already returned by `accept` and removed from
+        // `pending` — flushing must not manufacture a second, incomplete copy
+        // of traffic that already has a real response.
+        let mut p = Pairer::new();
+        p.accept(1, &req(7, 1_000_000_000), 1000);
+        let paired = p.accept(1, &resp(7, 1_100_000_000, 200), 1100);
+        assert!(paired.is_some());
+        assert!(p.flush_incomplete().is_empty());
     }
 
     #[test]

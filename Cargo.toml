@@ -15,6 +15,7 @@ agentsight-capture = "1.0"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 futures = "0.3"
+tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

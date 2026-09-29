@@ -1087,6 +1087,44 @@ mod tests {
     }
 
     #[test]
+    fn is_live_is_true_while_running_and_false_after_the_pid_exits() {
+        // Design doc §4.4/§5: a tap must never re-read `/proc` to *identify*
+        // a queued event, but the supervisor does use a fresh `/proc` read to
+        // check whether the incarnation it already pinned is still the one
+        // running — this is that check, exercised against a real process
+        // rather than synthetic fields.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn a live child process");
+        let pid = child.id();
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc/<pid>/stat");
+        let (session_id, start_time_ticks) = parse_proc_stat(pid, &stat).expect("parse /proc stat");
+        let uid = fs::metadata(format!("/proc/{pid}"))
+            .expect("read /proc/<pid> metadata")
+            .uid();
+        let incarnation = ProcessIncarnation {
+            pid,
+            start_time_ticks,
+            session_id,
+            uid,
+        };
+        assert!(
+            incarnation.is_live(),
+            "pinned incarnation should be live while the process is running"
+        );
+
+        child.kill().expect("kill child");
+        child
+            .wait()
+            .expect("reap child, so the PID is actually free");
+        assert!(
+            !incarnation.is_live(),
+            "pinned incarnation should not be live once the process has exited"
+        );
+    }
+
+    #[test]
     fn summarize_target_has_no_self_asserted_agent_key_for_a_dead_pid() {
         // 999999 is not a live process in this environment. A permission
         // failure or a process that has since exited must be silent `None`,
