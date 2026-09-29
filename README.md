@@ -54,6 +54,9 @@ content-derived interaction IDs. Output can remain local for
 [RailDash](https://github.com/datrail/raildash) or be forwarded to a configured
 endpoint.
 
+To monitor several agents in one sandbox, each attributed separately, see
+[docs/multi-agent-targets.md](docs/multi-agent-targets.md).
+
 ## Platforms and security
 
 Collection is Linux-only and needs root or the relevant BPF capabilities. WSL2
