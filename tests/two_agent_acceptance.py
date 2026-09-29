@@ -86,7 +86,7 @@ agents:
         )
         manifest.chmod(0o600)
         output = root / "interactions.jsonl"
-        binary = pathlib.Path("target/debug/railmon").resolve()
+        binary = pathlib.Path(os.environ.get("RAILMON_BIN", "target/debug/railmon")).resolve()
         railmon = subprocess.Popen(
             [
                 str(binary),

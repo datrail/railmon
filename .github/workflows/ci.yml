@@ -116,5 +116,25 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          # Loaded into the runner's daemon so the next step can run the very
+          # image a release would publish, not a separate source build.
+          load: true
+          tags: railmon:ci
           cache-from: type=gha,scope=image
           cache-to: type=gha,mode=max,scope=image
+
+      # The built-binary acceptance scripts (DR-109 M3/M4, DR-129) need root so
+      # the supervisor and each agent run under distinct UIDs. The container's
+      # root gives them that, and their AgentSight is a stub each script writes,
+      # so no eBPF, privilege or host PID namespace is involved. RAILMON_BIN
+      # points them at the collector the image ships.
+      - name: Acceptance against the built image
+        run: |
+          for t in two_agent target_restart ticket_claim analyzer_panic; do
+            echo "::group::${t}_acceptance"
+            docker run --rm --user 0 --entrypoint python3 \
+              -e RAILMON_BIN=/usr/local/bin/railmon-collector \
+              -v "$PWD/tests:/tests:ro" \
+              railmon:ci "/tests/${t}_acceptance.py"
+            echo "::endgroup::"
+          done
