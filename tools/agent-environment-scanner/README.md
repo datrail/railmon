@@ -304,6 +304,20 @@ diverge from it.
 re-runs the full collection (sandbox scan plus every currently-available
 keyed scan), not just the sandbox-wide half.
 
+The keyed registration state is also what the collector's multi-target
+capture reads to judge an unsigned `x-rail` ticket (DR-109 M3). Start the
+collector with `--registration-state` set to the same absolute path passed
+here as `--registration-output`; it re-reads each `<path>.<agent_key>` every
+few seconds. A ticket claiming the capturing target's own registered
+`agent_id` is recorded as corroboration (`process_target_with_ticket_claim`),
+one claiming a sibling's is a `conflict` with `agent_ref` and `agent_id`
+cleared, and any other claim is ignored — the process target alone decides.
+Without the flag every row is attributed by process target alone. The
+collector only trusts a state file whose `host_id` and `sandbox_name` equal
+the manifest's `sandbox` values, so pass the scanner `--host-id` and
+`--sandbox-name` (or `RAIL_HOST_ID`/the `rail.sandbox_name` label) matching
+the manifest; a mismatched file is logged and ignored.
+
 ## Authentication
 
 `RAIL_AUTH_MODE` (or `--auth-mode`) selects the credential presented when

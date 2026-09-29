@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -115,6 +115,109 @@ impl ProcessIncarnation {
             fs::metadata(format!("/proc/{}", self.pid)).is_ok_and(|meta| meta.uid() == self.uid);
         same_incarnation && same_uid
     }
+}
+
+/// The Rail Center `agent_id` each keyed target registered under, read from
+/// the scanner's own keyed registration state. It is what lets an unsigned
+/// `x-rail` ticket's claimed `agent_id` be resolved to an `agent_key` (design
+/// doc §4.5 rule 2) — and only ever to corroborate or contradict the process
+/// target, never to name an agent on its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegisteredAgents {
+    key_by_id: HashMap<String, String>,
+    id_by_key: HashMap<String, String>,
+}
+
+impl RegisteredAgents {
+    /// Builds the mapping from `(agent_key, agent_id)` pairs. An `agent_id`
+    /// claimed by more than one key cannot say which agent a ticket names,
+    /// so it is dropped for every key that claims it rather than guessed.
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        let pairs: Vec<(String, String)> = pairs.into_iter().collect();
+        let mut claims: HashMap<&str, usize> = HashMap::new();
+        for (_, id) in &pairs {
+            *claims.entry(id.as_str()).or_default() += 1;
+        }
+        let mut mapping = Self::default();
+        for (key, id) in &pairs {
+            if claims[id.as_str()] == 1 {
+                mapping.key_by_id.insert(id.clone(), key.clone());
+                mapping.id_by_key.insert(key.clone(), id.clone());
+            }
+        }
+        mapping
+    }
+
+    pub fn key_for(&self, agent_id: &str) -> Option<&str> {
+        self.key_by_id.get(agent_id).map(String::as_str)
+    }
+
+    pub fn id_for(&self, agent_key: &str) -> Option<&str> {
+        self.id_by_key.get(agent_key).map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.id_by_key.len()
+    }
+}
+
+/// Reads each declared agent's keyed registration state — the scanner writes
+/// `<base>.<agent_key>` for the un-keyed `--registration-output` base path —
+/// and returns the mapping plus one line per file that exists but could not
+/// be used. A missing file just means that key has not registered yet. A
+/// file that fails the control-path checks, does not parse, carries no UUID
+/// `agent_id`, or names a different host/sandbox than the manifest is left
+/// out: an unusable mapping only loses ticket corroboration, never the
+/// process target's attribution.
+pub fn load_registered_agents(
+    manifest: &TargetManifest,
+    base: &Path,
+) -> (RegisteredAgents, Vec<String>) {
+    let mut pairs = Vec::new();
+    let mut problems = Vec::new();
+    let Some(name) = base.file_name().and_then(|name| name.to_str()) else {
+        problems.push(format!(
+            "registration state path {} has no file name",
+            base.display()
+        ));
+        return (RegisteredAgents::default(), problems);
+    };
+    for target in &manifest.agents {
+        let path = base.with_file_name(format!("{name}.{}", target.agent_key));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            _ => {}
+        }
+        match read_registered_agent_id(manifest, &path) {
+            Ok(id) => pairs.push((target.agent_key.clone(), id)),
+            Err(error) => problems.push(format!("{}: {error:#}", path.display())),
+        }
+    }
+    (RegisteredAgents::from_pairs(pairs), problems)
+}
+
+fn read_registered_agent_id(manifest: &TargetManifest, path: &Path) -> Result<String> {
+    validate_control_path(path, None)?;
+    let bytes = fs::read(path).context("reading registration state")?;
+    let state: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parsing registration state")?;
+    for (field, expected) in [
+        ("host_id", &manifest.sandbox.host_id),
+        ("sandbox_name", &manifest.sandbox.sandbox_name),
+    ] {
+        match state.get(field) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(value)) if value == expected => {}
+            Some(other) => bail!("{field} {other} does not match the manifest's {expected:?}"),
+        }
+    }
+    let id = state
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .context("no agent_id")?;
+    uuid::Uuid::parse_str(id)
+        .map(|id| id.to_string())
+        .context("agent_id is not a UUID")
 }
 
 /// One declared agent's discovery outcome, in the shape the Python scanner
@@ -612,6 +715,90 @@ mod tests {
             .prefix("railmon-identity-test-")
             .tempdir_in(home)
             .expect("create temp dir under $HOME")
+    }
+
+    const PLANNER_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const WORKER_ID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+    fn write_state(dir: &Path, key: &str, state: serde_json::Value) {
+        let path = dir.join(format!("registration.json.{key}"));
+        fs::write(&path, state.to_string()).expect("write registration state");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod state");
+    }
+
+    #[test]
+    fn registered_agents_map_each_keys_state_and_skip_unregistered_keys() {
+        let dir = test_dir();
+        let m = manifest(vec![
+            target("planner", "/run/agents/planner.pid"),
+            target("worker-2", "/run/agents/worker-2.pid"),
+        ]);
+        write_state(
+            dir.path(),
+            "planner",
+            serde_json::json!({"agent_id": PLANNER_ID, "host_id": "host-1", "sandbox_name": "sandbox-1"}),
+        );
+        let (registered, problems) =
+            load_registered_agents(&m, &dir.path().join("registration.json"));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(registered.key_for(PLANNER_ID), Some("planner"));
+        assert_eq!(registered.id_for("planner"), Some(PLANNER_ID));
+        // worker-2 has not registered yet: not a problem, just no mapping.
+        assert_eq!(registered.id_for("worker-2"), None);
+        assert_eq!(registered.len(), 1);
+    }
+
+    #[test]
+    fn registered_agents_ignore_unusable_state_and_say_why() {
+        let dir = test_dir();
+        let m = manifest(vec![
+            target("planner", "/run/agents/planner.pid"),
+            target("worker-2", "/run/agents/worker-2.pid"),
+            target("critic", "/run/agents/critic.pid"),
+        ]);
+        // Another sandbox's state must not resolve this sandbox's tickets.
+        write_state(
+            dir.path(),
+            "planner",
+            serde_json::json!({"agent_id": PLANNER_ID, "host_id": "host-1", "sandbox_name": "elsewhere"}),
+        );
+        write_state(
+            dir.path(),
+            "worker-2",
+            serde_json::json!({"agent_id": "not-a-uuid"}),
+        );
+        write_state(
+            dir.path(),
+            "critic",
+            serde_json::json!({"agent_id": WORKER_ID}),
+        );
+        // A monitored agent able to rewrite the mapping could turn a sibling's
+        // traffic into a conflict; group-writable state is refused.
+        fs::set_permissions(
+            dir.path().join("registration.json.critic"),
+            fs::Permissions::from_mode(0o620),
+        )
+        .expect("chmod state");
+        let (registered, problems) =
+            load_registered_agents(&m, &dir.path().join("registration.json"));
+        assert_eq!(registered.len(), 0);
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("sandbox_name")));
+        assert!(problems.iter().any(|p| p.contains("not a UUID")));
+        assert!(problems.iter().any(|p| p.contains("group/other writable")));
+    }
+
+    #[test]
+    fn an_agent_id_claimed_by_two_keys_resolves_to_neither() {
+        let registered = RegisteredAgents::from_pairs([
+            ("planner".to_string(), PLANNER_ID.to_string()),
+            ("worker-2".to_string(), PLANNER_ID.to_string()),
+            ("critic".to_string(), WORKER_ID.to_string()),
+        ]);
+        assert_eq!(registered.key_for(PLANNER_ID), None);
+        assert_eq!(registered.id_for("planner"), None);
+        assert_eq!(registered.id_for("worker-2"), None);
+        assert_eq!(registered.key_for(WORKER_ID), Some("critic"));
     }
 
     #[test]
