@@ -70,8 +70,8 @@ impl Sink {
                 url: url.to_string(),
                 // Bounded on purpose. flush() is awaited from inside the
                 // capture loop, so an unbounded POST to a hung receiver stalls
-                // event reads, the flush timer and ctrl_c, and the probe's
-                // stdout pipe then backs up behind it. The Python bounded this
+                // event reads, the flush timer and shutdown signals, and the
+                // probe's stdout pipe then backs up behind it. The Python bounded this
                 // at 10s; matching that.
                 client: reqwest::Client::builder()
                     .timeout(Duration::from_secs(10))

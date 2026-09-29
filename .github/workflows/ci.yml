@@ -145,3 +145,9 @@ jobs:
               railmon:ci "/tests/${t}_acceptance.py"
             echo "::endgroup::"
           done
+          # The same two-agent run stopped the way `docker stop` stops it
+          # (DR-130): SIGTERM must flush and exit 0 like SIGINT.
+          docker run --rm --user 0 --entrypoint python3 \
+            -e RAILMON_BIN=/usr/local/bin/railmon-collector \
+            -v "$PWD/tests:/tests:ro" \
+            railmon:ci /tests/two_agent_acceptance.py --stop-signal TERM

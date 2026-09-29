@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Built-binary DR-109 acceptance with two real isolated agent processes."""
+"""Built-binary DR-109 acceptance with two real isolated agent processes.
 
+`--stop-signal TERM` stops RailMon the way `docker stop` does instead of with
+SIGINT; both must take the same clean shutdown path (DR-130).
+"""
+
+import argparse
 import json
 import os
 import pathlib
@@ -17,6 +22,9 @@ def require(condition: bool, message: str) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stop-signal", choices=("INT", "TERM"), default="INT")
+    stop_signal = signal.Signals[f"SIG{parser.parse_args().stop_signal}"]
     require(os.geteuid() == 0, "run as root so supervisor and agent UIDs differ")
     root = pathlib.Path(tempfile.mkdtemp(prefix="dr109-", dir="/run"))
     root.chmod(0o700)
@@ -108,8 +116,8 @@ agents:
             time.sleep(0.05)
         else:
             raise RuntimeError("RailMon did not capture both agents before timeout")
-        railmon.send_signal(signal.SIGINT)
-        require(railmon.wait(timeout=5) == 0, "RailMon did not stop cleanly on SIGINT")
+        railmon.send_signal(stop_signal)
+        require(railmon.wait(timeout=5) == 0, f"RailMon did not stop cleanly on {stop_signal.name}")
         rows = [json.loads(line) for line in output.read_text().splitlines()]
         require(len(rows) == 2, f"expected two interactions, got {len(rows)}")
         by_key = {row["agent_ref"]["agent_key"]: row for row in rows}
@@ -123,7 +131,7 @@ agents:
             by_key["planner"]["attribution"]["process"] != by_key["executor"]["attribution"]["process"],
             "process incarnations collapsed",
         )
-        print(json.dumps({"result": "PASS", "agents": sorted(by_key), "rows": len(rows)}))
+        print(json.dumps({"result": "PASS", "agents": sorted(by_key), "rows": len(rows), "stop_signal": stop_signal.name}))
     finally:
         for proc in agents:
             proc.terminate()
