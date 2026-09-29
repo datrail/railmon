@@ -134,10 +134,11 @@ jobs:
       # the supervisor and each agent run under distinct UIDs. The container's
       # root gives them that, and their AgentSight is a stub each script writes,
       # so no eBPF, privilege or host PID namespace is involved. RAILMON_BIN
-      # points them at the collector the image ships.
+      # points them at the collector the image ships; fail_closed also runs
+      # the scanner the image ships, since /tests has no source tree beside it.
       - name: Acceptance against the built image
         run: |
-          for t in two_agent target_restart ticket_claim analyzer_panic; do
+          for t in two_agent target_restart ticket_claim analyzer_panic fail_closed; do
             echo "::group::${t}_acceptance"
             docker run --rm --user 0 --entrypoint python3 \
               -e RAILMON_BIN=/usr/local/bin/railmon-collector \
