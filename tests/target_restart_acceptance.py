@@ -2,7 +2,9 @@
 """Built-binary DR-109 M3 acceptance: a target's tap stops mid-flight and
 RailMon survives it — flushing the pending request as incomplete, retrying
 discovery, and restarting capture under the same `agent_key` — instead of the
-whole collector exiting (the pre-M3-restart-work behavior this replaces).
+whole collector exiting (the pre-M3-restart-work behavior this replaces). Then
+the target exits quietly, with its tap still up and silent, and RailMon must
+still notice and restart capture against the replacement process.
 
 Companion to `two_agent_acceptance.py`, which only covers the steady-state
 two-agent happy path. Root-only (needs `setpriv` to run the target under a
@@ -152,9 +154,39 @@ agents:
             "restarted tap attributed traffic to the wrong process",
         )
 
+        # Then: the target exits *quietly*. Attempt 1's tap is still up and
+        # emits nothing more, so no event ever reaches the per-event liveness
+        # check — the retry tick's sweep has to notice the dead incarnation,
+        # stop that tap, and pick up the replacement process from the same
+        # locator under the same `agent_key`.
+        old_pid = target.pid
+        target.terminate()
+        target.wait(timeout=2)
+        target = subprocess.Popen(
+            ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--ptracer=any", "setsid", "sleep", "60"]
+        )
+        time.sleep(0.1)
+        require(target.poll() is None, "replacement planner process did not remain live")
+        require(target.pid != old_pid, "replacement planner reused the old PID; rerun")
+        (root / "planner.pid").write_text(f"{target.pid}\n")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and len(rows()) < 3:
+            require(railmon.poll() is None, "RailMon exited after its target exited quietly")
+            time.sleep(0.1)
+        after = rows()
+        require(len(after) == 3, f"expected a row from the replacement process, got {len(after)} rows")
+        third = after[2]
+        require(not third["raw"].get("incomplete"), "the replacement's interaction should be complete")
+        require(third["agent_ref"]["agent_key"] == "planner", "replacement tap lost its agent_ref")
+        require(
+            third["attribution"]["process"]["pid"] == target.pid,
+            "replacement tap attributed traffic to the wrong process",
+        )
+        require((root / "attempts").read_text() == "3", "quiet exit did not restart the tap exactly once")
+
         railmon.send_signal(signal.SIGINT)
         require(railmon.wait(timeout=5) == 0, "RailMon did not stop cleanly on SIGINT after a restart")
-        print(json.dumps({"result": "PASS", "rows": len(both)}))
+        print(json.dumps({"result": "PASS", "rows": len(after)}))
     finally:
         if railmon is not None and railmon.poll() is None:
             railmon.kill()

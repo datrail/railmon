@@ -336,6 +336,8 @@ enum TargetStreamItem {
     Ended(Result<Option<std::process::ExitStatus>, tokio::sync::oneshot::error::RecvError>),
 }
 
+type TargetStream = Pin<Box<dyn Stream<Item = TargetStreamItem> + Send>>;
+
 /// How often a target whose locator currently doesn't resolve (not_found,
 /// ambiguous, or just exited) gets another discovery attempt. Fixed rather
 /// than truly exponential — "bounded backoff" (design doc §5) mainly needs to
@@ -351,7 +353,7 @@ async fn spawn_target_tap(
     binary_path: Option<String>,
     process: identity::ProcessIncarnation,
     agent_key: &str,
-) -> Result<Pin<Box<dyn Stream<Item = TargetStreamItem> + Send>>> {
+) -> Result<TargetStream> {
     let filters = CaptureFilters {
         binary_path,
         pid: None,
@@ -393,6 +395,26 @@ async fn flush_target_incomplete(
         sink.emit(&value).await?;
     }
     Ok(())
+}
+
+/// Stops one running target: flushes its pending requests as incomplete and
+/// drops its tap stream (which kills the tap), leaving the slot `None` so the
+/// retry tick re-resolves it. A no-op for a target that is already down.
+async fn stop_target(
+    slot: &mut Option<TargetRuntime>,
+    stream_map: &mut StreamMap<usize, TargetStream>,
+    index: usize,
+    session_id: &str,
+    capture_start: &str,
+    sink: &mut Sink,
+) -> Result<()> {
+    stream_map.remove(&index);
+    match slot.take() {
+        Some(mut target) => {
+            flush_target_incomplete(&mut target, session_id, capture_start, sink).await
+        }
+        None => Ok(()),
+    }
 }
 
 /// The collector no longer exits when every target is simultaneously down
@@ -443,8 +465,7 @@ async fn run_multi_target(
     // capturing" — either never resolved, or resolved and then stopped —
     // and is retried on `retry_ticker` rather than ending the whole run.
     let mut targets: Vec<Option<TargetRuntime>> = Vec::with_capacity(manifest.agents.len());
-    let mut stream_map: StreamMap<usize, Pin<Box<dyn Stream<Item = TargetStreamItem> + Send>>> =
-        StreamMap::new();
+    let mut stream_map: StreamMap<usize, TargetStream> = StreamMap::new();
     let mut any_available = false;
     for (index, (target, outcome)) in manifest.agents.iter().zip(outcomes).enumerate() {
         match outcome {
@@ -525,14 +546,12 @@ async fn run_multi_target(
                                 "target '{}' exited or its PID was reused; stopping its tap and flushing pending requests as incomplete",
                                 target.agent_ref.agent_key
                             );
-                            let mut target = targets[index].take().expect("checked Some above");
-                            if let Err(error) =
-                                flush_target_incomplete(&mut target, session_id, capture_start, sink).await
-                            {
+                            if let Err(error) = stop_target(
+                                &mut targets[index], &mut stream_map, index, session_id, capture_start, sink,
+                            ).await {
                                 write_error = Some(error);
                                 break 'capture;
                             }
-                            stream_map.remove(&index);
                             log_target_availability_transition(&targets, &mut all_targets_down);
                             continue;
                         }
@@ -562,19 +581,18 @@ async fn run_multi_target(
                             Ok(None) => "unknown exit status".into(),
                             Err(error) => error.to_string(),
                         };
-                        if let Some(mut target) = targets[index].take() {
+                        if let Some(target) = targets[index].as_ref() {
                             log::warn!(
                                 "target '{}' tap ended ({detail}); flushing pending requests as incomplete, will retry discovery",
                                 target.agent_ref.agent_key
                             );
-                            if let Err(error) =
-                                flush_target_incomplete(&mut target, session_id, capture_start, sink).await
-                            {
-                                write_error = Some(error);
-                                break 'capture;
-                            }
                         }
-                        stream_map.remove(&index);
+                        if let Err(error) = stop_target(
+                            &mut targets[index], &mut stream_map, index, session_id, capture_start, sink,
+                        ).await {
+                            write_error = Some(error);
+                            break 'capture;
+                        }
                         log_target_availability_transition(&targets, &mut all_targets_down);
                     }
                 }
@@ -586,6 +604,26 @@ async fn run_multi_target(
             // `agent_key` and gets a new, freshly pinned incarnation (design
             // doc §4.4): none of the other running targets are disturbed.
             _ = retry_ticker.tick() => {
+                // A target that exits quietly produces no further events, so
+                // the per-event liveness check above never fires for it and
+                // its tap would stay bound to a dead session forever. Sweep
+                // every running target's pinned incarnation here too.
+                for (index, slot) in targets.iter_mut().enumerate() {
+                    let Some(target) = slot.as_ref() else { continue };
+                    if target.process.is_live() {
+                        continue;
+                    }
+                    log::warn!(
+                        "target '{}' exited or its PID was reused; stopping its tap and flushing pending requests as incomplete",
+                        target.agent_ref.agent_key
+                    );
+                    if let Err(error) = stop_target(
+                        slot, &mut stream_map, index, session_id, capture_start, sink,
+                    ).await {
+                        write_error = Some(error);
+                        break 'capture;
+                    }
+                }
                 if targets.iter().any(Option::is_none) {
                     let outcomes = manifest.resolve_all();
                     for (index, outcome) in outcomes.into_iter().enumerate() {
