@@ -119,6 +119,50 @@ pub fn to_attributed_runtime_interaction(
     output
 }
 
+/// A row captured on a process that more than one declared target claims
+/// (design doc §4.5 rule 6 and §5): `ambiguous`, with no agent identity —
+/// not even one an x-rail ticket claims — and never copied into either
+/// agent. `candidates` (the colliding agent keys) and the discovery reason
+/// go only into `raw`'s audit record. `process` is the pinned incarnation
+/// when the tapped session holds exactly one (always, while discovery only
+/// accepts session leaders), else null.
+pub fn to_ambiguous_runtime_interaction(
+    interaction: &Value,
+    session_id: Option<&str>,
+    capture_start: Option<&str>,
+    capture_source: &str,
+    candidates: &[String],
+    discovery_reason: &str,
+) -> Value {
+    let mut output = to_runtime_interaction(interaction, session_id, capture_start, capture_source);
+    let process = interaction
+        .get("process_start_time_ticks")
+        .and_then(Value::as_u64)
+        .map(|start_time| {
+            json!({
+                "pid": interaction.get("target_pid").cloned().unwrap_or(Value::Null),
+                "start_time_ticks": start_time
+            })
+        });
+    output["runtime_identity_version"] = json!(1);
+    output["agent_id"] = Value::Null;
+    output["agent_ref"] = Value::Null;
+    output["attribution"] = json!({
+        "state": "ambiguous",
+        "method": null,
+        "reason": "MULTIPLE_TARGETS",
+        "target_id": null,
+        "process": process,
+    });
+    if let Some(raw) = output["raw"].as_object_mut() {
+        raw.insert(
+            "railmon_attribution_audit".into(),
+            json!({"candidate_targets": candidates, "discovery_reason": discovery_reason}),
+        );
+    }
+    output
+}
+
 fn opt_str(v: Option<&str>) -> Value {
     v.map(|s| Value::String(s.to_string()))
         .unwrap_or(Value::Null)
@@ -567,6 +611,51 @@ mod tests {
         assert_eq!(out["attribution"]["reason"], "PROCESS_INCARNATION_UNPINNED");
         assert_eq!(out["agent_ref"], Value::Null);
         assert_eq!(out["agent_id"], Value::Null);
+    }
+
+    #[test]
+    fn an_ambiguous_row_names_no_agent_even_with_a_ticket() {
+        let mut v = pinned_with_ticket(Some("11111111-1111-4111-8111-111111111111"));
+        let candidates = vec!["executor".to_string(), "planner".to_string()];
+        let out = to_ambiguous_runtime_interaction(
+            &v,
+            Some("s"),
+            Some("t"),
+            "railmon",
+            &candidates,
+            "shared",
+        );
+        assert_eq!(out["attribution"]["state"], "ambiguous");
+        assert_eq!(out["attribution"]["reason"], "MULTIPLE_TARGETS");
+        assert_eq!(out["attribution"]["method"], Value::Null);
+        assert_eq!(out["attribution"]["target_id"], Value::Null);
+        assert_eq!(out["attribution"]["process"]["pid"], 4242);
+        assert_eq!(out["agent_ref"], Value::Null);
+        assert_eq!(out["agent_id"], Value::Null);
+        assert_eq!(
+            out["raw"]["railmon_attribution_audit"]["candidate_targets"],
+            json!(["executor", "planner"])
+        );
+        // The id is the same one the row would have had unkeyed, so an
+        // ambiguous row cannot be re-sent as a second, attributed copy.
+        assert_eq!(
+            out["interaction_id"],
+            to_runtime_interaction(&v, Some("s"), Some("t"), "railmon")["interaction_id"]
+        );
+
+        // Several incarnations in one tapped session: no single process.
+        v.as_object_mut()
+            .unwrap()
+            .remove("process_start_time_ticks");
+        let out = to_ambiguous_runtime_interaction(
+            &v,
+            Some("s"),
+            Some("t"),
+            "railmon",
+            &candidates,
+            "shared",
+        );
+        assert_eq!(out["attribution"]["process"], Value::Null);
     }
 
     #[test]

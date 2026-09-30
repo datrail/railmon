@@ -97,8 +97,15 @@ pub enum DiscoveryOutcome {
     NotFound(String),
     /// The locator resolved to a process, but that process (or its session,
     /// or its uid) is also claimed by another declared agent, so capture
-    /// could not be attributed to one key over the other.
-    Ambiguous(String),
+    /// could not be attributed to one key over the other. The process is
+    /// kept so its traffic can still be captured as `ambiguous` rather than
+    /// going unseen (design doc §5); `colliding` names, by manifest index,
+    /// every other target it collided with.
+    Ambiguous {
+        reason: String,
+        process: ProcessIncarnation,
+        colliding: Vec<usize>,
+    },
 }
 
 impl ProcessIncarnation {
@@ -254,7 +261,7 @@ fn summarize_target(target: &Target, outcome: &DiscoveryOutcome) -> ResolvedTarg
     let (status, reason, pid) = match outcome {
         DiscoveryOutcome::Available(process) => ("available", None, Some(process.pid)),
         DiscoveryOutcome::NotFound(reason) => ("not_found", Some(reason.clone()), None),
-        DiscoveryOutcome::Ambiguous(reason) => ("ambiguous", Some(reason.clone()), None),
+        DiscoveryOutcome::Ambiguous { reason, .. } => ("ambiguous", Some(reason.clone()), None),
     };
     ResolvedTargetSummary {
         agent_key: target.agent_key.clone(),
@@ -420,30 +427,46 @@ fn mark_collisions(outcomes: &mut [DiscoveryOutcome]) {
         }
     }
 
-    let mut ambiguous: HashMap<usize, String> = HashMap::new();
-    for indices in by_incarnation.values().filter(|indices| indices.len() > 1) {
-        for &index in indices {
-            ambiguous.entry(index).or_insert_with(|| {
-                "one process incarnation is claimed by multiple agent keys".to_string()
-            });
+    let mut ambiguous: HashMap<usize, (String, Vec<usize>)> = HashMap::new();
+    let groups = [
+        (
+            by_incarnation.into_values().collect::<Vec<_>>(),
+            "one process incarnation is claimed by multiple agent keys",
+        ),
+        (
+            by_session.into_values().collect(),
+            "agents share a process session; capture would be ambiguous",
+        ),
+        (
+            by_uid.into_values().collect(),
+            "agents share a uid; same-uid processes are not an attribution boundary",
+        ),
+    ];
+    // The first (most specific) reason wins; the colliding set is the union
+    // across every kind of collision.
+    for (grouped, reason) in groups {
+        for indices in grouped.iter().filter(|indices| indices.len() > 1) {
+            for &index in indices {
+                let entry = ambiguous
+                    .entry(index)
+                    .or_insert_with(|| (reason.to_string(), Vec::new()));
+                entry
+                    .1
+                    .extend(indices.iter().copied().filter(|&other| other != index));
+            }
         }
     }
-    for indices in by_session.values().filter(|indices| indices.len() > 1) {
-        for &index in indices {
-            ambiguous.entry(index).or_insert_with(|| {
-                "agents share a process session; capture would be ambiguous".to_string()
-            });
-        }
-    }
-    for indices in by_uid.values().filter(|indices| indices.len() > 1) {
-        for &index in indices {
-            ambiguous.entry(index).or_insert_with(|| {
-                "agents share a uid; same-uid processes are not an attribution boundary".to_string()
-            });
-        }
-    }
-    for (index, reason) in ambiguous {
-        outcomes[index] = DiscoveryOutcome::Ambiguous(reason);
+    for (index, (reason, mut colliding)) in ambiguous {
+        let DiscoveryOutcome::Available(process) = outcomes[index] else {
+            continue;
+        };
+        colliding.sort_unstable();
+        colliding.dedup();
+        outcomes[index] = DiscoveryOutcome::Ambiguous {
+            reason,
+            process,
+            colliding,
+        };
     }
 }
 
@@ -1140,7 +1163,7 @@ mod tests {
         mark_collisions(&mut outcomes);
         for outcome in &outcomes {
             match outcome {
-                DiscoveryOutcome::Ambiguous(reason) => {
+                DiscoveryOutcome::Ambiguous { reason, .. } => {
                     assert!(reason.contains("claimed by multiple agent keys"))
                 }
                 other => panic!("expected Ambiguous, got {other:?}"),
@@ -1154,7 +1177,9 @@ mod tests {
         mark_collisions(&mut outcomes);
         for outcome in &outcomes {
             match outcome {
-                DiscoveryOutcome::Ambiguous(reason) => assert!(reason.contains("process session")),
+                DiscoveryOutcome::Ambiguous { reason, .. } => {
+                    assert!(reason.contains("process session"))
+                }
                 other => panic!("expected Ambiguous, got {other:?}"),
             }
         }
@@ -1166,7 +1191,9 @@ mod tests {
         mark_collisions(&mut outcomes);
         for outcome in &outcomes {
             match outcome {
-                DiscoveryOutcome::Ambiguous(reason) => assert!(reason.contains("share a uid")),
+                DiscoveryOutcome::Ambiguous { reason, .. } => {
+                    assert!(reason.contains("share a uid"))
+                }
                 other => panic!("expected Ambiguous, got {other:?}"),
             }
         }
@@ -1180,9 +1207,45 @@ mod tests {
             DiscoveryOutcome::NotFound("no locator".to_string()),
         ];
         mark_collisions(&mut outcomes);
-        assert!(matches!(outcomes[0], DiscoveryOutcome::Ambiguous(_)));
-        assert!(matches!(outcomes[1], DiscoveryOutcome::Ambiguous(_)));
+        assert!(matches!(outcomes[0], DiscoveryOutcome::Ambiguous { .. }));
+        assert!(matches!(outcomes[1], DiscoveryOutcome::Ambiguous { .. }));
         assert_eq!(not_found_reason(&outcomes[2]), "no locator");
+    }
+
+    #[test]
+    fn mark_collisions_keeps_each_process_and_names_every_colliding_target() {
+        let mut outcomes = vec![
+            available(10, 100, 10, 1000),
+            available(10, 100, 10, 1000),
+            available(20, 200, 20, 1000),
+            available(30, 300, 30, 3000),
+        ];
+        mark_collisions(&mut outcomes);
+        match &outcomes[0] {
+            DiscoveryOutcome::Ambiguous {
+                reason,
+                process,
+                colliding,
+            } => {
+                assert!(reason.contains("claimed by multiple agent keys"));
+                assert_eq!(process.pid, 10);
+                assert_eq!(colliding, &vec![1, 2]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        match &outcomes[2] {
+            DiscoveryOutcome::Ambiguous {
+                reason,
+                process,
+                colliding,
+            } => {
+                assert!(reason.contains("share a uid"));
+                assert_eq!(process.pid, 20);
+                assert_eq!(colliding, &vec![0, 1]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        assert!(matches!(outcomes[3], DiscoveryOutcome::Available(_)));
     }
 
     #[test]
@@ -1215,7 +1278,16 @@ mod tests {
 
         let ambiguous = summarize_target(
             &t,
-            &DiscoveryOutcome::Ambiguous("shares a uid with 'planner'".to_string()),
+            &DiscoveryOutcome::Ambiguous {
+                reason: "shares a uid with 'planner'".to_string(),
+                process: ProcessIncarnation {
+                    pid: 42,
+                    start_time_ticks: 100,
+                    session_id: 42,
+                    uid: 1000,
+                },
+                colliding: vec![0],
+            },
         );
         assert_eq!(ambiguous.status, "ambiguous");
         assert_eq!(ambiguous.pid, None);
