@@ -3,6 +3,10 @@
 
 `--stop-signal TERM` stops RailMon the way `docker stop` does instead of with
 SIGINT; both must take the same clean shutdown path (DR-130).
+
+`--raildash BASE_URL` also delivers over RailMon's webhook to that RailDash,
+then checks RailDash stored both rows with their keys, attribution, PIDs and
+response status (DR-109 M4: CI runs it between the two built images).
 """
 
 import argparse
@@ -14,6 +18,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import urllib.request
 
 
 def require(condition: bool, message: str) -> None:
@@ -21,10 +26,18 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def get_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=10) as response:
+        return json.loads(response.read())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stop-signal", choices=("INT", "TERM"), default="INT")
-    stop_signal = signal.Signals[f"SIG{parser.parse_args().stop_signal}"]
+    parser.add_argument("--raildash", metavar="BASE_URL", help="also deliver to this RailDash and check what it stored")
+    options = parser.parse_args()
+    stop_signal = signal.Signals[f"SIG{options.stop_signal}"]
+    raildash = options.raildash.rstrip("/") if options.raildash else None
     require(os.geteuid() == 0, "run as root so supervisor and agent UIDs differ")
     root = pathlib.Path(tempfile.mkdtemp(prefix="dr109-", dir="/run"))
     root.chmod(0o700)
@@ -64,7 +77,7 @@ request = json.loads(json.dumps(base))
 request["data"].update({"message_type":"request","method":"POST","path":f"/{sid}","headers":{"host":"example.test"},"body":"{}"})
 print(json.dumps(request), flush=True)
 response = json.loads(json.dumps(base))
-response["data"].update({"message_type":"response","status":200,"headers":{},"body":"{}"})
+response["data"].update({"message_type":"response","status_code":200,"headers":{},"body":"{}"})
 print(json.dumps(response), flush=True)
 time.sleep(60)
 """
@@ -106,7 +119,8 @@ agents:
                 str(output),
                 "--output-format",
                 "runtime-interaction",
-            ],
+            ]
+            + (["--webhook", f"{raildash}/webhook/http-interactions"] if raildash else []),
         )
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -131,7 +145,33 @@ agents:
             by_key["planner"]["attribution"]["process"] != by_key["executor"]["attribution"]["process"],
             "process incarnations collapsed",
         )
-        print(json.dumps({"result": "PASS", "agents": sorted(by_key), "rows": len(rows), "stop_signal": stop_signal.name}))
+        if raildash:
+            # Stopping flushed the webhook batch, so RailDash has everything
+            # it will get: the same two rows, indexed under the same keys.
+            stored = get_json(f"{raildash}/api/interactions")
+            require(stored.get("total") == len(rows), f"RailDash stored {stored.get('total')} rows, not {len(rows)}")
+            for item in stored["items"]:
+                name = item.get("agent_key")
+                require(name in by_key, f"RailDash row names agent {name!r}")
+                require(item.get("attribution_state") == "attributed", f"RailDash lost {name}'s attribution")
+                require(item.get("pid") == by_key[name]["attribution"]["process"]["pid"], f"RailDash crossed {name}'s PID")
+                require(item.get("status_code") == 200, f"RailDash lost {name}'s response status")
+            filters = get_json(f"{raildash}/api/filters")
+            require(
+                filters.get("agent_keys") == sorted(by_key),
+                f"RailDash indexed {filters.get('agent_keys')}, not {sorted(by_key)}",
+            )
+        print(
+            json.dumps(
+                {
+                    "result": "PASS",
+                    "agents": sorted(by_key),
+                    "rows": len(rows),
+                    "stop_signal": stop_signal.name,
+                    **({"raildash_rows": len(rows)} if raildash else {}),
+                }
+            )
+        )
     finally:
         for proc in agents:
             proc.terminate()

@@ -166,3 +166,54 @@ jobs:
             -e RAILMON_BIN=/usr/local/bin/railmon-collector \
             -v "$PWD/tests:/tests:ro" \
             railmon:ci /tests/pid_reuse_acceptance.py
+
+      # DR-109 M4: this image and RailDash's, run together the way a user runs
+      # them (raildash/docs/asp-v1-acceptance.md). RailDash is built from its
+      # own master, so a break on either side of the seam shows up here. Not
+      # on the release path (inputs.ref set): a tag's result must not depend
+      # on whatever RailDash master is that day, so it runs on PRs and pushes.
+      - name: Check out RailDash
+        if: inputs.ref == ''
+        uses: actions/checkout@v4
+        with:
+          repository: datrail/raildash
+          path: raildash
+          persist-credentials: false
+
+      - name: RailMon and RailDash images together
+        if: inputs.ref == ''
+        run: |
+          docker build -t raildash:ci raildash
+          docker network create railmon-raildash
+          docker run -d --name raildash --network railmon-raildash \
+            -p 127.0.0.1:8000:8000 raildash:ci
+          for _ in $(seq 60); do
+            token=$(docker exec raildash cat /data/raildash.db.token 2>/dev/null || true)
+            [ -n "$token" ] && curl -fsS http://127.0.0.1:8000/webhook/health > /dev/null 2>&1 && break
+            sleep 0.5
+          done
+          [ -n "$token" ] || { docker logs raildash; exit 1; }
+          # Keyed runtime rows over the collector's webhook: RailDash must
+          # store both agents' rows with their keys, attribution and PIDs.
+          docker run --rm --network railmon-raildash --user 0 --entrypoint python3 \
+            -e RAILMON_BIN=/usr/local/bin/railmon-collector \
+            -v "$PWD/tests:/tests:ro" \
+            railmon:ci /tests/two_agent_acceptance.py --raildash http://raildash:8000 \
+            || { docker logs raildash; exit 1; }
+          # Interval scans delivering evidence bundles with the token RailDash
+          # wrote (DR-83): at least two ASPs arrive without a restart.
+          docker run -d --name railmon-scan --network railmon-raildash \
+            -e RAIL_RAILDASH_TOKEN="$token" -e RAIL_HOST_ID=ci-host \
+            railmon:ci scan --mode self --agent-key ci-agent \
+            --raildash-url http://raildash:8000 --interval 5
+          count() {
+            curl -fsS http://127.0.0.1:8000/api/asps | python3 -c \
+              'import json, sys; print(sum(i["agent_identity"]["value"] == "ci-agent" for i in json.load(sys.stdin)["items"]))'
+          }
+          for _ in $(seq 60); do
+            asps=$(count || echo 0)
+            [ "$asps" -ge 2 ] && break
+            sleep 0.5
+          done
+          [ "$asps" -ge 2 ] || { docker logs railmon-scan; docker logs raildash; exit 1; }
+          echo "{\"result\": \"PASS\", \"interval_asps\": $asps}"
