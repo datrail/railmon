@@ -6,7 +6,9 @@ Four cases, each against the shipped collector (and, for evidence, the shipped
 scanner), with real processes under distinct UIDs and a stub AgentSight:
 
 - ambiguity: two agent keys whose locators resolve to one process incarnation
-  are both `ambiguous` — no PID, no tap, no row under either key;
+  are both `ambiguous` — discovery gives neither a PID, and neither key gets a
+  tap or a row. The shared process is tapped once, and its traffic is one
+  `ambiguous` row naming no agent (design doc §5), whatever its ticket claims;
 - unknown: a key whose PID file names a process that has exited is
   `not_found`, and gets no tap and no row;
 - partial evidence: the scanner still writes one v2 collection holding every
@@ -209,23 +211,39 @@ agents:
             f"available sibling was not resolved: {status['reviewer']}",
         )
 
-        # Capture: only the available agent is tapped and only it gets a row.
-        env = {**os.environ, "STUB_LOG": str(root / "keyed-taps.jsonl")}
+        # Capture: the available agent gets an attributed row; the shared
+        # process is tapped once and its row names no agent, even though its
+        # ticket claims one.
+        claimed = str(uuid.uuid4())
+        ticket = base64.urlsafe_b64encode(json.dumps({"agent_id": claimed}).encode()).decode().rstrip("=")
+        env = {**os.environ, "STUB_LOG": str(root / "keyed-taps.jsonl"), "STUB_X_RAIL": ticket}
         rows = run_collector(
             binary,
             ["--target-manifest", str(manifest), "--agentsight", str(stub), "--output-format", "runtime-interaction"],
             root / "keyed.jsonl",
-            1,
+            2,
             env,
         )
-        require(len(rows) == 1, f"expected one interaction, got {len(rows)}")
-        row = rows[0]
-        require(row["attribution"]["state"] == "attributed", "available sibling was not attributed")
+        require(len(rows) == 2, f"expected two interactions, got {len(rows)}")
+        by_state = {row["attribution"]["state"]: row for row in rows}
+        require(set(by_state) == {"attributed", "ambiguous"}, f"row states {sorted(by_state)}")
+        row = by_state["attributed"]
         require(row["agent_ref"]["agent_key"] == "reviewer", f"row attributed to {row['agent_ref']}")
         require(row["attribution"]["process"]["pid"] == reviewer.pid, "row carries another process")
+        row = by_state["ambiguous"]
+        require(row["agent_ref"] is None and row["agent_id"] is None, "ambiguous row names an agent")
+        require(
+            row["attribution"]["reason"] == "MULTIPLE_TARGETS" and row["attribution"]["target_id"] is None,
+            f"ambiguous attribution {row['attribution']}",
+        )
+        require(row["attribution"]["process"]["pid"] == shared.pid, "ambiguous row carries another process")
+        require(
+            row["raw"]["railmon_attribution_audit"]["candidate_targets"] == ["executor", "planner"],
+            f"ambiguous audit {row['raw'].get('railmon_attribution_audit')}",
+        )
         taps = [json.loads(line) for line in (root / "keyed-taps.jsonl").read_text().splitlines()]
-        tapped = {int(args[args.index("--session") + 1]) for args in taps}
-        require(tapped == {reviewer.pid}, f"taps opened on {sorted(tapped)}, not only the reviewer")
+        tapped = sorted(int(args[args.index("--session") + 1]) for args in taps)
+        require(tapped == sorted([reviewer.pid, shared.pid]), f"taps opened on {tapped}, not once per process")
 
         # Evidence: one v2 collection keeps every key; only the reviewer has any.
         bundle_path = root / "evidence-bundle.json"
@@ -305,7 +323,7 @@ agents:
                 {
                     "result": "PASS",
                     "discovery": {key: status[key]["status"] for key in sorted(status)},
-                    "keyed_rows": 1,
+                    "keyed_rows": {state: 1 for state in sorted(by_state)},
                     "bundle_agents": {key: entries[key]["discovery_status"] for key in sorted(entries)},
                     "legacy_rows": 1,
                 }

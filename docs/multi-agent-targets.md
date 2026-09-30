@@ -44,9 +44,17 @@ What the collector checks beyond the schema, and what a violation looks like:
 - **One uid, one session per agent.** Each agent runs under its own uid, not
   the supervisor's, and leads its own process session (start it with
   `setsid`). Two agents sharing a uid, a session or a process are all marked
-  ambiguous and none of them is captured — a shared uid or session is not an
-  attribution boundary. Two agents may run the same binary; each gets its own
-  tap filtered by its session.
+  ambiguous — a shared uid or session is not an attribution boundary. Neither
+  gets a tap of its own or evidence; each process session they resolved to is
+  tapped once instead, and its rows are `ambiguous` with no agent. Two agents
+  may run the same binary; each gets its own tap filtered by its session.
+- **Locators are re-read only while some target is down.** Every 5 s, while
+  at least one declared target has no tap, RailMon re-resolves every locator.
+  A running target whose locator now collides with another's is tapped as
+  ambiguous; one whose locator names another process moves its tap there. One
+  whose locator names nothing keeps its tap while its pinned process lives,
+  unless another target now claims that process. While every target runs, a
+  rewritten locator is not noticed until one of them stops.
 - **Trusted control paths.** The manifest, each locator and every directory
   above them up to `/`, and each registration state file must be absolute, not
   a symlink, owned by root or the supervisor, not group/other-writable, and
@@ -118,6 +126,7 @@ Per row, the output carries `agent_ref` (host, sandbox, `agent_key`) and
 | `attributed` | `process_target` | captured from the agent's own tap; no usable ticket claim |
 | `attributed` | `process_target_with_ticket_claim` | the ticket names this target's own registered `agent_id` |
 | `conflict` | reason `TICKET_CLAIM_CONFLICT` | the ticket names a sibling's `agent_id`; `agent_ref` and `agent_id` are cleared and the claim is kept in `raw.railmon_attribution_audit` |
+| `ambiguous` | reason `MULTIPLE_TARGETS` | captured on a process session more than one target claims; `agent_ref`, `agent_id` and `target_id` are null, and `raw.railmon_attribution_audit` lists the `candidate_targets` and the discovery reason. `process` is the claimed process |
 
 Rows flushed because their target stopped mid-request carry
 `raw.incomplete: true`. Conflict and unattributed totals are not logged;
@@ -130,8 +139,17 @@ count them from the file, e.g.
 | --- | --- |
 | `target '<k>' not found: <reason>` | the PID file or cgroup, the process being alive, the control-path rules above, the process running as the supervisor's uid, or not leading its own session |
 | `target '<k>' is ambiguous: <reason>` | two agents sharing a uid, session or process |
+| `targets <k>, <k> sharing session <s> collide (…); capturing that session as ambiguous …` | that session's traffic goes to the unattributed queue until the collision clears |
+| `target '<k>' now collides with another target (…)` | a running target was claimed by another; its own tap stops and its session is tapped as ambiguous |
+| `targets <k>, <k> sharing session <s> collide but the shared tap failed to start: …` | the probe for that session (AgentSight path; with colliding targets naming different `binary_path`s the collector-wide `--binary-path` is used); retried every 5 s |
+| `session <s> is now claimed by targets <k>, <k>, …` | the set of targets claiming an already shared session changed; its tap keeps running and later rows' audit lists the new set |
+| `target '<k>' locator now names another process; moving its tap there` | its PID file or cgroup was rewritten while it ran |
+| `target '<k>' locator no longer names its running process, which another target now claims; stopping its tap` | its locator was removed and another target's names its process; that target gets the tap |
+| `a process in shared session <s> exited or its PID was reused; stopping its ambiguous tap` | the colliding process restarted; discovery re-runs within 5 s |
+| `shared ambiguous tap on session <s> ended (…); will retry discovery` | the probe for that shared session stopped |
+| `session <s> no longer collides as it did; stopping its shared ambiguous tap` | the collision cleared or changed; a target that now resolves alone gets its own tap back |
 | `target '<k>' resolved but its tap failed to start: …` | the probe for that agent (AgentSight path, `binary_path`); retried with the others |
-| `no declared agent resolved to a capturable process` (fatal, exit 1) | nothing in the manifest resolved at startup; run `--print-resolved-targets` |
+| `no declared agent resolved to a capturable process` (fatal, exit 1) | nothing in the manifest resolved to a process at startup, not even an ambiguous one; run `--print-resolved-targets` |
 | `target '<k>' exited or its PID was reused; stopping its tap …` | expected on agent restart; pending requests are written as incomplete |
 | `target '<k>' tap ended (…); … will retry discovery` | the probe for that one agent stopped |
 | `target '<k>' resolved again; tap restarted` | recovery, retried every 5 s under the same `agent_key` |
