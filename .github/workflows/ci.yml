@@ -169,8 +169,11 @@ jobs:
 
       # DR-109 M4: this image and RailDash's, run together the way a user runs
       # them (raildash/docs/asp-v1-acceptance.md). RailDash is built from its
-      # own master, so a break on either side of the seam shows up here.
+      # own master, so a break on either side of the seam shows up here. Not
+      # on the release path (inputs.ref set): a tag's result must not depend
+      # on whatever RailDash master is that day, so it runs on PRs and pushes.
       - name: Check out RailDash
+        if: inputs.ref == ''
         uses: actions/checkout@v4
         with:
           repository: datrail/raildash
@@ -178,6 +181,7 @@ jobs:
           persist-credentials: false
 
       - name: RailMon and RailDash images together
+        if: inputs.ref == ''
         run: |
           docker build -t raildash:ci raildash
           docker network create railmon-raildash
