@@ -152,13 +152,17 @@ jobs:
             -e RAILMON_BIN=/usr/local/bin/railmon-collector \
             -v "$PWD/tests:/tests:ro" \
             railmon:ci /tests/two_agent_acceptance.py --stop-signal TERM
-          # Stale PID reuse forces the newcomer onto the old PID through
-          # /proc/sys/kernel/ns_last_pid, which needs CHECKPOINT_RESTORE and a
-          # writable /proc/sys — scoped to this run only.
-          echo "::group::pid_reuse_acceptance"
+
+      # Unlike the step above, this one needs privilege: stale PID reuse forces
+      # the newcomer onto the old PID through /proc/sys/kernel/ns_last_pid,
+      # which takes CHECKPOINT_RESTORE, a writable /proc/sys, and no
+      # docker-default AppArmor profile (it denies writes under
+      # /proc/sys/kernel). Granted to this one run only.
+      - name: Stale PID reuse acceptance against the built image
+        run: |
           docker run --rm --user 0 --entrypoint python3 \
-            --cap-add CHECKPOINT_RESTORE --security-opt systempaths=unconfined \
+            --cap-add CHECKPOINT_RESTORE \
+            --security-opt systempaths=unconfined --security-opt apparmor=unconfined \
             -e RAILMON_BIN=/usr/local/bin/railmon-collector \
             -v "$PWD/tests:/tests:ro" \
             railmon:ci /tests/pid_reuse_acceptance.py
-          echo "::endgroup::"

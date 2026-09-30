@@ -17,8 +17,10 @@ PID but a different start time.
 
 Forcing a specific PID writes `/proc/sys/kernel/ns_last_pid`, which needs
 root with CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE over the PID namespace and
-a writable `/proc/sys` — in Docker, `--cap-add CHECKPOINT_RESTORE --security-opt
-systempaths=unconfined`. CI runs it inside the built image that way.
+a writable `/proc/sys` that no AppArmor profile guards — in Docker,
+`--cap-add CHECKPOINT_RESTORE --security-opt systempaths=unconfined
+--security-opt apparmor=unconfined`. CI runs it inside the built image that
+way.
 """
 
 import json
@@ -71,7 +73,7 @@ def main() -> None:
         NS_LAST_PID.write_text(NS_LAST_PID.read_text())
     except OSError as error:
         raise RuntimeError(
-            f"cannot write {NS_LAST_PID} ({error}); run with CAP_CHECKPOINT_RESTORE and a writable /proc/sys"
+            f"cannot write {NS_LAST_PID} ({error}); see this script's docstring for the privilege it needs"
         ) from error
     root = pathlib.Path(tempfile.mkdtemp(prefix="dr109-pid-reuse-", dir="/run"))
     root.chmod(0o700)
@@ -211,8 +213,9 @@ agents:
             "exited or its PID was reused" in log.read_text(),
             "RailMon did not notice the pinned incarnation was gone",
         )
-        # Whether the old tap got its event out before the retry tick's sweep
-        # stopped it; either way nothing may be recorded, but say which.
+        # Whether the old tap was still up to emit after the reuse, or the
+        # retry tick's sweep had already stopped it; either way nothing may be
+        # recorded, but say which.
         path = "event" if (root / "fired").exists() else "sweep"
 
         # Now the locator names the newcomer: a declared restart, captured
