@@ -54,6 +54,18 @@ content-derived interaction IDs. Output can remain local for
 [RailDash](https://github.com/datrail/raildash) or be forwarded to a configured
 endpoint.
 
+The collector's `--webhook` and `railmon forward` present the credential
+`RAIL_AUTH_MODE` names, matching Rail Center's `RAIL_AUTH_MODES_ACCEPTED`:
+`none` (default) sends nothing; `bearer` sends `RAIL_AUTH_TOKEN`, or the
+contents of `RAIL_AUTH_TOKEN_FILE`, re-read on every batch so a rotated secret
+needs no restart (setting both is refused); `gcp` mints an identity token for
+`RAIL_AUTH_AUDIENCE` from the workload's service account via the metadata
+server and keeps it only in memory. A credential that cannot be produced stops
+the process at startup and drops a later batch, and nothing is ever sent
+anonymously instead. A token set beside `none` is refused as a likely
+misconfiguration. RailDash's webhook ignores the header, so the default needs
+no change for a local stack.
+
 To monitor several agents in one sandbox, each attributed separately, see
 [docs/multi-agent-targets.md](docs/multi-agent-targets.md).
 

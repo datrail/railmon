@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 DEFAULT_SPOOL_DIR = Path(".datrail") / "rail-guardian" / "rail-collector"
@@ -20,6 +22,137 @@ DEFAULT_SPOOL_DIR = Path(".datrail") / "rail-guardian" / "rail-collector"
 
 class RailCollectorError(Exception):
     """User-correctable collector error."""
+
+
+AUTH_MODES = ("none", "bearer", "gcp")
+DEFAULT_METADATA_HOST = "metadata.google.internal"
+# Mint again once less than this much of an identity token's life is left.
+GCP_REFRESH_MARGIN_SECONDS = 300
+# RFC 7230 header-value characters; anything else in a token is refused by
+# offset, so the token itself never reaches a message.
+_HEADER_SAFE = set(chr(c) for c in range(0x21, 0x7F))
+
+
+def header_safe(raw: str, name: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise RailCollectorError(f"{name} is empty")
+    for offset, ch in enumerate(value):
+        if ch not in _HEADER_SAFE:
+            raise RailCollectorError(
+                f"{name} holds U+{ord(ch):04X} at offset {offset}, which cannot go in a header value"
+            )
+    return value
+
+
+def jwt_expiry(token: str) -> int | None:
+    """The `exp` claim of our own freshly minted JWT, unverified; None if unreadable."""
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        exp = claims.get("exp")
+        return exp if isinstance(exp, int) else None
+    except (IndexError, ValueError, AttributeError):
+        return None
+
+
+class Credential:
+    """The credential RAIL_AUTH_MODE names, the same contract as the collector's (RM-F2…F5).
+
+    - `none` (default) sends nothing; a token set beside it is refused.
+    - `bearer` sends RAIL_AUTH_TOKEN, or RAIL_AUTH_TOKEN_FILE re-read on every
+      forward so a rotated secret needs no restart; both set is refused.
+    - `gcp` mints an identity token for RAIL_AUTH_AUDIENCE from the metadata
+      server (GCE_METADATA_HOST overrides its address), held only in memory.
+
+    A credential that cannot be produced raises; nothing is sent anonymously.
+    """
+
+    def __init__(self, env: dict | None = None):
+        env = os.environ if env is None else env
+        get = lambda name: (env.get(name) or "").strip()  # noqa: E731
+        mode = get("RAIL_AUTH_MODE").lower()
+        token, token_file = get("RAIL_AUTH_TOKEN"), get("RAIL_AUTH_TOKEN_FILE")
+        token_set = "RAIL_AUTH_TOKEN" if token else "RAIL_AUTH_TOKEN_FILE" if token_file else None
+        self._token = self._token_file = self._audience = None
+        self._cached: tuple[str, int | None] | None = None
+
+        if mode in ("", "none"):
+            if token_set:
+                configured = "none" if mode else "unset, which is none"
+                raise RailCollectorError(
+                    f"RAIL_AUTH_MODE is {configured} and sends no credential, but {token_set} is set; "
+                    f"set RAIL_AUTH_MODE=bearer to use it, or unset {token_set} to mean none"
+                )
+            self.mode = "none"
+        elif mode == "bearer":
+            if token and token_file:
+                raise RailCollectorError(
+                    "RAIL_AUTH_MODE=bearer takes RAIL_AUTH_TOKEN or RAIL_AUTH_TOKEN_FILE, and both are set; unset one"
+                )
+            if token_file:
+                self._token_file = Path(token_file)
+            elif token:
+                self._token = header_safe(token, "RAIL_AUTH_TOKEN")
+            else:
+                raise RailCollectorError("RAIL_AUTH_MODE=bearer requires RAIL_AUTH_TOKEN or RAIL_AUTH_TOKEN_FILE")
+            self.mode = "bearer"
+        elif mode == "gcp":
+            if token_set:
+                raise RailCollectorError(
+                    f"RAIL_AUTH_MODE=gcp mints its own credential, but {token_set} is set; "
+                    "unset it, or set RAIL_AUTH_MODE=bearer to use it"
+                )
+            self._audience = get("RAIL_AUTH_AUDIENCE")
+            if not self._audience:
+                raise RailCollectorError("RAIL_AUTH_MODE=gcp requires RAIL_AUTH_AUDIENCE")
+            self._metadata_host = get("GCE_METADATA_HOST") or DEFAULT_METADATA_HOST
+            self.mode = "gcp"
+        else:
+            raise RailCollectorError(f"RAIL_AUTH_MODE must be one of {', '.join(AUTH_MODES)}, got: {mode}")
+
+    def headers(self, timeout: float = 10.0) -> dict[str, str]:
+        if self.mode == "none":
+            return {}
+        if self._token_file is not None:
+            try:
+                raw = self._token_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise RailCollectorError(
+                    f"reading RAIL_AUTH_TOKEN_FILE {self._token_file}: {exc.__class__.__name__}"
+                ) from None
+            return {"Authorization": f"Bearer {header_safe(raw, 'RAIL_AUTH_TOKEN_FILE')}"}
+        if self._token is not None:
+            return {"Authorization": f"Bearer {self._token}"}
+        return {"Authorization": f"Bearer {self._gcp_token(timeout)}"}
+
+    def _gcp_token(self, timeout: float) -> str:
+        if self._cached is not None:
+            token, exp = self._cached
+            if exp is not None and time.time() + GCP_REFRESH_MARGIN_SECONDS < exp:
+                return token
+        url = (
+            f"http://{self._metadata_host}/computeMetadata/v1/instance/service-accounts/default/identity?"
+            + urlencode({"audience": self._audience})
+        )
+        request = Request(url, headers={"Metadata-Flavor": "Google"})
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            raise RailCollectorError(
+                f"RAIL_AUTH_MODE=gcp: the metadata server at {self._metadata_host} returned {exc.code} "
+                "for an identity token"
+            ) from None
+        except (URLError, OSError) as exc:
+            raise RailCollectorError(
+                f"RAIL_AUTH_MODE=gcp: minting an identity token from the metadata server at "
+                f"{self._metadata_host}: {exc}"
+            ) from None
+        token = header_safe(body, "the metadata server's identity token")
+        exp = jwt_expiry(token)
+        self._cached = (token, exp) if exp is not None else None
+        return token
 
 
 def canonical_json(value: dict) -> str:
@@ -79,10 +212,12 @@ def load_spooled_event(path: Path) -> dict:
         raise RailCollectorError(f"{path}: invalid JSON: {exc}") from exc
 
 
-def post_event(center_url: str, event: dict, timeout: float) -> tuple[bool, int | None, str]:
+def post_event(
+    center_url: str, event: dict, timeout: float, auth_headers: dict[str, str] | None = None
+) -> tuple[bool, int | None, str]:
     url = f"{center_url.rstrip('/')}/v1/interactions"
     data = canonical_json(event).encode("utf-8")
-    request = Request(url, data=data, headers={"Content-Type": "application/json"})
+    request = Request(url, data=data, headers={"Content-Type": "application/json", **(auth_headers or {})})
     try:
         with urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
@@ -100,13 +235,28 @@ def drain_pending(
     center_url: str,
     timeout: float,
     keep_sent: bool,
+    credential: Credential | None = None,
 ) -> tuple[int, int]:
     sent = 0
     failed = 0
     if not pending_dir.exists():
         return sent, failed
 
-    for path in sorted(pending_dir.glob("*.json")):
+    paths = sorted(pending_dir.glob("*.json"))
+    if not paths:
+        return sent, failed
+    try:
+        auth_headers = credential.headers(timeout) if credential else {}
+    except RailCollectorError as exc:
+        # Left in the spool for the next drain, never sent anonymously.
+        print(
+            f"[rail-collector] RAIL_AUTH_MODE={credential.mode} could not produce a credential; "
+            f"{len(paths)} event(s) stay spooled: {exc}",
+            file=sys.stderr,
+        )
+        return sent, len(paths)
+
+    for path in paths:
         try:
             event = load_spooled_event(path)
         except RailCollectorError as exc:
@@ -114,7 +264,7 @@ def drain_pending(
             print(f"[rail-collector] skip invalid spool file: {exc}", file=sys.stderr)
             continue
 
-        ok, status, body = post_event(center_url, event, timeout)
+        ok, status, body = post_event(center_url, event, timeout, auth_headers)
         if ok:
             sent += 1
             if keep_sent:
@@ -165,11 +315,16 @@ def process_input(args: argparse.Namespace) -> int:
     if not center_url:
         raise RailCollectorError("--center-url or RAIL_CENTER_URL is required")
 
+    # Checked, and a first credential produced, before anything is read: a
+    # forwarder that cannot authenticate stops here (RM-F2).
+    credential = Credential()
+    credential.headers(args.post_timeout)
+
     spool_dir = Path(args.spool_dir)
     pending_dir = spool_dir / "pending"
     sent_dir = spool_dir / "sent"
 
-    sent, failed = drain_pending(pending_dir, sent_dir, center_url, args.post_timeout, args.keep_sent)
+    sent, failed = drain_pending(pending_dir, sent_dir, center_url, args.post_timeout, args.keep_sent, credential)
     if sent or failed:
         print(f"[rail-collector] startup drain sent={sent} failed={failed}", file=sys.stderr)
 
@@ -194,11 +349,13 @@ def process_input(args: argparse.Namespace) -> int:
 
         now = time.time()
         if queued >= args.flush_count or (now - last_flush) >= args.flush_interval:
-            drain_pending(pending_dir, sent_dir, center_url, args.post_timeout, args.keep_sent)
+            drain_pending(pending_dir, sent_dir, center_url, args.post_timeout, args.keep_sent, credential)
             queued = 0
             last_flush = now
 
-    _, final_failed = drain_pending(pending_dir, sent_dir, center_url, args.post_timeout, args.keep_sent)
+    _, final_failed = drain_pending(
+        pending_dir, sent_dir, center_url, args.post_timeout, args.keep_sent, credential
+    )
     return 0 if final_failed == 0 else 1
 
 
