@@ -81,7 +81,9 @@ An agent that opens a port is offering a service nobody declared.
 `railmon listen` runs [listensnoop](https://github.com/datrail/ebpf-tls-tap#listening-sockets)
 in the agent's PID namespace. It appends one line per socket the agent opens
 to accept traffic to `RAIL_LISTEN_FILE`, which an interval scan turns into
-the bundle's `observed_listeners`. A new listener is drift in RailDash. Use
+the bundle's `observed_listeners`, and a line per new client address that
+connects in, which becomes `observed_ingress_peers`. A new listener, or a new
+peer, is drift in RailDash. Use
 two containers beside the agent, sharing a volume the agent does not mount:
 
 ```bash

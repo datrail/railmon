@@ -30,11 +30,13 @@ KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # to one agent. Agent-scoped, one agent opening a port would read as drift
 # on every sibling's ASP. In `compose()`, per-agent scans taken while
 # listensnoop appended can disagree on it; that fails closed like any other
-# sandbox attribute that differs between agents.
+# sandbox attribute that differs between agents. `observed_ingress_peers`
+# (DR-145) comes from the same events and is sandbox-scoped for the same
+# reason.
 SANDBOX_ATTRIBUTES = frozenset(
     {
         "container_identity", "image_digest", "mounts", "deployment",
-        "sandbox_network_policy", "observed_listeners",
+        "sandbox_network_policy", "observed_listeners", "observed_ingress_peers",
     }
 )
 
