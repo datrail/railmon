@@ -169,6 +169,16 @@ jobs:
             -v "$PWD/tests:/tests:ro" \
             railmon:ci /tests/pid_reuse_acceptance.py
 
+      # DR-143: the probe the image ships, deployed the way the README says.
+      # An agent container opens a port. `railmon listen`, a privileged
+      # supervisor in the host PID namespace, runs listensnoop inside the
+      # agent's and appends to a volume the agent does not mount, and
+      # `railmon scan` reads it into the bundle. Then the agent kills the
+      # probe (the bundle must go PARTIAL) and restarts (the probe must
+      # follow). The privilege is the listen container's alone.
+      - name: listen and scan from the built image
+        run: python3 tests/listen_image_acceptance.py --image railmon:ci
+
       # DR-109 M4: this image and RailDash's, run together the way a user runs
       # them (raildash/docs/asp-v1-acceptance.md). RailDash is built from its
       # own master, so a break on either side of the seam shows up here. Not

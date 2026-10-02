@@ -1328,6 +1328,55 @@ class ListenersTest(unittest.TestCase):
                               self.event(kind="autobind", protocol="udp", port=40001, **old))
         self.assertEqual(sorted(str(entry["port"]) for entry in result["listeners"]), ["41234", "ephemeral"])
 
+    def test_a_heartbeat_says_whether_the_probe_is_still_running(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 10, 2, 9, 0, 0, tzinfo=timezone.utc)
+        alive = '{"kind":"alive","time":"%s","every":60}'
+        fresh = self.summary_at(now, alive % "2026-10-02T08:58:00Z", self.event())
+        self.assertEqual((fresh["stale"], fresh["last_alive"]), (False, "2026-10-02T08:58:00Z"))
+        # Three intervals is the grace; past it, the agent may have stopped it.
+        stale = self.summary_at(now, alive % "2026-10-02T08:56:59Z")
+        self.assertTrue(stale["stale"])
+        # The newest heartbeat counts, wherever it sits in the file.
+        newest = self.summary_at(now, alive % "2026-10-02T08:59:30Z", alive % "2026-10-02T08:00:00Z")
+        self.assertFalse(newest["stale"])
+        # No heartbeat at all (an older probe, or no -H): nothing to judge.
+        self.assertIsNone(self.summary_at(now, self.event())["stale"])
+
+    def test_start_records_count_attaches(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 10, 2, 9, 0, 0, tzinfo=timezone.utc)
+        start = '{"kind":"start","time":"%s","every":%d}'
+        once = self.summary_at(now, start % ("2026-10-02T08:59:00Z", 60), self.event())
+        self.assertEqual((once["starts"], once["restarted"], once["stale"]), (1, False, False))
+        twice = self.summary_at(now, start % ("2026-10-02T08:00:00Z", 60), self.event(),
+                                start % ("2026-10-02T08:59:30Z", 60))
+        self.assertEqual((twice["starts"], twice["restarted"]), (2, True))
+        # Without -H there is no interval to judge staleness by.
+        quiet = self.summary_at(now, start % ("2026-10-02T01:00:00Z", 0))
+        self.assertEqual((quiet["starts"], quiet["stale"]), (1, None))
+        none = self.summary_at(now, self.event())
+        self.assertEqual((none["starts"], none["restarted"]), (0, False))
+
+    def test_a_heartbeat_from_the_future_is_stale_too(self):
+        # A clock stepped back would otherwise keep it "fresh" for as long.
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 10, 2, 9, 0, 0, tzinfo=timezone.utc)
+        ahead = self.summary_at(now, '{"kind":"start","time":"2026-10-02T10:00:00Z","every":60}')
+        self.assertTrue(ahead["stale"])
+
+    def test_a_malformed_heartbeat_is_counted_not_trusted(self):
+        result = self.summary('{"kind":"alive","time":"yesterday","every":60}',
+                              '{"kind":"alive","time":"2026-10-02T08:58:00Z","every":0}',
+                              '{"kind":"start","time":"2026-10-02T08:58:00Z","every":true}')
+        self.assertEqual((result["stale"], result["malformed"], result["starts"]), (None, 3, 0))
+
+    def summary_at(self, now, *lines):
+        return scanner.summarize_listeners(list(lines), now)
+
     def test_lost_records_are_summed(self):
         result = self.summary('{"kind":"lost","count":3}', '{"kind":"lost","count":4}', self.event())
         self.assertEqual(result["lost"], 7)

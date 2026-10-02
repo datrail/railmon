@@ -1516,7 +1516,11 @@ def _printable(value: str, limit: int) -> str:
     return "".join(c if c.isprintable() else "?" for c in value[:limit])
 
 
-def summarize_listeners(lines: Iterable[str]) -> dict[str, Any]:
+# A heartbeat older than this many intervals means the probe stopped.
+HEARTBEAT_GRACE = 3
+
+
+def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> dict[str, Any]:
     """Turn listensnoop's JSON lines into the listening half of observed reach.
 
     A socket the agent opened to accept inbound traffic is reach in the other
@@ -1533,13 +1537,24 @@ def summarize_listeners(lines: Iterable[str]) -> dict[str, Any]:
     - an event with pid 0 came from outside the PID namespace listensnoop ran
       in, so it is not this sandbox's and is only counted;
     - `lost` sums listensnoop's own gap records: events it could not deliver,
-      so the list may be missing a listener.
+      so the list may be missing a listener;
+    - listensnoop prints a `start` record at each attach and, with -H, an
+      `alive` one each interval. The agent shares the probe's PID namespace
+      and can stop or kill it, so these decide whether the list can be
+      trusted:
+      * no start record: the probe never attached (or is older than them);
+      * more than one: it `restarted`, and missed whatever opened while it
+        was down (it does not report sockets already listening);
+      * the newest start/alive more than HEARTBEAT_GRACE intervals from
+        `now`, either way (a clock stepped back too): it is `stale`.
 
     Produce the file with listensnoop (ebpf-tls-tap) run in the agent's PID
     namespace; see the README's "Observed listeners".
     """
     listeners: set[tuple[str, str, Any, str]] = set()
     lost = unlisted = malformed = outside = 0
+    last_alive: datetime | None = None
+    every = starts = 0
     for line in lines:
         line = line.strip()
         if not line:
@@ -1556,6 +1571,20 @@ def summarize_listeners(lines: Iterable[str]) -> dict[str, Any]:
         if kind == "lost":
             count = event.get("count")
             lost += count if isinstance(count, int) and count > 0 else 0
+            continue
+        if kind in ("alive", "start"):
+            try:
+                seen = datetime.strptime(str(event.get("time")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                malformed += 1
+                continue
+            interval = event.get("every")
+            if not isinstance(interval, int) or isinstance(interval, bool) or interval < (kind == "alive"):
+                malformed += 1
+                continue
+            starts += kind == "start"
+            if last_alive is None or seen > last_alive:
+                last_alive, every = seen, interval
             continue
         port, protocol, addr = event.get("port"), event.get("protocol"), event.get("addr")
         comm, ephemeral = event.get("comm"), event.get("ephemeral")
@@ -1595,6 +1624,15 @@ def summarize_listeners(lines: Iterable[str]) -> dict[str, Any]:
         "unlisted": unlisted,
         "malformed": malformed,
         "outside_namespace": outside,
+        "starts": starts,
+        "restarted": starts > 1,
+        "last_alive": last_alive.strftime("%Y-%m-%dT%H:%M:%SZ") if last_alive else None,
+        # None when there is no interval to judge by: no -H, or no record.
+        "stale": (
+            None if last_alive is None or not every
+            else abs(((now or datetime.now(timezone.utc)) - last_alive).total_seconds())
+            > HEARTBEAT_GRACE * every
+        ),
     }
 
 

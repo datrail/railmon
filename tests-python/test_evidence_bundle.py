@@ -980,7 +980,8 @@ class ObservedListenersBundleTest(unittest.TestCase):
     @staticmethod
     def listening(listeners=(), **counts):
         base = {"source": "listensnoop", "listeners": list(listeners), "lost": 0,
-                "unlisted": 0, "malformed": 0, "outside_namespace": 0}
+                "unlisted": 0, "malformed": 0, "outside_namespace": 0,
+                "starts": 1, "restarted": False, "stale": False}
         base.update(counts)
         return base
 
@@ -1017,6 +1018,34 @@ class ObservedListenersBundleTest(unittest.TestCase):
                     self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
                     self.assertEqual(field["value"], list(listeners))
                     self.assertIn("may be missing", field["note"])
+
+    def test_a_restarted_or_never_attached_probe_is_a_source_we_cannot_reach(self):
+        # A restart is a gap the probe cannot fill (it does not report
+        # sockets already listening); no start record means it never ran.
+        for counts, words in (({"starts": 2, "restarted": True}, "restarted 1 time "),
+                              ({"starts": 0}, "never have attached")):
+            with self.subTest(counts=counts):
+                field = self.attribute(self.listening([self.LISTENER], **counts))
+                self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "NO_SOURCE_ACCESS"))
+                self.assertIn(words, field["note"])
+
+    def test_each_restart_is_one_drift_and_the_next_is_not_hidden(self):
+        # Accepting a restart (locking the PARTIAL ASP) must not hide the
+        # next one: the note changes on each restart, and only then.
+        once = self.attribute(self.listening([self.LISTENER], starts=2, restarted=True))
+        once_later = self.attribute(self.listening([self.LISTENER], starts=2, restarted=True, malformed=9))
+        twice = self.attribute(self.listening([self.LISTENER], starts=3, restarted=True))
+        self.assertEqual(once["note"], once_later["note"])
+        self.assertNotEqual(once["note"], twice["note"])
+        self.assertIn("restarted 2 times", twice["note"])
+
+    def test_a_stopped_probe_is_a_source_we_cannot_reach(self):
+        # The agent shares the probe's PID namespace and can kill it; a dead
+        # probe must not read as "no new listeners".
+        field = self.attribute(self.listening([self.LISTENER], stale=True))
+        self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "NO_SOURCE_ACCESS"))
+        self.assertIn("stopped reporting", field["note"])
+        self.assertEqual(self.attribute(self.listening([self.LISTENER], stale=False))["status"], "ANSWERED")
 
     def test_the_gap_note_carries_no_count_so_a_growing_one_is_not_drift(self):
         # RailDash compares notes; listensnoop's lost count only grows, and

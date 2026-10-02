@@ -46,6 +46,29 @@ case "$command_name" in
     forward|rail-collector)
         exec python3 "$root/rail-collector/rail_collector.py" "$@"
         ;;
+    listen)
+        # listensnoop: one JSON line per socket the agent opens to accept
+        # inbound traffic, appended to RAIL_LISTEN_FILE for `scan
+        # --listen-file` (DR-143), or to stdout when that is unset. Needs eBPF
+        # privilege. -n keeps other namespaces' sockets out of the file; -H
+        # lets the scan see a probe that stopped (RAIL_LISTEN_HEARTBEAT).
+        #
+        # With RAIL_LISTEN_CONTAINER (and --pid host plus the Docker
+        # socket), a supervisor outside the agent's reach keeps the probe
+        # attached to that container's PID namespace across agent restarts
+        # and kills. Without it, the probe runs in this container's own
+        # namespace (e.g. `--pid container:<agent>`) and stops with it.
+        listensnoop="${LISTENSNOOP_PATH:-/usr/local/bin/listensnoop}"
+        heartbeat="${RAIL_LISTEN_HEARTBEAT:-60}"
+        if [ -n "${RAIL_LISTEN_CONTAINER:-}" ]; then
+            exec python3 "$root/tools/listen/follow_container.py" \
+                "$RAIL_LISTEN_CONTAINER" -n -H "$heartbeat" "$@"
+        fi
+        if [ -n "${RAIL_LISTEN_FILE:-}" ]; then
+            exec "$listensnoop" -n -H "$heartbeat" "$@" >> "$RAIL_LISTEN_FILE"
+        fi
+        exec "$listensnoop" -n -H "$heartbeat" "$@"
+        ;;
     demo)
         # BDL-F4's local quickstart: self-scan plus a real, offline, local
         # capture, from this one container. See tools/local-demo/README.md.
@@ -61,6 +84,7 @@ Commands:
   scan       inspect and optionally register an agent
   skills     inventory OpenClaw/NemoClaw SKILL.md files
   forward    send captured interactions on to Rail Center
+  listen     report sockets the agent opens to accept traffic (listensnoop)
   demo       self-scan + a local offline capture, for a clean-checkout first run
 
 Called with no command, or with a flag first, RailMon runs the collector —

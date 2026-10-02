@@ -98,7 +98,12 @@ def main() -> int:
         return new[0]
 
     checks: dict[str, bool] = {}
-    listen_file.write_text(event(40000, "agent") + "\n", encoding="utf-8")
+    # A real probe's file opens with its start record (DR-143); without one
+    # the scanner reports that the probe may never have attached. No -H here
+    # ("every": 0), so no heartbeat is expected.
+    start = json.dumps({"kind": "start", "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "every": 0})
+    listen_file.write_text(start + "\n" + event(40000, "agent") + "\n", encoding="utf-8")
 
     baseline = scan()
     bundle = api(args.raildash, f"/api/asps/{baseline}/bundle", args.token)

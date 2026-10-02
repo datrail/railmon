@@ -128,11 +128,13 @@ jobs:
     steps:
       # Submodules are off by default. GITHUB_TOKEN cannot read another
       # repository, so a recursive checkout fails on any repo that declares a
-      # private submodule — including ones that no longer build from it:
-      # railmon still declares ebpf-tls-tap but downloads an AgentSight release
-      # binary instead, so fetching it would break the build for nothing.
+      # private submodule, including ones that do not build from it.
+      # railmon does build from one: its image compiles listensnoop from the
+      # ebpf-tls-tap submodule (DR-143), so the repo sets RAIL_SUBMODULES to
+      # `recursive`; ebpf-tls-tap is public, so the default token reads it.
       # A component whose image genuinely needs a submodule sets RAIL_SUBMODULES
-      # to `recursive` and adds a SUBMODULE_TOKEN with read access. The token
+      # to `recursive`, and adds a SUBMODULE_TOKEN with read access only when
+      # that submodule is private. The token
       # follows the same condition: a cross-repo PAT should not be handed to a
       # checkout that is not fetching anything from another repo.
       - uses: actions/checkout@v4

@@ -942,18 +942,38 @@ def build_evidence_bundle(
             "listensnoop events: protocol, bound address, port (a kernel-chosen "
             "port is 'ephemeral'), process name"
         )
-        # The note names the kind of gap, never a count: RailDash compares
-        # notes, and a count that grows with every scan (or that any process
-        # can inflate, as listensnoop's lost count can be) would be drift on
-        # every scan. The counts stay in the feature file.
+        # The note names the kind of gap, not a running count: RailDash
+        # compares notes, and a count that grows with every scan (or that any
+        # process can inflate, as listensnoop's lost count can be) would be
+        # drift on every scan. The counts stay in the feature file.
         gaps = []
+        unreachable = (
+            not listening.get("starts") or listening.get("restarted") or listening.get("stale")
+        )
+        if not listening.get("starts"):
+            gaps.append("no listensnoop start record (it may never have attached)")
+        if listening.get("restarted"):
+            # The one count a note carries: it changes only when the probe
+            # restarts, so each restart is one drift a user can accept, and
+            # the next one is drift again rather than hidden by that accept.
+            restarts = listening["starts"] - 1
+            gaps.append(
+                f"listensnoop restarted {restarts} time{'s' if restarts != 1 else ''}"
+                " (what opened while it was down is missing)"
+            )
+        if listening.get("stale"):
+            gaps.append("listensnoop stopped reporting (its heartbeat is stale)")
         if listening.get("lost"):
             gaps.append("listensnoop reported lost events")
         if listening.get("unlisted"):
             gaps.append("more distinct listeners than the cap")
         if gaps:
             attributes["observed_listeners"] = _partial(
-                heard, "observed", "SIZE_CAP_EXCEEDED", authored_by="none", method=method,
+                heard, "observed",
+                # A probe that is not running is a source we cannot reach;
+                # lost or unlisted events are a cap on what it delivered.
+                "NO_SOURCE_ACCESS" if unreachable else "SIZE_CAP_EXCEEDED",
+                authored_by="none", method=method,
                 note="; ".join(gaps) + ": listeners may be missing from this list",
             )
         elif heard:
