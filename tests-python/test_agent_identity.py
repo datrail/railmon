@@ -1441,6 +1441,64 @@ class ListenersTest(unittest.TestCase):
             self.assertEqual(result["malformed"], 2)
 
 
+class PeersTest(unittest.TestCase):
+    """listensnoop's peer events become a stable list of who connected in (DR-145)."""
+
+    START = '{"kind":"start","time":"2026-10-02T08:00:00Z","every":0,"peers":true}'
+
+    @staticmethod
+    def peer(**fields):
+        return ListenersTest.event(**{"kind": "peer", "peer": "8.8.4.4", **fields})
+
+    def summary(self, *lines):
+        return scanner.summarize_listeners(list(lines))
+
+    def test_each_distinct_peer_per_listener_is_listed_once_with_its_scope(self):
+        result = self.summary(self.START, self.peer(), self.peer(pid=42, timestamp_ns=9),
+                              self.peer(peer="10.1.2.3"), self.peer(peer="127.0.0.1"),
+                              self.peer(peer="fe80::1"), self.peer(peer="100.64.0.1"),
+                              self.peer(peer="192.0.2.1"),  # documentation space: not private
+                              self.peer(peer="2001:4860::8888", port=9090))
+        self.assertEqual(
+            [(p["port"], p["peer"], p["scope"]) for p in result["peers"]],
+            [(8080, "8.8.4.4", "public"), (8080, "10.1.2.3", "private"),
+             (8080, "100.64.0.1", "other"), (8080, "127.0.0.1", "loopback"),
+             (8080, "192.0.2.1", "other"),
+             (8080, "fe80::1", "link-local"), (9090, "2001:4860::8888", "public")])
+        self.assertEqual(result["peers"][0]["process"], "python3")  # IPv4 first, numerically
+        self.assertEqual(result["listeners"], [])  # a peer is not a new listener
+        self.assertTrue(result["peers_reported"])
+
+    def test_an_ipv4_mapped_peer_is_the_ipv4_peer(self):
+        result = self.summary(self.peer(peer="::ffff:8.8.4.4"), self.peer())
+        self.assertEqual([p["peer"] for p in result["peers"]], ["8.8.4.4"])
+
+    def test_a_kernel_chosen_listener_port_is_ephemeral_here_too(self):
+        first = self.summary(self.peer(port=41000, ephemeral=True))["peers"]
+        second = self.summary(self.peer(port=52000, ephemeral=True))["peers"]
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["port"], "ephemeral")
+
+    def test_the_newest_start_record_says_whether_peers_are_reported(self):
+        old = '{"kind":"start","time":"2026-10-02T09:00:00Z","every":0}'
+        self.assertFalse(self.summary(old)["peers_reported"])
+        self.assertTrue(self.summary(old.replace("09:00", "07:00"), self.START)["peers_reported"])
+        self.assertFalse(self.summary(self.START, old)["peers_reported"])
+        self.assertFalse(self.summary(self.START.replace("true", '"yes"'))["peers_reported"])
+
+    def test_a_peer_outside_the_namespace_or_malformed_is_counted_not_listed(self):
+        result = self.summary(self.peer(pid=0), self.peer(peer="not-an-ip"), self.peer(peer=7),
+                              self.peer(peer="1.2.3.4\u001b[2J"), ListenersTest.event(kind="peer"),
+                              self.peer(peer="fe80::1%\u001b[31mX\n"))
+        self.assertEqual((result["peers"], result["outside_namespace"], result["malformed"]), ([], 1, 5))
+
+    def test_past_the_cap_peers_are_counted_not_listed(self):
+        lines = [self.peer(peer=f"10.0.{i // 256}.{i % 256}") for i in range(scanner.PEER_CAP + 3)]
+        result = self.summary(*lines, self.peer(peer="10.0.0.0"))  # a repeat is never past the cap
+        self.assertEqual((len(result["peers"]), result["peers_unlisted"], result["unlisted"]),
+                         (scanner.PEER_CAP, 3, 0))
+
+
 class RegistrationStatusTest(unittest.TestCase):
     """A scorer reading "registered" off an agent that never reached the control
     plane would be reading a lie, so the status reports the outcome."""

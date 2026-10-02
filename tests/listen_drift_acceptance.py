@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""A listening socket that appears after the baseline is locked is drift (DR-125).
+"""A listening socket, or a peer connecting in, that appears after the baseline
+is locked is drift (DR-125, DR-145).
 
 Drives the real scanner and a real RailDash end to end. RailDash compares a
 new ASP against the active alignment when it arrives, so:
@@ -13,6 +14,9 @@ new ASP against the active alignment when it arrives, so:
    ports were asked for and sit inside the kernel's ephemeral range, where
    a guess from the number alone once called them both "ephemeral" and
    the new one vanished.
+4. lock that ASP as the new baseline; a known peer connecting again (another
+   PID, a later time) stays ALIGNED, and a new peer connecting in is DRIFT
+   DETECTED, with observed_ingress_peers the only attribute that changed.
 
 The scan command is a prefix the scanner's own arguments are appended to, so
 CI runs it in the RailMon image and a developer runs the source directly:
@@ -41,11 +45,12 @@ from urllib.request import Request, urlopen
 AGENT_KEY = "listen-acceptance-agent"
 
 
-def event(port: int, comm: str) -> str:
+def event(port: int, comm: str, peer: str | None = None, pid: int = 7) -> str:
     return json.dumps({
-        "timestamp_ns": time.monotonic_ns(), "kind": "listen", "pid": 7, "tid": 7,
-        "host_pid": 7007, "uid": 1000, "comm": comm, "protocol": "tcp",
+        "timestamp_ns": time.monotonic_ns(), "kind": "peer" if peer else "listen", "pid": pid,
+        "tid": pid, "host_pid": 7000 + pid, "uid": 1000, "comm": comm, "protocol": "tcp",
         "family": "ipv4", "addr": "0.0.0.0", "port": port, "ephemeral": False,
+        **({"peer": peer} if peer else {}),
     })
 
 
@@ -100,10 +105,12 @@ def main() -> int:
     checks: dict[str, bool] = {}
     # A real probe's file opens with its start record (DR-143); without one
     # the scanner reports that the probe may never have attached. No -H here
-    # ("every": 0), so no heartbeat is expected.
+    # ("every": 0), so no heartbeat is expected. "peers": this probe reports
+    # who connects in (DR-144).
     start = json.dumps({"kind": "start", "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "every": 0})
-    listen_file.write_text(start + "\n" + event(40000, "agent") + "\n", encoding="utf-8")
+                        "every": 0, "peers": True})
+    listen_file.write_text(start + "\n" + event(40000, "agent") + "\n"
+                           + event(40000, "agent", peer="127.0.0.1") + "\n", encoding="utf-8")
 
     baseline = scan()
     bundle = api(args.raildash, f"/api/asps/{baseline}/bundle", args.token)
@@ -126,6 +133,28 @@ def main() -> int:
     changes = (state.get("drift") or {}).get("changes") or []
     checks["a new listening port is drift"] = state["state"] == "DRIFT_DETECTED"
     checks["and observed_listeners is the only change"] = [c["name"] for c in changes] == ["observed_listeners"]
+    peers = api(args.raildash, f"/api/asps/{opened}/bundle", args.token)["attributes"]["observed_ingress_peers"]
+    checks["the bundle carries the peer and its scope"] = (
+        peers["status"] == "ANSWERED"
+        and peers["value"] == [{"protocol": "tcp", "addr": "0.0.0.0", "port": 40000, "process": "agent",
+                                "peer": "127.0.0.1", "scope": "loopback"}]
+    )
+
+    version = api(args.raildash, f"/api/asps/{opened}/lock", args.token, {"version": f"peers-{time.time_ns()}"})
+    api(args.raildash, f"/api/alignments/{version['alignment_version_id']}/switch", args.token, {})
+    with listen_file.open("a", encoding="utf-8") as f:
+        f.write(event(40000, "agent", peer="127.0.0.1", pid=8) + "\n")
+    again = scan()
+    checks["a known peer connecting again stays aligned"] = (
+        api(args.raildash, f"/api/asps/{again}/state")["state"] == "ALIGNED")
+    with listen_file.open("a", encoding="utf-8") as f:
+        f.write(event(40000, "agent", peer="8.8.4.4") + "\n")
+    connected = scan()
+    state = api(args.raildash, f"/api/asps/{connected}/state")
+    changes = (state.get("drift") or {}).get("changes") or []
+    checks["a new peer connecting in is drift"] = state["state"] == "DRIFT_DETECTED"
+    checks["and observed_ingress_peers is the only change"] = (
+        [c["name"] for c in changes] == ["observed_ingress_peers"])
 
     for name, passed in checks.items():
         print(("ok:   " if passed else "FAIL: ") + name)

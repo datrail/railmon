@@ -132,7 +132,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `tool_and_mcp_reach` | MCP inventory: name, the command's executable (not its arguments, which carry tokens), redacted url, transport |
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
-| `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events |
+| `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events; and `peers`, who connected in (see [Ingress peers](#ingress-peers)) |
 
 Metadata only — never a secret value. That is what makes the file safe to
 persist and hand to a scorer. It is written `0600`: the inventory names an
@@ -326,6 +326,40 @@ The attribute is new in rule pack 2. RailDash shows a baseline locked under
 pack 1 as `CONTRACT_MISMATCH`, not as drift, until a pack-2 ASP is locked.
 `tests/listen_drift_acceptance.py` runs the whole path against a real RailDash
 in CI.
+
+### Ingress peers
+
+The same file carries listensnoop's `peer` events (ebpf-tls-tap from DR-144
+on): each remote address a process accepted a TCP connection from, once per
+listener. They become the `observed_ingress_peers` attribute, the "Ingress
+request" dimension of the first ASP requirements, whose threshold is an
+approved list of addresses or "internal only":
+
+- each entry is `{protocol, addr, port, process, peer, scope}`. The first four
+  are the listener's, written as in `observed_listeners`, and a repeat of a
+  peer is the same entry, so the value only changes when a new peer
+  connects;
+- `scope` is `loopback`, `link-local`, `private` (RFC 1918 or IPv6 ULA),
+  `public` (globally routable) or `other` (CGNAT, documentation, reserved);
+- an IPv4 client of a dual-stack listener is its IPv4 address.
+
+The attribute is:
+
+- ANSWERED with the list, or ABSENT when nothing connected in;
+- PARTIAL for the same probe gaps as `observed_listeners` (restart, stale
+  heartbeat, never attached, lost events), or past 256 distinct peers. A
+  listener that the whole internet can reach meets new peers all the time,
+  and that is what the cap says;
+- BLIND without a file, or when the probe's newest `start` record lacks
+  `"peers": true`. That probe predates peer events, and "it didn't look" must
+  not read as "nobody connected".
+
+Only TCP peers are seen, and only once accepted. Behind NAT or a proxy, a
+peer is the last hop: a client of a Docker published port arrives as the
+bridge gateway when the userland proxy carries it. The attribute is
+sandbox-scoped, like `observed_listeners`, and new in rule pack 3: RailDash
+shows a baseline locked under pack 2 as `CONTRACT_MISMATCH` until a pack-3
+ASP is locked. The drift acceptance test covers it too.
 
 ## Agent identity
 

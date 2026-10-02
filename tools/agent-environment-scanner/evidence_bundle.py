@@ -70,7 +70,8 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 2 adds observed_listeners (DR-125). RailDash reports a baseline locked
 # under pack 1 as CONTRACT_MISMATCH until a pack-2 ASP is locked: the ASP v1
 # design's answer to "every added field would alert at once".
-RULE_PACK_VERSION = 2
+# Pack 3 adds observed_ingress_peers (DR-145), the same way.
+RULE_PACK_VERSION = 3
 
 # ── the v2 (DR-109 multi-agent) contract, loaded the same way ──────────────
 # A second, independent document: v2 is not v1-plus-fields, so it gets its
@@ -965,6 +966,7 @@ def build_evidence_bundle(
             gaps.append("listensnoop stopped reporting (its heartbeat is stale)")
         if listening.get("lost"):
             gaps.append("listensnoop reported lost events")
+        probe_gaps = list(gaps)  # what the peers share: everything but the listener cap
         if listening.get("unlisted"):
             gaps.append("more distinct listeners than the cap")
         if gaps:
@@ -984,6 +986,50 @@ def build_evidence_bundle(
         else:
             attributes["observed_listeners"] = _absent(
                 method + "; no socket started accepting inbound traffic in the window",
+                "observed",
+            )
+
+    # Who connected in (DR-145): the "Ingress request" dimension, whose
+    # threshold is an approved list of addresses or "internal only". Every
+    # peer is undeclared by construction, as listeners are; drift is the
+    # locked baseline's comparison. The same probe-health gaps apply, plus
+    # its own cap. A probe that predates peer events is BLIND, never ABSENT:
+    # it did not look, which is not "nobody connected".
+    if listening is None:
+        attributes["observed_ingress_peers"] = _blind(
+            "NOT_COLLECTED_BY_PACK", "observed",
+            note="no listensnoop event file was provided to this scan",
+        )
+    elif not listening.get("peers_reported") and not listening.get("peers"):
+        attributes["observed_ingress_peers"] = _blind(
+            "NOT_COLLECTED_BY_PACK", "observed",
+            note="this listensnoop does not report accepted peers (it predates them, or never attached)",
+        )
+    else:
+        met = listening.get("peers") or []
+        peer_method = (
+            "listensnoop peer events: each remote address a process accepted a TCP "
+            "connection from, per listener (protocol, bound address, port, process), "
+            "with its scope (loopback, link-local, private, public, other)"
+        )
+        peer_gaps = list(probe_gaps)
+        if listening.get("peers_unlisted"):
+            peer_gaps.append("more distinct peers than the cap")
+        if peer_gaps:
+            attributes["observed_ingress_peers"] = _partial(
+                met, "observed",
+                "NO_SOURCE_ACCESS" if unreachable else "SIZE_CAP_EXCEEDED",
+                authored_by="none", method=peer_method,
+                note="; ".join(peer_gaps) + ": peers may be missing from this list",
+            )
+        elif met:
+            attributes["observed_ingress_peers"] = _answered(
+                met, "observed", authored_by="none", method=peer_method,
+                note="a finite window; TCP only; behind NAT or a proxy a peer is its last hop",
+            )
+        else:
+            attributes["observed_ingress_peers"] = _absent(
+                peer_method + "; no inbound connection was accepted in the window",
                 "observed",
             )
 

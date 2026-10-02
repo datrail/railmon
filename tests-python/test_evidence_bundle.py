@@ -993,7 +993,8 @@ class ObservedListenersBundleTest(unittest.TestCase):
     def test_the_rule_pack_grew(self):
         # x-rail-spec's additions-version rule: a new attribute is a new pack,
         # which RailDash shows as CONTRACT_MISMATCH rather than drift.
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 2)
+        # Pack 3 added observed_ingress_peers (DR-145).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 3)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
@@ -1077,6 +1078,88 @@ class ObservedListenersBundleTest(unittest.TestCase):
         after = self.bundle(self.listening([self.LISTENER, dict(self.LISTENER, port="ephemeral", protocol="udp")]))["attributes"]
         changed = {name for name in before if before[name] != after[name]}
         self.assertEqual(changed, {"observed_listeners"})
+
+
+class ObservedIngressPeersBundleTest(unittest.TestCase):
+    """Who connected in, from listensnoop's peer events (DR-145)."""
+
+    PEER = {"protocol": "tcp", "addr": "0.0.0.0", "port": 8080, "process": "python3",
+            "peer": "8.8.4.4", "scope": "public"}
+
+    def bundle(self, listening):
+        return evidence_bundle.build_evidence_bundle(
+            build_args(), self_context(), dict(HOST_PAIR), identity(observed_listeners=listening)
+        )
+
+    @staticmethod
+    def listening(peers=(), reported=True, **counts):
+        base = ObservedListenersBundleTest.listening(peers=list(peers), peers_reported=reported,
+                                                     peers_unlisted=0)
+        base.update(counts)
+        return base
+
+    def attribute(self, listening):
+        bundle = self.bundle(listening)
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+        return bundle["attributes"]["observed_ingress_peers"]
+
+    def test_without_an_event_file_the_pack_says_it_did_not_look(self):
+        field = self.attribute(None)
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "NOT_COLLECTED_BY_PACK"))
+
+    def test_a_probe_that_predates_peers_is_blind_not_absent(self):
+        # It never looked: "nobody connected" would be a lie.
+        field = self.attribute(self.listening(reported=False))
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "NOT_COLLECTED_BY_PACK"))
+        self.assertIn("does not report accepted peers", field["note"])
+
+    def test_peers_are_answered_as_observed(self):
+        field = self.attribute(self.listening([self.PEER]))
+        self.assertEqual((field["status"], field["tier"], field["value"]),
+                         ("ANSWERED", "observed", [self.PEER]))
+
+    def test_an_empty_window_is_absent(self):
+        field = self.attribute(self.listening())
+        self.assertEqual((field["status"], field["value"]), ("ABSENT", None))
+
+    def test_probe_gaps_and_the_peer_cap_make_it_partial(self):
+        for counts, reason, words in (
+            ({"lost": 3}, "SIZE_CAP_EXCEEDED", "lost events"),
+            ({"peers_unlisted": 2}, "SIZE_CAP_EXCEEDED", "more distinct peers"),
+            ({"starts": 2, "restarted": True}, "NO_SOURCE_ACCESS", "restarted 1 time "),
+            ({"stale": True}, "NO_SOURCE_ACCESS", "stopped reporting"),
+        ):
+            for peers in ((), [self.PEER]):
+                with self.subTest(counts=counts, peers=peers):
+                    field = self.attribute(self.listening(peers, **counts))
+                    self.assertEqual((field["status"], field["reason"]), ("PARTIAL", reason))
+                    self.assertIn(words, field["note"])
+                    self.assertIn("peers may be missing", field["note"])
+
+    def test_the_listener_cap_is_not_a_peer_gap(self):
+        field = self.attribute(self.listening([self.PEER], unlisted=4))
+        self.assertEqual(field["status"], "ANSWERED")
+
+    def test_the_gap_note_carries_no_count(self):
+        first = self.attribute(self.listening([self.PEER], lost=3, peers_unlisted=1))
+        later = self.attribute(self.listening([self.PEER], lost=3000, peers_unlisted=90))
+        self.assertEqual(first, later)
+        self.assertNotRegex(first["note"], r"\d")
+
+    def test_a_new_peer_changes_this_value_and_nothing_else_moves(self):
+        before = self.bundle(self.listening([self.PEER]))["attributes"]
+        after = self.bundle(self.listening([self.PEER, dict(self.PEER, peer="1.1.1.1")]))["attributes"]
+        changed = {name for name in before if before[name] != after[name]}
+        self.assertEqual(changed, {"observed_ingress_peers"})
+
+    def test_peers_are_sandbox_scoped_in_a_multi_agent_bundle(self):
+        spec = importlib.util.spec_from_file_location(
+            "compose_evidence_bundle_v2", ROOT / "tools/agent-environment-scanner/compose_evidence_bundle_v2.py")
+        composer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(composer)
+        self.assertIn("observed_ingress_peers", composer.SANDBOX_ATTRIBUTES)
+        self.assertNotIn("observed_ingress_peers", composer.agent_scoped_attributes(
+            self.bundle(self.listening([self.PEER]))["attributes"]))
 
 
 class ScannerWiringTest(unittest.TestCase):

@@ -20,6 +20,11 @@ Checked, in order:
 3. the agent container restarts: the probe follows it into the new namespace
    and records the agent's listener again.
 
+And (DR-145) between 1 and 2: a client container connects to the agent over
+the Docker network; the probe reports the client's address as a peer of the
+agent's listener, and the bundle's observed_ingress_peers names it, scoped
+private.
+
 Needs Docker and a privileged-capable host (eBPF), as CI's runner is.
 
   python3 tests/listen_image_acceptance.py --image railmon:ci
@@ -45,6 +50,11 @@ while not os.path.exists("/sig/go"):
 s = socket.socket()
 s.bind(("0.0.0.0", %d))
 s.listen()
+def serve():
+    while True:
+        s.accept()[0].close()
+import threading
+threading.Thread(target=serve, daemon=True).start()
 with open("/sig/pid.tmp", "w") as f:
     f.write(str(os.getpid()))
 os.rename("/sig/pid.tmp", "/sig/pid")
@@ -106,7 +116,7 @@ def main() -> int:
     def ours() -> list[dict]:
         return [e for e in records() if e.get("port") == PORT and e.get("kind") == "listen"]
 
-    def scan() -> dict | None:
+    def scan(attribute: str = "observed_listeners") -> dict | None:
         # As this user: the scanner writes its outputs 0600, for its owner.
         result = docker("run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
                         "-v", f"{data}:/data:ro", "-v", f"{out}:/out",
@@ -117,7 +127,7 @@ def main() -> int:
         if result.returncode != 0:
             print(result.stdout, result.stderr, file=sys.stderr)
             return None
-        return json.loads((out / "bundle.json").read_text())["attributes"]["observed_listeners"]
+        return json.loads((out / "bundle.json").read_text())["attributes"][attribute]
 
     try:
         # --init, so the agent is not PID 1 and "its own PID" means something.
@@ -150,6 +160,27 @@ def main() -> int:
             listeners["status"] == "ANSWERED"
             and {"protocol": "tcp", "addr": "0.0.0.0", "port": PORT, "process": "python3"}
             in listeners["value"]
+        )
+
+        # 1b. a client on the Docker network connects in (DR-145)
+        # Per network: Docker 28 dropped the top-level NetworkSettings.IPAddress.
+        agent_ip = docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                          agent).stdout.strip()
+        connected = docker("run", "--rm", "--entrypoint", "python3", args.image, "-c",
+                           "import socket; c = socket.create_connection((%r, %d), timeout=10);"
+                           " print(c.getsockname()[0]); c.recv(1)" % (agent_ip, PORT), check=False)
+        client_ip = connected.stdout.strip()
+        checks["a client connected to the agent"] = connected.returncode == 0 and bool(client_ip)
+        peer_events = lambda: [e for e in records() if e.get("kind") == "peer" and e.get("port") == PORT]
+        wait_for("the peer event", lambda: peer_events(), timeout=30)
+        checks["listen reported the client as the agent's peer"] = [
+            (e["pid"], e["peer"]) for e in peer_events()] == [(agent_pid, client_ip)] and all(
+            e.get("peers") is True for e in records() if e.get("kind") == "start")
+        peers = scan("observed_ingress_peers")
+        checks["the bundle names the peer, scoped private"] = bool(peers) and (
+            peers["status"] == "ANSWERED"
+            and {"protocol": "tcp", "addr": "0.0.0.0", "port": PORT, "process": "python3",
+                 "peer": client_ip, "scope": "private"} in peers["value"]
         )
 
         # 2. the probe is killed
@@ -194,7 +225,7 @@ def main() -> int:
 
     for name, passed in checks.items():
         print(("ok:   " if passed else "FAIL: ") + name)
-    if len(checks) < 7 or not all(checks.values()):  # seven checks, all passed
+    if len(checks) < 10 or not all(checks.values()):  # ten checks, all passed
         return 1
     print(json.dumps({"result": "PASS", "port": PORT, "agent_pid": agent_pid}))
     return 0

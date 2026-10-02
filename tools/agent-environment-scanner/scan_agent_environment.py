@@ -12,6 +12,7 @@ import base64
 import copy
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -1507,6 +1508,10 @@ def declared_hosts(identity: dict[str, Any], env: dict[str, str]) -> set[str]:
 # compared field by field on every scan.
 LISTENER_CAP = 256
 LISTEN_KINDS = {"listen", "bind", "autobind"}
+# Distinct (listener, peer) pairs kept, for the same reason. A listener the
+# whole internet can reach meets a new peer on every scan; past the cap the
+# list says so (PARTIAL) rather than growing without bound.
+PEER_CAP = 256
 # A line of this many characters or more is not one listensnoop wrote (its
 # lines are ~250); it is skipped without being read into memory whole.
 MAX_LISTEN_LINE = 4096
@@ -1514,6 +1519,46 @@ MAX_LISTEN_LINE = 4096
 
 def _printable(value: str, limit: int) -> str:
     return "".join(c if c.isprintable() else "?" for c in value[:limit])
+
+
+# Named, not ipaddress's is_private: that also covers documentation,
+# benchmarking and reserved space, which are not "inside the network".
+PRIVATE_NETWORKS = tuple(
+    ipaddress.ip_network(net) for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+)
+
+
+def peer_scope(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    """Where a peer connected from, in the words of the ASP requirement's
+    "internal only" threshold: loopback, link-local, private (RFC 1918, ULA),
+    public (globally routable), or other (CGNAT, documentation, reserved...)."""
+    if address.is_loopback:
+        return "loopback"
+    if address.is_link_local:
+        return "link-local"
+    if any(address in net for net in PRIVATE_NETWORKS if net.version == address.version):
+        return "private"
+    if address.is_global:
+        return "public"
+    return "other"
+
+
+def _peer_address(value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    # listensnoop never writes a zone ("fe80::1%eth0"), and ipaddress keeps
+    # one verbatim, control characters and all: refuse it.
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id is not None:
+        return None
+    # listensnoop already writes an IPv4 client of a dual-stack listener as
+    # IPv4; normalise anyway, so one client is one peer whatever wrote it.
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
 
 
 # A heartbeat older than this many intervals means the probe stopped.
@@ -1548,12 +1593,24 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
       * the newest start/alive more than HEARTBEAT_GRACE intervals from
         `now`, either way (a clock stepped back too): it is `stale`.
 
+    `peer` events (DR-145) are who actually connected in: per listener, the
+    distinct remote addresses a process accepted a connection from, each
+    with its scope. Kept the same way (no counts, no PIDs, a chosen port as
+    "ephemeral"), so the value changes only when a new peer appears. Only a
+    listensnoop from DR-144 on reports them, and its start records say
+    `"peers": true`; `peers_reported` says whether the newest one did, so
+    an empty list from a probe that predates them is never read as "nobody
+    connected". Peer events are kept whatever the start record says.
+
     Produce the file with listensnoop (ebpf-tls-tap) run in the agent's PID
     namespace; see the README's "Observed listeners".
     """
     listeners: set[tuple[str, str, Any, str]] = set()
-    lost = unlisted = malformed = outside = 0
+    peers: set[tuple[str, str, Any, str, Any]] = set()
+    lost = unlisted = peers_unlisted = malformed = outside = 0
     last_alive: datetime | None = None
+    last_start: datetime | None = None
+    peers_reported = False
     every = starts = 0
     for line in lines:
         line = line.strip()
@@ -1582,14 +1639,18 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
             if not isinstance(interval, int) or isinstance(interval, bool) or interval < (kind == "alive"):
                 malformed += 1
                 continue
-            starts += kind == "start"
+            if kind == "start":
+                starts += 1
+                if last_start is None or seen >= last_start:
+                    last_start, peers_reported = seen, event.get("peers") is True
             if last_alive is None or seen > last_alive:
                 last_alive, every = seen, interval
             continue
         port, protocol, addr = event.get("port"), event.get("protocol"), event.get("addr")
         comm, ephemeral = event.get("comm"), event.get("ephemeral")
+        peer = _peer_address(event.get("peer")) if kind == "peer" else None
         if (
-            kind not in LISTEN_KINDS
+            (kind not in LISTEN_KINDS and not (kind == "peer" and peer is not None))
             or not isinstance(port, int) or not 0 <= port <= 65535
             or not isinstance(protocol, str) or not isinstance(addr, str)
             or not isinstance(comm, str) or not isinstance(event.get("pid"), int)
@@ -1610,6 +1671,13 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
             "ephemeral" if chosen else port,
             _printable(comm, 16),
         )
+        if peer is not None:
+            pair = (*key, peer)
+            if pair not in peers and len(peers) >= PEER_CAP:
+                peers_unlisted += 1
+            else:
+                peers.add(pair)
+            continue
         if key not in listeners and len(listeners) >= LISTENER_CAP:
             unlisted += 1
             continue
@@ -1620,8 +1688,16 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
             {"protocol": protocol, "addr": addr, "port": port, "process": process}
             for protocol, addr, port, process in sorted(listeners, key=lambda k: (k[0], k[1], str(k[2]), k[3]))
         ],
+        "peers": [
+            {"protocol": protocol, "addr": addr, "port": port, "process": process,
+             "peer": str(peer), "scope": peer_scope(peer)}
+            for protocol, addr, port, process, peer in sorted(
+                peers, key=lambda k: (k[0], k[1], str(k[2]), k[3], k[4].version, k[4]))
+        ],
+        "peers_reported": peers_reported,
         "lost": lost,
         "unlisted": unlisted,
+        "peers_unlisted": peers_unlisted,
         "malformed": malformed,
         "outside_namespace": outside,
         "starts": starts,
