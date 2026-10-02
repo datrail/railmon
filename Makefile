@@ -23,6 +23,7 @@ test-python:
 		tools/agent-environment-scanner/scan_agent_environment.py \
 		tools/agent-environment-scanner/evidence_bundle.py \
 		tools/agent-environment-scanner/compose_evidence_bundle_v2.py \
+		tools/listen/follow_container.py \
 		tools/skills-scanner/skill_scanner.py \
 		rail-collector/rail_collector.py \
 		tools/local-demo/demo_server.py \

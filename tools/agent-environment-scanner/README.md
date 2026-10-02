@@ -266,8 +266,11 @@ The other direction of reach: a socket the agent opened to *accept* traffic is
 a service nobody declared, the shape a covert channel takes.
 `--listen-file` (or `RAIL_LISTEN_FILE`) reads the JSON lines that
 [`listensnoop`](https://github.com/datrail/ebpf-tls-tap#listening-sockets)
-appends. Build it from ebpf-tls-tap (`make build-bpf`) and run it in the
-agent's PID namespace, so that only this sandbox's sockets carry a PID:
+appends. The RailMon image ships it as `railmon listen`; the
+[top-level README](../../README.md#listening-sockets) has the two-container
+deployment. Run it in the agent's PID namespace, so that only this sandbox's
+sockets carry a PID. Without the image, build it from ebpf-tls-tap
+(`make build-bpf`) and enter the namespace yourself:
 
 ```bash
 agent=$(docker inspect -f '{{.State.Pid}}' my-agent)
@@ -294,8 +297,9 @@ The events are per PID namespace, which is the sandbox, so in a multi-agent
 bundle `observed_listeners` is sandbox-scoped, not per agent.
 
 Keep the file where the agent cannot write. An agent that can truncate it, or
-edit it, can hide its own listener, and deleting it fails the scan. The nsenter
-recipe above writes it on the host. Lines of 4096 characters or more are
+edit it, can hide its own listener, and deleting it fails the scan. The
+two-container deployment keeps it on a volume the agent does not mount; the
+nsenter recipe writes it on the host. Lines of 4096 characters or more are
 skipped as malformed.
 
 `ephemeral` needs a listensnoop from DR-125 on. With an older one, only an
@@ -309,8 +313,13 @@ RailDash's comparison against the locked baseline: a new entry is a change to
 
 - ANSWERED with the list;
 - ABSENT when nothing listened;
-- PARTIAL (`SIZE_CAP_EXCEEDED`) when listensnoop reported lost events or more
-  than 256 distinct listeners were seen. A gap never reads as "none";
+- PARTIAL when the list may be missing a listener. A gap never reads as
+  "none". There are two reasons:
+  - `NO_SOURCE_ACCESS` covers three cases: listensnoop restarted (a second
+    `start` record), its heartbeat is more than three intervals old, or it
+    never attached (no `start` record);
+  - `SIZE_CAP_EXCEEDED`: it reported lost events, or more than 256 distinct
+    listeners were seen;
 - BLIND without a file.
 
 The attribute is new in rule pack 2. RailDash shows a baseline locked under
