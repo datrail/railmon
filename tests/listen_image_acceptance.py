@@ -163,7 +163,9 @@ def main() -> int:
         )
 
         # 1b. a client on the Docker network connects in (DR-145)
-        agent_ip = docker("inspect", "-f", "{{.NetworkSettings.IPAddress}}", agent).stdout.strip()
+        # Per network: Docker 28 dropped the top-level NetworkSettings.IPAddress.
+        agent_ip = docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                          agent).stdout.strip()
         connected = docker("run", "--rm", "--entrypoint", "python3", args.image, "-c",
                            "import socket; c = socket.create_connection((%r, %d), timeout=10);"
                            " print(c.getsockname()[0]); c.recv(1)" % (agent_ip, PORT), check=False)
