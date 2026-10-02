@@ -24,8 +24,18 @@ KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # it is named explicitly in that sentence — an omission that would have let
 # it ride into `agents[].attributes` as if it varied per agent, when a
 # container has exactly one network mode for every process inside it.
+#
+# `observed_listeners` (DR-125) is here for a different reason: listensnoop
+# runs per PID namespace, which is the sandbox, and nothing maps its events
+# to one agent. Agent-scoped, one agent opening a port would read as drift
+# on every sibling's ASP. In `compose()`, per-agent scans taken while
+# listensnoop appended can disagree on it; that fails closed like any other
+# sandbox attribute that differs between agents.
 SANDBOX_ATTRIBUTES = frozenset(
-    {"container_identity", "image_digest", "mounts", "deployment", "sandbox_network_policy"}
+    {
+        "container_identity", "image_digest", "mounts", "deployment",
+        "sandbox_network_policy", "observed_listeners",
+    }
 )
 
 

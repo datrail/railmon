@@ -219,3 +219,13 @@ jobs:
           done
           [ "$asps" -ge 2 ] || { docker logs railmon-scan; docker logs raildash; exit 1; }
           echo "{\"result\": \"PASS\", \"interval_asps\": $asps}"
+          # DR-125: a listening socket that appears after the baseline was
+          # locked is drift, and an unchanged window is not. Real scanner in
+          # the image, real RailDash, listensnoop lines in a mounted file.
+          mkdir -p "$RUNNER_TEMP/listen"
+          python3 tests/listen_drift_acceptance.py \
+            --raildash http://127.0.0.1:8000 --scan-raildash http://raildash:8000 \
+            --token "$token" \
+            --listen-dir "$RUNNER_TEMP/listen" --scan-listen-dir /listen \
+            --scan "docker run --rm --network railmon-raildash -e RAIL_RAILDASH_TOKEN -e RAIL_HOST_ID -v $RUNNER_TEMP/listen:/listen:ro railmon:ci scan" \
+            || { docker logs raildash; exit 1; }

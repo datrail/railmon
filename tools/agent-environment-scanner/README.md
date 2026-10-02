@@ -132,6 +132,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `tool_and_mcp_reach` | MCP inventory: name, the command's executable (not its arguments, which carry tokens), redacted url, transport |
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
+| `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events |
 
 Metadata only — never a secret value. That is what makes the file safe to
 persist and hand to a scorer. It is written `0600`: the inventory names an
@@ -258,6 +259,64 @@ and the summary counts, and deliberately nothing else. `tool_calls` also carries
 `input`/`output` and `process_nodes` carries full `argv` — conversation and
 command-line *contents*, not metadata — which must never reach a file that is
 persisted and handed to a scorer.
+
+## Observed listeners (optional)
+
+The other direction of reach: a socket the agent opened to *accept* traffic is
+a service nobody declared, the shape a covert channel takes.
+`--listen-file` (or `RAIL_LISTEN_FILE`) reads the JSON lines that
+[`listensnoop`](https://github.com/datrail/ebpf-tls-tap#listening-sockets)
+appends. Build it from ebpf-tls-tap (`make build-bpf`) and run it in the
+agent's PID namespace, so that only this sandbox's sockets carry a PID:
+
+```bash
+agent=$(docker inspect -f '{{.State.Pid}}' my-agent)
+sudo nsenter -t "$agent" -p -- ./bpf/listensnoop >> listen.jsonl &
+python3 .../scan_agent_environment.py --listen-file listen.jsonl
+```
+
+The scanner re-reads the whole file on every scan, so the list covers
+everything since listensnoop started. It becomes the `observed_listeners`
+attribute, and it is built so that it only changes when the agent starts
+listening somewhere new:
+
+- each entry is `{protocol, addr, port, process}`, with no counts or PIDs;
+- a port the kernel chose (listensnoop's `ephemeral`: a bind to port 0, a
+  `listen()` on an unbound socket, an autobind) is `ephemeral`, not a number
+  that differs on every run. A port the caller asked for stays a number in
+  any range, so a covert listener on one is a new entry;
+- an event with `pid` 0 came from outside listensnoop's PID namespace. It is
+  counted (`outside_namespace`) but not listed;
+- the PARTIAL note names the kind of gap, never a count, so a growing lost
+  count is not drift on every scan. The counts are in the feature file.
+
+The events are per PID namespace, which is the sandbox, so in a multi-agent
+bundle `observed_listeners` is sandbox-scoped, not per agent.
+
+Keep the file where the agent cannot write. An agent that can truncate it, or
+edit it, can hide its own listener, and deleting it fails the scan. The nsenter
+recipe above writes it on the host. Lines of 4096 characters or more are
+skipped as malformed.
+
+`ephemeral` needs a listensnoop from DR-125 on. With an older one, only an
+autobind is known to be kernel-chosen, so a bind to port 0 shows its real
+port, which changes when the agent restarts. That causes churn, but it never
+hides a listener.
+
+No configuration declares a listener, so every one is undeclared. Drift is
+RailDash's comparison against the locked baseline: a new entry is a change to
+`observed_listeners`. The attribute is:
+
+- ANSWERED with the list;
+- ABSENT when nothing listened;
+- PARTIAL (`SIZE_CAP_EXCEEDED`) when listensnoop reported lost events or more
+  than 256 distinct listeners were seen. A gap never reads as "none";
+- BLIND without a file.
+
+The attribute is new in rule pack 2. RailDash shows a baseline locked under
+pack 1 as `CONTRACT_MISMATCH`, not as drift, until a pack-2 ASP is locked.
+`tests/listen_drift_acceptance.py` runs the whole path against a real RailDash
+in CI.
 
 ## Agent identity
 
