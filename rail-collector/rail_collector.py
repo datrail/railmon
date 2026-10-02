@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 DEFAULT_SPOOL_DIR = Path(".datrail") / "rail-guardian" / "rail-collector"
 
@@ -31,6 +31,21 @@ GCP_REFRESH_MARGIN_SECONDS = 300
 # RFC 7230 header-value characters; anything else in a token is refused by
 # offset, so the token itself never reaches a message.
 _HEADER_SAFE = set(chr(c) for c in range(0x21, 0x7F))
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Refuse to follow: urllib would carry `Authorization` to wherever a 3xx
+    points, any host or scheme. A redirect surfaces as an HTTPError instead,
+    so the event stays spooled."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = build_opener(_NoRedirect)
+# The metadata server is link-local: never through an HTTP proxy, which would
+# see the minted identity token in clear.
+_METADATA_OPENER = build_opener(ProxyHandler({}), _NoRedirect)
 
 
 def header_safe(raw: str, name: str) -> str:
@@ -137,7 +152,7 @@ class Credential:
         )
         request = Request(url, headers={"Metadata-Flavor": "Google"})
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with _METADATA_OPENER.open(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8", errors="replace")
         except HTTPError as exc:
             raise RailCollectorError(
@@ -219,7 +234,7 @@ def post_event(
     data = canonical_json(event).encode("utf-8")
     request = Request(url, data=data, headers={"Content-Type": "application/json", **(auth_headers or {})})
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
             return 200 <= response.status < 300, response.status, body
     except HTTPError as exc:

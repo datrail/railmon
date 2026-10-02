@@ -75,8 +75,13 @@ impl Sink {
                 // event reads, the flush timer and shutdown signals, and the
                 // probe's stdout pipe then backs up behind it. The Python bounded this
                 // at 10s; matching that.
+                //
+                // Redirects are not followed: reqwest keeps `Authorization`
+                // across a same-host redirect even when it downgrades https to
+                // http. A 3xx is a failed delivery like any other status.
                 client: reqwest::Client::builder()
                     .timeout(Duration::from_secs(10))
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .unwrap_or_default(),
                 batch: Vec::with_capacity(batch_size.max(1)),

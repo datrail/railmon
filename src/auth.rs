@@ -137,8 +137,12 @@ impl Credential {
                 Ok(Self::Gcp(GcpIdentity {
                     audience,
                     metadata_host,
+                    // Link-local, so never through an HTTP proxy (which would
+                    // see the minted token in clear) and never redirected.
                     client: reqwest::Client::builder()
                         .timeout(Duration::from_secs(10))
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
                         .build()
                         .unwrap_or_default(),
                     cached: None,

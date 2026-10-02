@@ -46,11 +46,15 @@ class Recorder(BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
         self.server.seen.append(("POST", self.path, self.headers.get("Authorization")))
-        self.send_response(202)
+        if self.server.redirect:
+            self.send_response(302)
+            self.send_header("Location", self.server.redirect)
+        else:
+            self.send_response(202)
         self.end_headers()
 
     def do_GET(self):
-        self.server.seen.append(("GET", self.path, self.headers.get("Metadata-Flavor")))
+        self.server.seen.append(("GET", self.path, self.headers.get("Metadata-Flavor"), self.headers.get("Authorization")))
         body = self.server.identity.encode()
         self.send_response(self.server.identity_status)
         self.send_header("Content-Length", str(len(body)))
@@ -64,6 +68,7 @@ class ForwardAuthTest(unittest.TestCase):
         self.server.seen = []
         self.server.identity = jwt(int(time.time()) + 3600)
         self.server.identity_status = 200
+        self.server.redirect = None
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -84,7 +89,17 @@ class ForwardAuthTest(unittest.TestCase):
         )
 
     def posts(self):
-        return [auth for method, _, auth in self.server.seen if method == "POST"]
+        return [entry[2] for entry in self.server.seen if entry[0] == "POST"]
+
+    def test_a_redirect_is_not_followed_with_the_credential(self):
+        self.server.redirect = f"http://{self.host}/elsewhere"
+        result = self.forward(RAIL_AUTH_MODE="bearer", RAIL_AUTH_TOKEN="t-1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        # Retried by the final drain, but only ever at Rail Center's own URL.
+        self.assertTrue(self.posts())
+        self.assertEqual({e[1] for e in self.server.seen if e[0] == "POST"}, {"/v1/interactions"})
+        self.assertEqual([e for e in self.server.seen if e[0] == "GET"], [])
+        self.assertEqual(len(list((Path(self.tmp.name) / "pending").glob("*.json"))), 1)
 
     def test_none_is_anonymous_by_decision(self):
         result = self.forward()
@@ -121,7 +136,7 @@ class ForwardAuthTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.posts(), [f"Bearer {self.server.identity}"])
-        gets = [(path, flavor) for method, path, flavor in self.server.seen if method == "GET"]
+        gets = [entry[1:3] for entry in self.server.seen if entry[0] == "GET"]
         # Minted once at startup, reused for the forward while fresh.
         self.assertEqual(
             gets,
