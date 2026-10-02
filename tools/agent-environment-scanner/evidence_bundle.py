@@ -67,7 +67,10 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Ours, not the consumer's: the consumer's mock numbers its own packs; pack 1
 # is this collector's attribute set, and x-rail-spec's additions-version rule
 # applies when the set grows. Not in the schema — it is only bounded there.
-RULE_PACK_VERSION = 1
+# Pack 2 adds observed_listeners (DR-125). RailDash reports a baseline locked
+# under pack 1 as CONTRACT_MISMATCH until a pack-2 ASP is locked: the ASP v1
+# design's answer to "every added field would alert at once".
+RULE_PACK_VERSION = 2
 
 # ── the v2 (DR-109 multi-agent) contract, loaded the same way ──────────────
 # A second, independent document: v2 is not v1-plus-fields, so it gets its
@@ -712,6 +715,7 @@ def build_evidence_bundle(
     egress_host = scanner.url_host(base_url) if base_url else None
     mcp: list[dict[str, Any]] = identity.get("mcp_servers") or []
     reach: dict[str, Any] = identity.get("observed_reach") or {}
+    listening: dict[str, Any] | None = identity.get("observed_listeners")
     # ── inputs_attempted: the sources, and whether each was reached ──────
     raw_named = getattr(args, "config_path", []) or []
     config_paths = [Path(p).expanduser() for p in raw_named] \
@@ -739,8 +743,12 @@ def build_evidence_bundle(
     inputs: dict[str, Any] = {
         # We are the runtime observation source when the scan happens inside the
         # runtime; a docker-mode scan reads its container, not itself, so its
-        # runtime source is the wire - and this pack ships without a tap.
-        "runtime": _source(True, mode == "self" or bool(reach), "NO_SOURCE_ACCESS"),
+        # runtime source is the wire. The pack ships without a tap, so that is
+        # reached only through a file a tap wrote: an AgentSight snapshot or
+        # listensnoop events.
+        "runtime": _source(
+            True, mode == "self" or bool(reach) or listening is not None, "NO_SOURCE_ACCESS"
+        ),
         # A root the operator named and we could not read is the failure the
         # permissions attribute names precisely; any failure means this source
         # was not fully reached, so the source's reason is the worst of them.
@@ -916,6 +924,48 @@ def build_evidence_bundle(
             "NOT_COLLECTED_BY_PACK", "declared",
             note="NOT COMPUTABLE — needs declared AND observed; observed is blind without a snapshot",
         )
+
+    # Sockets the agent opened to accept inbound traffic: reach in the other
+    # direction. No declaration names a listener, so every one is undeclared
+    # by construction; drift is the locked baseline's comparison of this list.
+    # The value carries no counts or PIDs, so it only changes when a new kind
+    # of listener appears. A gap in the events (lost, or past the cap) makes
+    # the list PARTIAL: a missing listener must never read as "none".
+    if listening is None:
+        attributes["observed_listeners"] = _blind(
+            "NOT_COLLECTED_BY_PACK", "observed",
+            note="no listensnoop event file was provided to this scan",
+        )
+    else:
+        heard = listening.get("listeners") or []
+        method = (
+            "listensnoop events: protocol, bound address, port (a kernel-chosen "
+            "port is 'ephemeral'), process name"
+        )
+        # The note names the kind of gap, never a count: RailDash compares
+        # notes, and a count that grows with every scan (or that any process
+        # can inflate, as listensnoop's lost count can be) would be drift on
+        # every scan. The counts stay in the feature file.
+        gaps = []
+        if listening.get("lost"):
+            gaps.append("listensnoop reported lost events")
+        if listening.get("unlisted"):
+            gaps.append("more distinct listeners than the cap")
+        if gaps:
+            attributes["observed_listeners"] = _partial(
+                heard, "observed", "SIZE_CAP_EXCEEDED", authored_by="none", method=method,
+                note="; ".join(gaps) + ": listeners may be missing from this list",
+            )
+        elif heard:
+            attributes["observed_listeners"] = _answered(
+                heard, "observed", authored_by="none", method=method,
+                note="a finite window; a listener opened before listensnoop started is not in it",
+            )
+        else:
+            attributes["observed_listeners"] = _absent(
+                method + "; no socket started accepting inbound traffic in the window",
+                "observed",
+            )
 
     # ── credentials ───────────────────────────────────────────────────────
     secrets = scanner.collect_secret_hygiene(

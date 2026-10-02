@@ -13,6 +13,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCANNER_DIR = ROOT / "tools" / "agent-environment-scanner"
@@ -1283,6 +1284,112 @@ class ObservedReachTest(unittest.TestCase):
             path = Path(tmp) / "snapshot.json"
             path.write_text(json.dumps(big), encoding="utf-8")
             self.assertEqual(scanner.load_snapshot(path)["schema_version"], 1)
+
+
+class ListenersTest(unittest.TestCase):
+    """listensnoop's JSON lines become a stable list of what the agent listens on (DR-125)."""
+
+    @staticmethod
+    def event(**fields):
+        import json
+
+        base = {"timestamp_ns": 1, "kind": "listen", "pid": 41, "tid": 41, "host_pid": 9041,
+                "uid": 1000, "comm": "python3", "protocol": "tcp", "family": "ipv4",
+                "addr": "127.0.0.1", "port": 8080, "ephemeral": False}
+        base.update(fields)
+        return json.dumps(base)
+
+    def summary(self, *lines):
+        return scanner.summarize_listeners(list(lines))
+
+    def test_a_listening_socket_is_reported_without_pids_or_counts(self):
+        listeners = self.summary(self.event(), self.event(timestamp_ns=2, pid=42))["listeners"]
+        self.assertEqual(listeners, [{"protocol": "tcp", "addr": "127.0.0.1", "port": 8080, "process": "python3"}])
+
+    def test_a_kernel_chosen_port_is_ephemeral_so_the_value_is_stable(self):
+        first = self.summary(self.event(port=41234, ephemeral=True),
+                             self.event(kind="autobind", protocol="udp", addr="0.0.0.0", port=40001, ephemeral=True))
+        second = self.summary(self.event(port=50999, ephemeral=True),
+                              self.event(kind="autobind", protocol="udp", addr="0.0.0.0", port=33333, ephemeral=True))
+        self.assertEqual(first["listeners"], second["listeners"])
+        self.assertEqual({entry["port"] for entry in first["listeners"]}, {"ephemeral"})
+
+    def test_an_asked_for_port_stays_a_number_inside_the_ephemeral_range(self):
+        # A covert listener on port 45000 must not pass as "ephemeral" just
+        # because 45000 is a number the kernel could have picked.
+        baseline = self.summary(self.event(port=40000))["listeners"]
+        later = self.summary(self.event(port=40000), self.event(port=45000))["listeners"]
+        self.assertEqual([entry["port"] for entry in later], [40000, 45000])
+        self.assertNotEqual(baseline, later)
+
+    def test_without_the_flag_only_an_autobind_is_known_to_be_chosen(self):
+        old = dict(ephemeral=None)
+        result = self.summary(self.event(port=41234, **old),
+                              self.event(kind="autobind", protocol="udp", port=40001, **old))
+        self.assertEqual(sorted(str(entry["port"]) for entry in result["listeners"]), ["41234", "ephemeral"])
+
+    def test_lost_records_are_summed(self):
+        result = self.summary('{"kind":"lost","count":3}', '{"kind":"lost","count":4}', self.event())
+        self.assertEqual(result["lost"], 7)
+
+    def test_a_process_outside_listensnoops_namespace_is_counted_not_listed(self):
+        result = self.summary(self.event(pid=0, port=22, comm="sshd"))
+        self.assertEqual((result["listeners"], result["outside_namespace"]), ([], 1))
+
+    def test_garbage_lines_are_counted_and_skipped(self):
+        result = self.summary("not json", "[1]", self.event(port="80"), self.event(kind="unknown"),
+                              self.event(ephemeral="yes"), "", self.event())
+        self.assertEqual((len(result["listeners"]), result["malformed"]), (1, 5))
+
+    def test_past_the_cap_listeners_are_counted_not_listed(self):
+        lines = [self.event(port=port) for port in range(1000, 1000 + scanner.LISTENER_CAP + 5)]
+        result = self.summary(*lines, self.event(port=1000))  # a repeat is never "past the cap"
+        self.assertEqual((len(result["listeners"]), result["unlisted"]), (scanner.LISTENER_CAP, 5))
+
+    def test_hostile_strings_cannot_carry_control_characters(self):
+        listener, = self.summary(self.event(comm="evil\n\u001b[31m", addr="1.2.3.4\u001b[2J",
+                                            protocol="tcp\r"))["listeners"]
+        for field in ("process", "addr", "protocol"):
+            self.assertTrue(listener[field].isprintable(), field)
+
+    def test_the_file_is_streamed_and_an_unreadable_one_is_an_error(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "listen.jsonl"
+            path.write_text("\n".join([self.event(), self.event(port=9090)]) + "\n", encoding="utf-8")
+            self.assertEqual(len(scanner.load_listen_events(path)["listeners"]), 2)
+            with self.assertRaises(scanner.ScannerError):
+                scanner.load_listen_events(Path(tmp) / "missing.jsonl")
+
+    def test_the_reader_never_holds_more_than_one_bounded_chunk(self):
+        import io
+
+        limit = scanner.MAX_LISTEN_LINE
+        reads: list[int] = []
+
+        class Recording(io.StringIO):
+            def readline(self, size=-1):
+                line = super().readline(size)
+                reads.append(len(line))
+                return line
+
+        text = "a\n" + "x" * (limit * 3) + "\n" + "b" * (limit - 1) + "\n" + "c" * limit
+        lines = list(scanner._bounded_lines(Recording(text)))
+        self.assertEqual(lines, ["a\n", "\x00oversized", "b" * (limit - 1) + "\n", "\x00oversized"])
+        self.assertLessEqual(max(reads), limit)
+
+    def test_an_oversized_line_is_skipped_without_losing_its_neighbours(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "listen.jsonl"
+            path.write_text(self.event() + "\n" + "x" * (scanner.MAX_LISTEN_LINE * 3) + "\n"
+                            + self.event(port=9090) + "\n" + "y" * scanner.MAX_LISTEN_LINE,
+                            encoding="utf-8")
+            result = scanner.load_listen_events(path)
+            self.assertEqual([entry["port"] for entry in result["listeners"]], [8080, 9090])
+            self.assertEqual(result["malformed"], 2)
 
 
 class RegistrationStatusTest(unittest.TestCase):

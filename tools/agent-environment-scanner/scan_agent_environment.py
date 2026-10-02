@@ -23,7 +23,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
@@ -1502,6 +1502,128 @@ def declared_hosts(identity: dict[str, Any], env: dict[str, str]) -> set[str]:
     return {host for host in hosts if host}
 
 
+# Distinct listeners kept in the bundle. More are counted, not listed: the
+# events come from every process in the sandbox, and a value this size is
+# compared field by field on every scan.
+LISTENER_CAP = 256
+LISTEN_KINDS = {"listen", "bind", "autobind"}
+# A line of this many characters or more is not one listensnoop wrote (its
+# lines are ~250); it is skipped without being read into memory whole.
+MAX_LISTEN_LINE = 4096
+
+
+def _printable(value: str, limit: int) -> str:
+    return "".join(c if c.isprintable() else "?" for c in value[:limit])
+
+
+def summarize_listeners(lines: Iterable[str]) -> dict[str, Any]:
+    """Turn listensnoop's JSON lines into the listening half of observed reach.
+
+    A socket the agent opened to accept inbound traffic is reach in the other
+    direction: a service the agent offers that its configuration never
+    declared, the shape a covert channel takes. Like `summarize_observed`,
+    this keeps names and no counts or PIDs, so the value only changes when a
+    new kind of listener appears:
+
+    - a port the kernel chose (listensnoop's `ephemeral`: a bind to port 0, a
+      listen() on an unbound socket, an autobind) is "ephemeral" rather than
+      a number that differs on every run. A port the caller asked for stays a
+      number whatever range it is in: it is the service's identity, and a
+      covert listener on one must not pass as ephemeral;
+    - an event with pid 0 came from outside the PID namespace listensnoop ran
+      in, so it is not this sandbox's and is only counted;
+    - `lost` sums listensnoop's own gap records: events it could not deliver,
+      so the list may be missing a listener.
+
+    Produce the file with listensnoop (ebpf-tls-tap) run in the agent's PID
+    namespace; see the README's "Observed listeners".
+    """
+    listeners: set[tuple[str, str, Any, str]] = set()
+    lost = unlisted = malformed = outside = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if not isinstance(event, dict):
+            malformed += 1
+            continue
+        kind = event.get("kind")
+        if kind == "lost":
+            count = event.get("count")
+            lost += count if isinstance(count, int) and count > 0 else 0
+            continue
+        port, protocol, addr = event.get("port"), event.get("protocol"), event.get("addr")
+        comm, ephemeral = event.get("comm"), event.get("ephemeral")
+        if (
+            kind not in LISTEN_KINDS
+            or not isinstance(port, int) or not 0 <= port <= 65535
+            or not isinstance(protocol, str) or not isinstance(addr, str)
+            or not isinstance(comm, str) or not isinstance(event.get("pid"), int)
+            or not isinstance(ephemeral, (bool, type(None)))
+        ):
+            malformed += 1
+            continue
+        if event["pid"] == 0:
+            outside += 1
+            continue
+        # A listensnoop older than the flag (before DR-125) only marks an
+        # autobind for sure. Its port-0 binds then show their real ports,
+        # which differ per run: churn, but never a hidden listener.
+        chosen = ephemeral if ephemeral is not None else kind == "autobind"
+        key = (
+            _printable(protocol, 16),
+            _printable(addr, 64),
+            "ephemeral" if chosen else port,
+            _printable(comm, 16),
+        )
+        if key not in listeners and len(listeners) >= LISTENER_CAP:
+            unlisted += 1
+            continue
+        listeners.add(key)
+    return {
+        "source": "listensnoop",
+        "listeners": [
+            {"protocol": protocol, "addr": addr, "port": port, "process": process}
+            for protocol, addr, port, process in sorted(listeners, key=lambda k: (k[0], k[1], str(k[2]), k[3]))
+        ],
+        "lost": lost,
+        "unlisted": unlisted,
+        "malformed": malformed,
+        "outside_namespace": outside,
+    }
+
+
+def _bounded_lines(stream: Any) -> Iterable[str]:
+    """Lines of at most MAX_LISTEN_LINE characters; a longer one is yielded
+    as a single unparseable marker, never held whole."""
+    while True:
+        line = stream.readline(MAX_LISTEN_LINE)
+        if not line:
+            return
+        if len(line) == MAX_LISTEN_LINE and not line.endswith("\n"):
+            while True:  # discard the rest of it
+                rest = stream.readline(MAX_LISTEN_LINE)
+                if not rest or rest.endswith("\n"):
+                    break
+            yield "\x00oversized"
+            continue
+        yield line
+
+
+def load_listen_events(path: Path) -> dict[str, Any]:
+    # Streamed, not read whole: listensnoop appends for as long as it runs.
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return summarize_listeners(_bounded_lines(stream))
+    except OSError as exc:
+        raise ScannerError(f"cannot read listensnoop events {path}: {exc}") from exc
+
+
 def load_snapshot(path: Path) -> dict[str, Any]:
     # Read it whole. load_json_file() goes through read_text(), which caps at
     # 64 KB for config files; a snapshot of a real session is megabytes, and the
@@ -1561,6 +1683,7 @@ def build_feature_file(
         },
         "skills": payload.get("skills") or [],
         **({"observed_reach": identity["observed_reach"]} if identity.get("observed_reach") else {}),
+        **({"observed_listeners": identity["observed_listeners"]} if identity.get("observed_listeners") else {}),
     }
 
 
@@ -1577,6 +1700,7 @@ def collect_identity(args: argparse.Namespace, context: dict[str, Any]) -> dict[
         "registration_status": "registration_failed" if args.register else "unregistered",
         "mcp_servers": [],
         "observed_reach": None,
+        "observed_listeners": None,
     }
 
 
@@ -1607,6 +1731,9 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
             load_snapshot(Path(args.observed_file).expanduser()),
             declared_hosts(identity, context["env"]),
         )
+    listen_file = resolve_listen_file(args)
+    if listen_file:
+        identity["observed_listeners"] = load_listen_events(Path(listen_file).expanduser())
     return context, payload, identity
 
 
@@ -1869,6 +1996,10 @@ def configured_raildash_url(args: argparse.Namespace) -> str | None:
 
 def configured_agent_key(args: argparse.Namespace) -> str | None:
     return first_nonempty(args.agent_key, os.environ.get("RAIL_AGENT_KEY"))
+
+
+def resolve_listen_file(args: argparse.Namespace) -> str | None:
+    return first_nonempty(getattr(args, "listen_file", None), os.environ.get("RAIL_LISTEN_FILE"))
 
 
 def configured_target_manifest(args: argparse.Namespace) -> str | None:
@@ -2533,6 +2664,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="AgentSight snapshot (agentsight report export -o snapshot.json) to summarise "
         "into the observed-reach dimension. Names and counts only; no prompts, tool "
         "arguments or command lines are read from it.",
+    )
+    parser.add_argument(
+        "--listen-file",
+        help="listensnoop JSON lines (from ebpf-tls-tap, run in the agent's PID namespace) to "
+        "summarise into the observed listening sockets. Protocol, address, port and process "
+        "name only. Defaults to RAIL_LISTEN_FILE.",
     )
     parser.add_argument("--host-id", help="Host identity override. Defaults to RAIL_HOST_ID.")
     parser.add_argument(

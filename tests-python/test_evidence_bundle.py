@@ -967,6 +967,89 @@ class BundleWritePathTest(unittest.TestCase):
             self.assertEqual(notes_attrs["approval_policy"]["status"], "BLIND")
 
 
+class ObservedListenersBundleTest(unittest.TestCase):
+    """The listening half of observed reach in the bundle (DR-125)."""
+
+    LISTENER = {"protocol": "tcp", "addr": "0.0.0.0", "port": 4444, "process": "python3"}
+
+    def bundle(self, listening):
+        return evidence_bundle.build_evidence_bundle(
+            build_args(), self_context(), dict(HOST_PAIR), identity(observed_listeners=listening)
+        )
+
+    @staticmethod
+    def listening(listeners=(), **counts):
+        base = {"source": "listensnoop", "listeners": list(listeners), "lost": 0,
+                "unlisted": 0, "malformed": 0, "outside_namespace": 0}
+        base.update(counts)
+        return base
+
+    def attribute(self, listening):
+        bundle = self.bundle(listening)
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+        return bundle["attributes"]["observed_listeners"]
+
+    def test_the_rule_pack_grew(self):
+        # x-rail-spec's additions-version rule: a new attribute is a new pack,
+        # which RailDash shows as CONTRACT_MISMATCH rather than drift.
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 2)
+
+    def test_without_an_event_file_the_pack_says_it_did_not_look(self):
+        field = self.attribute(None)
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "NOT_COLLECTED_BY_PACK"))
+
+    def test_listeners_are_answered_as_observed(self):
+        field = self.attribute(self.listening([self.LISTENER]))
+        self.assertEqual((field["status"], field["tier"], field["value"]),
+                         ("ANSWERED", "observed", [self.LISTENER]))
+
+    def test_an_empty_window_is_absent_not_an_empty_answer(self):
+        field = self.attribute(self.listening())
+        self.assertEqual((field["status"], field["value"]), ("ABSENT", None))
+
+    def test_a_gap_makes_the_list_partial_even_when_it_is_empty(self):
+        # Lost events may have been the one listener that mattered: a gap
+        # must never read as "none".
+        for counts in ({"lost": 3}, {"unlisted": 2}):
+            for listeners in ((), [self.LISTENER]):
+                with self.subTest(counts=counts, listeners=listeners):
+                    field = self.attribute(self.listening(listeners, **counts))
+                    self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
+                    self.assertEqual(field["value"], list(listeners))
+                    self.assertIn("may be missing", field["note"])
+
+    def test_the_gap_note_carries_no_count_so_a_growing_one_is_not_drift(self):
+        # RailDash compares notes; listensnoop's lost count only grows, and
+        # any process can inflate it.
+        first = self.attribute(self.listening([self.LISTENER], lost=3, unlisted=1))
+        later = self.attribute(self.listening([self.LISTENER], lost=3000, unlisted=50))
+        self.assertEqual(first, later)
+        self.assertNotRegex(first["note"], r"\d")
+
+    def test_listeners_are_sandbox_scoped_in_a_multi_agent_bundle(self):
+        # One PID namespace's events, not attributable to one agent.
+        spec = importlib.util.spec_from_file_location(
+            "compose_evidence_bundle_v2", ROOT / "tools/agent-environment-scanner/compose_evidence_bundle_v2.py")
+        composer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(composer)
+
+        self.assertIn("observed_listeners", composer.SANDBOX_ATTRIBUTES)
+        self.assertNotIn("observed_listeners", composer.agent_scoped_attributes(
+            self.bundle(self.listening([self.LISTENER]))["attributes"]))
+
+    def test_events_reach_the_runtime_source_in_docker_mode(self):
+        bundle = evidence_bundle.build_evidence_bundle(
+            build_args(), docker_context(), dict(HOST_PAIR), identity(observed_listeners=self.listening())
+        )
+        self.assertTrue(bundle["inputs_attempted"]["runtime"]["reached"])
+
+    def test_a_new_listener_changes_the_value_and_nothing_else_moves(self):
+        before = self.bundle(self.listening([self.LISTENER]))["attributes"]
+        after = self.bundle(self.listening([self.LISTENER, dict(self.LISTENER, port="ephemeral", protocol="udp")]))["attributes"]
+        changed = {name for name in before if before[name] != after[name]}
+        self.assertEqual(changed, {"observed_listeners"})
+
+
 class ScannerWiringTest(unittest.TestCase):
     """Subprocess runs mirroring the registration/feature-file guarantees."""
 
@@ -982,6 +1065,47 @@ class ScannerWiringTest(unittest.TestCase):
             env={k: v for k, v in os.environ.items() if not k.startswith("RAIL_")},
             timeout=120,
         )
+
+    def test_a_listen_file_reaches_the_feature_file_and_the_bundle(self):
+        import tempfile
+
+        line = json.dumps({"kind": "listen", "pid": 7, "tid": 7, "host_pid": 7, "uid": 0,
+                           "comm": "nc", "protocol": "tcp", "family": "ipv4",
+                           "addr": "0.0.0.0", "port": 4444})
+        for how in ("flag", "env"):
+            with self.subTest(how=how), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "listen.jsonl").write_text(line + "\n", encoding="utf-8")
+                argv = ["--mode", "self", "--host-id", "h-1",
+                        "--feature-output", f"{tmp}/features.json",
+                        "--evidence-bundle-output", f"{tmp}/bundle.json"]
+                if how == "flag":
+                    argv += ["--listen-file", f"{tmp}/listen.jsonl"]
+                    proc = self.run_scan(tmp, argv, tmp)
+                else:
+                    import subprocess
+
+                    proc = subprocess.run(
+                        ["python3", str(SCANNER)] + argv, cwd=tmp, capture_output=True, text=True,
+                        env={**{k: v for k, v in os.environ.items() if not k.startswith("RAIL_")},
+                             "RAIL_LISTEN_FILE": f"{tmp}/listen.jsonl"},
+                        timeout=120,
+                    )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                features = json.loads(Path(tmp, "features.json").read_text())
+                bundle = json.loads(Path(tmp, "bundle.json").read_text())
+                expected = [{"protocol": "tcp", "addr": "0.0.0.0", "port": 4444, "process": "nc"}]
+                self.assertEqual(features["observed_listeners"]["listeners"], expected)
+                self.assertEqual(bundle["attributes"]["observed_listeners"]["value"], expected)
+
+    def test_an_unreadable_listen_file_fails_the_scan_loudly(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1",
+                                       "--feature-output", f"{tmp}/features.json",
+                                       "--listen-file", f"{tmp}/missing.jsonl"], tmp)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("cannot read listensnoop events", proc.stderr)
 
     def test_a_failed_registration_still_writes_the_bundle(self):
         import tempfile
