@@ -239,3 +239,12 @@ jobs:
             --listen-dir "$RUNNER_TEMP/listen" --scan-listen-dir /listen \
             --scan "docker run --rm --network railmon-raildash -e RAIL_RAILDASH_TOKEN -e RAIL_HOST_ID -v $RUNNER_TEMP/listen:/listen:ro railmon:ci scan" \
             || { docker logs raildash; exit 1; }
+          # DR-109: a manifest-scoped scan delivers one evidence-bundle v2
+          # collection; locked as the baseline, a declared agent whose
+          # process stops is drift on that agent alone.
+          docker run --rm --network railmon-raildash --user 0 --entrypoint python3 \
+            -e RAILMON_BIN=/usr/local/bin/railmon-collector \
+            -v "$PWD/tests:/tests:ro" \
+            railmon:ci /tests/multi_agent_drift_acceptance.py \
+            --raildash http://raildash:8000 --token "$token" \
+            || { docker logs raildash; exit 1; }

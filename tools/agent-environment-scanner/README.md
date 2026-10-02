@@ -406,6 +406,14 @@ diverge from it.
 re-runs the full collection (sandbox scan plus every currently-available
 keyed scan), not just the sandbox-wide half.
 
+The collection is delivered as one evidence-bundle v2 document, and RailDash
+locks it as a baseline like a v1 bundle. Every declared agent stays in it:
+one whose process has gone is still listed, now as `not_found`. Against the
+baseline, that is drift on that agent alone (`AGENT_CHANGED`, then its
+attributes and sources), with siblings and the sandbox scope unchanged.
+`tests/multi_agent_drift_acceptance.py` runs that path in the image against
+a real RailDash in CI.
+
 The keyed registration state is also what the collector's multi-target
 capture reads to judge an unsigned `x-rail` ticket (DR-109 M3). Start the
 collector with `--registration-state` set to the same absolute path passed
