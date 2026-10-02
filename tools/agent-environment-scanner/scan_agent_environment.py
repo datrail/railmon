@@ -2778,14 +2778,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
     interval = configured_scan_interval(args)
-    if args.register:
-        # DR-46: a credential the configuration cannot produce is reported
-        # before a scan runs, not after it, and nothing registers without it.
-        try:
-            auth_headers(args.auth_mode)
-        except ScannerError as exc:
-            print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-            return 2
     # DR-109 M2: a target manifest turns each collection from one scan into
     # the sandbox-wide scan plus one agent-scoped scan per resolved key.
     # `configured_target_manifest`'s absence preserves the exact legacy

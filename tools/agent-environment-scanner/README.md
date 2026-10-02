@@ -334,8 +334,10 @@ registering, mirroring Rail Center's `RAIL_AUTH_MODES_ACCEPTED`:
   (`GCE_METADATA_HOST` overrides the address), held only in memory until
   shortly before it expires. Nothing is stored or rotated by hand.
 
-With `--register`, a credential that cannot be produced stops the scanner
-before it scans (exit 2); nothing is ever sent anonymously instead. The
+With `--register`, a credential that cannot be produced fails that
+registration like any other delivery failure (non-zero exit; the feature file
+and `--raildash-url` delivery still happen); nothing is ever sent anonymously
+instead. The
 registration request does not follow redirects, so the credential cannot be
 carried to another host. These are the same variables, read the same way, as
 the collector's `--webhook` and `railmon forward`.

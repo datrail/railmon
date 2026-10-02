@@ -878,16 +878,18 @@ class GcpAndRedirectTest(unittest.TestCase):
         self.assertIn("HTTP 302", str(caught.exception))
         self.assertEqual(self.plane.seen, [("POST", "/v1/agents/register", "Bearer t-1")])
 
-    def test_an_unproducible_credential_stops_before_the_scan(self):
+    def test_an_unproducible_credential_fails_registration_without_sending(self):
+        """A failed registration, like any other: the feature file and other
+        delivery targets are still attempted, and nothing reaches Rail Center."""
         import subprocess
 
         result = subprocess.run(
             [sys.executable, str(SCANNER), "--mode", "self", "--host-id", "h", "--register",
-             "--center-url", f"http://{self.plane.host}"],
+             "--center-url", f"http://{self.plane.host}", "--no-feature-file", "--no-evidence-bundle"],
             env=clean_env(RAIL_AUTH_MODE="bearer", RAIL_AUTH_TOKEN_FILE="/nonexistent/token"),
             capture_output=True, text=True, timeout=60,
         )
-        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("RAIL_AUTH_TOKEN_FILE", result.stderr)
         self.assertEqual(self.plane.seen, [])
 

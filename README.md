@@ -60,9 +60,10 @@ the credential `RAIL_AUTH_MODE` names, matching Rail Center's
 `RAIL_AUTH_TOKEN`, or the contents of `RAIL_AUTH_TOKEN_FILE`, re-read on every
 batch or scan so a rotated secret needs no restart (setting both is refused);
 `gcp` mints an identity token for `RAIL_AUTH_AUDIENCE` from the workload's
-service account via the metadata server and keeps it only in memory. A credential that cannot be produced stops
-the process at startup and drops a later batch, and nothing is ever sent
-anonymously instead. A token set beside `none` is refused as a likely
+service account via the metadata server and keeps it only in memory. A
+credential that cannot be produced stops the collector at startup, drops a
+later batch, and fails a scan's registration; nothing is ever sent anonymously
+instead. A token set beside `none` is refused as a likely
 misconfiguration. RailDash's webhook ignores the header, so the default needs
 no change for a local stack.
 
