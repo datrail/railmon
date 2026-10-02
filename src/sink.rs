@@ -5,6 +5,7 @@
 //! or when the flush interval expires, so a quiet agent's last few interactions
 //! are not stranded in a buffer waiting for traffic that never comes.
 
+use crate::auth::Credential;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::Write;
@@ -36,6 +37,7 @@ struct Webhook {
     flush_interval: Duration,
     last_flush: Instant,
     failures: u64,
+    credential: Credential,
 }
 
 impl Sink {
@@ -73,8 +75,13 @@ impl Sink {
                 // event reads, the flush timer and shutdown signals, and the
                 // probe's stdout pipe then backs up behind it. The Python bounded this
                 // at 10s; matching that.
+                //
+                // Redirects are not followed: reqwest keeps `Authorization`
+                // across a same-host redirect even when it downgrades https to
+                // http. A 3xx is a failed delivery like any other status.
                 client: reqwest::Client::builder()
                     .timeout(Duration::from_secs(10))
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .unwrap_or_default(),
                 batch: Vec::with_capacity(batch_size.max(1)),
@@ -82,11 +89,21 @@ impl Sink {
                 flush_interval,
                 last_flush: Instant::now(),
                 failures: 0,
+                credential: Credential::None,
             }),
             written: 0,
             session_id: session_id.to_string(),
             capture_start: capture_start.to_string(),
         })
+    }
+
+    /// The credential every webhook batch presents (`RAIL_AUTH_MODE`). Without
+    /// a webhook there is nothing to present it to.
+    pub fn with_credential(mut self, credential: Credential) -> Self {
+        if let Some(hook) = self.webhook.as_mut() {
+            hook.credential = credential;
+        }
+        self
     }
 
     /// True when neither destination is configured — the caller warns rather
@@ -159,6 +176,35 @@ impl Webhook {
         let batch_count = batches.len();
         let deadline = tokio::time::Instant::now() + WEBHOOK_FLUSH_DEADLINE;
 
+        // One credential for the whole flush, inside the same deadline. One
+        // that cannot be produced drops the batches rather than sending them
+        // anonymously (RM-F2).
+        let authorization = match tokio::time::timeout_at(deadline, self.credential.authorization())
+            .await
+        {
+            Ok(Ok(authorization)) => authorization,
+            Ok(Err(error)) => {
+                self.failures += batch_count as u64;
+                log::warn!(
+                    "RAIL_AUTH_MODE={} could not produce a credential; dropping {batch_count} \
+                     webhook batch(es) rather than sending them anonymously: {error:#}",
+                    self.credential.mode()
+                );
+                self.last_flush = Instant::now();
+                return;
+            }
+            Err(_) => {
+                self.failures += batch_count as u64;
+                log::warn!(
+                    "RAIL_AUTH_MODE={} credential took over {}s; dropping {batch_count} webhook batch(es)",
+                    self.credential.mode(),
+                    WEBHOOK_FLUSH_DEADLINE.as_secs()
+                );
+                self.last_flush = Instant::now();
+                return;
+            }
+        };
+
         for (batch_index, interactions) in batches.into_iter().enumerate() {
             let count = interactions.len();
             let body = webhook_body(interactions, session_id, capture_start);
@@ -173,12 +219,14 @@ impl Webhook {
                 );
             }
 
-            let request = self
+            let mut request = self
                 .client
                 .post(&self.url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send();
+                .header(reqwest::header::CONTENT_TYPE, "application/json");
+            if let Some(value) = authorization.as_deref() {
+                request = request.header(reqwest::header::AUTHORIZATION, value);
+            }
+            let request = request.body(body).send();
             match tokio::time::timeout_at(deadline, request).await {
                 Ok(Ok(resp)) if resp.status().is_success() => {
                     log::debug!("delivered {count} interaction(s)");

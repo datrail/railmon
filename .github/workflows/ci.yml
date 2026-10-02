@@ -140,7 +140,7 @@ jobs:
       # the scanner the image ships, since /tests has no source tree beside it.
       - name: Acceptance against the built image
         run: |
-          for t in two_agent target_restart ticket_claim analyzer_panic fail_closed ambiguous_capture; do
+          for t in two_agent target_restart ticket_claim analyzer_panic fail_closed ambiguous_capture webhook_auth; do
             echo "::group::${t}_acceptance"
             docker run --rm --user 0 --entrypoint python3 \
               -e RAILMON_BIN=/usr/local/bin/railmon-collector \

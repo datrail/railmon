@@ -7,6 +7,7 @@
 //! compose files, run scripts and the container entrypoint pass these flags,
 //! and a port that quietly renamed them would break every caller for no gain.
 
+mod auth;
 mod identity;
 mod interaction;
 mod pipeline;
@@ -200,6 +201,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The webhook's credential is checked, and a first one produced, before
+    // anything is captured: a collector that cannot authenticate would
+    // otherwise look alive while every batch it sends is refused (RM-F2).
+    let credential = match args.webhook.as_deref() {
+        Some(_) => {
+            let mut credential = auth::Credential::from_env().context("RAIL_AUTH_MODE")?;
+            credential
+                .authorization()
+                .await
+                .context("producing the webhook credential RAIL_AUTH_MODE names")?;
+            log::info!("webhook credential: RAIL_AUTH_MODE={}", credential.mode());
+            credential
+        }
+        None => auth::Credential::None,
+    };
+
     // Fail on a missing binary before opening sinks or claiming to capture:
     // the old failure mode was a collector that looked alive and produced
     // nothing.
@@ -235,7 +252,8 @@ async fn main() -> Result<()> {
         &session_id,
         &capture_start,
     )
-    .context("configuring output")?;
+    .context("configuring output")?
+    .with_credential(credential);
 
     // rail-center has no RuntimeInteraction endpoint: POST /v1/interactions
     // takes HttpInteractionPayload, which is the legacy-http shape. Posting the
