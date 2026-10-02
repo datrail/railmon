@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -102,7 +103,9 @@ def main() -> int:
         return [e for e in records() if e.get("port") == PORT and e.get("kind") == "listen"]
 
     def scan() -> dict | None:
-        result = docker("run", "--rm", "-v", f"{data}:/data:ro", "-v", f"{out}:/out",
+        # As this user: the scanner writes its outputs 0600, for its owner.
+        result = docker("run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+                        "-v", f"{data}:/data:ro", "-v", f"{out}:/out",
                         args.image, "scan", "--mode", "self", "--host-id", "ci-listen-host",
                         "--listen-file", "/data/listen.jsonl",
                         "--feature-output", "/out/features.json",
@@ -170,10 +173,13 @@ def main() -> int:
         )
         finished = True
     finally:
-        for name in (agent, probe):
-            if not finished or not all(checks.values()):
+        # Every log first: removing the agent tears its namespace down and
+        # kills the probe, which would then show up in the probe's log.
+        if not finished or not all(checks.values()):
+            for name in (agent, probe):
                 logs = docker("logs", name, check=False)
                 print(f"--- {name}\n{logs.stdout}{logs.stderr}", file=sys.stderr)
+        for name in (probe, agent):
             docker("rm", "-f", name, check=False)
         shutil.rmtree(work, ignore_errors=True)
 
