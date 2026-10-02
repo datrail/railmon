@@ -8,6 +8,7 @@ POST /v1/agents/register schema.
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import getpass
 import hashlib
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
 LOCAL_BASE_HOSTS = (
@@ -1680,26 +1681,134 @@ def registration_url(center_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
 
 
-def auth_headers(mode: str | None = None) -> dict[str, str]:
+DEFAULT_METADATA_HOST = "metadata.google.internal"
+# Mint again once less than this much of an identity token's life is left.
+GCP_REFRESH_MARGIN_SECONDS = 300
+_HEADER_SAFE = frozenset(chr(c) for c in range(0x21, 0x7F))
+# (metadata host, audience) -> (token, exp). In memory only: a scanner on an
+# interval reuses a fresh token across passes and never writes one down.
+_GCP_TOKENS: dict[tuple[str, str], tuple[str, int]] = {}
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Refuse to follow: urllib carries `Authorization` to wherever a 3xx
+    points, any host or scheme. A redirect surfaces as an HTTPError instead."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_REGISTRATION_OPENER = build_opener(_NoRedirect)
+# The metadata server is link-local: never through an HTTP proxy, which would
+# see the minted identity token in clear.
+_METADATA_OPENER = build_opener(ProxyHandler({}), _NoRedirect)
+
+
+def _header_safe(raw: str, name: str) -> str:
+    """`raw` trimmed, or a refusal naming `name` and the offset, never the value."""
+    value = raw.strip()
+    if not value:
+        raise ScannerError(f"{name} is empty")
+    for offset, ch in enumerate(value):
+        if ch not in _HEADER_SAFE:
+            raise ScannerError(f"{name} holds U+{ord(ch):04X} at offset {offset}, which cannot go in a header value")
+    return value
+
+
+def _jwt_expiry(token: str) -> int | None:
+    """The `exp` claim of our own freshly minted JWT, unverified; None if unreadable."""
+    try:
+        payload = token.split(".")[1]
+        exp = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("exp")
+    except (IndexError, ValueError, AttributeError):
+        return None
+    return exp if isinstance(exp, int) and not isinstance(exp, bool) else None
+
+
+def _gcp_identity_token(audience: str, timeout: float) -> str:
+    host = first_nonempty(os.environ.get("GCE_METADATA_HOST")) or DEFAULT_METADATA_HOST
+    cached = _GCP_TOKENS.get((host, audience))
+    if cached and time.time() + GCP_REFRESH_MARGIN_SECONDS < cached[1]:
+        return cached[0]
+    request = Request(
+        f"http://{host}/computeMetadata/v1/instance/service-accounts/default/identity?"
+        + urlencode({"audience": audience}),
+        headers={"Metadata-Flavor": "Google"},
+    )
+    try:
+        with _METADATA_OPENER.open(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raise ScannerError(
+            f"RAIL_AUTH_MODE=gcp: the metadata server at {host} returned {exc.code} for an identity token"
+        ) from None
+    except (URLError, TimeoutError, OSError) as exc:
+        raise ScannerError(f"RAIL_AUTH_MODE=gcp: minting an identity token from the metadata server at {host}: {exc}") from None
+    token = _header_safe(body, "the metadata server's identity token")
+    exp = _jwt_expiry(token)
+    if exp is None:
+        _GCP_TOKENS.pop((host, audience), None)
+    else:
+        _GCP_TOKENS[(host, audience)] = (token, exp)
+    return token
+
+
+def auth_headers(mode: str | None = None, timeout: float = 15.0) -> dict[str, str]:
     """The credential this component presents, chosen by RAIL_AUTH_MODE.
 
-    Mirrors rail-center's RAIL_AUTH_MODES_ACCEPTED: `none` sends nothing and is
-    accepted only while the control plane still lists `none`; `bearer` sends the
-    token from RAIL_AUTH_TOKEN. `gcp` belongs to DR-10's shared token client, so
-    it fails loudly here rather than silently degrading to an anonymous call
-    that the operator believes is authenticated.
+    Mirrors rail-center's RAIL_AUTH_MODES_ACCEPTED, and the collector's
+    `--webhook` (RailMon `src/auth.rs`) reads the same variables the same way:
+
+    - `none` (default) sends nothing. A token set beside it is refused: it is an
+      operator who set the credential and not the mode.
+    - `bearer` sends RAIL_AUTH_TOKEN, or the contents of RAIL_AUTH_TOKEN_FILE,
+      read on every call so a rotated file takes effect on the next pass
+      without a restart. Neither form wins when both are set; that is refused.
+    - `gcp` mints an identity token for RAIL_AUTH_AUDIENCE from the workload's
+      metadata server (GCE_METADATA_HOST overrides its address), held only in
+      memory until shortly before it expires.
+
+    Anything it cannot produce raises, never degrading to an anonymous call
+    the operator believes is authenticated. No message quotes a token.
     """
-    resolved = (first_nonempty(mode, os.environ.get("RAIL_AUTH_MODE")) or "none").lower()
+    explicit = first_nonempty(mode)
+    resolved = (explicit or first_nonempty(os.environ.get("RAIL_AUTH_MODE")) or "none").lower()
+    token = first_nonempty(os.environ.get("RAIL_AUTH_TOKEN"))
+    token_file = first_nonempty(os.environ.get("RAIL_AUTH_TOKEN_FILE"))
+    token_set = "RAIL_AUTH_TOKEN" if token else "RAIL_AUTH_TOKEN_FILE" if token_file else None
     if resolved not in AUTH_MODES:
         raise ScannerError(f"RAIL_AUTH_MODE must be one of {', '.join(AUTH_MODES)}, got: {resolved}")
     if resolved == "none":
+        if token_set:
+            configured = "none" if explicit or first_nonempty(os.environ.get("RAIL_AUTH_MODE")) else "unset, which is none"
+            raise ScannerError(
+                f"RAIL_AUTH_MODE is {configured} and sends no credential, but {token_set} is set; "
+                f"set RAIL_AUTH_MODE=bearer to use it, or unset {token_set} to mean none"
+            )
         return {}
     if resolved == "bearer":
-        token = first_nonempty(os.environ.get("RAIL_AUTH_TOKEN"))
+        if token and token_file:
+            raise ScannerError(
+                "RAIL_AUTH_MODE=bearer takes RAIL_AUTH_TOKEN or RAIL_AUTH_TOKEN_FILE, and both are set; unset one"
+            )
+        if token_file:
+            try:
+                raw = Path(token_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ScannerError(f"reading RAIL_AUTH_TOKEN_FILE {token_file}: {exc.__class__.__name__}") from None
+            return {"Authorization": f"Bearer {_header_safe(raw, 'RAIL_AUTH_TOKEN_FILE')}"}
         if not token:
-            raise ScannerError("RAIL_AUTH_MODE=bearer requires RAIL_AUTH_TOKEN")
-        return {"Authorization": f"Bearer {token}"}
-    raise ScannerError("RAIL_AUTH_MODE=gcp is not implemented here; it lands with DR-10's token client")
+            raise ScannerError("RAIL_AUTH_MODE=bearer requires RAIL_AUTH_TOKEN or RAIL_AUTH_TOKEN_FILE")
+        return {"Authorization": f"Bearer {_header_safe(token, 'RAIL_AUTH_TOKEN')}"}
+    if token_set:
+        raise ScannerError(
+            f"RAIL_AUTH_MODE=gcp mints its own credential, but {token_set} is set; "
+            "unset it, or set RAIL_AUTH_MODE=bearer to use it"
+        )
+    audience = first_nonempty(os.environ.get("RAIL_AUTH_AUDIENCE"))
+    if not audience:
+        raise ScannerError("RAIL_AUTH_MODE=gcp requires RAIL_AUTH_AUDIENCE")
+    return {"Authorization": f"Bearer {_gcp_identity_token(audience, timeout)}"}
 
 
 def post_registration(
@@ -1715,12 +1824,12 @@ def post_registration(
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
-            **auth_headers(auth_mode),
+            **auth_headers(auth_mode, timeout),
         },
         method="POST",
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with _REGISTRATION_OPENER.open(req, timeout=timeout) as resp:
             body_text = resp.read().decode("utf-8", errors="replace")
             try:
                 body = json.loads(body_text) if body_text else None
@@ -2669,6 +2778,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
     interval = configured_scan_interval(args)
+    if args.register:
+        # DR-46: a credential the configuration cannot produce is reported
+        # before a scan runs, not after it, and nothing registers without it.
+        try:
+            auth_headers(args.auth_mode)
+        except ScannerError as exc:
+            print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+            return 2
     # DR-109 M2: a target manifest turns each collection from one scan into
     # the sandbox-wide scan plus one agent-scoped scan per resolved key.
     # `configured_target_manifest`'s absence preserves the exact legacy

@@ -78,6 +78,9 @@ SCANNER_ENV_KEYS = (
     "RAIL_HOST_ID",
     "RAIL_AUTH_MODE",
     "RAIL_AUTH_TOKEN",
+    "RAIL_AUTH_TOKEN_FILE",
+    "RAIL_AUTH_AUDIENCE",
+    "GCE_METADATA_HOST",
     "RAIL_CENTER_URL",
     "RAIL_FEATURE_OUTPUT",
     "RAIL_REGISTRATION_OUTPUT",
@@ -680,9 +683,17 @@ class McpEnvInventoryTest(unittest.TestCase):
         self.assertIn("delivery", {skill["name"] for skill in skills})
 
 
+AUTH_ENV_KEYS = ("RAIL_AUTH_MODE", "RAIL_AUTH_TOKEN", "RAIL_AUTH_TOKEN_FILE", "RAIL_AUTH_AUDIENCE", "GCE_METADATA_HOST")
+
+
 class AuthModeTest(unittest.TestCase):
     def setUp(self):
-        for key in ("RAIL_AUTH_MODE", "RAIL_AUTH_TOKEN"):
+        for key in AUTH_ENV_KEYS:
+            os.environ.pop(key, None)
+        scanner._GCP_TOKENS.clear()
+
+    def tearDown(self):
+        for key in AUTH_ENV_KEYS:
             os.environ.pop(key, None)
 
     def test_default_sends_nothing(self):
@@ -696,9 +707,189 @@ class AuthModeTest(unittest.TestCase):
         os.environ["RAIL_AUTH_TOKEN"] = "t-1"
         self.assertEqual(scanner.auth_headers("bearer"), {"Authorization": "Bearer t-1"})
 
-    def test_gcp_fails_loudly_rather_than_degrading(self):
-        with self.assertRaises(scanner.ScannerError):
+    def test_gcp_without_an_audience_fails_loudly_rather_than_degrading(self):
+        with self.assertRaises(scanner.ScannerError) as caught:
             scanner.auth_headers("gcp")
+        self.assertIn("RAIL_AUTH_AUDIENCE", str(caught.exception))
+
+    def test_a_token_beside_none_is_refused_without_quoting_it(self):
+        os.environ["RAIL_AUTH_TOKEN"] = "s3cret"
+        with self.assertRaises(scanner.ScannerError) as caught:
+            scanner.auth_headers()
+        self.assertIn("unset, which is none", str(caught.exception))
+        self.assertNotIn("s3cret", str(caught.exception))
+
+    def test_token_file_is_read_on_every_call_so_rotation_needs_no_restart(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "token"
+            path.write_text("first\n")
+            os.environ["RAIL_AUTH_TOKEN_FILE"] = str(path)
+            self.assertEqual(scanner.auth_headers("bearer"), {"Authorization": "Bearer first"})
+            path.write_text("second\n")
+            self.assertEqual(scanner.auth_headers("bearer"), {"Authorization": "Bearer second"})
+            # Emptied or unreadable: an error, never an anonymous call.
+            path.write_text("")
+            with self.assertRaises(scanner.ScannerError):
+                scanner.auth_headers("bearer")
+            path.unlink()
+            with self.assertRaises(scanner.ScannerError) as caught:
+                scanner.auth_headers("bearer")
+            self.assertIn("RAIL_AUTH_TOKEN_FILE", str(caught.exception))
+
+    def test_neither_token_form_wins_when_both_are_set(self):
+        os.environ["RAIL_AUTH_TOKEN"] = "a"
+        os.environ["RAIL_AUTH_TOKEN_FILE"] = "/run/t"
+        with self.assertRaises(scanner.ScannerError) as caught:
+            scanner.auth_headers("bearer")
+        self.assertIn("both are set", str(caught.exception))
+
+    def test_a_token_that_cannot_go_in_a_header_is_refused_by_offset(self):
+        os.environ["RAIL_AUTH_TOKEN"] = "ab\ncd"
+        with self.assertRaises(scanner.ScannerError) as caught:
+            scanner.auth_headers("bearer")
+        self.assertIn("U+000A at offset 2", str(caught.exception))
+
+
+def _jwt(exp: int) -> str:
+    import base64
+    import json
+
+    enc = lambda v: base64.urlsafe_b64encode(v.encode()).decode().rstrip("=")  # noqa: E731
+    return ".".join([enc('{"alg":"RS256"}'), enc(json.dumps({"exp": exp})), "sig"])
+
+
+class FakeControlPlane:
+    """Rail Center's register route plus the GCP metadata identity endpoint,
+    recording what actually arrived."""
+
+    def __init__(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        plane = self
+        self.seen: list[tuple[str, str, str | None]] = []
+        self.identities: list[tuple[int, str]] = []
+        self.redirect: str | None = None
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                plane.seen.append(("POST", self.path, self.headers.get("Authorization")))
+                if plane.redirect:
+                    self.send_response(302)
+                    self.send_header("Location", plane.redirect)
+                    self.end_headers()
+                    return
+                body = b'{"agent_id":"550e8400-e29b-41d4-a716-446655440000","registration_status":"registered"}'
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                plane.seen.append(("GET", self.path, self.headers.get("Metadata-Flavor")))
+                status, body = plane.identities.pop(0) if plane.identities else (500, "exhausted")
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body.encode())
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.host = f"127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class GcpAndRedirectTest(unittest.TestCase):
+    """DR-46 (RS-F14/F15) against a real local HTTP server, so the header that
+    actually leaves the process is what gets asserted."""
+
+    def setUp(self):
+        for key in AUTH_ENV_KEYS:
+            os.environ.pop(key, None)
+        scanner._GCP_TOKENS.clear()
+        self.plane = FakeControlPlane()
+        self.addCleanup(self.plane.close)
+
+    def tearDown(self):
+        for key in AUTH_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def test_gcp_mints_for_the_audience_and_reuses_a_fresh_token(self):
+        import time
+
+        fresh = _jwt(int(time.time()) + 3600)
+        self.plane.identities = [(200, fresh)]
+        os.environ.update(RAIL_AUTH_AUDIENCE="https://rc.example/api", GCE_METADATA_HOST=self.plane.host)
+        self.assertEqual(scanner.auth_headers("gcp"), {"Authorization": f"Bearer {fresh}"})
+        self.assertEqual(scanner.auth_headers("gcp"), {"Authorization": f"Bearer {fresh}"})
+        self.assertEqual(
+            self.plane.seen,
+            [
+                (
+                    "GET",
+                    "/computeMetadata/v1/instance/service-accounts/default/identity"
+                    "?audience=https%3A%2F%2Frc.example%2Fapi",
+                    "Google",
+                )
+            ],
+        )
+
+    def test_gcp_mints_again_near_expiry(self):
+        import time
+
+        stale, fresh = _jwt(int(time.time()) + 60), _jwt(int(time.time()) + 3600)
+        self.plane.identities = [(200, stale), (200, fresh)]
+        os.environ.update(RAIL_AUTH_AUDIENCE="aud", GCE_METADATA_HOST=self.plane.host)
+        self.assertEqual(scanner.auth_headers("gcp"), {"Authorization": f"Bearer {stale}"})
+        self.assertEqual(scanner.auth_headers("gcp"), {"Authorization": f"Bearer {fresh}"})
+
+    def test_gcp_without_an_identity_fails(self):
+        self.plane.identities = [(404, "no service account")]
+        os.environ.update(RAIL_AUTH_AUDIENCE="aud", GCE_METADATA_HOST=self.plane.host)
+        with self.assertRaises(scanner.ScannerError) as caught:
+            scanner.auth_headers("gcp")
+        self.assertIn("returned 404", str(caught.exception))
+
+    def test_registration_presents_the_minted_token(self):
+        import time
+
+        fresh = _jwt(int(time.time()) + 3600)
+        self.plane.identities = [(200, fresh)]
+        os.environ.update(RAIL_AUTH_AUDIENCE="aud", GCE_METADATA_HOST=self.plane.host)
+        result = scanner.post_registration(f"http://{self.plane.host}", {"x": 1}, auth_mode="gcp")
+        self.assertEqual(result["status"], 201)
+        self.assertEqual(self.plane.seen[-1], ("POST", "/v1/agents/register", f"Bearer {fresh}"))
+
+    def test_registration_does_not_follow_a_redirect_with_the_credential(self):
+        self.plane.redirect = f"http://{self.plane.host}/elsewhere"
+        os.environ["RAIL_AUTH_TOKEN"] = "t-1"
+        with self.assertRaises(scanner.ScannerError) as caught:
+            scanner.post_registration(f"http://{self.plane.host}", {"x": 1}, auth_mode="bearer")
+        self.assertIn("HTTP 302", str(caught.exception))
+        self.assertEqual(self.plane.seen, [("POST", "/v1/agents/register", "Bearer t-1")])
+
+    def test_an_unproducible_credential_stops_before_the_scan(self):
+        import subprocess
+
+        result = subprocess.run(
+            [sys.executable, str(SCANNER), "--mode", "self", "--host-id", "h", "--register",
+             "--center-url", f"http://{self.plane.host}"],
+            env=clean_env(RAIL_AUTH_MODE="bearer", RAIL_AUTH_TOKEN_FILE="/nonexistent/token"),
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("RAIL_AUTH_TOKEN_FILE", result.stderr)
+        self.assertEqual(self.plane.seen, [])
 
     def test_unknown_mode_is_rejected(self):
         with self.assertRaises(scanner.ScannerError):

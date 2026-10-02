@@ -324,10 +324,21 @@ the manifest; a mismatched file is logged and ignored.
 registering, mirroring Rail Center's `RAIL_AUTH_MODES_ACCEPTED`:
 
 - `none` (default) — sends nothing; accepted while the control plane still
-  lists `none`.
-- `bearer` — sends `RAIL_AUTH_TOKEN` as `Authorization: Bearer …`.
-- `gcp` — belongs to DR-10's shared token client; it fails loudly here rather
-  than degrading to an anonymous call an operator believes is authenticated.
+  lists `none`. A token set beside it is refused as a likely misconfiguration.
+- `bearer` — sends `RAIL_AUTH_TOKEN`, or the contents of
+  `RAIL_AUTH_TOKEN_FILE`, as `Authorization: Bearer …`. The file is read on
+  every pass, so with `--interval` a rotated secret takes effect without a
+  restart. Setting both is refused; neither form wins.
+- `gcp` — mints an identity token for `RAIL_AUTH_AUDIENCE` (Rail Center's
+  `SERVICE_TOKEN_AUDIENCE`) from the workload's metadata server
+  (`GCE_METADATA_HOST` overrides the address), held only in memory until
+  shortly before it expires. Nothing is stored or rotated by hand.
+
+With `--register`, a credential that cannot be produced stops the scanner
+before it scans (exit 2); nothing is ever sent anonymously instead. The
+registration request does not follow redirects, so the credential cannot be
+carried to another host. These are the same variables, read the same way, as
+the collector's `--webhook` and `railmon forward`.
 
 ## Local Machine Scan
 
