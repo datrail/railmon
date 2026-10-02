@@ -107,8 +107,10 @@ The probe runs with two options:
 - `-n`, so only the agent's namespace is recorded;
 - a heartbeat every 60 seconds (`RAIL_LISTEN_HEARTBEAT`).
 
-The agent can still kill the probe, and the probe does not report sockets that
-are already listening when it attaches. So any restart leaves a gap, and the
+The agent may be able to kill the probe: it shares the probe's PID
+namespace, though a host's security profile can stop it. The probe crashes or
+restarts too, and it does not report sockets that are already listening when
+it attaches. So any restart leaves a gap, and the
 scan says so: `observed_listeners` goes PARTIAL, which is drift, in three
 cases:
 - a second start record;

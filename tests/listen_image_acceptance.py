@@ -14,8 +14,9 @@ Checked, in order:
 
 1. the event carries the agent's own PID (as its namespace numbers it) and an
    asked-for port, and the bundle's observed_listeners names port and process;
-2. the agent kills listensnoop: the supervisor attaches again, and the
-   bundle goes PARTIAL, because the probe missed whatever opened meanwhile;
+2. listensnoop is killed (by the agent where the host lets it, else from
+   outside, as a crash): the supervisor attaches again, and the bundle goes
+   PARTIAL, because the probe missed whatever opened meanwhile;
 3. the agent container restarts: the probe follows it into the new namespace
    and records the agent's listener again.
 
@@ -49,7 +50,10 @@ with open("/sig/pid.tmp", "w") as f:
 os.rename("/sig/pid.tmp", "/sig/pid")
 time.sleep(600)
 """ % PORT
-# Run inside the agent: kill the probe the way a misaligned agent could.
+# Kill the probe: from inside the agent, the way a misaligned agent would
+# try, or from the probe's own container (host PID namespace) to stand in
+# for a crash where the agent cannot (a host security profile can stop it,
+# e.g. Docker's AppArmor profile against an unconfined, privileged probe).
 KILL_PROBE = r"""
 import os, signal
 for pid in os.listdir("/proc"):
@@ -148,9 +152,14 @@ def main() -> int:
             in listeners["value"]
         )
 
-        # 2. the agent kills the probe
-        killed = docker("exec", agent, "python3", "-c", KILL_PROBE).stdout.split()
-        checks["the agent could kill the probe"] = len(killed) == 1
+        # 2. the probe is killed
+        killed = docker("exec", agent, "python3", "-c", KILL_PROBE, check=False).stdout.split()
+        if killed:
+            print("note: the agent could kill the probe; the restart record is what shows it")
+        else:
+            print("note: the agent cannot signal the probe here; killing it from outside instead")
+            killed = docker("exec", probe, "python3", "-c", KILL_PROBE, check=False).stdout.split()
+        checks["the probe was killed"] = len(killed) == 1
         wait_for("the probe to come back", lambda: attaches() >= 2, timeout=30)
         listeners = scan()
         checks["a killed probe makes the bundle PARTIAL, not quiet"] = bool(listeners) and (
@@ -185,7 +194,7 @@ def main() -> int:
 
     for name, passed in checks.items():
         print(("ok:   " if passed else "FAIL: ") + name)
-    if len(checks) < 7 or not all(checks.values()):
+    if len(checks) < 7 or not all(checks.values()):  # seven checks, all passed
         return 1
     print(json.dumps({"result": "PASS", "port": PORT, "agent_pid": agent_pid}))
     return 0
