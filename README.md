@@ -5,6 +5,13 @@ interactions. It combines a Rust collector with AgentSight's eBPF TLS probe,
 plus Python commands for environment scanning, skill discovery, and forwarding
 captures to a webhook.
 
+A scan produces an evidence bundle, which
+[RailDash](https://github.com/datrail/raildash) turns into an Agent Security
+Profile (ASP): what the agent is set up to use and was observed doing. Once an
+ASP is locked as the baseline, later scans that differ from it are drift.
+These terms are defined in the
+[DatRail glossary](https://github.com/datrail/datrail-project/blob/master/docs/glossary.md).
+
 ## Quick start
 
 The collector requires Linux, a BTF-enabled kernel, and eBPF privileges:
@@ -24,6 +31,12 @@ cargo build --release
 sudo ./target/release/railmon --agentsight bin/agentsight \
   --mode http --output capture.jsonl
 ```
+
+`railmon` with a command (`railmon collect`, `railmon scan`, …) is the
+container image's entrypoint, so those commands work only inside the
+container, e.g. `docker run --rm --privileged --pid host railmon collect …`.
+There is no `sudo railmon collect` on the host: there the native build above
+runs the collector directly, with collector flags and no command.
 
 Other commands do not require eBPF privileges:
 

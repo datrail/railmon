@@ -1,7 +1,7 @@
 # tools/local-demo
 
-Backs `railmon demo`, the local quickstart added for [DR-48](https://railxia.atlassian.net/browse/DR-48)
-(BDL-F4 — RailMon deployable locally on its own). Nothing here is used by
+Backs `railmon demo`, the local quickstart that shows RailMon working on its
+own, from one container. Nothing here is used by
 `collect`, `scan`, `skills`, or `forward` outside of this one command.
 
 RailDash's local quickstart could ship a static capture file to read on first
@@ -34,10 +34,10 @@ duplicate: a real deployment filtering on the agent's own identity would see
 each exchange once. Worth knowing before reading `capture.jsonl`, and worth
 not mistaking for a double-write bug.
 
-## DR-81's two extra knobs
+## Two optional knobs
 
-`railmon demo` alone (DR-48) never sets these, and a bare `make demo` behaves
-exactly as before. DR-81's compose bundle (owned by
+`railmon demo` alone never sets these, and a bare `make demo` leaves them
+unset. RailDash's compose bundle (owned by
 [`datrail/raildash`](https://github.com/datrail/raildash), not this repo) sets
 both so the same demo run wires both of RailDash's ingestion paths at once
 instead of just the file:
@@ -49,8 +49,7 @@ instead of just the file:
 
 Both matter together, not separately: RailMon's legacy-http JSONL lines carry
 no `session_id` field of their own (only the `RuntimeInteraction` output
-format embeds one, and that format has no consumer — see the main README's
-"Run" section), and RailDash's dedup index is `(session_id, interaction_id)`,
+format embeds one, and the demo writes the default legacy-http format), and RailDash's dedup index is `(session_id, interaction_id)`,
 not `interaction_id` alone. So the bundle's file-import step (`raildash load
 ... --session-id <same value>`) has to be told the session id explicitly — it
 can't recover it from the file. Passing `RAILMON_SESSION_ID` here is what

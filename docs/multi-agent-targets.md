@@ -1,11 +1,10 @@
 # Running RailMon against several agents in one sandbox
 
-This is the operator's page for `--target-manifest` (DR-109): how to write the
+This is the operator's page for `--target-manifest`: how to write the
 manifest, what RailMon reports while it runs, how to diagnose a target that is
 not being captured, and how to go back to single-agent mode. The scanner's
 side — per-agent scans, keyed artifacts, delivery — is in
-[the scanner README](../tools/scan/README.md#multi-agent-target-manifest-dr-109-m2).
-The design is `railxia/docs/design/2026-09-24-multi-agent-container/`.
+[the scanner README](../tools/scan/README.md#multi-agent-target-manifest).
 
 ## Writing the manifest
 
@@ -66,12 +65,18 @@ What the collector checks beyond the schema, and what a violation looks like:
 - `sandbox.access` is validated but not yet used by the collector; the scanner
   still reaches the container through its own `--mode docker --container`.
 
-Check a manifest without capturing anything (`railmon collect …` is the
-image's entrypoint; a native build runs `./target/release/railmon …` with the
-same flags):
+Check a manifest without capturing anything. The `railmon collect` commands
+on this page run inside the RailMon container image, where `railmon` is the
+entrypoint; there is no `railmon collect` command on the host. A native build
+runs the collector binary directly, as root, with the same flags (no
+`collect`):
 
 ```bash
-railmon collect --target-manifest /etc/railmon/targets.yaml --print-resolved-targets
+# in the container image
+docker run --rm --privileged --pid host -v /etc/railmon:/etc/railmon:ro \
+  railmon collect --target-manifest /etc/railmon/targets.yaml --print-resolved-targets
+# native build, on the host
+sudo ./target/release/railmon --target-manifest /etc/railmon/targets.yaml --print-resolved-targets
 ```
 
 It prints one JSON array with an object per agent — `status` is `available`,
@@ -154,7 +159,7 @@ count them from the file, e.g.
 | `target '<k>' tap ended (…); … will retry discovery` | the probe for that one agent stopped |
 | `target '<k>' resolved again; tap restarted` | recovery, retried every 5 s under the same `agent_key` |
 | `every declared target is currently down; capture is idle …` | RailMon keeps running and retrying; it does not exit |
-| `capture analyzer panicked on captured traffic (…); stopping this tap` | malformed traffic (e.g. an HPACK block) hit the analyzer; only that tap stops and restarts (DR-129) |
+| `capture analyzer panicked on captured traffic (…); stopping this tap` | malformed traffic (e.g. an HPACK block) hit the analyzer; only that tap stops and restarts |
 | `ignoring registration state for ticket-claim resolution: <path>: <error>` | the state file fails the control-path rules, has no UUID `agent_id`, or names a different host/sandbox than the manifest |
 | `keyed capture requires …` / `… cannot be combined with --target-manifest` | a flag combination keyed mode refuses (exit 1) |
 
