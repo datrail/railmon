@@ -53,8 +53,10 @@ The image builds from the ebpf-tls-tap submodule, so clone with
 `scan` needs a host id (`RAIL_HOST_ID` or `--host-id`) to build its evidence
 bundle; without one it exits 2 (see [Configuration](#configuration)).
 
-Run `railmon help` for the command suite and `railmon --help` for collector
-options. [`.env.example`](.env.example) lists supported configuration.
+For the command suite run `docker run --rm railmon help`, and for collector
+options `docker run --rm railmon --help` (inside the container `railmon` is the
+image's entrypoint; a native build's `./target/release/railmon --help` shows
+the collector options only). [`.env.example`](.env.example) lists supported configuration.
 
 ## Architecture
 
