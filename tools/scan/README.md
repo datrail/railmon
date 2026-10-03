@@ -7,6 +7,10 @@ This tool is meant to run before registration. It does not capture traffic and
 does not require eBPF privileges. It reads container metadata, safe environment
 metadata, system/runtime information, owner identity, and optional MCP config.
 
+Every example below assumes the host id is set (`RAIL_HOST_ID`, or
+`--host-id`). Without one the evidence bundle fails its contract and the scan
+exits `2`; pass `--no-evidence-bundle` to scan without a bundle.
+
 ## Output Schema
 
 The output matches `RegisterAgentRequest` in rail-center:
@@ -477,6 +481,7 @@ the collector's `--webhook` and `railmon forward`.
 From the repository root:
 
 ```bash
+export RAIL_HOST_ID=my-host
 python3 tools/scan/scan_agent_environment.py
 ```
 

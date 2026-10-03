@@ -42,13 +42,16 @@ Other commands do not require eBPF privileges:
 
 ```bash
 docker build -t railmon .
-docker run --rm railmon scan --mode self
+docker run --rm -e RAIL_HOST_ID=my-host railmon scan --mode self
 docker run --rm railmon skills --help
 docker run --rm railmon forward --help
 ```
 
 The image builds from the ebpf-tls-tap submodule, so clone with
 `--recursive` (or run `git submodule update --init --recursive`) first.
+
+`scan` needs a host id (`RAIL_HOST_ID` or `--host-id`) to build its evidence
+bundle; without one it exits 2 (see [Configuration](#configuration)).
 
 Run `railmon help` for the command suite and `railmon --help` for collector
 options. [`.env.example`](.env.example) lists supported configuration.
