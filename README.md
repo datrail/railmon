@@ -163,7 +163,7 @@ The ones you are most likely to set:
 | `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
 | `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | listensnoop's JSON lines: where `listen` appends and `scan` reads. |
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
-| `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railscan/evidence-bundle.json` | Where the evidence bundle is written. |
+| `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `bin/agentsight`; the image sets its own | The AgentSight probe binary. |
 
 A flag always wins over its variable. `scan` exits 2 when the evidence bundle
