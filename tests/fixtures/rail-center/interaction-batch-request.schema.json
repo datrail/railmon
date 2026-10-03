@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Vendored copy of Rail Center's POST /v1/interactions request body (InteractionBatchRequest and the schemas it references), translated from OpenAPI 3.0 to JSON Schema: `nullable: true` becomes a null type or a null branch, nothing else changed. Source: rail-center api/openapi/api.yaml at commit cbcbfbc, components.schemas InteractionBatchRequest, HttpInteractionPayload, HttpRequestPayload, HttpResponsePayload, RuntimeAgentRef, RuntimeAttribution, RuntimeProcessRef. The service validates the same body with the Pydantic models in api/src/registry/schemas.py, which accept everything this accepts. Refresh this file when that contract changes.",
+  "title": "Rail Center InteractionBatchRequest",
+  "$ref": "#/$defs/InteractionBatchRequest",
+  "$defs": {
+    "InteractionBatchRequest": {
+      "type": "object",
+      "required": ["session_id", "interactions"],
+      "properties": {
+        "session_id": {"type": "string"},
+        "agent": {"type": "string"},
+        "capture_start": {"type": "string", "format": "date-time"},
+        "interactions": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {"$ref": "#/$defs/HttpInteractionPayload"}
+        }
+      }
+    },
+    "HttpInteractionPayload": {
+      "type": "object",
+      "required": ["timestamp"],
+      "properties": {
+        "timestamp": {"type": "string", "format": "date-time"},
+        "pid": {"type": "integer"},
+        "tid": {"type": "integer"},
+        "request": {"$ref": "#/$defs/HttpRequestPayload"},
+        "response": {"$ref": "#/$defs/HttpResponsePayload"},
+        "latency_ms": {"type": "number"},
+        "request_size": {"type": "integer"},
+        "response_size": {"type": "integer"},
+        "truncated": {"type": "boolean", "default": false},
+        "idempotency_key": {"type": ["string", "null"], "maxLength": 255},
+        "runtime_identity_version": {"type": ["integer", "null"], "enum": [1, null]},
+        "agent_ref": {"oneOf": [{"$ref": "#/$defs/RuntimeAgentRef"}, {"type": "null"}]},
+        "attribution": {"oneOf": [{"$ref": "#/$defs/RuntimeAttribution"}, {"type": "null"}]}
+      }
+    },
+    "HttpRequestPayload": {
+      "type": "object",
+      "required": ["method", "path"],
+      "properties": {
+        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]},
+        "path": {"type": "string"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "body": {}
+      }
+    },
+    "HttpResponsePayload": {
+      "type": "object",
+      "properties": {
+        "status_code": {"type": "integer"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "body": {},
+        "is_sse": {"type": "boolean"}
+      }
+    },
+    "RuntimeAgentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "sandbox_name", "agent_key"],
+      "properties": {
+        "host_id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "sandbox_name": {"type": "string", "minLength": 1, "maxLength": 255},
+        "agent_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"}
+      }
+    },
+    "RuntimeAttribution": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "method", "target_id", "process"],
+          "properties": {
+            "state": {"type": "string", "enum": ["attributed"]},
+            "method": {"type": "string", "enum": ["process_target", "process_target_with_ticket_claim"]},
+            "target_id": {"type": "string", "minLength": 1},
+            "process": {"$ref": "#/$defs/RuntimeProcessRef"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "reason"],
+          "properties": {
+            "state": {"type": "string", "enum": ["ambiguous", "unknown", "conflict"]},
+            "reason": {"type": "string", "minLength": 1},
+            "target_id": {"type": ["string", "null"]},
+            "process": {"oneOf": [{"$ref": "#/$defs/RuntimeProcessRef"}, {"type": "null"}]}
+          }
+        }
+      ]
+    },
+    "RuntimeProcessRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "start_time_ticks"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "start_time_ticks": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}
