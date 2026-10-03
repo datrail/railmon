@@ -19,8 +19,11 @@ out_dir="${RAILMON_DEMO_OUT:-/out}"
 mkdir -p "$out_dir"
 
 echo "railmon demo: 1/3 self-scan -> $out_dir/features.json"
+# The demo shows the inventory only. Without --no-evidence-bundle the scan
+# also builds an evidence bundle, which needs RAIL_HOST_ID and otherwise
+# fails the scan (and, under set -e, the demo).
 python3 "$root/tools/scan/scan_agent_environment.py" \
-    --mode self --output "$out_dir/features.json" >/dev/null
+    --mode self --no-evidence-bundle --output "$out_dir/features.json" >/dev/null
 # store_json (scan_agent_environment.py) opens with O_TRUNC, so re-running
 # this replaces features.json rather than growing it — running the demo
 # twice does not duplicate the inventory.

@@ -142,6 +142,37 @@ See
 [the scanner's README](tools/scan/README.md#observed-listeners-optional)
 for what the attribute holds.
 
+## Configuration
+
+Every setting is an environment variable; RailMon loads no `.env` file
+itself. [`.env.example`](.env.example) lists every variable the code reads.
+The ones you are most likely to set:
+
+| Variable | Read by | Default | What it does |
+| --- | --- | --- | --- |
+| `RAIL_HOST_ID` | `scan` (`--host-id`) | none | Names the host in the evidence bundle and the registration; the same value RailProxy and the other Rail components on the host use. No fallback is invented: unset, the bundle fails its contract and `scan` exits 2 unless `--no-evidence-bundle` is given. |
+| `RAIL_AGENT_KEY` | `scan` (`--agent-key`) | none | The agent's key in RailDash, sent as `?agent_key=` with the bundle. RailDash needs it when the bundle carries no deployment pair (`RAIL_DEPLOYMENT` plus `RAIL_NAMESPACE`, or a Compose project and service). |
+| `RAIL_RAILDASH_URL` | `scan` (`--raildash-url`) | none | Setting it is the request to deliver each evidence bundle to RailDash's `/v1/evidence-bundles`. |
+| `RAIL_RAILDASH_TOKEN` | `scan` | none | RailDash's local write token (`X-RailDash-Token`), printed when RailDash starts and written to `<db path>.token`. |
+| `RAIL_SCAN_INTERVAL_IN_SECONDS` | `scan` (`--interval`) | unset: scan once and exit | Keeps `scan` running and scans again on this interval (3600 if the value is not a number). |
+| `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. |
+| `RAIL_AUTH_MODE` | collector `--webhook`, `forward`, `scan --register` | `none` | The credential to present: `none`, `bearer` or `gcp`. See above for `RAIL_AUTH_TOKEN`, `RAIL_AUTH_TOKEN_FILE` and `RAIL_AUTH_AUDIENCE`. |
+| `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
+| `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | listensnoop's JSON lines: where `listen` appends and `scan` reads. |
+| `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
+| `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railscan/evidence-bundle.json` | Where the evidence bundle is written. |
+| `AGENTSIGHT_PATH` | collector (`--agentsight`) | `bin/agentsight`; the image sets its own | The AgentSight probe binary. |
+
+A flag always wins over its variable. `scan` exits 2 when the evidence bundle
+it built fails its contract, when a delivery (`--register` or RailDash) fails,
+or when the feature file cannot be written.
+
+An interval scan whose evidence bundle has not changed since the previous
+scan re-sends that bundle, `bundle_id` and all, so RailDash answers
+`duplicate` and keeps one ASP for it instead of one per interval. The bundle's
+`collected_at` is then when that content was first collected. A restarted
+`scan` starts afresh and sends a new bundle once.
+
 ## Platforms and security
 
 Collection is Linux-only and needs root or the relevant BPF capabilities. WSL2

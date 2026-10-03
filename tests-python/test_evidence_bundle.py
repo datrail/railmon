@@ -1494,5 +1494,160 @@ class RaildashDeliveryWiringTest(unittest.TestCase):
         self.assertIn("HTTP 400", proc.stderr)
 
 
+class ScanExitAndConfigTest(unittest.TestCase):
+    """DR-157: a bundle that fails its contract fails the scan, and
+    `--observed-file` has an environment variable like `--listen-file`."""
+
+    def run_scan(self, tmp: str, extra: list[str], env: dict | None = None):
+        import subprocess
+
+        return subprocess.run(
+            ["python3", str(SCANNER)] + extra,
+            cwd=tmp,
+            capture_output=True,
+            text=True,
+            env={**{k: v for k, v in os.environ.items() if not k.startswith("RAIL_")}, **(env or {})},
+            timeout=120,
+        )
+
+    def test_a_bundle_that_fails_its_contract_fails_the_scan(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # No RAIL_HOST_ID and no --host-id: the bundle has no host_id,
+            # which its schema requires.
+            proc = self.run_scan(tmp, ["--mode", "self", "--no-feature-file",
+                                       "--evidence-bundle-output", f"{tmp}/bundle.json"])
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("evidence bundle failed its contract", proc.stderr)
+            self.assertFalse(Path(tmp, "bundle.json").exists())
+
+    def test_skipping_the_bundle_skips_its_contract(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.run_scan(tmp, ["--mode", "self", "--no-feature-file", "--no-evidence-bundle"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_the_observed_file_can_come_from_the_environment(self):
+        import tempfile
+
+        snapshot = {"network_targets": [{"host": "api.example.test", "path": "/v1", "count": 3}]}
+        for how in ("flag", "env"):
+            with self.subTest(how=how), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+                argv = ["--mode", "self", "--host-id", "h-1", "--no-evidence-bundle",
+                        "--feature-output", f"{tmp}/features.json"]
+                env = {}
+                if how == "flag":
+                    argv += ["--observed-file", f"{tmp}/snapshot.json"]
+                else:
+                    env["RAIL_OBSERVED_FILE"] = f"{tmp}/snapshot.json"
+                proc = self.run_scan(tmp, argv, env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                features = json.loads(Path(tmp, "features.json").read_text())
+                hosts = [d["host"] for d in features["observed_reach"]["destinations"]]
+                self.assertEqual(hosts, ["api.example.test"])
+
+
+class UnchangedBundleReuseTest(unittest.TestCase):
+    """DR-157: an interval scan of an unchanged agent re-sends the same
+    bundle bytes, so RailDash (which keys an ASP on their digest) stores one
+    ASP rather than one per interval."""
+
+    def setUp(self):
+        evidence_bundle._previous_bundles.clear()
+        self.addCleanup(evidence_bundle._previous_bundles.clear)
+
+    def test_unchanged_content_reuses_the_previous_bundle(self):
+        first = build_bundle()
+        second = build_bundle()
+        self.assertNotEqual(first["bundle_id"], second["bundle_id"])
+        self.assertEqual(evidence_bundle.content_fingerprint(first), evidence_bundle.content_fingerprint(second))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIs(evidence_bundle.reuse_unchanged_bundle(first), first)
+            self.assertIs(evidence_bundle.reuse_unchanged_bundle(second), first)
+
+    def test_changed_content_is_a_new_bundle_and_the_new_reference(self):
+        first = build_bundle()
+        changed = build_bundle()
+        changed["attributes"]["system_prompt_present"] = {"status": "ABSENT"}
+        third = json.loads(json.dumps(changed))
+        third["bundle_id"] = "bnd-other"
+        with contextlib.redirect_stderr(io.StringIO()):
+            evidence_bundle.reuse_unchanged_bundle(first)
+            self.assertIs(evidence_bundle.reuse_unchanged_bundle(changed), changed)
+            self.assertIs(evidence_bundle.reuse_unchanged_bundle(third), changed)
+
+    def test_another_agent_key_never_reuses_a_bundle(self):
+        first = build_bundle()
+        second = build_bundle()
+        with contextlib.redirect_stderr(io.StringIO()):
+            evidence_bundle.reuse_unchanged_bundle(first, "agent-a")
+            self.assertIs(evidence_bundle.reuse_unchanged_bundle(second, "agent-b"), second)
+
+    def test_interval_scans_post_identical_bytes_while_nothing_changes(self):
+        import tempfile
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        bodies: list[bytes] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                duplicate = body in bodies
+                bodies.append(body)
+                payload = json.dumps({"accepted": True, "asp_id": "asp-1", "duplicate": duplicate}).encode()
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        ticks = {"n": 0}
+
+        def sleep(_seconds):
+            ticks["n"] += 1
+            if ticks["n"] >= 3:
+                raise KeyboardInterrupt
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                env = {k: v for k, v in os.environ.items() if not k.startswith("RAIL_")}
+                stderr = io.StringIO()
+                # The scanner imports evidence_bundle lazily; point that
+                # import at the module this file loaded, for this run only.
+                modules = {"evidence_bundle": evidence_bundle, "scan_agent_environment": scanner}
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.dict(sys.modules, modules), \
+                        mock.patch.object(scanner.time, "sleep", sleep), \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    code = scanner.main([
+                        "--mode", "self", "--host-id", "h-1", "--agent-key", "a-1",
+                        "--no-feature-file", "--evidence-bundle-output", f"{tmp}/bundle.json",
+                        "--raildash-url", f"http://127.0.0.1:{server.server_address[1]}",
+                        "--interval", "0",
+                    ])
+                on_disk = Path(tmp, "bundle.json").read_bytes()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertEqual(len(bodies), 3)
+        self.assertEqual(len(set(bodies)), 1, "an unchanged scan must re-send the same bytes")
+        self.assertEqual(bodies[0], on_disk)
+        self.assertEqual(stderr.getvalue().count("duplicate"), 2)
+        self.assertEqual(stderr.getvalue().count("evidence bundle unchanged since"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
