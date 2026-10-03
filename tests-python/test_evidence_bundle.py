@@ -1284,7 +1284,8 @@ class ScannerWiringTest(unittest.TestCase):
     def test_a_railscan_layout_keeps_its_default_paths(self):
         """DR-161: a working directory that already has RailScan's
         `.rail/railscan/` keeps getting its feature file and bundle there, with
-        a deprecation note, until `.rail/railmon/` exists."""
+        a deprecation note, until the files are moved — also when
+        `--register` or another output creates `.rail/railmon/` first."""
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1297,7 +1298,14 @@ class ScannerWiringTest(unittest.TestCase):
             self.assertFalse(Path(tmp, ".rail", "railmon").exists())
             self.assertIn("deprecated RailScan location", proc.stderr)
 
-            Path(tmp, ".rail", "railmon").mkdir()
+            Path(tmp, ".rail", "railmon", "forward").mkdir(parents=True)
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1"], tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(Path(tmp, ".rail", "railmon", "features.json").exists())
+            self.assertIn("deprecated RailScan location", proc.stderr)
+
+            for name in ("features.json", "evidence-bundle.json"):
+                (legacy / name).rename(Path(tmp, ".rail", "railmon", name))
             proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1"], tmp)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertTrue(Path(tmp, ".rail", "railmon", "features.json").exists())

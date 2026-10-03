@@ -82,9 +82,10 @@ By default, Rail Center's response is stored at:
 ```
 
 (RailScan wrote it to `.datrail/rail-guardian/registration.json`. Where that
-directory exists and `.rail/railmon/` does not, the scanner keeps using the old
-location and prints a deprecation note; the feature file and evidence bundle
-below follow the same rule for `.rail/railscan/`.)
+directory exists and `.rail/railmon/registration.json` does not, the scanner
+keeps using the old location and prints a deprecation note; the feature file
+and evidence bundle below follow the same rule for `.rail/railscan/`. Move the
+files, or set the path explicitly, to finish the move.)
 
 The stored file contains:
 

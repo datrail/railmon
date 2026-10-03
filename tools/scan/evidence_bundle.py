@@ -1354,15 +1354,18 @@ def default_output(new: Path, legacy: Path) -> Path:
     The scanner's defaults moved from `.rail/railscan/` and
     `.datrail/rail-guardian/` to `.rail/railmon/`. Whatever reads the old
     files keeps working as long as the old directory exists and the new one
-    does not; the scanner says so once per path, and creating the new
-    directory (or passing the path explicitly) completes the move."""
-    if legacy.parent.is_dir() and not new.parent.exists():
+    holds no such file yet (the plain file or a per-agent `<name>.<key>`).
+    Decided per file, not per directory: another output, or the forwarder's
+    spool, creating `.rail/railmon/` must not move this one. The scanner says
+    so once per path; moving the files (or passing the path explicitly)
+    completes the move."""
+    if legacy.parent.is_dir() and not any(new.parent.glob(new.name + "*")):
         if legacy not in _legacy_defaults_reported:
             _legacy_defaults_reported.add(legacy)
             print(
                 f"railmon scan: writing {legacy}, the deprecated RailScan location, "
-                f"because {legacy.parent} exists and {new.parent} does not; "
-                f"move it to {new.parent} or set the path explicitly",
+                f"because {legacy.parent} exists and {new} does not; "
+                f"move it to {new} or set the path explicitly",
                 file=sys.stderr,
             )
         return legacy

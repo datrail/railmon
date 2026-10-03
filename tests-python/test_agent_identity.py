@@ -482,7 +482,12 @@ class LegacyDefaultPathTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, ".datrail", "rail-guardian").mkdir(parents=True)
             self.assertEqual(self.path_in(tmp), Path(".datrail/rail-guardian/registration.json"))
+            # The feature file creating .rail/railmon/ does not move it...
             Path(tmp, ".rail", "railmon").mkdir(parents=True)
+            Path(tmp, ".rail", "railmon", "features.json").write_text("{}")
+            self.assertEqual(self.path_in(tmp), Path(".datrail/rail-guardian/registration.json"))
+            # ...a registration file there does, keyed per agent or not.
+            Path(tmp, ".rail", "railmon", "registration.json.planner").write_text("{}")
             self.assertEqual(self.path_in(tmp), Path(".rail/railmon/registration.json"))
 
 
