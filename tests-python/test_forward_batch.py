@@ -191,13 +191,12 @@ class ForwardEnvelopeTest(unittest.TestCase):
         self.assertEqual(list((self.spool / "pending").glob("*.json")), [])
         self.assertEqual(len(list((self.spool / "rejected").glob("*.json"))), 1)
 
-    def test_a_server_error_over_one_item_is_isolated_and_kept_for_retry(self):
+    def test_a_server_error_keeps_the_whole_batch_pending_unsplit(self):
         self.server.fail_status = 500
-        self.server.poison = {EVENTS[1]["interaction_id"]}
-        self.assertEqual(self.drain(EVENTS), (2, 1))
-        self.assertEqual(sorted(self.server.accepted), sorted([EVENTS[0]["interaction_id"], EVENTS[2]["interaction_id"]]))
-        # A 5xx may be transient: the item stays pending rather than rejected.
-        self.assertEqual(len(list((self.spool / "pending").glob("*.json"))), 1)
+        self.assertEqual(self.drain(EVENTS), (0, 3))
+        # One request, not a bisection: a 5xx may be transient.
+        self.assertEqual(len(self.server.bodies), 1)
+        self.assertEqual(len(list((self.spool / "pending").glob("*.json"))), 3)
         self.assertFalse((self.spool / "rejected").exists())
 
     def test_batches_are_bounded_by_bytes_too(self):

@@ -62,10 +62,10 @@ pending, and a flush happens every `--flush-count` events (default 1) or
 bigger batches. Rail Center answers 202 with `recorded`, `duplicates` and
 `conflicts` counts, which the forwarder logs.
 
-A batch refused with 413 or 422, or failing with a 5xx, is halved and each
-half retried, so one bad item does not hold the rest back. An item refused
-on its own (413/422) moves to `<spool>/rejected/`; one that gets a 5xx on its
-own stays pending, since the error may pass.
+A batch refused with 413 or 422 is halved and each half retried, so one bad
+item does not hold the rest back; an item refused on its own moves to
+`<spool>/rejected/`. A 5xx is not split: the whole batch stays pending and is
+retried at the next flush, since a server error may pass.
 [`tests/fixtures/rail-center/`](../../tests/fixtures/rail-center/) holds a
 vendored copy of Rail Center's schema for this body and a fixture checked
 against it.
@@ -74,10 +74,12 @@ against it.
 
 Every valid event is written to `<spool>/pending/` before it is sent, and the
 file is deleted once Rail Center answers 2xx (`--keep-sent` moves it to
-`<spool>/sent/` instead). An event that fails stays pending and is retried at
-every later flush and on the next start; `--drain-only` resends what is
-pending without reading new input. Replaying the same `interaction_id` is safe: Rail Center treats it as
-the same interaction.
+`<spool>/sent/` instead). An event that fails for a reason that may pass
+(unreachable, a redirect, a 5xx) stays pending and is retried at every later
+flush and on the next start; one Rail Center refuses outright (413/422, on its
+own) moves to `<spool>/rejected/`. `--drain-only` resends what is pending
+without reading new input. Replaying an event is safe: its `interaction_id`
+is the item's `idempotency_key`, so Rail Center records it once.
 
 The spool defaults to `.rail/railmon/forward/` (relative to the working
 directory; `--spool-dir` sets it). It used to be

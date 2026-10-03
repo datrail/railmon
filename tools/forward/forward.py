@@ -477,10 +477,11 @@ def drain_pending(
                     f"status={status}{_outcome(body)}",
                     file=sys.stderr,
                 )
-            elif status is not None and (status in (413, 422) or status >= 500) and len(chunk) > 1:
-                # Rail Center refuses (or fails on) a whole batch over one
-                # item. Halved, the rest still land and only that item is
-                # left, instead of it holding its neighbours back forever.
+            elif status in (413, 422) and len(chunk) > 1:
+                # Rail Center refuses a whole batch over one item. Halved, the
+                # rest still land and only that item is left, instead of it
+                # holding its neighbours back forever. A 5xx is not split: it
+                # says nothing about the batch's contents and may pass.
                 half = len(chunk) // 2
                 chunks[:0] = [chunk[:half], chunk[half:]]
             elif status in (413, 422):
@@ -496,8 +497,8 @@ def drain_pending(
                     file=sys.stderr,
                 )
             else:
-                # Unreachable, a redirect, or a server error on a single item:
-                # possibly transient, so it stays pending for the next drain.
+                # Unreachable, a redirect, or a server error: possibly
+                # transient, so the batch stays pending for the next drain.
                 failed += len(chunk)
                 print(
                     f"[rail-collector] forward failed {len(chunk)} interaction(s) session={session[0]} "
