@@ -1846,9 +1846,10 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         [Path(path).expanduser() for path in args.mcp_config] or default_mcp_paths(context["env"]),
         context["env"],
     )
-    if args.observed_file:
+    observed_file = resolve_observed_file(args)
+    if observed_file:
         identity["observed_reach"] = summarize_observed(
-            load_snapshot(Path(args.observed_file).expanduser()),
+            load_snapshot(Path(observed_file).expanduser()),
             declared_hosts(identity, context["env"]),
         )
     listen_file = resolve_listen_file(args)
@@ -2122,6 +2123,10 @@ def resolve_listen_file(args: argparse.Namespace) -> str | None:
     return first_nonempty(getattr(args, "listen_file", None), os.environ.get("RAIL_LISTEN_FILE"))
 
 
+def resolve_observed_file(args: argparse.Namespace) -> str | None:
+    return first_nonempty(getattr(args, "observed_file", None), os.environ.get("RAIL_OBSERVED_FILE"))
+
+
 def configured_target_manifest(args: argparse.Namespace) -> str | None:
     return first_nonempty(args.target_manifest, os.environ.get("RAIL_TARGET_MANIFEST"))
 
@@ -2233,6 +2238,11 @@ def _deliver_v1_fallback(args: argparse.Namespace) -> int:
     context, payload, identity = result
     bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
     exit_code = 0
+    if bundle is None:
+        # Already reported: the bundle failed its own contract (DR-157).
+        exit_code = 2
+    else:
+        bundle = evidence_bundle.reuse_unchanged_bundle(bundle, configured_agent_key(args))
     if not args.no_evidence_bundle and bundle is not None:
         bundle_path = evidence_bundle.evidence_bundle_output_path(args)
         try:
@@ -2298,6 +2308,9 @@ def _deliver_v2_collection(args: argparse.Namespace, sandbox_v1: dict[str, Any],
     except (ValueError, ScannerError) as exc:
         print(f"agent-environment-scanner: evidence bundle v2 composition failed: {exc}", file=sys.stderr)
         return 2
+    # DR-157: an interval scan whose collection has not changed re-sends the
+    # previous one, so RailDash records a duplicate rather than a new ASP.
+    collection = evidence_bundle.reuse_unchanged_bundle(collection)
 
     exit_code = 0
     # Built once above; every consumer below shares this exact dict/bytes.
@@ -2791,7 +2804,7 @@ def make_parser() -> argparse.ArgumentParser:
         "--observed-file",
         help="AgentSight snapshot (agentsight report export -o snapshot.json) to summarise "
         "into the observed-reach dimension. Names and counts only; no prompts, tool "
-        "arguments or command lines are read from it.",
+        "arguments or command lines are read from it. Defaults to RAIL_OBSERVED_FILE.",
     )
     parser.add_argument(
         "--listen-file",
@@ -2925,6 +2938,7 @@ def run_one_scan(args: argparse.Namespace) -> int:
     (including this module's own tests) goes through this unchanged."""
     feature_file_written = True
     delivery_failed = False
+    bundle_failed = False
     raildash_url = configured_raildash_url(args)
     try:
         context, payload, identity = scan(args)
@@ -3000,6 +3014,18 @@ def run_one_scan(args: argparse.Namespace) -> int:
                 import evidence_bundle  # lazy: breaks the import cycle
 
                 bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
+                if bundle is None:
+                    # Already reported. A bundle that fails its own contract
+                    # fails the scan (DR-157), whether or not it was going
+                    # anywhere: exiting 0 here left a supervisor or CI job
+                    # believing a scan produced evidence when none was written.
+                    bundle_failed = True
+                else:
+                    # DR-157: unchanged content since this process's last
+                    # scan reuses that scan's bundle (bundle_id and all), so
+                    # an interval scan re-sends the same bytes and RailDash
+                    # dedupes them instead of storing a new ASP per tick.
+                    bundle = evidence_bundle.reuse_unchanged_bundle(bundle, configured_agent_key(args))
 
                 if not args.no_evidence_bundle and bundle is not None:
                     bundle_path = evidence_bundle.evidence_bundle_output_path(args)
@@ -3036,7 +3062,7 @@ def run_one_scan(args: argparse.Namespace) -> int:
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         return 2
-    return 0 if feature_file_written and not delivery_failed else 2
+    return 0 if feature_file_written and not delivery_failed and not bundle_failed else 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3056,7 +3082,9 @@ def main(argv: list[str] | None = None) -> int:
     # without the scanner being re-run by hand; one that changes or
     # disappears between scans is reflected the same way, because every
     # iteration re-delivers (to rail-center and/or RailDash) rather than only
-    # diffing locally. The last exit code is what the process exits with, so
+    # diffing locally. An unchanged evidence bundle is re-sent as the same
+    # bytes (`evidence_bundle.reuse_unchanged_bundle`), so RailDash keeps one
+    # ASP for it instead of one per tick (DR-157). The last exit code is what the process exits with, so
     # a deployment supervisor (systemd, a container restart policy) still
     # sees a failing scan as a failure rather than this loop swallowing it.
     exit_code = 0

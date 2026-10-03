@@ -227,22 +227,28 @@ jobs:
             railmon:ci /tests/two_agent_acceptance.py --raildash http://raildash:8000 \
             || { docker logs raildash; exit 1; }
           # Interval scans delivering evidence bundles with the token RailDash
-          # wrote (DR-83): at least two ASPs arrive without a restart.
+          # wrote (DR-83), without a restart. Nothing about the scanned
+          # container changes between scans, so every delivery after the
+          # first is the same bytes and RailDash keeps exactly one ASP
+          # (DR-157) rather than one per interval.
           docker run -d --name railmon-scan --network railmon-raildash \
             -e RAIL_RAILDASH_TOKEN="$token" -e RAIL_HOST_ID=ci-host \
             railmon:ci scan --mode self --agent-key ci-agent \
-            --raildash-url http://raildash:8000 --interval 5
+            --raildash-url http://raildash:8000 --interval 2
           count() {
             curl -fsS http://127.0.0.1:8000/api/asps | python3 -c \
               'import json, sys; print(sum(i["agent_identity"]["value"] == "ci-agent" for i in json.load(sys.stdin)["items"]))'
           }
+          duplicates=0
           for _ in $(seq 60); do
-            asps=$(count || echo 0)
-            [ "$asps" -ge 2 ] && break
+            duplicates=$(docker logs railmon-scan 2>&1 | grep -c 'delivered evidence bundle to raildash: HTTP 202 duplicate' || true)
+            [ "$duplicates" -ge 2 ] && break
             sleep 0.5
           done
-          [ "$asps" -ge 2 ] || { docker logs railmon-scan; docker logs raildash; exit 1; }
-          echo "{\"result\": \"PASS\", \"interval_asps\": $asps}"
+          asps=$(count || echo 0)
+          [ "$duplicates" -ge 2 ] && [ "$asps" -eq 1 ] \
+            || { docker logs railmon-scan; docker logs raildash; exit 1; }
+          echo "{\"result\": \"PASS\", \"interval_deliveries\": $((duplicates + 1)), \"interval_asps\": $asps}"
           # DR-125: a listening socket that appears after the baseline was
           # locked is drift, and an unchanged window is not. Real scanner in
           # the image, real RailDash, listensnoop lines in a mounted file.

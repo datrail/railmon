@@ -1581,6 +1581,9 @@ class ArtifactPermissionsTest(unittest.TestCase):
                     "--output",
                     str(payload),
                     "--no-feature-file",
+                    # No host id here, so a bundle would fail its contract
+                    # and, since DR-157, the scan with it.
+                    "--no-evidence-bundle",
                 ],
                 capture_output=True,
                 text=True,

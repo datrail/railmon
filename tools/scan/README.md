@@ -7,6 +7,10 @@ This tool is meant to run before registration. It does not capture traffic and
 does not require eBPF privileges. It reads container metadata, safe environment
 metadata, system/runtime information, owner identity, and optional MCP config.
 
+Every example below assumes the host id is set (`RAIL_HOST_ID`, or
+`--host-id`). Without one the evidence bundle fails its contract and the scan
+exits `2`; pass `--no-evidence-bundle` to scan without a bundle.
+
 ## Output Schema
 
 The output matches `RegisterAgentRequest` in rail-center:
@@ -175,7 +179,10 @@ It is written to `.rail/railmon/evidence-bundle.json` (override with
 `--no-evidence-bundle`), like the feature file it is created `0600`, and it
 rides the same guarantee: the bundle is written from the same `finally`, so it
 lands even when the registration fails. A write failure is reported without
-changing the exit code — the feature file owns that.
+changing the exit code — the feature file owns that. A bundle that fails its
+own contract (for example, no `host_id` because `RAIL_HOST_ID` is unset) is
+not written and fails the scan with exit code `2`; `--no-evidence-bundle`
+skips building it.
 
 The envelope names the container the bundle was collected from with
 `host_id` and `sandbox_name` — the pair the scan registers the container
@@ -218,6 +225,15 @@ This POSTs to `<raildash-url>/v1/evidence-bundles`, which RailDash dedupes by
 the content digest of the bytes it receives. Use `RAIL_RAILDASH_URL` instead
 of `--raildash-url` when running as a service.
 
+With `--interval`, a scan whose bundle is unchanged since the same process's
+previous scan (everything but `bundle_id` and `collected_at` equal) reuses
+that previous bundle whole, so the file and the POST carry the same bytes as
+last time and RailDash answers `duplicate` instead of storing a new ASP every
+interval. It is still re-sent rather than skipped, so a RailDash that was
+reset, or that pruned the row, gets it back. A content-derived `bundle_id`
+alone would not do this: `collected_at` would still differ, and RailDash
+refuses a known `bundle_id` with different bytes.
+
 It is independent of `--register`/`--center-url`: name either URL, both, or
 neither in one invocation, and each target is attempted and reported on its
 own — a failed `--register` does not skip the RailDash delivery, and vice
@@ -253,6 +269,9 @@ sudo agentsight record -- claude          # or: agentsight report --local  (no s
 agentsight report export -o snapshot.json
 python3 .../scan_agent_environment.py --observed-file snapshot.json
 ```
+
+`RAIL_OBSERVED_FILE` works in place of the flag, like `RAIL_LISTEN_FILE` for
+`--listen-file`.
 
 AgentSight has already done the parsing and the aggregation, so the scanner only
 classifies, redacts and diffs — it grows no parser of its own. The payoff is
@@ -462,6 +481,7 @@ the collector's `--webhook` and `railmon forward`.
 From the repository root:
 
 ```bash
+export RAIL_HOST_ID=my-host
 python3 tools/scan/scan_agent_environment.py
 ```
 

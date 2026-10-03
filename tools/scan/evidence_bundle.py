@@ -26,6 +26,7 @@ network or a clone of the consumer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1426,6 +1427,54 @@ def try_build_verified_bundle(
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         return None
+
+
+# ── unchanged scans reuse the previous bundle (DR-157) ───────────────────────
+# Every build mints a fresh `bundle_id` and `collected_at`, and RailDash keys
+# an ASP on the exact bytes' digest, so an interval scan of an agent that did
+# not change used to store a new ASP on every tick. The cache below lets a
+# scan whose content (everything but those two envelope fields) matches this
+# process's previous scan of the same scope reuse that scan's bundle whole:
+# the file and the POST carry the same bytes as last time, RailDash answers
+# `duplicate`, and nothing piles up. Re-sending (rather than skipping the
+# POST) keeps a RailDash that was reset, or that pruned the row, current.
+#
+# Deriving `bundle_id` from the content alone would not do: `collected_at`
+# still differs, and RailDash refuses a known `bundle_id` with different
+# bytes (409). The reused bundle's `collected_at` is when this content was
+# first collected.
+
+_VOLATILE_ENVELOPE_KEYS = frozenset({"bundle_id", "collected_at"})
+_previous_bundles: dict[tuple[Any, ...], tuple[str, dict[str, Any]]] = {}
+
+
+def content_fingerprint(bundle: dict[str, Any]) -> str:
+    """sha256 over the bundle minus `bundle_id` and `collected_at`."""
+    content = {key: value for key, value in bundle.items() if key not in _VOLATILE_ENVELOPE_KEYS}
+    canonical = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def reuse_unchanged_bundle(bundle: dict[str, Any], agent_key: str | None = None) -> dict[str, Any]:
+    """This process's previous bundle for the same scope when the content is
+    unchanged, otherwise `bundle` (remembered for the next call).
+
+    The scope is the bundle version, the host/sandbox pair and the RailDash
+    agent key, so a multi-agent run's per-key bundles never stand in for one
+    another.
+    """
+    scope = (bundle.get("bundle_version"), bundle.get("host_id"), bundle.get("sandbox_name"), agent_key)
+    fingerprint = content_fingerprint(bundle)
+    previous = _previous_bundles.get(scope)
+    if previous is not None and previous[0] == fingerprint:
+        print(
+            f"[agent-environment-scanner] evidence bundle unchanged since {previous[1].get('collected_at')}; "
+            f"reusing bundle_id={previous[1].get('bundle_id')}",
+            file=sys.stderr,
+        )
+        return previous[1]
+    _previous_bundles[scope] = (fingerprint, bundle)
+    return bundle
 
 
 def render_bundle_bytes(bundle: dict[str, Any], compact: bool) -> bytes:
