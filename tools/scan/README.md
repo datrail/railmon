@@ -42,7 +42,7 @@ state, and the feature file — is created `0600`.
 
 ## Registration Flow
 
-RC-41 flow is supported directly:
+The registration flow is supported directly:
 
 ```text
 collect environment data + skills data
@@ -116,7 +116,7 @@ python3 tools/scan/scan_agent_environment.py \
 ```
 
 Use `RAIL_CENTER_URL` instead of `--center-url` when running as a service.
-The `DATRAIL_*` names it used to accept were removed in DR-74 — there is no
+The `DATRAIL_*` names it used to accept have been removed — there is no
 fallback, so a deployment still setting an old name gets no value at all rather
 than a silently ignored one.
 Rail Center unreachable errors, invalid payload responses, and invalid response
@@ -205,7 +205,7 @@ collected or written to the bundle.
 ## RailDash delivery
 
 A user should never have to run a CLI command to get an evidence bundle into
-RailDash (standing decision: ASP must not depend on the CLI). `--raildash-url`
+RailDash, where it becomes an Agent Security Profile (ASP). `--raildash-url`
 POSTs the bundle's exact bytes — the same bytes `--evidence-bundle-output`
 would write — straight to a RailDash instance:
 
@@ -227,9 +227,8 @@ for delivery even when the local file write is skipped.
 `--agent-key` (or `RAIL_AGENT_KEY`) is forwarded as the request's
 `?agent_key=` query parameter, for RailDash to resolve identity when the
 bundle carries no deployment pair — the same key `raildash asp load
---agent-key` takes today. (This is a best guess at DR-120's exact contract,
-made before that route's PR existed; if DR-120 lands with `agent_key` as a
-header instead, this is the one place to change.)
+--agent-key` takes. RailDash's `POST /v1/evidence-bundles` reads it from that
+query parameter.
 
 RailDash is expected to run localhost-only, so no auth header is sent by
 default. `--auth-mode`/`RAIL_AUTH_MODE` (see [Authentication](#authentication))
@@ -308,7 +307,7 @@ two-container deployment keeps it on a volume the agent does not mount; the
 nsenter recipe writes it on the host. Lines of 4096 characters or more are
 skipped as malformed.
 
-`ephemeral` needs a listensnoop from DR-125 on. With an older one, only an
+`ephemeral` needs a listensnoop recent enough to report it. With an older one, only an
 autobind is known to be kernel-chosen, so a bind to port 0 shows its real
 port, which changes when the agent restarts. That causes churn, but it never
 hides a listener.
@@ -335,8 +334,8 @@ in CI.
 
 ### Ingress peers
 
-The same file carries listensnoop's `peer` events (ebpf-tls-tap from DR-144
-on): each remote address a process accepted a TCP connection from, once per
+The same file carries listensnoop's `peer` events (from ebpf-tls-tap versions
+that report them): each remote address a process accepted a TCP connection from, once per
 listener. They become the `observed_ingress_peers` attribute, the "Ingress
 request" dimension of the first ASP requirements, whose threshold is an
 approved list of addresses or "internal only":
@@ -379,7 +378,7 @@ Both identity fields are optional on Rail Center's side and bounded to its
 storage width (64 and 255), so the scanner truncates rather than letting a long
 value surface as a server error.
 
-## Multi-agent target manifest (DR-109 M2)
+## Multi-agent target manifest
 
 `--target-manifest` (or `RAIL_TARGET_MANIFEST`) names the same
 `target-manifest-v1` YAML the collector reads with its own `--target-manifest`
@@ -421,7 +420,7 @@ attributes and sources), with siblings and the sandbox scope unchanged.
 a real RailDash in CI.
 
 The keyed registration state is also what the collector's multi-target
-capture reads to judge an unsigned `x-rail` ticket (DR-109 M3). Start the
+capture reads to judge an unsigned `x-rail` ticket. Start the
 collector with `--registration-state` set to the same absolute path passed
 here as `--registration-output`; it re-reads each `<path>.<agent_key>` every
 few seconds. A ticket claiming the capturing target's own registered
@@ -587,8 +586,8 @@ python3 tools/scan/scan_agent_environment.py \
 ```
 
 An estate that declares its MCP server via environment variables instead of a
-config file (confirmed for one GCP estate behind DR-123, e.g.
-`compose.agent-zone.yml`: one server per agent) is still discovered — no flag
+config file (as some Compose deployments do, one server per agent) is still
+discovered — no flag
 needed. If both `AGENT_MCP_NAME` and `AGENT_MCP_URL` are set, that server is
 added to the inventory and skills list the same way a `.mcp.json` entry would
 be, merged with any file-derived servers (a file entry with the same name
@@ -612,7 +611,7 @@ uv run --python 3.13 --with pydantic --with typing-extensions python -c '
 import json, sys
 sys.path.insert(0, "api/src")
 from registry.schemas import RegisterAgentRequest
-RegisterAgentRequest.model_validate(json.load(open("../datrail-agent-monitor/output/registration-payload.json")))
+RegisterAgentRequest.model_validate(json.load(open("/path/to/registration-payload.json")))
 print("valid")
 '
 ```
