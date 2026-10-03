@@ -4,7 +4,7 @@ This is the operator's page for `--target-manifest` (DR-109): how to write the
 manifest, what RailMon reports while it runs, how to diagnose a target that is
 not being captured, and how to go back to single-agent mode. The scanner's
 side — per-agent scans, keyed artifacts, delivery — is in
-[the scanner README](../tools/agent-environment-scanner/README.md#multi-agent-target-manifest-dr-109-m2).
+[the scanner README](../tools/scan/README.md#multi-agent-target-manifest-dr-109-m2).
 The design is `railxia/docs/design/2026-09-24-multi-agent-container/`.
 
 ## Writing the manifest

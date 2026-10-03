@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCANNER = ROOT / "tools" / "agent-environment-scanner" / "scan_agent_environment.py"
+SCANNER = ROOT / "tools" / "scan" / "scan_agent_environment.py"
 
 _spec = importlib.util.spec_from_file_location("scan_agent_environment", SCANNER)
 scanner = importlib.util.module_from_spec(_spec)

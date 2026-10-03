@@ -37,7 +37,7 @@ from urllib.request import Request, urlopen
 
 KEYS = ("drift-executor", "drift-planner")
 GONE = "drift-executor"
-DEFAULT_SCANNER = "/opt/railmon/tools/agent-environment-scanner/scan_agent_environment.py"
+DEFAULT_SCANNER = "/opt/railmon/tools/scan/scan_agent_environment.py"
 
 
 def require(condition: bool, message: str) -> None:

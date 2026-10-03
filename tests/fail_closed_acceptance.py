@@ -73,7 +73,7 @@ def railmon_root() -> pathlib.Path:
     if configured:
         return pathlib.Path(configured)
     checkout = pathlib.Path(__file__).resolve().parent.parent
-    if (checkout / "tools/agent-environment-scanner").is_dir():
+    if (checkout / "tools/scan").is_dir():
         return checkout
     return pathlib.Path("/opt/railmon")
 
@@ -247,7 +247,7 @@ agents:
 
         # Evidence: one v2 collection keeps every key; only the reviewer has any.
         bundle_path = root / "evidence-bundle.json"
-        scanner = railmon_root() / "tools/agent-environment-scanner/scan_agent_environment.py"
+        scanner = railmon_root() / "tools/scan/scan_agent_environment.py"
         scan = subprocess.run(
             [
                 sys.executable,

@@ -5,7 +5,8 @@ RailMon is the runtime-interaction collector in
 reconstructs into interactions, attributes each one to an agent from its
 `x-rail` ticket, and forwards them.
 
-Where RailScan sees an agent's static setup, RailMon sees what it actually did.
+Its `scan` and `skills` commands (formerly the separate RailScan) record an
+agent's static setup; the collector records what it actually did.
 
 ## What is ours and what is upstream's
 

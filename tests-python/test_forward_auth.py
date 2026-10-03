@@ -18,9 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-SPEC = importlib.util.spec_from_file_location("rail_collector", ROOT / "rail-collector" / "rail_collector.py")
-rail_collector = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(rail_collector)
+SPEC = importlib.util.spec_from_file_location("forward", ROOT / "tools" / "forward" / "forward.py")
+forward = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(forward)
 
 AUTH_VARS = ("RAIL_AUTH_MODE", "RAIL_AUTH_TOKEN", "RAIL_AUTH_TOKEN_FILE", "RAIL_AUTH_AUDIENCE", "GCE_METADATA_HOST")
 
@@ -87,6 +87,38 @@ class ForwardAuthTest(unittest.TestCase):
             text=True,
             timeout=30,
         )
+
+    def forward_from(self, cwd, *args):
+        """`railmon forward` without --spool-dir, from `cwd`."""
+        env = {k: v for k, v in os.environ.items() if k not in AUTH_VARS}
+        env.update(RAILMON_ROOT=str(ROOT), RAIL_CENTER_URL=f"http://{self.host}")
+        return subprocess.run(
+            [str(ROOT / "entrypoint.sh"), "forward", *args],
+            cwd=cwd,
+            input=json.dumps(EVENT) + "\n",
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_the_default_spool_is_railmons(self):
+        result = self.forward_from(self.tmp.name, "--keep-sent")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(list(Path(self.tmp.name, ".rail/railmon/forward/sent").glob("*.json"))), 1)
+        self.assertFalse(Path(self.tmp.name, ".datrail").exists())
+
+    def test_a_rail_collector_spool_is_still_drained(self):
+        """DR-161: events left pending under RailScan's spool are delivered
+        after an upgrade, not stranded beside a new empty spool."""
+        legacy = Path(self.tmp.name, ".datrail/rail-guardian/rail-collector")
+        forward.spool_event(dict(EVENT, interaction_id="left-behind"), legacy / "pending")
+        result = self.forward_from(self.tmp.name, "--drain-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.posts(), [None])
+        self.assertEqual(list((legacy / "pending").glob("*.json")), [])
+        self.assertIn("legacy spool", result.stderr)
+        self.assertFalse(Path(self.tmp.name, ".rail").exists())
 
     def posts(self):
         return [entry[2] for entry in self.server.seen if entry[0] == "POST"]
@@ -162,7 +194,7 @@ class CredentialTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             token = Path(tmp) / "token"
             token.write_text("first\n")
-            credential = rail_collector.Credential(
+            credential = forward.Credential(
                 {"RAIL_AUTH_MODE": "bearer", "RAIL_AUTH_TOKEN_FILE": str(token)}
             )
             self.assertEqual(credential.headers(), {"Authorization": "Bearer first"})
@@ -171,8 +203,8 @@ class CredentialTest(unittest.TestCase):
 
             token.write_text("")
             pending = Path(tmp) / "pending"
-            rail_collector.spool_event(EVENT, pending)
-            sent, failed = rail_collector.drain_pending(
+            forward.spool_event(EVENT, pending)
+            sent, failed = forward.drain_pending(
                 pending, Path(tmp) / "sent", "http://127.0.0.1:9", 1.0, False, credential
             )
             self.assertEqual((sent, failed), (0, 1))
@@ -189,8 +221,8 @@ class CredentialTest(unittest.TestCase):
         ]
         for env, expected in cases:
             with self.subTest(env=env):
-                with self.assertRaises(rail_collector.RailCollectorError) as caught:
-                    rail_collector.Credential(env)
+                with self.assertRaises(forward.RailCollectorError) as caught:
+                    forward.Credential(env)
                 self.assertIn(expected, str(caught.exception))
                 self.assertNotIn("ab\ncd", str(caught.exception))
 

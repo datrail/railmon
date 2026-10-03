@@ -27,7 +27,7 @@ from types import ModuleType
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCANNER_DIR = ROOT / "tools" / "agent-environment-scanner"
+SCANNER_DIR = ROOT / "tools" / "scan"
 SCANNER = SCANNER_DIR / "scan_agent_environment.py"
 
 _spec = importlib.util.spec_from_file_location("scan_agent_environment", SCANNER)
@@ -1059,7 +1059,7 @@ class ObservedListenersBundleTest(unittest.TestCase):
     def test_listeners_are_sandbox_scoped_in_a_multi_agent_bundle(self):
         # One PID namespace's events, not attributable to one agent.
         spec = importlib.util.spec_from_file_location(
-            "compose_evidence_bundle_v2", ROOT / "tools/agent-environment-scanner/compose_evidence_bundle_v2.py")
+            "compose_evidence_bundle_v2", ROOT / "tools/scan/compose_evidence_bundle_v2.py")
         composer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(composer)
 
@@ -1154,7 +1154,7 @@ class ObservedIngressPeersBundleTest(unittest.TestCase):
 
     def test_peers_are_sandbox_scoped_in_a_multi_agent_bundle(self):
         spec = importlib.util.spec_from_file_location(
-            "compose_evidence_bundle_v2", ROOT / "tools/agent-environment-scanner/compose_evidence_bundle_v2.py")
+            "compose_evidence_bundle_v2", ROOT / "tools/scan/compose_evidence_bundle_v2.py")
         composer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(composer)
         self.assertIn("observed_ingress_peers", composer.SANDBOX_ATTRIBUTES)
@@ -1276,9 +1276,41 @@ class ScannerWiringTest(unittest.TestCase):
                 tmp,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            default = Path(tmp, ".rail", "railscan", "evidence-bundle.json")
+            default = Path(tmp, ".rail", "railmon", "evidence-bundle.json")
             self.assertTrue(default.exists())
             self.assertEqual(json.loads(default.read_text())["bundle_version"], 1)
+            self.assertFalse(Path(tmp, ".rail", "railscan").exists())
+
+    def test_a_railscan_layout_keeps_its_default_paths(self):
+        """DR-161: a working directory that already has RailScan's
+        `.rail/railscan/` keeps getting its feature file and bundle there, with
+        a deprecation note, until the files are moved — also when
+        `--register` or another output creates `.rail/railmon/` first."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".rail", "railscan").mkdir(parents=True)
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1"], tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            legacy = Path(tmp, ".rail", "railscan")
+            self.assertTrue((legacy / "features.json").exists())
+            self.assertEqual(json.loads((legacy / "evidence-bundle.json").read_text())["bundle_version"], 1)
+            self.assertFalse(Path(tmp, ".rail", "railmon").exists())
+            self.assertIn("deprecated RailScan location", proc.stderr)
+
+            Path(tmp, ".rail", "railmon", "forward").mkdir(parents=True)
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1"], tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(Path(tmp, ".rail", "railmon", "features.json").exists())
+            self.assertIn("deprecated RailScan location", proc.stderr)
+
+            for name in ("features.json", "evidence-bundle.json"):
+                (legacy / name).rename(Path(tmp, ".rail", "railmon", name))
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1"], tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(Path(tmp, ".rail", "railmon", "features.json").exists())
+            self.assertTrue(Path(tmp, ".rail", "railmon", "evidence-bundle.json").exists())
+            self.assertNotIn("deprecated RailScan location", proc.stderr)
 
 
 class RaildashDeliveryWiringTest(unittest.TestCase):

@@ -4,18 +4,24 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-HARDENING_ROOT="${RAIL_AGENT_HARDENING_ROOT:-$REPO_ROOT/../agent-hardening}"
-EXAMPLE_DIR="$HARDENING_ROOT/nemoclaw"
+# The Compose service ships beside this script (examples/nemoclaw/). An
+# agent-hardening checkout named by RAIL_AGENT_HARDENING_ROOT is still honoured,
+# but that repository is deprecated and no longer needed.
+if [[ -n "${RAIL_AGENT_HARDENING_ROOT:-}" ]]; then
+  echo "run-nemoclaw: RAIL_AGENT_HARDENING_ROOT is deprecated; the Compose file now ships in $SCRIPT_DIR/examples/nemoclaw" >&2
+  EXAMPLE_DIR="$RAIL_AGENT_HARDENING_ROOT/nemoclaw"
+else
+  EXAMPLE_DIR="$SCRIPT_DIR/examples/nemoclaw"
+fi
 OUTPUT_DIR="$EXAMPLE_DIR/output"
 OUTPUT_FILE="$OUTPUT_DIR/nemoclaw-skills.json"
 
-mkdir -p "$EXAMPLE_DIR/nemoclaw-data" "$OUTPUT_DIR"
-
 if [[ ! -f "$EXAMPLE_DIR/docker-compose.yml" ]]; then
-  echo "run-nemoclaw: set RAIL_AGENT_HARDENING_ROOT to an agent-hardening checkout" >&2
+  echo "run-nemoclaw: no docker-compose.yml in $EXAMPLE_DIR" >&2
   exit 2
 fi
+
+mkdir -p "$OUTPUT_DIR"
 
 cd "$EXAMPLE_DIR"
 docker compose up -d nemoclaw
@@ -39,7 +45,6 @@ sleep "${SKILL_SCANNER_STARTUP_DELAY:-5}"
 python3 "$SCRIPT_DIR/skill_scanner.py" \
   --agent nemoclaw \
   --container "$CONTAINER_ID" \
-  --root "$EXAMPLE_DIR/nemoclaw-data" \
   --output "$OUTPUT_FILE"
 
 echo "NemoClaw skills written to $OUTPUT_FILE"

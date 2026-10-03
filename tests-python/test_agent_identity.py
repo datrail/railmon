@@ -7,16 +7,19 @@ dependencies to install.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCANNER_DIR = ROOT / "tools" / "agent-environment-scanner"
+SCANNER_DIR = ROOT / "tools" / "scan"
 SCANNER = SCANNER_DIR / "scan_agent_environment.py"
 
 _spec = importlib.util.spec_from_file_location("scan_agent_environment", SCANNER)
@@ -461,8 +464,35 @@ class McpCommandTest(unittest.TestCase):
         self.assertEqual(scanner.command_basename('/usr/bin/mcp-server --name "unclosed'), "mcp-server")
 
 
+class LegacyDefaultPathTest(unittest.TestCase):
+    """DR-161: the registration state moved from RailScan's
+    `.datrail/rail-guardian/` to `.rail/railmon/`, and stays where an existing
+    layout already keeps it."""
+
+    def path_in(self, cwd: str) -> Path:
+        args = scanner.make_parser().parse_args([])
+        with contextlib.chdir(cwd), contextlib.redirect_stderr(io.StringIO()):
+            return scanner.registration_output_path(args)
+
+    def test_new_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.path_in(tmp), Path(".rail/railmon/registration.json"))
+
+    def test_an_existing_rail_guardian_directory_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".datrail", "rail-guardian").mkdir(parents=True)
+            self.assertEqual(self.path_in(tmp), Path(".datrail/rail-guardian/registration.json"))
+            # The feature file creating .rail/railmon/ does not move it...
+            Path(tmp, ".rail", "railmon").mkdir(parents=True)
+            Path(tmp, ".rail", "railmon", "features.json").write_text("{}")
+            self.assertEqual(self.path_in(tmp), Path(".datrail/rail-guardian/registration.json"))
+            # ...a registration file there does, keyed per agent or not.
+            Path(tmp, ".rail", "railmon", "registration.json.planner").write_text("{}")
+            self.assertEqual(self.path_in(tmp), Path(".rail/railmon/registration.json"))
+
+
 class TicketHandlingTest(unittest.TestCase):
-    """RailScan is the registrar, and a registrar holds no credentials."""
+    """`railmon scan` is the registrar, and a registrar holds no credentials."""
 
     RESPONSE = {
         "status": 201,

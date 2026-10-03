@@ -1,0 +1,30 @@
+# Reference Compose service for tools/skills/run-openclaw.sh, vendored from the
+# archived DatRail agent-hardening reference repo (Apache-2.0, like this one) so
+# the script no longer needs that checkout. DatRail does not publish the agent
+# image: set OPENCLAW_IMAGE to a reviewed tag or digest, never a floating
+# `latest`.
+services:
+  openclaw:
+    image: ${OPENCLAW_IMAGE:?Set OPENCLAW_IMAGE to a reviewed tag or digest}
+    user: "${AGENT_UID:-1000}:${AGENT_GID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    volumes:
+      - openclaw-data:/home/node/.openclaw
+    ports:
+      - "127.0.0.1:${OPENCLAW_PORT:-18790}:18789"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    restart: unless-stopped
+
+volumes:
+  openclaw-data:

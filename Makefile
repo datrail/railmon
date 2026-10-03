@@ -20,18 +20,25 @@ test-rust:
 
 test-python:
 	python3 -m py_compile \
-		tools/agent-environment-scanner/scan_agent_environment.py \
-		tools/agent-environment-scanner/evidence_bundle.py \
-		tools/agent-environment-scanner/compose_evidence_bundle_v2.py \
+		tools/scan/scan_agent_environment.py \
+		tools/scan/evidence_bundle.py \
+		tools/scan/compose_evidence_bundle_v2.py \
 		tools/listen/follow_container.py \
-		tools/skills-scanner/skill_scanner.py \
-		rail-collector/rail_collector.py \
+		tools/skills/skill_scanner.py \
+		tools/forward/forward.py \
 		tools/local-demo/demo_server.py \
 		tools/local-demo/demo_client.py
 	sh -n tools/local-demo/run_local_demo.sh
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh scan --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh forward --help >/dev/null
+	# The deprecated RailScan-era names and paths still resolve.
+	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh agent-environment-scanner --help >/dev/null
+	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills-scanner --help >/dev/null
+	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh rail-collector --help >/dev/null
+	python3 tools/agent-environment-scanner/scan_agent_environment.py --help >/dev/null
+	python3 tools/skills-scanner/skill_scanner.py --help >/dev/null
+	python3 rail-collector/rail_collector.py --help >/dev/null
 	python3 -m unittest discover -s tests-python
 
 fmt:
