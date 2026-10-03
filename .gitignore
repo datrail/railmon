@@ -17,3 +17,8 @@ out/
 # Scanner default output (feature file, evidence bundle): local per-machine
 # runs only, never a deliverable.
 .rail/
+# RailScan-era default location, still written where it already exists.
+.datrail/
+
+# tools/skills/run-*.sh write their inventory beside the vendored Compose file.
+tools/skills/examples/*/output/

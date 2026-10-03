@@ -100,11 +100,16 @@ COPY --from=listensnoop /src/bpf/listensnoop /usr/local/bin/listensnoop
 # (util-linux, in the base image); fail here rather than at first use.
 RUN command -v nsenter
 
+# tools/ carries symlinks from the RailScan-era paths
+# (tools/agent-environment-scanner, tools/skills-scanner) to tools/scan and
+# tools/skills, and rail-collector/rail_collector.py points at
+# tools/forward/forward.py, so a deployment that calls a script by its old
+# path keeps working. COPY keeps them as symlinks.
 COPY tools/ /opt/railmon/tools/
 COPY rail-collector/ /opt/railmon/rail-collector/
 # The evidence-bundle schemas are the scanner's own contract, read (not merely
-# tested against) at import time by tools/agent-environment-scanner/
-# evidence_bundle.py — both versions have to ship, unlike schemas/'s other,
+# tested against) at import time by tools/scan/evidence_bundle.py — both
+# versions have to ship, unlike schemas/'s other,
 # test-only copies. A missing one is a FileNotFoundError on every scan, which
 # is what v2 was until CI started running a scan in the built image.
 COPY schemas/evidence-bundle-v1.schema.json schemas/evidence-bundle-v2.schema.json /opt/railmon/schemas/

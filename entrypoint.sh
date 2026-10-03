@@ -11,9 +11,10 @@
 #     so `docker run railmon --mode http …` must keep working. Anything that
 #     starts with a dash, and the empty invocation, go to the collector.
 #   * RailScan's image used long command names (`agent-environment-scanner`,
-#     `skills-scanner`, `rail-collector`). Those are kept as aliases so a
-#     compose file that switches image does not also have to rewrite its
-#     command.
+#     `skills-scanner`, `rail-collector`). Those are kept as deprecated
+#     aliases so a compose file that switches image does not also have to
+#     rewrite its command, and so are the old script paths under
+#     $RAILMON_ROOT (symlinks to tools/scan, tools/skills, tools/forward).
 set -eu
 
 root="${RAILMON_ROOT:-/opt/railmon}"
@@ -38,13 +39,13 @@ case "$command_name" in
         exec "$collector" "$@"
         ;;
     scan|agent-environment-scanner)
-        exec python3 "$root/tools/agent-environment-scanner/scan_agent_environment.py" "$@"
+        exec python3 "$root/tools/scan/scan_agent_environment.py" "$@"
         ;;
     skills|skills-scanner)
-        exec python3 "$root/tools/skills-scanner/skill_scanner.py" "$@"
+        exec python3 "$root/tools/skills/skill_scanner.py" "$@"
         ;;
     forward|rail-collector)
-        exec python3 "$root/rail-collector/rail_collector.py" "$@"
+        exec python3 "$root/tools/forward/forward.py" "$@"
         ;;
     listen)
         # listensnoop: one JSON line per socket the agent opens to accept
@@ -91,7 +92,8 @@ Called with no command, or with a flag first, RailMon runs the collector —
 so `railmon --mode http --output x.jsonl` still means what it used to.
 
 RailScan's command names (agent-environment-scanner, skills-scanner,
-rail-collector) are accepted as aliases.
+rail-collector) are still accepted as aliases, but are deprecated: use
+scan, skills and forward.
 EOF
         ;;
     python|python3|sh|/bin/sh)

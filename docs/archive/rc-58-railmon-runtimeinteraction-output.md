@@ -1,3 +1,5 @@
+> **Historical.** Kept as a record of the pre-consolidation layout; it no longer describes how RailMon works or is run.
+
 # RC-58: RailMon RuntimeInteraction Output Format
 
 RC-58 defines the standard output format that RailMon emits for Rail Center.

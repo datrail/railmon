@@ -1,3 +1,5 @@
+> **Historical.** Kept as a record of the pre-consolidation layout; it no longer describes how RailMon works or is run.
+
 # RC-74: RailMon To Runtime Monitor Integration
 
 RC-74 / 4.9 connects RailMon's standard RuntimeInteraction output from RC-58
@@ -28,7 +30,7 @@ Related docs:
 
 | Ticket | Document |
 | --- | --- |
-| RC-58 / 3.12 | `docs/rc-58-railmon-runtimeinteraction-output.md` |
+| RC-58 / 3.12 | [`rc-58-railmon-runtimeinteraction-output.md`](rc-58-railmon-runtimeinteraction-output.md) |
 | RC-75 / 4.10 | `docs/rc-75-railcollector-forwarding.md` |
 | Unified runtime runbook | `docs/rail-center-runtime-integration.md` |
 

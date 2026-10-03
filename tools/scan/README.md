@@ -55,13 +55,13 @@ Run the skills scanner first if the agent uses OpenClaw/NemoClaw `SKILL.md`
 files:
 
 ```bash
-tools/skills-scanner/run-openclaw.sh
+tools/skills/run-openclaw.sh
 ```
 
 Then register the agent with Rail Center:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --mode docker \
   --container openclaw-monitoring-openclaw-1 \
   --skills-file examples/openclaw-monitoring/output/openclaw-skills.json \
@@ -78,8 +78,13 @@ with any MCP skills discovered from `.mcp.json`.
 By default, Rail Center's response is stored at:
 
 ```text
-.datrail/rail-guardian/registration.json
+.rail/railmon/registration.json
 ```
+
+(RailScan wrote it to `.datrail/rail-guardian/registration.json`. Where that
+directory exists and `.rail/railmon/` does not, the scanner keeps using the old
+location and prints a deprecation note; the feature file and evidence bundle
+below follow the same rule for `.rail/railscan/`.)
 
 The stored file contains:
 
@@ -103,10 +108,10 @@ holds no credentials.
 Override the state file with:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --register \
   --center-url http://localhost:23001 \
-  --registration-output /var/lib/datrail/rail-guardian-registration.json
+  --registration-output /var/lib/railmon/registration.json
 ```
 
 Use `RAIL_CENTER_URL` instead of `--center-url` when running as a service.
@@ -119,7 +124,7 @@ bodies are reported as scanner errors with exit code `2`.
 ## Feature file
 
 The feature file is the scanner's primary output and needs no control plane. It
-is written to `.rail/railscan/features.json` (override with `--feature-output`
+is written to `.rail/railmon/features.json` (override with `--feature-output`
 or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 1–5 at inventory depth:
 
@@ -164,7 +169,7 @@ instead of guessing what an empty one means. Honesty over completeness: an
 attribute this pack cannot collect is emitted `BLIND` with the reason why,
 never an empty `ANSWERED` that reads as "none exists".
 
-It is written to `.rail/railscan/evidence-bundle.json` (override with
+It is written to `.rail/railmon/evidence-bundle.json` (override with
 `--evidence-bundle-output` or `RAIL_EVIDENCE_BUNDLE_OUTPUT`; skip with
 `--no-evidence-bundle`), like the feature file it is created `0600`, and it
 rides the same guarantee: the bundle is written from the same `finally`, so it
@@ -204,7 +209,7 @@ POSTs the bundle's exact bytes — the same bytes `--evidence-bundle-output`
 would write — straight to a RailDash instance:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --raildash-url http://localhost:8000
 ```
 
@@ -457,20 +462,20 @@ the collector's `--webhook` and `railmon forward`.
 From the repository root:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py
+python3 tools/scan/scan_agent_environment.py
 ```
 
 Write the payload to a file:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --output output/registration-payload.json
 ```
 
 Use explicit values when the model or provider cannot be inferred:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --sandbox-type bare_metal \
   --llm-provider anthropic \
   --llm-model claude-sonnet-4-20250514
@@ -490,7 +495,7 @@ Run the scanner against the running OpenClaw container:
 
 ```bash
 cd ../..
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --mode docker \
   --container openclaw-monitoring-openclaw-1 \
   --output examples/openclaw-monitoring/output/registration-payload.json
@@ -513,7 +518,7 @@ Expected detection for the bundled OpenClaw compose file:
 To infer model from an actual monitor capture:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --mode docker \
   --container openclaw-monitoring-openclaw-1 \
   --capture-file examples/openclaw-monitoring/output/openclaw-capture.jsonl
@@ -533,7 +538,7 @@ Run the scanner against the running NemoClaw container:
 
 ```bash
 cd ../..
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --mode docker \
   --container nemoclaw-monitoring-nemoclaw-1 \
   --output examples/nemoclaw-monitoring/output/registration-payload.json
@@ -556,7 +561,7 @@ Expected detection for the bundled NemoClaw compose file:
 To infer model from an actual monitor capture:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --mode docker \
   --container nemoclaw-monitoring-nemoclaw-1 \
   --capture-file examples/nemoclaw-monitoring/output/nemoclaw-capture.jsonl
@@ -576,7 +581,7 @@ Each `mcpServers` entry becomes a registration `SkillInput` with
 `source_type: "mcp_config"`. Pass custom paths with:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --mcp-config /path/to/.mcp.json
 ```
 
@@ -592,7 +597,7 @@ a multi-server `mcpServers` block.
 Merge external skills from the skills scanner:
 
 ```bash
-python3 tools/agent-environment-scanner/scan_agent_environment.py \
+python3 tools/scan/scan_agent_environment.py \
   --skills-file examples/openclaw-monitoring/output/openclaw-skills.json
 ```
 

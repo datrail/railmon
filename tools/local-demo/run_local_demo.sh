@@ -19,7 +19,7 @@ out_dir="${RAILMON_DEMO_OUT:-/out}"
 mkdir -p "$out_dir"
 
 echo "railmon demo: 1/3 self-scan -> $out_dir/features.json"
-python3 "$root/tools/agent-environment-scanner/scan_agent_environment.py" \
+python3 "$root/tools/scan/scan_agent_environment.py" \
     --mode self --output "$out_dir/features.json" >/dev/null
 # store_json (scan_agent_environment.py) opens with O_TRUNC, so re-running
 # this replaces features.json rather than growing it — running the demo

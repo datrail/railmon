@@ -8,14 +8,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-MODULE = ROOT / "tools/agent-environment-scanner/compose_evidence_bundle_v2.py"
+MODULE = ROOT / "tools/scan/compose_evidence_bundle_v2.py"
 spec = importlib.util.spec_from_file_location("compose_evidence_bundle_v2", MODULE)
 composer = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(composer)
 
 _bundle_spec = importlib.util.spec_from_file_location(
-    "evidence_bundle", ROOT / "tools/agent-environment-scanner/evidence_bundle.py"
+    "evidence_bundle", ROOT / "tools/scan/evidence_bundle.py"
 )
 evidence_bundle = importlib.util.module_from_spec(_bundle_spec)
 assert _bundle_spec.loader is not None

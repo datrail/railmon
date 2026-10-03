@@ -1341,14 +1341,41 @@ def build_evidence_bundle(
 # the brain's input, not the scan's primary artifact, so a write failure is
 # reported without changing the exit code - the feature file owns that.
 
-DEFAULT_EVIDENCE_BUNDLE_OUTPUT = Path(".rail") / "railscan" / "evidence-bundle.json"
+DEFAULT_EVIDENCE_BUNDLE_OUTPUT = Path(".rail") / "railmon" / "evidence-bundle.json"
+LEGACY_EVIDENCE_BUNDLE_OUTPUT = Path(".rail") / "railscan" / "evidence-bundle.json"
+
+_legacy_defaults_reported: set[Path] = set()
+
+
+def default_output(new: Path, legacy: Path) -> Path:
+    """A default output path, or its RailScan-era location in a working
+    directory that still uses the old layout.
+
+    The scanner's defaults moved from `.rail/railscan/` and
+    `.datrail/rail-guardian/` to `.rail/railmon/`. Whatever reads the old
+    files keeps working as long as the old directory exists and the new one
+    does not; the scanner says so once per path, and creating the new
+    directory (or passing the path explicitly) completes the move."""
+    if legacy.parent.is_dir() and not new.parent.exists():
+        if legacy not in _legacy_defaults_reported:
+            _legacy_defaults_reported.add(legacy)
+            print(
+                f"railmon scan: writing {legacy}, the deprecated RailScan location, "
+                f"because {legacy.parent} exists and {new.parent} does not; "
+                f"move it to {new.parent} or set the path explicitly",
+                file=sys.stderr,
+            )
+        return legacy
+    return new
 
 
 def evidence_bundle_output_path(args: Any) -> Path:
     configured = (
         getattr(args, "evidence_bundle_output", None) or os.environ.get("RAIL_EVIDENCE_BUNDLE_OUTPUT")
     )
-    return Path(configured).expanduser() if configured else DEFAULT_EVIDENCE_BUNDLE_OUTPUT
+    if configured:
+        return Path(configured).expanduser()
+    return default_output(DEFAULT_EVIDENCE_BUNDLE_OUTPUT, LEGACY_EVIDENCE_BUNDLE_OUTPUT)
 
 
 def build_verified_bundle(

@@ -132,6 +132,20 @@ jobs:
       - name: Scan inside the built image
         run: docker run --rm railmon:ci scan --mode self --host-id ci --compact > /dev/null
 
+      # The RailScan-era command names and script paths are deprecated but
+      # kept: the old paths are symlinks, which only a run in the image shows
+      # survived COPY.
+      - name: Legacy names inside the built image
+        run: |
+          docker run --rm railmon:ci agent-environment-scanner --mode self --host-id ci --compact > /dev/null
+          docker run --rm railmon:ci skills-scanner --help > /dev/null
+          docker run --rm railmon:ci rail-collector --help > /dev/null
+          for script in tools/agent-environment-scanner/scan_agent_environment.py \
+                        tools/skills-scanner/skill_scanner.py \
+                        rail-collector/rail_collector.py; do
+            docker run --rm --entrypoint python3 railmon:ci "/opt/railmon/$script" --help > /dev/null
+          done
+
       # The built-binary acceptance scripts (DR-109 M3/M4, DR-129) need root so
       # the supervisor and each agent run under distinct UIDs. The container's
       # root gives them that, and their AgentSight is a stub each script writes,

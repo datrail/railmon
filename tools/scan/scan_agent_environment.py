@@ -57,8 +57,14 @@ MODEL_KEYS = {
     "model_name",
     "modelName",
 }
-DEFAULT_REGISTRATION_OUTPUT = Path(".datrail") / "rail-guardian" / "registration.json"
-DEFAULT_FEATURE_OUTPUT = Path(".rail") / "railscan" / "features.json"
+DEFAULT_REGISTRATION_OUTPUT = Path(".rail") / "railmon" / "registration.json"
+DEFAULT_FEATURE_OUTPUT = Path(".rail") / "railmon" / "features.json"
+# RailScan-era defaults, still written where that layout is in use; see
+# evidence_bundle.default_output.
+LEGACY_REGISTRATION_OUTPUT = Path(".datrail") / "rail-guardian" / "registration.json"
+LEGACY_FEATURE_OUTPUT = Path(".rail") / "railscan" / "features.json"
+# A format identifier, not a path: consumers match on it, so it keeps the name
+# the format was published under.
 FEATURE_SCHEMA_VERSION = "railscan.features/v1"
 DEFAULT_CONTAINER_CONFIG_ROOTS = (
     "/home/node/.openclaw",
@@ -2644,22 +2650,30 @@ def registration_output_path(args: argparse.Namespace) -> Path:
         args.registration_output,
         os.environ.get("RAIL_REGISTRATION_OUTPUT"),
     )
-    return Path(configured).expanduser() if configured else DEFAULT_REGISTRATION_OUTPUT
+    if configured:
+        return Path(configured).expanduser()
+    import evidence_bundle  # lazy: breaks the import cycle
+
+    return evidence_bundle.default_output(DEFAULT_REGISTRATION_OUTPUT, LEGACY_REGISTRATION_OUTPUT)
 
 
 def feature_output_path(args: argparse.Namespace) -> Path:
     configured = first_nonempty(args.feature_output, os.environ.get("RAIL_FEATURE_OUTPUT"))
-    return Path(configured).expanduser() if configured else DEFAULT_FEATURE_OUTPUT
+    if configured:
+        return Path(configured).expanduser()
+    import evidence_bundle  # lazy: breaks the import cycle
+
+    return evidence_bundle.default_output(DEFAULT_FEATURE_OUTPUT, LEGACY_FEATURE_OUTPUT)
 
 
 def build_registration_state(center_url: str, payload: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
     """What we keep from a registration: the agent id, and nothing that is a ticket.
 
-    The response carries a `token`, and RailScan drops it on the floor. It is a
+    The response carries a `token`, and the scanner drops it on the floor. It is a
     placeholder minted with a null posture — posture is scored asynchronously
     after the response returns — so anything that stored or forwarded it would
     pin the fleet to a posture that was never computed. The proxy fetches its own
-    ticket; RailScan is the registrar, and a registrar holds no credentials.
+    ticket; the scanner is the registrar, and a registrar holds no credentials.
     """
     body = response.get("body")
     if not isinstance(body, dict):
@@ -2802,7 +2816,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evidence-bundle-output",
         help="Write the evidence bundle (the profile brain's input) here. "
-        "Defaults to .rail/railscan/evidence-bundle.json; RAIL_EVIDENCE_BUNDLE_OUTPUT also works.",
+        "Defaults to .rail/railmon/evidence-bundle.json; RAIL_EVIDENCE_BUNDLE_OUTPUT also works.",
     )
     parser.add_argument(
         "--no-evidence-bundle",

@@ -92,84 +92,50 @@ examples/nemoclaw-monitoring/nemoclaw-data  -> /home/node/.openclaw
 URL query strings and fragments are removed before output to avoid leaking
 credentials embedded in documentation.
 
-## Real OpenClaw Run
+## Real OpenClaw and NemoClaw runs
 
-From the repository root:
+`run-openclaw.sh` and `run-nemoclaw.sh` start the real agent from the Compose
+service in `examples/openclaw/` or `examples/nemoclaw/`, wait for the container,
+and scan `/home/node/.openclaw` inside it. DatRail does not publish the agent
+images, so name a reviewed tag or digest and the provider key the service
+needs:
 
 ```bash
-cd datrail-agent-monitor
-tools/skills-scanner/run-openclaw.sh
-cat examples/openclaw-monitoring/output/openclaw-skills.json
+export OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:REVIEWED_TAG
+export OPENAI_API_KEY=...
+tools/skills/run-openclaw.sh
+cat tools/skills/examples/openclaw/output/openclaw-skills.json
 ```
 
-The script runs the real OpenClaw service from
-`examples/openclaw-monitoring/docker-compose.yml`, discovers the running
-container, scans both the host data volume and `/home/node/.openclaw` inside the
-container, then writes:
+NemoClaw is the same with `NEMOCLAW_IMAGE` and `run-nemoclaw.sh`, writing
+`tools/skills/examples/nemoclaw/output/nemoclaw-skills.json`.
 
-```text
-examples/openclaw-monitoring/output/openclaw-skills.json
-```
-
-If OpenClaw has no `SKILL.md` files loaded yet, the output is `[]`. That is a
+If the agent has no `SKILL.md` files loaded yet, the output is `[]`. That is a
 successful scan of the real container, not a mock.
 
 The script waits briefly after the container is ready so OpenClaw can finish
 installing plugin runtime dependencies. Override the delay when needed:
 
 ```bash
-SKILL_SCANNER_STARTUP_DELAY=15 tools/skills-scanner/run-openclaw.sh
+SKILL_SCANNER_STARTUP_DELAY=15 tools/skills/run-openclaw.sh
 ```
+
+The Compose files used to come from a separate agent-hardening checkout named
+by `RAIL_AGENT_HARDENING_ROOT`. That repository is deprecated and the files now
+ship here; the variable is still honoured, with a deprecation note.
 
 Manual equivalent:
 
 ```bash
-cd datrail-agent-monitor/examples/openclaw-monitoring
-mkdir -p openclaw-data output
+cd tools/skills/examples/openclaw
 docker compose up -d openclaw
 OPENCLAW_CONTAINER="$(docker compose ps -q openclaw)"
 
-cd ../..
-python3 tools/skills-scanner/skill_scanner.py \
+cd ../../../..
+python3 tools/skills/skill_scanner.py \
   --agent openclaw \
   --container "$OPENCLAW_CONTAINER" \
-  --root examples/openclaw-monitoring/openclaw-data \
-  --output examples/openclaw-monitoring/output/openclaw-skills.json
-```
-
-## Real NemoClaw Run
-
-From the repository root:
-
-```bash
-cd datrail-agent-monitor
-tools/skills-scanner/run-nemoclaw.sh
-cat examples/nemoclaw-monitoring/output/nemoclaw-skills.json
-```
-
-The script runs the real NemoClaw service from
-`examples/nemoclaw-monitoring/docker-compose.yml`, discovers the running
-container, scans both the host data volume and `/home/node/.openclaw` inside the
-container, then writes:
-
-```text
-examples/nemoclaw-monitoring/output/nemoclaw-skills.json
-```
-
-Manual equivalent:
-
-```bash
-cd datrail-agent-monitor/examples/nemoclaw-monitoring
-mkdir -p nemoclaw-data output
-docker compose up -d nemoclaw
-NEMOCLAW_CONTAINER="$(docker compose ps -q nemoclaw)"
-
-cd ../..
-python3 tools/skills-scanner/skill_scanner.py \
-  --agent nemoclaw \
-  --container "$NEMOCLAW_CONTAINER" \
-  --root examples/nemoclaw-monitoring/nemoclaw-data \
-  --output examples/nemoclaw-monitoring/output/nemoclaw-skills.json
+  --output tools/skills/examples/openclaw/output/openclaw-skills.json
 ```
 
 ## Existing Containers
@@ -177,7 +143,7 @@ python3 tools/skills-scanner/skill_scanner.py \
 Scan an already-running OpenClaw container:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --agent openclaw \
   --container openclaw-test
 ```
@@ -185,7 +151,7 @@ python3 tools/skills-scanner/skill_scanner.py \
 Scan an already-running NemoClaw container:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --agent nemoclaw \
   --container nemoclaw-test
 ```
@@ -204,7 +170,7 @@ This keeps the integration read-only.
 Scan explicit directories:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --root examples/openclaw-monitoring/openclaw-data \
   --root examples/nemoclaw-monitoring/nemoclaw-data
 ```
@@ -226,7 +192,7 @@ By default, the scanner prints only the `skills` list. To emit a complete
 `RegisterAgentRequest` payload:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --agent openclaw \
   --container "$OPENCLAW_CONTAINER" \
   --payload \
@@ -238,7 +204,7 @@ python3 tools/skills-scanner/skill_scanner.py \
 To register directly with rail-center:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --agent openclaw \
   --container "$OPENCLAW_CONTAINER" \
   --register \
@@ -249,7 +215,7 @@ python3 tools/skills-scanner/skill_scanner.py \
 ```
 
 For richer environment detection, use
-`tools/agent-environment-scanner/scan_agent_environment.py` and replace its
+`tools/scan/scan_agent_environment.py` and replace its
 `skills` field with this tool's output.
 
 ## Trigger-Based Scanning
@@ -257,7 +223,7 @@ For richer environment detection, use
 Run continuously and emit whenever `SKILL.md` content changes:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --container "$OPENCLAW_CONTAINER" \
   --watch \
   --poll-interval 5
@@ -271,7 +237,7 @@ container fallback reads.
 Run a daily scan:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --container "$OPENCLAW_CONTAINER" \
   --daily \
   --output /var/log/datrail/openclaw-skills.json
@@ -280,7 +246,7 @@ python3 tools/skills-scanner/skill_scanner.py \
 Or choose an explicit interval:
 
 ```bash
-python3 tools/skills-scanner/skill_scanner.py \
+python3 tools/skills/skill_scanner.py \
   --container "$OPENCLAW_CONTAINER" \
   --interval-seconds 3600
 ```
@@ -290,15 +256,15 @@ python3 tools/skills-scanner/skill_scanner.py \
 Syntax check:
 
 ```bash
-python3 -m py_compile tools/skills-scanner/skill_scanner.py
+python3 -m py_compile tools/skills/skill_scanner.py
 ```
 
 Run against real apps:
 
 ```bash
-tools/skills-scanner/run-openclaw.sh
-tools/skills-scanner/run-nemoclaw.sh
+tools/skills/run-openclaw.sh
+tools/skills/run-nemoclaw.sh
 ```
 
-These commands use the real OpenClaw/NemoClaw containers from `examples/`; they
-do not create artificial skill fixtures.
+These commands use the real OpenClaw/NemoClaw containers from
+`tools/skills/examples/`; they do not create artificial skill fixtures.

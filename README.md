@@ -126,7 +126,7 @@ are not recorded. Start it before the agent, or restart the agent once it is
 running. Only the `listen` container is privileged. The agent can't reach the
 volume, so it can't edit its own record.
 See
-[the scanner's README](tools/agent-environment-scanner/README.md#observed-listeners-optional)
+[the scanner's README](tools/scan/README.md#observed-listeners-optional)
 for what the attribute holds.
 
 ## Platforms and security
