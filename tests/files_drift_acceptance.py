@@ -13,10 +13,11 @@ listen_drift_acceptance.py does for listeners:
    observed_file_access the only attribute that changed;
 4. lock that ASP; a write to the file that was only read before is DRIFT
    DETECTED again: the entry's `write` turned true;
-5. (DR-166) the agent writes and reads back randomly named temp files, named
-   by the real generators (Python's tempfile.mkstemp, NamedTemporaryFile
-   and the name it checks /tmp with, coreutils mktemp): they arrive folded into templated
-   paths (/tmp/tmp*, ...) and the note says so. Lock that ASP;
+5. (DR-166) the agent writes randomly named temp files (and reads one
+   back), named by the real generators (Python's tempfile.mkstemp,
+   NamedTemporaryFile and the name it checks /tmp with, coreutils mktemp):
+   they arrive folded into templated paths (/tmp/tmp*, ...) and the note
+   says so. Lock that ASP;
 6. a second run writes temp files under new random names: ALIGNED;
 7. a write to a new fixed name in /tmp (/tmp/exfil.tar) is DRIFT DETECTED,
    on observed_file_access alone, with the path kept as it is.

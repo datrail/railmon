@@ -1720,6 +1720,9 @@ class EphemeralFileAccessTest(unittest.TestCase):
             # Vim's swap file, whichever letter it got.
             ("/tmp/.notes.txt.swp", "/tmp/.notes.txt.sw*"),
             ("/tmp/.notes.txt.swo", "/tmp/.notes.txt.sw*"),
+            # Even when the edited file's own name looks random.
+            ("/tmp/.Report2.swp", "/tmp/.Report2.sw*"),
+            ("/tmp/.Report2.swo", "/tmp/.Report2.sw*"),
         ):
             with self.subTest(path=path):
                 self.assertEqual(self.template(path), expected)
@@ -1732,6 +1735,8 @@ class EphemeralFileAccessTest(unittest.TestCase):
             "/tmp/abcdefghi", "/tmp/0vuw8his.txt", "/tmp/Abcdefgh",
             # A directory merely named like one does not make its file random.
             "/tmp/tmpk3j_9xq2/out.json",
+            # The prefix-less pattern only directly in a temp dir.
+            "/tmp/work/abcdefgh", "/var/tmp/a/0vuw8his",
         ):
             with self.subTest(path=path):
                 self.assertIsNone(self.template(path))
@@ -1778,6 +1783,19 @@ class EphemeralFileAccessTest(unittest.TestCase):
                                            self.entry("/tmp/tmp*", layer=True)])
         self.assertEqual(result["collapsed"], 3)
 
+    def test_a_fold_whose_entry_is_left_out_is_not_counted(self):
+        # The note says files were folded only when a templated entry is listed.
+        with mock.patch.object(scanner, "FILE_ACCESS_TRACKED", 1):
+            result = self.summary(self.event(path="/a", read=False, write=True),
+                                  self.event(path="/tmp/tmpk3j_9xq2", read=False, write=True))
+        self.assertEqual((result["files"], result["collapsed"], result["unlisted"]),
+                         ([self.entry("/a", read=False, write=True)], 0, 1))
+        with mock.patch.object(scanner, "FILE_ACCESS_CAP", 1):
+            result = self.summary(self.event(path="/a", read=False, write=True),
+                                  self.event(path="/tmp/tmpk3j_9xq2"), self.event(path="/tmp/tmp9zz8yy7x"))
+        self.assertEqual((result["files"], result["collapsed"], result["unlisted"]),
+                         ([self.entry("/a", read=False, write=True)], 0, 1))
+
     def test_nothing_folded_counts_zero(self):
         result = self.summary(self.event(path="/tmp/exfil.tar"))
         self.assertEqual((result["files"], result["collapsed"]), ([self.entry("/tmp/exfil.tar")], 0))
@@ -1789,14 +1807,24 @@ class EphemeralFileAccessTest(unittest.TestCase):
         self.assertEqual((result["unlisted"], result["collapsed"]), (0, len(names)))
 
     def test_the_scanned_tmpdir_is_a_temp_dir_and_a_bad_one_is_ignored(self):
-        dirs = scanner.file_temp_dirs({"TMPDIR": "/scratch/agent/"})
+        dirs = scanner.file_temp_dirs({"TMPDIR": "/scratch/agent/", "HOME": "/home/a"})
         self.assertEqual(dirs, (*scanner.FILE_TEMP_DIRS, "/scratch/agent"))
         self.assertEqual(self.template("/scratch/agent/tmpk3j_9xq2", dirs), "/scratch/agent/tmp*")
+        self.assertEqual(self.template("/scratch/agent/0vuw8his", dirs), "/scratch/agent/*")
         self.assertIsNone(self.template("/scratch/agentx/tmpk3j_9xq2", dirs))
+        # The agent sets $TMPDIR, so only files directly in it fold.
+        self.assertIsNone(self.template("/scratch/agent/sub/tmpk3j_9xq2", dirs))
+        # A $TMPDIR below /tmp folds below itself anyway, as part of /tmp.
+        self.assertEqual(self.template("/tmp/a/b/tmpk3j_9xq2", scanner.file_temp_dirs({"TMPDIR": "/tmp/a"})),
+                         "/tmp/a/b/tmp*")
         for value in ("/", "", "relative/tmp", "/a/../b", "/a//b", "/a/./b", "/a\nb", None, 7,
-                      "/tmp", "/" + "a" * 300):
+                      "/tmp", "/" + "a" * 300, "/etc", "/etc/x", "/usr/local/tmp", "/dev/x", "/proc/1",
+                      "/home/a", "/home/a/"):
             with self.subTest(value=value):
-                self.assertEqual(scanner.file_temp_dirs({"TMPDIR": value}), scanner.FILE_TEMP_DIRS)
+                self.assertEqual(scanner.file_temp_dirs({"TMPDIR": value, "HOME": "/home/a"}),
+                                 scanner.FILE_TEMP_DIRS)
+        self.assertEqual(scanner.file_temp_dirs({"TMPDIR": "/home/a/tmp", "HOME": "/home/a"}),
+                         (*scanner.FILE_TEMP_DIRS, "/home/a/tmp"))
         self.assertEqual(scanner.file_temp_dirs(None), scanner.FILE_TEMP_DIRS)
         self.assertIsNone(self.template("/scratch/agent/tmpk3j_9xq2"))
 

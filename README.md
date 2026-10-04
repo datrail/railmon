@@ -157,11 +157,11 @@ namespace, which appends a line the first time a process opens a regular file
 to read, write or run it. An interval scan turns those lines into the bundle's
 `observed_file_access`: what the kernel saw the sandbox open, kept apart from
 anything a configuration declares or a tool call asked for. A newly written
-path is drift in RailDash; a randomly named temp file (Python's `tempfile`,
+path is drift in RailDash. A randomly named temp file (Python's `tempfile`,
 `mkstemp`, `mktemp`, a Vim swap file) under `/tmp`, `/var/tmp`, `/dev/shm` or
-the agent's `$TMPDIR` is folded into one templated path such as `/tmp/tmp*`
-first, so a new random name each run is not, while a new fixed name like
-`/tmp/exfil.tar` still is. The deployment is the listener one with its own
+in the agent's `$TMPDIR` is first folded into one templated path such as
+`/tmp/tmp*`, so a new random name each run is not drift, while a new name that
+fits no pattern, like `/tmp/exfil.tar`, still is. The deployment is the listener one with its own
 variables (`RAIL_FILES_CONTAINER`, `RAIL_FILES_FILE`, `RAIL_FILES_HEARTBEAT`),
 and the scan reads both files:
 
