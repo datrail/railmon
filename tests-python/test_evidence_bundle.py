@@ -1446,11 +1446,11 @@ class ScannerWiringTest(unittest.TestCase):
                                "dev": "0:1", "ino": 2})
 
         lines = [json.dumps({"kind": "start", "time": "2026-10-03T08:00:00Z", "every": 0}),
-                 opened("/scratch/tmpk3j_9xq2"), opened("/scratch/tmp9zz8yy7x"), opened("/tmp/tmpqwertyui")]
+                 opened("/scratch/tmp/tmpk3j_9xq2"), opened("/scratch/tmp/tmp9zz8yy7x"), opened("/tmp/tmpqwertyui")]
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "files.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
             env = {k: v for k, v in os.environ.items() if not k.startswith("RAIL_")}
-            env["TMPDIR"] = "/scratch"
+            env["TMPDIR"] = "/scratch/tmp"
             proc = subprocess.run(
                 ["python3", str(SCANNER), "--mode", "self", "--host-id", "h-1",
                  "--feature-output", f"{tmp}/features.json", "--evidence-bundle-output", f"{tmp}/bundle.json",
@@ -1460,7 +1460,7 @@ class ScannerWiringTest(unittest.TestCase):
             features = json.loads(Path(tmp, "features.json").read_text())["observed_file_access"]
             field = json.loads(Path(tmp, "bundle.json").read_text())["attributes"]["observed_file_access"]
         expected = [{"path": path, "read": False, "write": True, "exec": False, "layer": False}
-                    for path in ("/scratch/tmp*", "/tmp/tmp*")]
+                    for path in ("/scratch/tmp/tmp*", "/tmp/tmp*")]
         self.assertEqual((features["files"], features["collapsed"]), (expected, 3))
         self.assertEqual((field["status"], field["value"]), ("ANSWERED", expected))
         self.assertIn("randomly named temp files are folded", field["note"])

@@ -463,10 +463,14 @@ names, and only those, at the source:
   the scanner's own in `--mode self`). The agent can set `$TMPDIR`, so it
   counts only when it is an absolute path of at most 256 printable
   characters (a trailing `/` is dropped) with no empty, `.` or `..` part,
-  and is not `/`, the environment's `$HOME`, or in or below `/bin`, `/boot`,
-  `/dev`, `/etc`, `/lib*`, `/proc`, `/sbin`, `/sys` or `/usr`;
+  whose last part names a temp dir (`tmp`, `temp`, `tmpdir` or `tempdir`, in
+  any case, with or without a leading `.`), and which is not the
+  environment's `$HOME` or in or below `/bin`, `/boot`, `/dev`, `/etc`,
+  `/lib`, `/lib32`, `/lib64`, `/libexec`, `/libx32`, `/proc`, `/sbin`, `/sys`
+  or `/usr`. So `/home/a/.tmp` counts, and `/home/a`, `~/.ssh` or a workdir
+  never do;
 - only when the file's own name matches one of these, in full. The first
-  that matches wins:
+  that matches, and may apply where the file is, wins:
 
   | Pattern | Made by | Example | Folded path |
   | --- | --- | --- | --- |

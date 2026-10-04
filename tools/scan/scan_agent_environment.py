@@ -1786,14 +1786,17 @@ MAX_FILE_LINE = 65536
 # is in the baseline such a write is aligned. That is the price of not
 # reporting drift on every scan, and the README says so.
 FILE_TEMP_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
-# A $TMPDIR is refused when it is, or is below, one of these: they hold the
-# system and the agent's own code, never scratch files.
-FILE_TEMP_REFUSED = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32",
-                     "/proc", "/sbin", "/sys", "/usr")
+# The agent sets $TMPDIR, so it counts only when its last part names a temp
+# dir (/scratch/tmp, /home/a/.tmp, /work/temp), never a home, a workdir or
+# ~/.ssh; and even then not when it is, or is below, one of these system dirs.
+FILE_TEMP_DIR_NAME = re.compile(r"\.?(?:tmp|temp)(?:dir)?", re.IGNORECASE)
+FILE_TEMP_REFUSED = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libexec",
+                     "/libx32", "/proc", "/sbin", "/sys", "/usr")
 # An optional extension the caller asked for (mkstemp's suffix, mkstemps).
 _TEMP_SUFFIX = r"(?P<suffix>\.[A-Za-z0-9]{1,8})?"
 # (name pattern, what its `random` group must hold, whether it may fold below
-# a temp dir as well as directly in it). The first that matches wins.
+# a temp dir as well as directly in it). The first that matches, and may
+# apply where the file is, wins.
 FILE_TEMP_PATTERNS = (
     # Vim's swap files, whose last letter moves on (.swp, .swo, ...) when one
     # is already taken. First, so a swap file of an edited file whose name
@@ -1822,10 +1825,10 @@ def file_temp_dirs(env: dict[str, str] | None = None) -> tuple[str, ...]:
     """The temp dirs whose randomly named files are folded: FILE_TEMP_DIRS,
     plus the scanned environment's $TMPDIR (where that agent's tempfile and
     mktemp write) when it is a plain absolute directory: printable, at most
-    256 characters, no empty, `.` or `..` part, not the root, not the
-    environment's $HOME, and not in FILE_TEMP_REFUSED. The agent can set it,
-    so anything else is ignored, and only files directly in it are folded
-    (`ephemeral_file_template`)."""
+    256 characters, no empty, `.` or `..` part, a last part that names a temp
+    dir (FILE_TEMP_DIR_NAME), not the environment's $HOME, and not in
+    FILE_TEMP_REFUSED. The agent can set it, so anything else is ignored,
+    and only files directly in it are folded (`ephemeral_file_template`)."""
     dirs = list(FILE_TEMP_DIRS)
     env = env or {}
     tmpdir, home = env.get("TMPDIR"), env.get("HOME")
@@ -1834,6 +1837,7 @@ def file_temp_dirs(env: dict[str, str] | None = None) -> tuple[str, ...]:
         if (
             tmpdir.startswith("/") and len(tmpdir) <= 256 and tmpdir.isprintable()
             and all(part not in ("", ".", "..") for part in tmpdir.split("/")[1:])
+            and FILE_TEMP_DIR_NAME.fullmatch(tmpdir.rsplit("/", 1)[-1]) is not None
             and not any(tmpdir == root or tmpdir.startswith(root + "/") for root in FILE_TEMP_REFUSED)
             and tmpdir != (home.rstrip("/") if isinstance(home, str) else None)
             and tmpdir not in dirs
@@ -1861,7 +1865,7 @@ def ephemeral_file_template(path: str, temp_dirs: Iterable[str] = FILE_TEMP_DIRS
         match = pattern.fullmatch(name)
         if match and (random_must is None or random_must.search(match.group("random"))):
             if not (directly or nested):
-                return None
+                continue  # a later pattern may still fold it below one
             return f"{directory}/{match.group('prefix')}*{match.groupdict().get('suffix') or ''}"
     return None
 
@@ -1913,6 +1917,8 @@ def summarize_file_access(
     # of them it stops growing.
     collapsed: set[int] = set()
     folded_into: dict[tuple[str, bool], int] = {}
+    # Every templated entry, uncapped, so the note is said whenever one is listed.
+    templated: set[tuple[str, bool]] = set()
     # Written or run entries left out or unnamed, counted apart from reads so
     # the bundle's note can say a write was lost, not just "more files".
     unlisted_write_exec = unnamed_write_exec = 0
@@ -1980,6 +1986,8 @@ def summarize_file_access(
             if not (seen[1] or seen[2]) and (merged[1] or merged[2]):
                 tracked_reads -= 1  # it moves classes; the total does not grow
                 tracked_write_exec += 1
+        if template is not None:
+            templated.add(key)
         if template is not None and len(collapsed) < FILE_ACCESS_TRACKED:
             folded = hash((path, layer))
             if folded not in collapsed:
@@ -2013,8 +2021,10 @@ def summarize_file_access(
         "unlisted_write_exec": unlisted_write_exec,
         "unnamed_write_exec": unnamed_write_exec,
         # Only the entries in the list count, so the note never claims a fold
-        # whose entry the cap left out.
-        "collapsed": sum(folded_into.get((entry["path"], entry["layer"]), 0) for entry in kept),
+        # whose entry the cap left out; and a listed templated entry always
+        # counts, so the note is never lost once the count stopped growing.
+        "collapsed": sum(max(folded_into.get(key, 0), 1) for key in
+                         ((entry["path"], entry["layer"]) for entry in kept) if key in templated),
         "malformed": malformed,
         "outside_namespace": outside,
         **health.summary(now),
