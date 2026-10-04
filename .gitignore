@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 *.jsonl
+# Test inputs are JSONL on purpose.
+!tests/fixtures/*.jsonl
 captured.json
 bin/
 
