@@ -143,7 +143,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
 | `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events; and `peers`, who connected in (see [Ingress peers](#ingress-peers)) |
-| `observed_file_access` | only with `--files-file`: the files the sandbox opened, as `files` (path and read/write/exec/layer), plus counts of lost, unlisted, unnamed and malformed events, and `collapsed`, the distinct randomly named temp files folded into listed entries (see [Observed file access](#observed-file-access-optional)) |
+| `observed_file_access` | only with `--files-file`: the files the sandbox opened, as `files` (path and read/write/exec/layer), plus counts of lost, unlisted, unnamed and malformed events, and `collapsed`, the distinct randomly named temp files folded into listed entries (a lower bound past 16,384) (see [Observed file access](#observed-file-access-optional)) |
 
 Metadata only — never a secret value. That is what makes the file safe to
 persist and hand to a scorer. It is written `0600`: the inventory names an
@@ -510,8 +510,9 @@ When an entry in the list holds a folded file, the note says "randomly named
 temp files are folded into one path per directory and name pattern, with * for
 the random part", so a templated path never passes for a file of that name.
 The feature file's `collapsed` counts the distinct paths folded into listed
-entries. Folding is new in rule pack 5: RailDash shows a baseline locked under
-pack 4 as `CONTRACT_MISMATCH`, not as drift, until a pack-5 ASP is locked.
+entries; past 16,384 it is a lower bound, with at least 1 per listed template.
+Folding is new in rule pack 5: RailDash shows a baseline locked under pack 4 as
+`CONTRACT_MISMATCH`, not as drift, until a pack-5 ASP is locked.
 
 ### Schema and limits
 

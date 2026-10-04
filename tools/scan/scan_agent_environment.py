@@ -1903,7 +1903,8 @@ def summarize_file_access(
     - a randomly named temp file (`ephemeral_file_template`) is folded into
       its template's entry, its access unioned in like any other open, and
       the distinct paths folded into entries that made the list are counted
-      in `collapsed` (up to FILE_ACCESS_TRACKED);
+      in `collapsed`. Past FILE_ACCESS_TRACKED folds it is a lower bound,
+      though every listed templated entry still counts at least 1;
     - `lost` and the start/alive records mean what they do for listensnoop.
 
     Produce the file with filesnoop run in the agent's PID namespace (`-n`);
