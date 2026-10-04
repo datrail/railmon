@@ -75,7 +75,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 4 adds observed_file_access (DR-154), the same way.
 # Pack 5 folds its randomly named temp files into templated paths (DR-166):
 # a pack-4 baseline holds them verbatim, so it is not comparable.
-RULE_PACK_VERSION = 5
+# Pack 6 reports observed_destinations without a snapshot as BLIND, not
+# ABSENT (DR-168): a pack-5 baseline would show that as a status change.
+RULE_PACK_VERSION = 6
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -990,7 +992,12 @@ def build_evidence_bundle(
             note="a finite window; destinations unseen in it are not destinations that do not exist",
         )
     else:
-        attributes["observed_destinations"] = _absent("no AgentSight snapshot was provided to this scan", "observed")
+        # Nobody watched, so this is not "looked and found none" (ANSWERED []
+        # above is that): BLIND, the way tool_names says it (DR-168).
+        attributes["observed_destinations"] = _blind(
+            "NOT_COLLECTED_BY_PACK", "observed",
+            note="no AgentSight snapshot was provided to this scan",
+        )
 
     if reach:
         undeclared = sorted(set(reach.get("undeclared_destinations") or []))

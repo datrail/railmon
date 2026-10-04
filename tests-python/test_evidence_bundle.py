@@ -969,6 +969,31 @@ class BundleWritePathTest(unittest.TestCase):
             self.assertEqual(notes_attrs["approval_policy"]["status"], "BLIND")
 
 
+class ObservedDestinationsBundleTest(unittest.TestCase):
+    """observed_destinations says whether anyone watched (DR-168)."""
+
+    def attributes(self, reach):
+        bundle = evidence_bundle.build_evidence_bundle(
+            build_args(), self_context(), dict(HOST_PAIR), identity(observed_reach=reach)
+        )
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+        return bundle["attributes"]
+
+    def test_without_a_snapshot_the_pack_says_it_did_not_look(self):
+        # ABSENT would read as "looked, and the agent sends nowhere", and a
+        # baseline locked from it would call every later host new.
+        attributes = self.attributes(None)
+        field = attributes["observed_destinations"]
+        self.assertEqual((field["status"], field["reason"], field["tier"]),
+                         ("BLIND", "NOT_COLLECTED_BY_PACK", "observed"))
+        self.assertIn("no AgentSight snapshot", field["note"])
+        self.assertEqual(field["reason"], attributes["tool_names"]["reason"])
+
+    def test_a_snapshot_with_no_traffic_is_answered_empty(self):
+        field = self.attributes(scanner.summarize_observed({"summary": {}}, set()))["observed_destinations"]
+        self.assertEqual((field["status"], field["value"]), ("ANSWERED", []))
+
+
 class ObservedListenersBundleTest(unittest.TestCase):
     """The listening half of observed reach in the bundle (DR-125)."""
 
@@ -997,8 +1022,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # which RailDash shows as CONTRACT_MISMATCH rather than drift.
         # Pack 3 added observed_ingress_peers (DR-145), pack 4
         # observed_file_access (DR-154); pack 5 folds its random temp names
-        # (DR-166), so a pack-4 baseline is not compared against it.
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 5)
+        # (DR-166), so a pack-4 baseline is not compared against it; pack 6
+        # makes observed_destinations BLIND without a snapshot (DR-168).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 6)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)

@@ -279,6 +279,15 @@ classifies, redacts and diffs — it grows no parser of its own. The payoff is
 `undeclared_destinations`: hosts the agent reached that nothing in its
 configuration declared.
 
+Without a snapshot, `observed_destinations`, `undeclared_destinations` and
+`tool_names` are `BLIND` / `NOT_COLLECTED_BY_PACK`: nobody watched, which is
+not the same as an agent that sends nowhere. A snapshot with no traffic did
+look: `observed_destinations` is then an `ANSWERED` empty list, and
+`tool_names` and `undeclared_destinations` are `ABSENT` with nothing to list.
+`observed_destinations` used to be `ABSENT` without a snapshot too; rule
+pack 6 corrected it, so RailDash shows a baseline locked under pack 5 as
+`CONTRACT_MISMATCH`, not as drift, until a pack-6 ASP is locked.
+
 It reads `network_targets`, `tool_calls[].tool_name`, `token_summary[].group`
 and the summary counts, and deliberately nothing else. `tool_calls` also carries
 `input`/`output` and `process_nodes` carries full `argv` — conversation and
