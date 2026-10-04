@@ -4,7 +4,11 @@ POST /v1/interactions takes, not one RuntimeInteraction object per request.
 The request body is checked against a vendored copy of Rail Center's
 published contract (tests/fixtures/rail-center/, source and commit in its
 `$comment`), and against a fixture that was itself validated against both that
-schema and Rail Center's Pydantic model. Stdlib only, like the forwarder.
+schema and Rail Center's Pydantic model. The two are not identical: the
+published schema allows only the standard HTTP methods where the model takes
+any string, and the model alone requires `body` to be an object and
+`runtime_identity_version`/`attribution`/`agent_ref` to come as a consistent
+set. The forwarder meets both. Stdlib only, like the forwarder.
 """
 
 from __future__ import annotations
@@ -218,6 +222,25 @@ class ForwardEnvelopeTest(unittest.TestCase):
         self.assertEqual(len(rail_collector.event_session(event)[0]), 64)
         event["raw"]["request"]["method"] = "M" * 17
         self.assertNotIn("request", rail_collector.to_interaction_item(event))
+
+    def test_a_capture_start_that_is_not_a_real_instant_is_left_out(self):
+        event = json.loads(json.dumps(EVENTS[0]))
+        for bad in ("2026-13-02T17:00:00Z", "2026-10-02T25:00:00Z", "2026-02-30T00:00:00Z", "yesterday"):
+            event["raw"]["railmon_capture_start"] = bad
+            self.assertIsNone(rail_collector.event_session(event)[1], bad)
+        for good in ("2026-10-02T17:00:00Z", "2026-10-02t17:00:00.123456789z", "2026-10-02T17:00:00+00:00"):
+            event["raw"]["railmon_capture_start"] = good
+            self.assertEqual(rail_collector.event_session(event)[1], good)
+
+    def test_integers_rail_center_cannot_store_are_left_out(self):
+        event = json.loads(json.dumps(EVENTS[0]))
+        event["raw"].update(pid=2**31, tid=-(2**31) - 1, request_size=2**31 - 1)
+        event["raw"]["response"]["status_code"] = 2**40
+        item = rail_collector.to_interaction_item(event)
+        self.assertNotIn("pid", item)
+        self.assertNotIn("tid", item)
+        self.assertEqual(item["request_size"], 2**31 - 1)
+        self.assertNotIn("status_code", item["response"])
 
     def test_an_unreachable_center_keeps_every_event_spooled(self):
         self.url = "http://127.0.0.1:9"

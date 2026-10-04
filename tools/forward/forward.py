@@ -249,6 +249,9 @@ MAX_BATCH_BYTES = 16 * 1024 * 1024
 MAX_METHOD_CHARS = 16
 MAX_PATH_CHARS = 2048
 MAX_SESSION_ID_CHARS = 64
+# Its integer columns (pid, tid, request_size, response_size, status_code)
+# are 32-bit; a value outside that range is also a 500, so it is left out.
+INT32_MIN, INT32_MAX = -(2**31), 2**31 - 1
 DEFAULT_BATCH_SIZE = 100
 COLLECTOR_AGENT = "railmon"  # what the collector's `--webhook` names itself
 UNKNOWN_SESSION = "unknown"
@@ -256,7 +259,22 @@ _DATE_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Z
 
 
 def _as_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+    """An integer Rail Center can store, else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and INT32_MIN <= value <= INT32_MAX:
+        return value
+    return None
+
+
+def _date_time(value: object) -> str | None:
+    """`value` if it is an RFC 3339-shaped date-time that names a real
+    instant (no month 13, no hour 25), else None."""
+    if not isinstance(value, str) or not _DATE_TIME.match(value):
+        return None
+    try:
+        datetime.fromisoformat(value.upper())  # a lowercase t or z is still RFC 3339
+    except ValueError:
+        return None
+    return value
 
 
 def _string_headers(value: object) -> dict | None:
@@ -351,10 +369,7 @@ def event_session(event: dict) -> tuple[str, str | None]:
     if not isinstance(session_id, str) or not session_id.strip():
         session_id = UNKNOWN_SESSION
     session_id = session_id[:MAX_SESSION_ID_CHARS]
-    capture_start = raw.get("railmon_capture_start")
-    if not isinstance(capture_start, str) or not _DATE_TIME.match(capture_start):
-        capture_start = None
-    return session_id, capture_start
+    return session_id, _date_time(raw.get("railmon_capture_start"))
 
 
 def batch_envelope(session: tuple[str, str | None], items: list[dict]) -> dict:
@@ -481,7 +496,10 @@ def drain_pending(
                 # Rail Center refuses a whole batch over one item. Halved, the
                 # rest still land and only that item is left, instead of it
                 # holding its neighbours back forever. A 5xx is not split: it
-                # says nothing about the batch's contents and may pass.
+                # is usually transient. One an item's own content causes
+                # (a value too large for a column) keeps that batch pending
+                # until fixed; to_interaction_item trims or drops the values
+                # known to do that, so the rest is not expected.
                 half = len(chunk) // 2
                 chunks[:0] = [chunk[:half], chunk[half:]]
             elif status in (413, 422):
@@ -498,7 +516,8 @@ def drain_pending(
                 )
             else:
                 # Unreachable, a redirect, or a server error: possibly
-                # transient, so the batch stays pending for the next drain.
+                # transient, so the batch stays pending, unsplit, for the
+                # next drain.
                 failed += len(chunk)
                 print(
                     f"[rail-collector] forward failed {len(chunk)} interaction(s) session={session[0]} "

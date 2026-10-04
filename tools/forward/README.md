@@ -53,7 +53,9 @@ event's `interaction_id`. A keyed event's `runtime_identity_version`,
 `agent_ref` and `attribution` ride along, except that a null `method` or
 `reason` is left out, as Rail Center's published schema requires. A path
 longer than 2048 characters or a session id longer than 64 is trimmed to
-what Rail Center stores.
+what Rail Center stores, and an integer (pid, tid, sizes, status code) outside
+its 32-bit columns is left out, as is a `capture_start` that is not a real
+date-time.
 
 Events are grouped by capture session, in batches of at most `--batch-size`
 (default 100, at most 1000) and 16 MiB of JSON. Each flush sends everything
