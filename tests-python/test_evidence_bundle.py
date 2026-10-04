@@ -20,10 +20,11 @@ import io
 import json
 import os
 import sys
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1618,6 +1619,14 @@ class UnchangedBundleReuseTest(unittest.TestCase):
             if ticks["n"] >= 3:
                 raise KeyboardInterrupt
 
+        # Replace the scanner's `time` reference, not the shared `time`
+        # module: any other `time.sleep` in the process (a polling loop left
+        # over from another test) would otherwise use up the scan loop's ticks.
+        scanner_time = SimpleNamespace(
+            **{name: getattr(time, name) for name in dir(time) if not name.startswith("__")}
+        )
+        scanner_time.sleep = sleep
+
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 env = {k: v for k, v in os.environ.items() if not k.startswith("RAIL_")}
@@ -1627,7 +1636,7 @@ class UnchangedBundleReuseTest(unittest.TestCase):
                 modules = {"evidence_bundle": evidence_bundle, "scan_agent_environment": scanner}
                 with mock.patch.dict(os.environ, env, clear=True), \
                         mock.patch.dict(sys.modules, modules), \
-                        mock.patch.object(scanner.time, "sleep", sleep), \
+                        mock.patch.object(scanner, "time", scanner_time), \
                         contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
                     code = scanner.main([
                         "--mode", "self", "--host-id", "h-1", "--agent-key", "a-1",
