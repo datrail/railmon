@@ -1571,6 +1571,49 @@ def _peer_address(value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address |
 HEARTBEAT_GRACE = 3
 
 
+def _probe_beat(event: dict[str, Any], kind: str) -> tuple[datetime, int] | None:
+    """A `start` or `alive` record's time and interval, or None when it is
+    malformed. listensnoop and filesnoop write them the same way."""
+    try:
+        seen = datetime.strptime(str(event.get("time")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    interval = event.get("every")
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval < (kind == "alive"):
+        return None
+    return seen, interval
+
+
+class _ProbeHealth:
+    """Whether a probe's event file can be trusted, from its start and alive
+    records: no start record, a restart, or a stale heartbeat (see
+    `summarize_listeners`). Shared by listensnoop's and filesnoop's files."""
+
+    def __init__(self) -> None:
+        self.starts = 0
+        self.every = 0
+        self.last_alive: datetime | None = None
+
+    def beat(self, kind: str, seen: datetime, interval: int) -> None:
+        self.starts += kind == "start"
+        if self.last_alive is None or seen > self.last_alive:
+            self.last_alive, self.every = seen, interval
+
+    def summary(self, now: datetime | None) -> dict[str, Any]:
+        last_alive, every = self.last_alive, self.every
+        return {
+            "starts": self.starts,
+            "restarted": self.starts > 1,
+            "last_alive": last_alive.strftime("%Y-%m-%dT%H:%M:%SZ") if last_alive else None,
+            # None when there is no interval to judge by: no -H, or no record.
+            "stale": (
+                None if last_alive is None or not every
+                else abs(((now or datetime.now(timezone.utc)) - last_alive).total_seconds())
+                > HEARTBEAT_GRACE * every
+            ),
+        }
+
+
 def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> dict[str, Any]:
     """Turn listensnoop's JSON lines into the listening half of observed reach.
 
@@ -1614,10 +1657,9 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
     listeners: set[tuple[str, str, Any, str]] = set()
     peers: set[tuple[str, str, Any, str, Any]] = set()
     lost = unlisted = peers_unlisted = malformed = outside = 0
-    last_alive: datetime | None = None
+    health = _ProbeHealth()
     last_start: datetime | None = None
     peers_reported = False
-    every = starts = 0
     for line in lines:
         line = line.strip()
         if not line:
@@ -1636,21 +1678,14 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
             lost += count if isinstance(count, int) and count > 0 else 0
             continue
         if kind in ("alive", "start"):
-            try:
-                seen = datetime.strptime(str(event.get("time")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            except ValueError:
+            beat = _probe_beat(event, kind)
+            if beat is None:
                 malformed += 1
                 continue
-            interval = event.get("every")
-            if not isinstance(interval, int) or isinstance(interval, bool) or interval < (kind == "alive"):
-                malformed += 1
-                continue
-            if kind == "start":
-                starts += 1
-                if last_start is None or seen >= last_start:
-                    last_start, peers_reported = seen, event.get("peers") is True
-            if last_alive is None or seen > last_alive:
-                last_alive, every = seen, interval
+            seen, interval = beat
+            if kind == "start" and (last_start is None or seen >= last_start):
+                last_start, peers_reported = seen, event.get("peers") is True
+            health.beat(kind, seen, interval)
             continue
         port, protocol, addr = event.get("port"), event.get("protocol"), event.get("addr")
         comm, ephemeral = event.get("comm"), event.get("ephemeral")
@@ -1706,28 +1741,182 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
         "peers_unlisted": peers_unlisted,
         "malformed": malformed,
         "outside_namespace": outside,
-        "starts": starts,
-        "restarted": starts > 1,
-        "last_alive": last_alive.strftime("%Y-%m-%dT%H:%M:%SZ") if last_alive else None,
-        # None when there is no interval to judge by: no -H, or no record.
-        "stale": (
-            None if last_alive is None or not every
-            else abs(((now or datetime.now(timezone.utc)) - last_alive).total_seconds())
-            > HEARTBEAT_GRACE * every
-        ),
+        **health.summary(now),
     }
 
 
-def _bounded_lines(stream: Any) -> Iterable[str]:
-    """Lines of at most MAX_LISTEN_LINE characters; a longer one is yielded
-    as a single unparseable marker, never held whole."""
+# Distinct (path, layer) entries kept in the bundle. A process opens many
+# files: a stdlib-only Python touches ~150 on start, and a real agent with its
+# packages far more. So the cap is wider than the listeners', and when it is
+# hit, what is dropped is reads: every write and exec is kept first, since a
+# newly written path is the drift that matters most.
+FILE_ACCESS_CAP = 512
+# And a byte budget, because the agent names its files: a 1024-character
+# path of non-ASCII characters renders as ~6 KB (the bundle is written with
+# ensure_ascii), so 512 of them would push the bundle past RailDash's 1 MiB
+# bound and every delivery would be refused. Each entry is measured as
+# rendered compactly, plus FILE_ENTRY_OVERHEAD for the indentation of the
+# pretty-printed form. An entry that does not fit is left out and counted,
+# like one past the cap. Ordinary paths reach the 512 cap long before this.
+FILE_ACCESS_BYTES = 256 * 1024
+FILE_ENTRY_OVERHEAD = 128
+# Distinct entries tracked while reading, before the cap picks; beyond this
+# they are only counted. Read-only entries and written-or-run ones each get
+# this many, so a flood of reads cannot use up the room a write needs.
+# filesnoop's own dedup LRU is 65,536 entries.
+FILE_ACCESS_TRACKED = 16384
+# A longer path is counted, not listed: it would let one entry dominate the
+# bundle. PATH_MAX is 4096, so an agent can make one; that is a gap (PARTIAL),
+# never a silent omission.
+FILE_PATH_MAX = 1024
+# filesnoop's longest line: a 4096-byte path with every byte escaped as
+# \u00XX, its path_hex, and the fixed fields, about 33,000 characters.
+MAX_FILE_LINE = 65536
+
+
+def summarize_file_access(lines: Iterable[str], now: datetime | None = None) -> dict[str, Any]:
+    """Turn filesnoop's JSON lines into the files the sandbox opened (DR-154).
+
+    filesnoop (ebpf-tls-tap, DR-152) reports the first time each process
+    opens each regular file for each kind of access. Like the listeners,
+    this keeps what was touched and how, with no counts, PIDs or process
+    names, so the value only changes when a file is opened in a new way:
+
+    - one entry per (path, layer), with `read`, `write` and `exec` the union
+      of every access seen. A file first read and later written is one entry
+      whose `write` turns true: that change is the drift;
+    - process names are left out: comm is per thread and agent-chosen
+      (Python names its threads "Thread-8 (reader)"), so it would churn;
+    - `layer` is filesnoop's flag for an open overlayfs made in a layer
+      beneath, under the credentials of a user-namespace mounter; its path is
+      the layer's, so it is its own entry;
+    - an event with pid 0 came from outside filesnoop's PID namespace, so it
+      is only counted;
+    - a path filesnoop could not resolve (`path_error`) or longer than
+      FILE_PATH_MAX is counted as `unnamed`: a file was opened that the list
+      cannot show. `unnamed_write_exec` counts those that were written or
+      run, and `unlisted_write_exec` the written or run entries left out,
+      so a lost write reads differently from a lost read;
+    - past FILE_ACCESS_CAP entries, or FILE_ACCESS_BYTES as rendered, reads
+      are dropped first and counted in `unlisted`, so every write and exec
+      is kept while there is room. While each class stays within
+      FILE_ACCESS_TRACKED, the choice depends only on the set seen, not on
+      the order of the lines;
+    - `lost` and the start/alive records mean what they do for listensnoop.
+
+    Produce the file with filesnoop run in the agent's PID namespace (`-n`);
+    the image's `railmon files` does that.
+    """
+    files: dict[tuple[str, bool], list[bool]] = {}
+    lost = unlisted = unnamed = malformed = outside = 0
+    # Written or run entries left out or unnamed, counted apart from reads so
+    # the bundle's note can say a write was lost, not just "more files".
+    unlisted_write_exec = unnamed_write_exec = 0
+    tracked_reads = tracked_write_exec = 0
+    health = _ProbeHealth()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if not isinstance(event, dict):
+            malformed += 1
+            continue
+        kind = event.get("kind")
+        if kind == "lost":
+            count = event.get("count")
+            lost += count if isinstance(count, int) and count > 0 else 0
+            continue
+        if kind in ("alive", "start"):
+            beat = _probe_beat(event, kind)
+            if beat is None:
+                malformed += 1
+                continue
+            health.beat(kind, beat[0], beat[1])
+            continue
+        path, layer = event.get("path"), event.get("layer", False)
+        access = [event.get(name) for name in ("read", "write", "exec")]
+        if (
+            kind != "open"
+            or not isinstance(path, str)
+            or not all(isinstance(flag, bool) for flag in access)
+            or not isinstance(layer, bool)
+            or not isinstance(event.get("pid"), int) or isinstance(event.get("pid"), bool)
+        ):
+            malformed += 1
+            continue
+        if event["pid"] == 0:
+            outside += 1
+            continue
+        changes = access[1] or access[2]
+        if not path or len(path) > FILE_PATH_MAX:
+            unnamed += 1
+            unnamed_write_exec += changes
+            continue
+        key = (_printable(path, FILE_PATH_MAX), layer)
+        seen = files.get(key)
+        if seen is None:
+            if (tracked_write_exec if changes else tracked_reads) >= FILE_ACCESS_TRACKED:
+                unlisted += 1
+                unlisted_write_exec += changes
+                continue
+            files[key] = list(access)
+            if changes:
+                tracked_write_exec += 1
+            else:
+                tracked_reads += 1
+        else:
+            files[key] = merged = [old or new for old, new in zip(seen, access)]
+            if not (seen[1] or seen[2]) and (merged[1] or merged[2]):
+                tracked_reads -= 1  # it moves classes; the total does not grow
+                tracked_write_exec += 1
+    # Writes and execs first, then by path: the same set always yields the
+    # same value, and a new read can only displace another read. Within the
+    # byte budget, an entry too large to fit is skipped, not the rest.
+    ranked = sorted(files.items(), key=lambda item: (not (item[1][1] or item[1][2]), item[0]))
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for (path, layer), (read, write, run) in ranked:
+        if len(kept) >= FILE_ACCESS_CAP:
+            break
+        entry = {"path": path, "read": read, "write": write, "exec": run, "layer": layer}
+        size = len(json.dumps(entry, separators=(",", ":"))) + FILE_ENTRY_OVERHEAD
+        if used + size > FILE_ACCESS_BYTES:
+            continue
+        kept.append(entry)
+        used += size
+    kept.sort(key=lambda entry: (entry["path"], entry["layer"]))
+    unlisted += len(ranked) - len(kept)
+    unlisted_write_exec += sum(1 for _, (_, write, run) in ranked if write or run) \
+        - sum(1 for entry in kept if entry["write"] or entry["exec"])
+    return {
+        "source": "filesnoop",
+        "files": kept,
+        "lost": lost,
+        "unlisted": unlisted,
+        "unnamed": unnamed,
+        "unlisted_write_exec": unlisted_write_exec,
+        "unnamed_write_exec": unnamed_write_exec,
+        "malformed": malformed,
+        "outside_namespace": outside,
+        **health.summary(now),
+    }
+
+
+def _bounded_lines(stream: Any, limit: int = MAX_LISTEN_LINE) -> Iterable[str]:
+    """Lines of at most `limit` characters; a longer one is yielded as a
+    single unparseable marker, never held whole."""
     while True:
-        line = stream.readline(MAX_LISTEN_LINE)
+        line = stream.readline(limit)
         if not line:
             return
-        if len(line) == MAX_LISTEN_LINE and not line.endswith("\n"):
+        if len(line) == limit and not line.endswith("\n"):
             while True:  # discard the rest of it
-                rest = stream.readline(MAX_LISTEN_LINE)
+                rest = stream.readline(limit)
                 if not rest or rest.endswith("\n"):
                     break
             yield "\x00oversized"
@@ -1742,6 +1931,15 @@ def load_listen_events(path: Path) -> dict[str, Any]:
             return summarize_listeners(_bounded_lines(stream))
     except OSError as exc:
         raise ScannerError(f"cannot read listensnoop events {path}: {exc}") from exc
+
+
+def load_file_events(path: Path) -> dict[str, Any]:
+    # Streamed, like listensnoop's: filesnoop appends for as long as it runs.
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return summarize_file_access(_bounded_lines(stream, MAX_FILE_LINE))
+    except OSError as exc:
+        raise ScannerError(f"cannot read filesnoop events {path}: {exc}") from exc
 
 
 def load_snapshot(path: Path) -> dict[str, Any]:
@@ -1804,6 +2002,7 @@ def build_feature_file(
         "skills": payload.get("skills") or [],
         **({"observed_reach": identity["observed_reach"]} if identity.get("observed_reach") else {}),
         **({"observed_listeners": identity["observed_listeners"]} if identity.get("observed_listeners") else {}),
+        **({"observed_file_access": identity["observed_file_access"]} if identity.get("observed_file_access") else {}),
     }
 
 
@@ -1821,6 +2020,7 @@ def collect_identity(args: argparse.Namespace, context: dict[str, Any]) -> dict[
         "mcp_servers": [],
         "observed_reach": None,
         "observed_listeners": None,
+        "observed_file_access": None,
     }
 
 
@@ -1855,6 +2055,9 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
     listen_file = resolve_listen_file(args)
     if listen_file:
         identity["observed_listeners"] = load_listen_events(Path(listen_file).expanduser())
+    files_file = resolve_files_file(args)
+    if files_file:
+        identity["observed_file_access"] = load_file_events(Path(files_file).expanduser())
     return context, payload, identity
 
 
@@ -2121,6 +2324,10 @@ def configured_agent_key(args: argparse.Namespace) -> str | None:
 
 def resolve_listen_file(args: argparse.Namespace) -> str | None:
     return first_nonempty(getattr(args, "listen_file", None), os.environ.get("RAIL_LISTEN_FILE"))
+
+
+def resolve_files_file(args: argparse.Namespace) -> str | None:
+    return first_nonempty(getattr(args, "files_file", None), os.environ.get("RAIL_FILES_FILE"))
 
 
 def resolve_observed_file(args: argparse.Namespace) -> str | None:
@@ -2811,6 +3018,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="listensnoop JSON lines (from ebpf-tls-tap, run in the agent's PID namespace) to "
         "summarise into the observed listening sockets. Protocol, address, port and process "
         "name only. Defaults to RAIL_LISTEN_FILE.",
+    )
+    parser.add_argument(
+        "--files-file",
+        help="filesnoop JSON lines (from ebpf-tls-tap, run in the agent's PID namespace) to "
+        "summarise into the observed file access. Path and read/write/exec only; no file "
+        "content. Defaults to RAIL_FILES_FILE.",
     )
     parser.add_argument("--host-id", help="Host identity override. Defaults to RAIL_HOST_ID.")
     parser.add_argument(

@@ -67,6 +67,8 @@ flowchart LR
   scanner[Environment and skill scanners] --> output[Local observations]
   agent -->|listen, bind| listen[listensnoop eBPF probe]
   listen -->|JSONL| scanner
+  agent -->|open, execve| files[filesnoop eBPF probe]
+  files -->|JSONL| scanner
   collector -->|JSONL| file[Capture file]
   collector -->|webhook| dash[RailDash or Rail Center]
 ```
@@ -147,6 +149,39 @@ See
 [the scanner's README](tools/scan/README.md#observed-listeners-optional)
 for what the attribute holds.
 
+### Opened files
+
+`railmon files` does the same for files. It runs
+[filesnoop](https://github.com/datrail/ebpf-tls-tap#file-opens) in the agent's PID
+namespace, which appends a line the first time a process opens a regular file
+to read, write or run it. An interval scan turns those lines into the bundle's
+`observed_file_access`: what the kernel saw the sandbox open, kept apart from
+anything a configuration declares or a tool call asked for. A newly written
+path is drift in RailDash. The deployment is the listener one with its own
+variables (`RAIL_FILES_CONTAINER`, `RAIL_FILES_FILE`, `RAIL_FILES_HEARTBEAT`),
+and the scan reads both files:
+
+```bash
+docker run -d --name rail-files --restart unless-stopped --privileged --pid host \
+  -v /var/run/docker.sock:/var/run/docker.sock -v rail-listen:/data \
+  -e RAIL_FILES_CONTAINER=my-agent -e RAIL_FILES_FILE=/data/files.jsonl \
+  railmon files
+docker run -d --name rail-scan -v rail-listen:/data:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e RAIL_LISTEN_FILE=/data/listen.jsonl -e RAIL_FILES_FILE=/data/files.jsonl \
+  -e RAIL_RAILDASH_URL=... -e RAIL_RAILDASH_TOKEN=... \
+  railmon scan --mode docker --container my-agent --interval 300
+```
+
+The same supervisor keeps filesnoop attached across agent restarts and kills.
+Each restart, a stale heartbeat or no start record makes the attribute
+PARTIAL, as for listeners. filesnoop does not report files already open when
+it attaches, so start `files` before the agent. It reports paths, never file
+content, but paths can be sensitive; the volume holding them should be as
+private as the agent's own files. See
+[the scanner's README](tools/scan/README.md#observed-file-access-optional)
+for what the attribute holds and how it is bounded.
+
 ## Configuration
 
 Every setting is an environment variable; RailMon loads no `.env` file
@@ -164,6 +199,7 @@ The ones you are most likely to set:
 | `RAIL_AUTH_MODE` | collector `--webhook`, `forward`, `scan --register` | `none` | The credential to present: `none`, `bearer` or `gcp`. See above for `RAIL_AUTH_TOKEN`, `RAIL_AUTH_TOKEN_FILE` and `RAIL_AUTH_AUDIENCE`. |
 | `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
 | `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | listensnoop's JSON lines: where `listen` appends and `scan` reads. |
+| `RAIL_FILES_FILE` | `scan` (`--files-file`), `files` | none | filesnoop's JSON lines: where `files` appends and `scan` reads. |
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `bin/agentsight`; the image sets its own | The AgentSight probe binary. |

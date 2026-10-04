@@ -1,5 +1,6 @@
-# Three stages: build the collector, build listensnoop, then ship a runtime
-# that carries only the two binaries and AgentSight. The builder image is ~1.5GB of Rust toolchain and none
+# Three stages: build the collector, build the eBPF probes (listensnoop and
+# filesnoop), then ship a runtime that carries only those binaries and
+# AgentSight. The builder image is ~1.5GB of Rust toolchain and none
 # of it needs to reach a host that is already running an agent under eBPF.
 FROM rust:1-slim-bookworm AS build
 
@@ -18,14 +19,16 @@ COPY src/ ./src/
 # force it — otherwise the stub above is what gets shipped.
 RUN touch src/main.rs && cargo build --release --locked
 
-# listensnoop (ebpf-tls-tap, DR-124/DR-125): the eBPF probe behind `railmon
-# listen`, reporting each socket an agent opens to accept inbound traffic.
-# Built from the ebpf-tls-tap submodule, which pins the probe together with its
-# libbpf, bpftool and kernel headers, on the same base as the runtime below so
-# the libelf and glibc it links against are the ones it runs with. The build
+# The eBPF probes from ebpf-tls-tap: listensnoop (DR-124/DR-125), behind
+# `railmon listen`, reporting each socket an agent opens to accept inbound
+# traffic; and filesnoop (DR-152), behind `railmon files`, reporting each
+# regular file it opens to read, write or run (DR-154).
+# Built from the ebpf-tls-tap submodule, which pins the probes together with
+# their libbpf, bpftool and kernel headers, on the same base as the runtime below so
+# the libelf and glibc they link against are the ones they run with. The build
 # fails, not skips, when the submodule was not checked out: an image without
-# the probe would answer `listen` with "not found".
-FROM python:3.13-slim AS listensnoop
+# a probe would answer `listen` or `files` with "not found".
+FROM python:3.13-slim AS probes
 RUN apt-get update && apt-get install -y --no-install-recommends \
       clang llvm gcc libc6-dev libelf-dev zlib1g-dev libssl-dev make pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -34,7 +37,7 @@ COPY ebpf-tls-tap/ ./
 RUN test -f libbpf/src/Makefile || { \
       echo "ebpf-tls-tap submodule is empty: git submodule update --init --recursive" >&2; \
       exit 1; } \
-    && make -C bpf listensnoop
+    && make -C bpf listensnoop filesnoop
 
 # python:3.13-slim, not debian-slim, and the version is the point. RailScan's
 # image was 3.13 and its CI pinned 3.13; folding the scanner in on top of
@@ -95,9 +98,11 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 # The collector keeps a distinct name so the entrypoint can dispatch to it
 # without recursing into itself.
 COPY --from=build /src/target/release/railmon /usr/local/bin/railmon-collector
-COPY --from=listensnoop /src/bpf/listensnoop /usr/local/bin/listensnoop
-# `railmon listen`'s supervisor enters the agent's PID namespace with nsenter
-# (util-linux, in the base image); fail here rather than at first use.
+COPY --from=probes /src/bpf/listensnoop /usr/local/bin/listensnoop
+COPY --from=probes /src/bpf/filesnoop /usr/local/bin/filesnoop
+# The supervisor behind `railmon listen` and `railmon files` enters the
+# agent's PID namespace with nsenter (util-linux, in the base image); fail
+# here rather than at first use.
 RUN command -v nsenter
 
 # tools/ carries symlinks from the RailScan-era paths

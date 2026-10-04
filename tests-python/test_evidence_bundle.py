@@ -15,6 +15,7 @@ with no dependencies to install.
 from __future__ import annotations
 
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -994,8 +995,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
     def test_the_rule_pack_grew(self):
         # x-rail-spec's additions-version rule: a new attribute is a new pack,
         # which RailDash shows as CONTRACT_MISMATCH rather than drift.
-        # Pack 3 added observed_ingress_peers (DR-145).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 3)
+        # Pack 3 added observed_ingress_peers (DR-145), pack 4
+        # observed_file_access (DR-154).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 4)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
@@ -1163,6 +1165,145 @@ class ObservedIngressPeersBundleTest(unittest.TestCase):
             self.bundle(self.listening([self.PEER]))["attributes"]))
 
 
+class ObservedFileAccessBundleTest(unittest.TestCase):
+    """The files the sandbox opened, from filesnoop (DR-154)."""
+
+    WROTE = {"path": "/data/out.txt", "read": False, "write": True, "exec": False, "layer": False}
+    READ = {"path": "/etc/hosts", "read": True, "write": False, "exec": False, "layer": False}
+
+    def bundle(self, files, **identity_overrides):
+        return evidence_bundle.build_evidence_bundle(
+            build_args(), self_context(), dict(HOST_PAIR),
+            identity(observed_file_access=files, **identity_overrides),
+        )
+
+    @staticmethod
+    def files(entries=(), **counts):
+        base = {"source": "filesnoop", "files": list(entries), "lost": 0, "unlisted": 0,
+                "unnamed": 0, "malformed": 0, "outside_namespace": 0,
+                "starts": 1, "restarted": False, "stale": False}
+        base.update(counts)
+        return base
+
+    def attribute(self, files):
+        bundle = self.bundle(files)
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+        return bundle["attributes"]["observed_file_access"]
+
+    def test_without_an_event_file_the_pack_says_it_did_not_look(self):
+        field = self.attribute(None)
+        self.assertEqual((field["status"], field["reason"], field["tier"]),
+                         ("BLIND", "NOT_COLLECTED_BY_PACK", "observed"))
+
+    def test_files_are_answered_as_observed_and_authored_by_nobody(self):
+        # Kernel-observed: never declared, and nothing the agent wrote.
+        field = self.attribute(self.files([self.READ, self.WROTE]))
+        self.assertEqual((field["status"], field["tier"], field["authored_by"], field["value"]),
+                         ("ANSWERED", "observed", "none", [self.READ, self.WROTE]))
+
+    def test_an_empty_window_is_absent_not_an_empty_answer(self):
+        field = self.attribute(self.files())
+        self.assertEqual((field["status"], field["value"]), ("ABSENT", None))
+
+    def test_probe_gaps_the_cap_and_unnamed_paths_make_it_partial(self):
+        for counts, reason, words in (
+            ({"lost": 3}, "SIZE_CAP_EXCEEDED", "filesnoop reported lost events"),
+            ({"unlisted": 2}, "SIZE_CAP_EXCEEDED", "more distinct files than the cap"),
+            ({"unnamed": 1}, "SIZE_CAP_EXCEEDED", "could not read"),
+            ({"starts": 0}, "NO_SOURCE_ACCESS", "no filesnoop start record"),
+            ({"starts": 2, "restarted": True}, "NO_SOURCE_ACCESS", "filesnoop restarted 1 time "),
+            ({"stale": True}, "NO_SOURCE_ACCESS", "filesnoop stopped reporting"),
+        ):
+            for entries in ((), [self.WROTE]):
+                with self.subTest(counts=counts, entries=entries):
+                    field = self.attribute(self.files(entries, **counts))
+                    self.assertEqual((field["status"], field["reason"]), ("PARTIAL", reason))
+                    self.assertEqual(field["value"], list(entries))
+                    self.assertIn(words, field["note"])
+                    self.assertIn("files may be missing", field["note"])
+
+    def test_a_lost_write_changes_the_note_of_an_already_partial_list(self):
+        # A baseline locked while reads overflowed the cap must still drift
+        # when a write is what goes missing.
+        reads_only = self.attribute(self.files([self.WROTE], unlisted=40))
+        write_lost = self.attribute(self.files([self.WROTE], unlisted=41, unlisted_write_exec=1))
+        self.assertNotEqual(reads_only["note"], write_lost["note"])
+        self.assertIn("written or run files past the cap", write_lost["note"])
+        unnamed = self.attribute(self.files([self.WROTE], unnamed=2))
+        unnamed_write = self.attribute(self.files([self.WROTE], unnamed=3, unnamed_write_exec=1))
+        self.assertNotEqual(unnamed["note"], unnamed_write["note"])
+        self.assertEqual(write_lost["reason"], "SIZE_CAP_EXCEEDED")
+
+    def test_the_gap_note_carries_no_count(self):
+        first = self.attribute(self.files([self.WROTE], lost=3, unlisted=1, unnamed=1, malformed=2))
+        later = self.attribute(self.files([self.WROTE], lost=3000, unlisted=90, unnamed=7, malformed=9))
+        self.assertEqual(first, later)
+        self.assertNotRegex(first["note"], r"\d")
+
+    def test_a_newly_written_path_changes_this_value_and_nothing_else_moves(self):
+        before = self.bundle(self.files([self.READ]))["attributes"]
+        after = self.bundle(self.files([self.READ, self.WROTE]))["attributes"]
+        changed = {name for name in before if before[name] != after[name]}
+        self.assertEqual(changed, {"observed_file_access"})
+
+    def test_listener_gaps_do_not_leak_into_file_access_or_back(self):
+        listening = ObservedListenersBundleTest.listening(lost=5, starts=0)
+        attrs = self.bundle(self.files([self.WROTE]), observed_listeners=listening)["attributes"]
+        self.assertEqual(attrs["observed_file_access"]["status"], "ANSWERED")
+        self.assertEqual(attrs["observed_listeners"]["status"], "PARTIAL")
+        attrs = self.bundle(self.files([self.WROTE], lost=1),
+                            observed_listeners=ObservedListenersBundleTest.listening())["attributes"]
+        self.assertEqual(attrs["observed_listeners"]["status"], "ABSENT")
+
+    def test_events_reach_the_runtime_source_in_docker_mode(self):
+        bundle = evidence_bundle.build_evidence_bundle(
+            build_args(), docker_context(), dict(HOST_PAIR), identity(observed_file_access=self.files())
+        )
+        self.assertTrue(bundle["inputs_attempted"]["runtime"]["reached"])
+
+    def test_the_contract_holds_the_value_to_its_shape(self):
+        # The published schema accepts any attribute value; verify_bundle
+        # holds this one to FILE_ACCESS_VALUE_SCHEMA, so a producer bug is a
+        # failed scan, not a bundle RailDash has to guess at.
+        good = self.bundle(self.files([self.WROTE]))
+        self.assertEqual(evidence_bundle.contract_problems(good), [])
+        for broken, words in (
+            ([dict(self.WROTE, process="python3")], "not a field"),
+            ([dict(self.WROTE, write="yes")], "must be a boolean"),
+            ([{k: v for k, v in self.WROTE.items() if k != "layer"}], "required"),
+            ([dict(self.WROTE, path="")], "non-empty"),
+            ([dict(self.WROTE, path="/" + "x" * 1024)], "exceeds 1024"),
+            ([self.WROTE] * 513, "at most 512"),
+            ([dict(self.WROTE, path=f"/{i}" + "\u00e9" * 1000) for i in range(60)], "byte bound"),
+            ({"path": "/x"}, "must be an array"),
+        ):
+            with self.subTest(words=words):
+                bundle = copy.deepcopy(good)
+                bundle["attributes"]["observed_file_access"]["value"] = broken
+                problems = evidence_bundle.contract_problems(bundle)
+                self.assertTrue(any(words in p for p in problems), problems)
+
+    def test_the_shape_check_matches_the_summarizer_bounds(self):
+        self.assertEqual(evidence_bundle.FILE_ACCESS_VALUE_SCHEMA["maxItems"], scanner.FILE_ACCESS_CAP)
+        self.assertEqual(evidence_bundle.FILE_ACCESS_VALUE_SCHEMA["items"]["properties"]["path"]["maxLength"],
+                         scanner.FILE_PATH_MAX)
+        self.assertEqual(evidence_bundle.FILE_ACCESS_VALUE_MAX_BYTES, scanner.FILE_ACCESS_BYTES)
+
+    def test_file_access_is_sandbox_scoped_in_a_multi_agent_bundle(self):
+        spec = importlib.util.spec_from_file_location(
+            "compose_evidence_bundle_v2", ROOT / "tools/scan/compose_evidence_bundle_v2.py")
+        composer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(composer)
+        self.assertIn("observed_file_access", composer.SANDBOX_ATTRIBUTES)
+        self.assertNotIn("observed_file_access", composer.agent_scoped_attributes(
+            self.bundle(self.files([self.WROTE]))["attributes"]))
+
+    def test_a_v2_bundle_holds_the_sandbox_value_to_its_shape(self):
+        problems = evidence_bundle._semantic_problems_v2(
+            {"sandbox": {"attributes": {"observed_file_access": {"value": [{"path": "/x"}]}}}, "agents": []})
+        self.assertTrue(any("observed_file_access.value[0].read" in p for p in problems), problems)
+
+
 class ScannerWiringTest(unittest.TestCase):
     """Subprocess runs mirroring the registration/feature-file guarantees."""
 
@@ -1209,6 +1350,51 @@ class ScannerWiringTest(unittest.TestCase):
                 expected = [{"protocol": "tcp", "addr": "0.0.0.0", "port": 4444, "process": "nc"}]
                 self.assertEqual(features["observed_listeners"]["listeners"], expected)
                 self.assertEqual(bundle["attributes"]["observed_listeners"]["value"], expected)
+
+    def test_a_files_file_reaches_the_feature_file_and_the_bundle(self):
+        import subprocess
+        import tempfile
+
+        lines = [
+            json.dumps({"kind": "start", "time": "2026-10-03T08:00:00Z", "every": 0}),
+            json.dumps({"timestamp_ns": 1, "kind": "open", "pid": 7, "tid": 7, "host_pid": 7, "uid": 0,
+                        "comm": "sh", "path": "/tmp/out.txt", "read": False, "write": True,
+                        "exec": False, "creat": True, "trunc": True, "append": False,
+                        "dev": "0:1", "ino": 2}),
+        ]
+        for how in ("flag", "env"):
+            with self.subTest(how=how), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "files.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                argv = ["--mode", "self", "--host-id", "h-1",
+                        "--feature-output", f"{tmp}/features.json",
+                        "--evidence-bundle-output", f"{tmp}/bundle.json"]
+                env = {k: v for k, v in os.environ.items() if not k.startswith("RAIL_")}
+                if how == "flag":
+                    argv += ["--files-file", f"{tmp}/files.jsonl"]
+                else:
+                    env["RAIL_FILES_FILE"] = f"{tmp}/files.jsonl"
+                proc = subprocess.run(["python3", str(SCANNER)] + argv, cwd=tmp, capture_output=True,
+                                      text=True, env=env, timeout=120)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                features = json.loads(Path(tmp, "features.json").read_text())
+                bundle = json.loads(Path(tmp, "bundle.json").read_text())
+                expected = [{"path": "/tmp/out.txt", "read": False, "write": True, "exec": False,
+                             "layer": False}]
+                self.assertEqual(features["observed_file_access"]["files"], expected)
+                field = bundle["attributes"]["observed_file_access"]
+                self.assertEqual((field["status"], field["tier"], field["value"]),
+                                 ("ANSWERED", "observed", expected))
+                self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
+    def test_an_unreadable_files_file_fails_the_scan_loudly(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1",
+                                       "--feature-output", f"{tmp}/features.json",
+                                       "--files-file", f"{tmp}/missing.jsonl"], tmp)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("cannot read filesnoop events", proc.stderr)
 
     def test_an_unreadable_listen_file_fails_the_scan_loudly(self):
         import tempfile

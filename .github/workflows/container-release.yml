@@ -129,7 +129,8 @@ jobs:
       # Submodules are off by default. GITHUB_TOKEN cannot read another
       # repository, so a recursive checkout fails on any repo that declares a
       # private submodule, including ones that do not build from it.
-      # railmon does build from one: its image compiles listensnoop from the
+      # railmon does build from one: its image compiles listensnoop and
+      # filesnoop (DR-154) from the
       # ebpf-tls-tap submodule (DR-143), so the repo sets RAIL_SUBMODULES to
       # `recursive`; ebpf-tls-tap is public, so the default token reads it.
       # A component whose image genuinely needs a submodule sets RAIL_SUBMODULES

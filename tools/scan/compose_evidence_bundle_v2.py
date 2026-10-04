@@ -32,11 +32,13 @@ KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # listensnoop appended can disagree on it; that fails closed like any other
 # sandbox attribute that differs between agents. `observed_ingress_peers`
 # (DR-145) comes from the same events and is sandbox-scoped for the same
-# reason.
+# reason, and so is `observed_file_access` (DR-154): filesnoop runs per PID
+# namespace too.
 SANDBOX_ATTRIBUTES = frozenset(
     {
         "container_identity", "image_digest", "mounts", "deployment",
         "sandbox_network_policy", "observed_listeners", "observed_ingress_peers",
+        "observed_file_access",
     }
 )
 

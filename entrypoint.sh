@@ -70,6 +70,25 @@ case "$command_name" in
         fi
         exec "$listensnoop" -n -H "$heartbeat" "$@"
         ;;
+    files)
+        # filesnoop (DR-152): one JSON line the first time a process opens a
+        # regular file for a kind of access (read, write, exec), appended to
+        # RAIL_FILES_FILE for `scan --files-file` (DR-154), or to stdout when
+        # that is unset. The same shape as `listen`: eBPF privilege, -n, -H
+        # (RAIL_FILES_HEARTBEAT), and with RAIL_FILES_CONTAINER the same
+        # supervisor, following that container's PID namespace.
+        filesnoop="${FILESNOOP_PATH:-/usr/local/bin/filesnoop}"
+        heartbeat="${RAIL_FILES_HEARTBEAT:-60}"
+        if [ -n "${RAIL_FILES_CONTAINER:-}" ]; then
+            exec python3 "$root/tools/listen/follow_container.py" \
+                --command files --probe "$filesnoop" --output "${RAIL_FILES_FILE:-}" \
+                "$RAIL_FILES_CONTAINER" -n -H "$heartbeat" "$@"
+        fi
+        if [ -n "${RAIL_FILES_FILE:-}" ]; then
+            exec "$filesnoop" -n -H "$heartbeat" "$@" >> "$RAIL_FILES_FILE"
+        fi
+        exec "$filesnoop" -n -H "$heartbeat" "$@"
+        ;;
     demo)
         # BDL-F4's local quickstart: self-scan plus a real, offline, local
         # capture, from this one container. See tools/local-demo/README.md.
@@ -86,6 +105,7 @@ Commands:
   skills     inventory OpenClaw/NemoClaw SKILL.md files
   forward    send captured interactions on to Rail Center
   listen     report sockets the agent opens to accept traffic (listensnoop)
+  files      report files the agent opens to read, write or run (filesnoop)
   demo       self-scan + a local offline capture, for a clean-checkout first run
 
 Called with no command, or with a flag first, RailMon runs the collector —

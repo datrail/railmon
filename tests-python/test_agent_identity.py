@@ -1529,6 +1529,204 @@ class PeersTest(unittest.TestCase):
                          (scanner.PEER_CAP, 3, 0))
 
 
+class FileAccessTest(unittest.TestCase):
+    """filesnoop's JSON lines become a stable list of the files the sandbox opened (DR-154)."""
+
+    START = '{"kind":"start","time":"2026-10-03T08:00:00Z","every":0}'
+
+    @staticmethod
+    def event(**fields):
+        import json
+
+        # A line as filesnoop (ebpf-tls-tap 7b6da87) prints it.
+        base = {"timestamp_ns": 1, "kind": "open", "pid": 41, "tid": 41, "host_pid": 9041,
+                "uid": 1000, "comm": "python3", "path": "/etc/hosts", "read": True,
+                "write": False, "exec": False, "creat": False, "trunc": False,
+                "append": False, "dev": "0:52", "ino": 77}
+        base.update(fields)
+        return json.dumps(base)
+
+    def summary(self, *lines, now=None):
+        return scanner.summarize_file_access(list(lines), now)
+
+    def entry(self, path="/etc/hosts", read=True, write=False, exec=False, layer=False):
+        return {"path": path, "read": read, "write": write, "exec": exec, "layer": layer}
+
+    def test_an_open_is_listed_without_pids_counts_or_process_names(self):
+        # Another process, thread name and time: the same entry, so the
+        # value does not churn with them.
+        result = self.summary(self.START, self.event(),
+                              self.event(pid=42, tid=43, comm="Thread-8 (reader)", timestamp_ns=9))
+        self.assertEqual(result["files"], [self.entry()])
+        self.assertEqual((result["source"], result["starts"], result["restarted"]), ("filesnoop", 1, False))
+
+    def test_access_is_the_union_so_a_new_write_changes_the_entry(self):
+        before = self.summary(self.START, self.event(path="/data/notes.txt"))
+        after = self.summary(self.START, self.event(path="/data/notes.txt"),
+                             self.event(path="/data/notes.txt", read=False, write=True, pid=50))
+        self.assertEqual(before["files"], [self.entry("/data/notes.txt")])
+        self.assertEqual(after["files"], [self.entry("/data/notes.txt", write=True)])
+
+    def test_exec_and_read_write_are_kept_as_filesnoop_reports_them(self):
+        result = self.summary(self.event(path="/usr/bin/curl", exec=True),
+                              self.event(path="/tmp/db", write=True))
+        self.assertEqual(result["files"], [self.entry("/tmp/db", write=True),
+                                           self.entry("/usr/bin/curl", exec=True)])
+
+    def test_a_layer_open_is_its_own_entry(self):
+        # Its path is the layer's, so it must not merge with an open of the
+        # overlay path that happens to read the same.
+        result = self.summary(self.event(path="/secret"), self.event(path="/secret", layer=True))
+        self.assertEqual(result["files"], [self.entry("/secret"), self.entry("/secret", layer=True)])
+
+    def test_a_process_outside_filesnoops_namespace_is_counted_not_listed(self):
+        result = self.summary(self.event(pid=0, path="/etc/shadow"))
+        self.assertEqual((result["files"], result["outside_namespace"]), ([], 1))
+
+    def test_an_unnamed_or_overlong_path_is_counted_as_a_gap(self):
+        result = self.summary(self.event(path="", path_error=-36),
+                              self.event(path="/" + "a" * scanner.FILE_PATH_MAX),
+                              self.event(path="/" + "b" * (scanner.FILE_PATH_MAX - 1)))
+        self.assertEqual(result["unnamed"], 2)
+        self.assertEqual([len(e["path"]) for e in result["files"]], [scanner.FILE_PATH_MAX])
+
+    def test_control_characters_in_a_path_are_not_carried(self):
+        result = self.summary(self.event(path="/tmp/a\u001b[2J\nb"))
+        self.assertEqual(result["files"], [self.entry("/tmp/a?[2J?b")])
+
+    def test_garbage_lines_are_counted_and_skipped(self):
+        result = self.summary("not json", "[1]", "\x00oversized", self.event(kind="close"),
+                              self.event(read="yes"), self.event(layer=1), self.event(path=7),
+                              self.event(pid="41"), self.event(pid=True), self.event(write=None),
+                              "", self.event())
+        self.assertEqual((result["files"], result["malformed"]), ([self.entry()], 10))
+
+    def test_lost_and_probe_health_are_read_like_listensnoops(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 10, 3, 9, 0, 0, tzinfo=timezone.utc)
+        result = self.summary('{"kind":"start","time":"2026-10-03T08:00:00Z","every":60}',
+                              '{"kind":"start","time":"2026-10-03T08:10:00Z","every":60}',
+                              '{"kind":"alive","time":"2026-10-03T08:20:00Z","every":60}',
+                              '{"kind":"lost","count":3}', '{"kind":"lost","count":4}',
+                              '{"kind":"alive","time":"later","every":60}', now=now)
+        self.assertEqual((result["lost"], result["starts"], result["restarted"], result["stale"],
+                          result["last_alive"], result["malformed"]),
+                         (7, 2, True, True, "2026-10-03T08:20:00Z", 1))
+        fresh = self.summary('{"kind":"alive","time":"2026-10-03T08:59:00Z","every":60}', now=now)
+        self.assertEqual((fresh["stale"], fresh["starts"]), (False, 0))
+
+    def test_past_the_cap_reads_go_first_and_every_write_and_exec_stays(self):
+        cap = scanner.FILE_ACCESS_CAP
+        reads = [self.event(path=f"/lib/{i:04d}.so") for i in range(cap)]
+        writes = [self.event(path=f"/zz/out-{i}", read=False, write=True) for i in range(3)]
+        runs = [self.event(path="/zz/bin/sh", exec=True)]
+        result = self.summary(*reads, *writes, *runs)
+        paths = [e["path"] for e in result["files"]]
+        self.assertEqual(len(paths), cap)
+        self.assertEqual(result["unlisted"], 4)
+        self.assertEqual(paths[-4:], ["/zz/bin/sh", "/zz/out-0", "/zz/out-1", "/zz/out-2"])
+        # Not the order of the lines: the same set is the same value.
+        self.assertEqual(self.summary(*runs, *writes, *reversed(reads))["files"], result["files"])
+
+    def test_tracking_is_bounded_and_the_rest_are_counted(self):
+        # The cap is wider than the bound here, so only the bound can stop
+        # the fourth and fifth file.
+        with mock.patch.object(scanner, "FILE_ACCESS_TRACKED", 3), mock.patch.object(scanner, "FILE_ACCESS_CAP", 10):
+            result = self.summary(*(self.event(path=f"/f{i}") for i in range(5)),
+                                  self.event(path="/f0", write=True))  # a known file still merges
+        self.assertEqual(result["files"], [self.entry("/f0", write=True), self.entry("/f1"), self.entry("/f2")])
+        self.assertEqual(result["unlisted"], 2)
+
+    def test_a_flood_of_reads_cannot_use_up_the_room_a_write_needs(self):
+        # Reads tracked to the bound, then a write: the write is still kept,
+        # and it outranks every read at the cap.
+        with mock.patch.object(scanner, "FILE_ACCESS_TRACKED", 3):
+            result = self.summary(*(self.event(path=f"/zzz/{i}") for i in range(10)),
+                                  self.event(path="/home/a/.bashrc", read=False, write=True))
+        self.assertIn(self.entry("/home/a/.bashrc", read=False, write=True), result["files"])
+        self.assertEqual((result["unlisted"], result["unlisted_write_exec"]), (7, 0))
+
+    def test_a_lost_write_is_counted_apart_from_lost_reads(self):
+        with mock.patch.object(scanner, "FILE_ACCESS_TRACKED", 1):
+            result = self.summary(self.event(path="/a", write=True), self.event(path="/b", write=True),
+                                  self.event(path="/c"), self.event(path="/d"),
+                                  self.event(path="/" + "x" * scanner.FILE_PATH_MAX, exec=True),
+                                  self.event(path=""))
+        self.assertEqual((result["unlisted"], result["unlisted_write_exec"]), (2, 1))
+        self.assertEqual((result["unnamed"], result["unnamed_write_exec"]), (2, 1))
+        with mock.patch.object(scanner, "FILE_ACCESS_CAP", 1):
+            result = self.summary(self.event(path="/a", write=True), self.event(path="/b", exec=True),
+                                  self.event(path="/c"))
+        self.assertEqual((result["unlisted"], result["unlisted_write_exec"]), (2, 1))
+
+    def test_the_value_has_a_byte_budget_whatever_the_paths_are(self):
+        # 1000 non-ASCII characters render as ~6 KB each (ensure_ascii):
+        # without a byte budget 512 of them would pass RailDash's 1 MiB bound.
+        import json
+
+        heavy = [self.event(path=f"/{i:03d}" + "\u00e9" * 1000, read=False, write=True) for i in range(512)]
+        result = self.summary(*heavy, self.event(path="/short", read=False, write=True))
+        rendered = len(json.dumps(result["files"], separators=(",", ":")))
+        self.assertLessEqual(rendered, scanner.FILE_ACCESS_BYTES)
+        self.assertGreater(result["unlisted"], 400)
+        self.assertEqual(result["unlisted"], result["unlisted_write_exec"])
+        # An entry too large to fit is skipped, not everything after it.
+        self.assertIn(self.entry("/short", read=False, write=True), result["files"])
+
+    def test_the_loader_reads_a_long_filesnoop_line(self):
+        # A 4096-byte path, every byte escaped, is far past listensnoop's
+        # line bound and must still parse (then count as unnamed).
+        import io
+
+        line = self.event(path="\u0001" * 4095) + "\n"
+        self.assertGreater(len(line), scanner.MAX_LISTEN_LINE * 5)
+        result = scanner.summarize_file_access(
+            scanner._bounded_lines(io.StringIO(line + self.event() + "\n"), scanner.MAX_FILE_LINE))
+        self.assertEqual((result["unnamed"], result["malformed"], result["files"]), (1, 0, [self.entry()]))
+
+
+class FollowContainerProbeTest(unittest.TestCase):
+    """`railmon files` reuses `listen`'s supervisor with --probe and --output (DR-154)."""
+
+    def test_the_named_probe_appends_to_the_named_file_not_the_listen_file(self):
+        import signal
+        import subprocess
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_docker = tmp_path / "docker"
+            fake_docker.write_text("#!/bin/sh\necho 4242\n")
+            # nsenter -t PID -p -- PROBE ARGS: run the probe in place.
+            fake_nsenter = tmp_path / "nsenter"
+            fake_nsenter.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n')
+            probe = tmp_path / "filesnoop"
+            probe.write_text('#!/bin/sh\necho "{\\"kind\\":\\"start\\",\\"args\\":\\"$*\\"}"\n'
+                             "exec sleep 30\n")
+            for script in (fake_docker, fake_nsenter, probe):
+                script.chmod(0o755)
+            files, listen = tmp_path / "files.jsonl", tmp_path / "listen.jsonl"
+            env = {**os.environ, "RAIL_DOCKER": str(fake_docker), "RAIL_NSENTER": str(fake_nsenter),
+                   "RAIL_LISTEN_FILE": str(listen)}
+            supervisor = subprocess.Popen(
+                [sys.executable, str(ROOT / "tools/listen/follow_container.py"), "--command", "files",
+                 "--probe", str(probe),
+                 "--output", str(files), "agent", "-n", "-H", "5"],
+                env=env, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline and not (files.exists() and files.read_text()):
+                    time.sleep(0.05)
+            finally:
+                supervisor.send_signal(signal.SIGTERM)
+                _, stderr = supervisor.communicate(timeout=20)
+            self.assertEqual(files.read_text().strip(), '{"kind":"start","args":"-n -H 5"}')
+            self.assertFalse(listen.exists())
+            self.assertIn("[railmon files] attaching to agent (pid 4242)", stderr)
+            self.assertEqual(supervisor.returncode, 0)
+
+
 class RegistrationStatusTest(unittest.TestCase):
     """A scorer reading "registered" off an agent that never reached the control
     plane would be reading a lie, so the status reports the outcome."""

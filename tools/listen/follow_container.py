@@ -13,6 +13,11 @@ how the scanner knows the probe was down: listensnoop does not report sockets
 already listening when it attaches, so anything opened in the gap is missing,
 and the bundle says so instead of reading as "no new listeners".
 
+The same supervisor runs filesnoop for `railmon files` (DR-154): `--probe`
+names the binary and `--output` the file it appends to. Without them it is
+listensnoop (LISTENSNOOP_PATH) appending to RAIL_LISTEN_FILE, as before.
+filesnoop prints the same start records, so a restart shows the same way.
+
 Needs: `--pid host`, eBPF privilege, and the Docker socket.
 """
 
@@ -64,21 +69,33 @@ def stop_listensnoop(child: subprocess.Popen) -> None:
             pass
 
 
+# The railmon command this supervisor runs for, in its log prefix. `listen`
+# by default, so existing log filters on "[railmon listen]" keep matching.
+COMMAND = "listen"
+
+
 def log(message: str) -> None:
-    print(f"[railmon listen] {message}", file=sys.stderr, flush=True)
+    print(f"[railmon {COMMAND}] {message}", file=sys.stderr, flush=True)
 
 
 def main() -> int:
+    global COMMAND
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--command", default=COMMAND, help="railmon command, for the log prefix")
+    parser.add_argument("--probe", help="probe binary (default: LISTENSNOOP_PATH, else listensnoop)")
+    parser.add_argument("--output", help="file to append to; empty for stdout "
+                        "(default: RAIL_LISTEN_FILE)")
     parser.add_argument("container", help="agent container name or id")
     parser.add_argument("listensnoop_args", nargs=argparse.REMAINDER,
-                        help="arguments passed to listensnoop")
+                        help="arguments passed to the probe")
     args = parser.parse_args()
 
     docker = os.environ.get("RAIL_DOCKER", "docker")
     nsenter = os.environ.get("RAIL_NSENTER", "nsenter")
-    listensnoop = os.environ.get("LISTENSNOOP_PATH", "/usr/local/bin/listensnoop")
-    output = os.environ.get("RAIL_LISTEN_FILE")
+    listensnoop = args.probe or os.environ.get("LISTENSNOOP_PATH", "/usr/local/bin/listensnoop")
+    COMMAND = args.command
+    probe_name = os.path.basename(listensnoop)
+    output = args.output if args.output is not None else os.environ.get("RAIL_LISTEN_FILE")
     sink = open(output, "ab", buffering=0) if output else sys.stdout.buffer
 
     child: subprocess.Popen | None = None
@@ -119,7 +136,7 @@ def main() -> int:
         code = child.wait()
         child = None
         if not stopping:
-            log(f"listensnoop exited ({code}); reattaching")
+            log(f"{probe_name} exited ({code}); reattaching")
             time.sleep(POLL_SECONDS)
     return 0
 
