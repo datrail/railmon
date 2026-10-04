@@ -73,7 +73,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # design's answer to "every added field would alert at once".
 # Pack 3 adds observed_ingress_peers (DR-145), the same way.
 # Pack 4 adds observed_file_access (DR-154), the same way.
-RULE_PACK_VERSION = 4
+# Pack 5 folds its randomly named temp files into templated paths (DR-166):
+# a pack-4 baseline holds them verbatim, so it is not comparable.
+RULE_PACK_VERSION = 5
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1120,18 +1122,26 @@ def build_evidence_bundle(
             file_gaps.append("a file whose path filesnoop could not read, or longer than the cap")
         if file_access.get("unnamed_write_exec"):
             file_gaps.append("a written or run file among them")
+        # Said whenever it happened, so a templated path never passes for
+        # one the agent opened by that name. No count, like the gaps: the
+        # count is in the feature file.
+        folded = (
+            "; randomly named temp files are folded into one path per directory "
+            "and name pattern, with * for the random part"
+            if file_access.get("collapsed") else ""
+        )
         if file_gaps:
             attributes["observed_file_access"] = _partial(
                 opened, "observed",
                 "NO_SOURCE_ACCESS" if file_unreachable else "SIZE_CAP_EXCEEDED",
                 authored_by="none", method=file_method,
-                note="; ".join(file_gaps) + ": files may be missing from this list",
+                note="; ".join(file_gaps) + ": files may be missing from this list" + folded,
             )
         elif opened:
             attributes["observed_file_access"] = _answered(
                 opened, "observed", authored_by="none", method=file_method,
                 note="a finite window; a file opened before filesnoop started, or read "
-                "through a descriptor opened before then, is not in it",
+                "through a descriptor opened before then, is not in it" + folded,
             )
         else:
             attributes["observed_file_access"] = _absent(

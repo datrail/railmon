@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A file the agent opens in a new way after the baseline is locked is drift (DR-154).
+"""A file the agent opens in a new way after the baseline is locked is drift (DR-154, DR-166).
 
 Drives the real scanner and a real RailDash end to end, the way
 listen_drift_acceptance.py does for listeners:
@@ -12,7 +12,15 @@ listen_drift_acceptance.py does for listeners:
 3. append a write to a new path and scan: DRIFT DETECTED, with
    observed_file_access the only attribute that changed;
 4. lock that ASP; a write to the file that was only read before is DRIFT
-   DETECTED again: the entry's `write` turned true.
+   DETECTED again: the entry's `write` turned true;
+5. (DR-166) the agent writes randomly named temp files (and reads one
+   back), named by the real generators (Python's tempfile.mkstemp,
+   NamedTemporaryFile and the name it checks /tmp with, coreutils mktemp):
+   they arrive folded into templated paths (/tmp/tmp*, ...) and the note
+   says so. Lock that ASP;
+6. a second run writes temp files under new random names: ALIGNED;
+7. a write to a new fixed name in /tmp (/tmp/exfil.tar) is DRIFT DETECTED,
+   on observed_file_access alone, with the path kept as it is.
 
   python3 tests/files_drift_acceptance.py --raildash http://127.0.0.1:8000 \\
       --token "$(cat raildash.db.token)" \\
@@ -138,6 +146,54 @@ def main() -> int:
     state, changed = drift(scan())
     checks["writing a file that was only read is drift"] = (
         state == "DRIFT_DETECTED" and changed == ["observed_file_access"])
+
+    # DR-166: randomly named temp files. Each run creates real ones the way
+    # an agent would, and removes them; the events carry the names they got.
+    def temp_run(pid: int) -> list[str]:
+        # The file Python's tempfile writes to check /tmp is writable, once
+        # per process, is named the way this private generator names it.
+        made = ["/tmp/" + next(tempfile._get_candidate_names())]
+        fd, path = tempfile.mkstemp(dir="/tmp")
+        os.close(fd)
+        made.append(path)
+        with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".json") as named:
+            made.append(named.name)
+        made.append(subprocess.run(["mktemp", "-p", "/tmp"], capture_output=True, text=True,
+                                   check=True).stdout.strip())
+        for path in made:
+            if os.path.exists(path):
+                os.unlink(path)
+        append(*(event(path, read=False, write=True, pid=pid) for path in made),
+               event(made[1], pid=pid))  # the mkstemp file, read back
+        return made
+
+    first_names = temp_run(20)
+    temp = scan()
+    field = api(args.raildash, f"/api/asps/{temp}/bundle", args.token)["attributes"]["observed_file_access"]
+    paths = {entry["path"]: entry for entry in field["value"]}
+    checks["random temp names arrive as templated paths"] = (
+        field["status"] == "ANSWERED"
+        and paths.get("/tmp/tmp*", {}).get("write") is True and paths["/tmp/tmp*"]["read"] is True
+        and paths.get("/tmp/tmp*.json", {}).get("write") is True
+        and paths.get("/tmp/tmp.*", {}).get("write") is True
+        and paths.get("/tmp/*", {}).get("write") is True
+        and not any(name in paths for name in first_names)
+    )
+    checks["and the note says they were folded"] = "randomly named temp files are folded" in field["note"]
+    lock(temp, "files-temp")
+
+    second_names = temp_run(21)
+    checks["the second run's names differ from the first's"] = not set(first_names) & set(second_names)
+    checks["a second run under new random names stays aligned"] = drift(scan())[0] == "ALIGNED"
+
+    append(event("/tmp/exfil.tar", read=False, write=True, pid=22))
+    exfil = scan()
+    state, changed = drift(exfil)
+    value = api(args.raildash, f"/api/asps/{exfil}/bundle", args.token)["attributes"]["observed_file_access"]["value"]
+    checks["a new fixed name in /tmp is still drift"] = (
+        state == "DRIFT_DETECTED" and changed == ["observed_file_access"]
+        and any(entry["path"] == "/tmp/exfil.tar" and entry["write"] for entry in value)
+    )
 
     for name, passed in checks.items():
         print(("ok:   " if passed else "FAIL: ") + name)
