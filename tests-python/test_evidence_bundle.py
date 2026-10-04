@@ -1262,9 +1262,9 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
         self.assertTrue(bundle["inputs_attempted"]["runtime"]["reached"])
 
     def test_the_contract_holds_the_value_to_its_shape(self):
-        # The published schema accepts any attribute value; verify_bundle
-        # holds this one to FILE_ACCESS_VALUE_SCHEMA, so a producer bug is a
-        # failed scan, not a bundle RailDash has to guess at.
+        # The published schema holds this value to `file_access_value`, and
+        # verify_bundle walks that schema, so a producer bug is a failed
+        # scan, not a bundle RailDash has to guess at.
         good = self.bundle(self.files([self.WROTE]))
         self.assertEqual(evidence_bundle.contract_problems(good), [])
         for broken, words in (
@@ -1283,6 +1283,26 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
                 problems = evidence_bundle.contract_problems(bundle)
                 self.assertTrue(any(words in p for p in problems), problems)
 
+    def test_the_published_schema_carries_the_shape(self):
+        # One copy: the scanner's shape is the published def, and the v1
+        # schema applies it to both statuses that carry the list, so a
+        # consumer validating against the published schema holds the value
+        # to the same shape verify_bundle does (the byte bound stays code).
+        self.assertEqual(evidence_bundle.FILE_ACCESS_VALUE_SCHEMA, SCHEMA["$defs"]["file_access_value"])
+        self.assertEqual(
+            SCHEMA["properties"]["attributes"]["properties"]["observed_file_access"]["allOf"][1],
+            {"if": {"properties": {"status": {"enum": ["ANSWERED", "PARTIAL"]}}},
+             "then": {"properties": {"value": {"$ref": "#/$defs/file_access_value"}}}})
+        partial = self.bundle(self.files([self.WROTE], lost=3))
+        self.assertEqual(partial["attributes"]["observed_file_access"]["status"], "PARTIAL")
+        self.assertEqual(evidence_bundle.contract_problems(partial), [])
+        partial["attributes"]["observed_file_access"]["value"] = [dict(self.WROTE, pid=7)]
+        self.assertTrue(any("value[0].pid: not a field" in p
+                            for p in evidence_bundle._schema_problems(partial, SCHEMA, "bundle")))
+        absent = self.bundle(self.files([]))
+        self.assertEqual(absent["attributes"]["observed_file_access"]["status"], "ABSENT")
+        self.assertEqual(evidence_bundle.contract_problems(absent), [])
+
     def test_the_shape_check_matches_the_summarizer_bounds(self):
         self.assertEqual(evidence_bundle.FILE_ACCESS_VALUE_SCHEMA["maxItems"], scanner.FILE_ACCESS_CAP)
         self.assertEqual(evidence_bundle.FILE_ACCESS_VALUE_SCHEMA["items"]["properties"]["path"]["maxLength"],
@@ -1299,9 +1319,17 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
             self.bundle(self.files([self.WROTE]))["attributes"]))
 
     def test_a_v2_bundle_holds_the_sandbox_value_to_its_shape(self):
-        problems = evidence_bundle._semantic_problems_v2(
-            {"sandbox": {"attributes": {"observed_file_access": {"value": [{"path": "/x"}]}}}, "agents": []})
-        self.assertTrue(any("observed_file_access.value[0].read" in p for p in problems), problems)
+        # The statuses v1's schema applies the shape to, so v1 and v2 agree.
+        self.assertEqual(evidence_bundle.FILE_ACCESS_VALUED_STATUSES, {"ANSWERED", "PARTIAL"})
+        for status in ("ANSWERED", "PARTIAL"):
+            with self.subTest(status=status):
+                problems = evidence_bundle._semantic_problems_v2({"sandbox": {"attributes": {
+                    "observed_file_access": {"status": status, "value": [{"path": "/x"}]}}}, "agents": []})
+                self.assertTrue(any("observed_file_access.value[0].read" in p for p in problems), problems)
+        huge = [dict(self.WROTE, path=f"/{i}" + "\u00e9" * 1000) for i in range(60)]
+        problems = evidence_bundle._semantic_problems_v2({"sandbox": {"attributes": {
+            "observed_file_access": {"status": "ABSENT", "value": huge}}}, "agents": []})
+        self.assertTrue(any("byte bound" in p for p in problems), problems)
 
 
 class ScannerWiringTest(unittest.TestCase):

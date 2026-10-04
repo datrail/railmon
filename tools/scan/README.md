@@ -448,10 +448,13 @@ The attribute is:
     a path was unnamed;
 - BLIND without a file.
 
-`verify_bundle` holds the value to that shape (`FILE_ACCESS_VALUE_SCHEMA` in
-`evidence_bundle.py`): five fields, all required, a path of 1 to 1024
-characters, at most 512 entries and 256 KiB of compact JSON. The published schema accepts any attribute
-value, and it gains this shape once RailDash's vendored copy moves with it.
+The published v1 schema holds an ANSWERED or PARTIAL value to that shape
+(`$defs.file_access_value` in `schemas/evidence-bundle-v1.schema.json`): five
+fields, all required, a path of 1 to 1024 characters, at most 512 entries.
+`verify_bundle` walks that schema, and adds the bound no schema keyword
+states: at most 256 KiB of compact JSON. The v2 schema has no per-attribute
+shapes, so `verify_bundle_v2` holds the sandbox-scoped value to the same def
+in code.
 
 Not covered, because filesnoop does not see it: files already open when it
 attached, reads and writes through a descriptor opened earlier or passed in,

@@ -75,34 +75,23 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 4 adds observed_file_access (DR-154), the same way.
 RULE_PACK_VERSION = 4
 
-# The value shape of observed_file_access (DR-154), in the published schema's
-# own dialect and checked by the same walker. It lives here, not in
-# schemas/evidence-bundle-v1.schema.json, for now: RailDash vendors that file
-# byte-for-byte and its CI fails the moment the two differ, so the schema
-# moves with RailDash's re-vendor (DR-154's RailDash half). Until then the
-# attribute validates against the published schema as any attribute does,
-# and `verify_bundle` holds the producer to this stricter shape.
+# The value shape of observed_file_access (DR-154), published in the v1
+# schema as `$defs.file_access_value`, which the v1 walk applies to an
+# ANSWERED or PARTIAL value (the two statuses that carry the list). The v2
+# schema has no per-attribute shapes (see its `$comment`), so
+# `_semantic_problems_v2` holds the sandbox value to this same def, the way
+# RailDash holds a v2 `deployment` value to v1's `deployment_value`.
 # Plus a bound the schema dialect cannot state: the value's compact JSON
 # (ensure_ascii, as the bundle is written) is at most this many bytes, so an
 # agent naming its files cannot push the bundle past RailDash's 1 MiB bound.
 # The scanner's FILE_ACCESS_BYTES budget keeps it there.
 FILE_ACCESS_VALUE_MAX_BYTES = 256 * 1024
-FILE_ACCESS_VALUE_SCHEMA: dict[str, Any] = {
-    "type": "array",
-    "maxItems": 512,
-    "items": {
-        "type": "object",
-        "required": ["path", "read", "write", "exec", "layer"],
-        "additionalProperties": False,
-        "properties": {
-            "path": {"type": "string", "minLength": 1, "maxLength": 1024},
-            "read": {"type": "boolean"},
-            "write": {"type": "boolean"},
-            "exec": {"type": "boolean"},
-            "layer": {"type": "boolean"},
-        },
-    },
-}
+FILE_ACCESS_VALUE_SCHEMA: dict[str, Any] = SCHEMA["$defs"]["file_access_value"]
+# The statuses the v1 schema applies that shape to: the two that carry the list.
+FILE_ACCESS_VALUED_STATUSES = frozenset(
+    SCHEMA["properties"]["attributes"]["properties"]["observed_file_access"]["allOf"][1]["if"]
+    ["properties"]["status"]["enum"]
+)
 
 # ── the v2 (DR-109 multi-agent) contract, loaded the same way ──────────────
 # A second, independent document: v2 is not v1-plus-fields, so it gets its
@@ -319,12 +308,12 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: di
 
 
 def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
-    """The two rules the published schema cannot express (see its top-level
-    $comment): every attestation_ref names a real attestation, and a
+    """The rules the published schema cannot express (see its top-level
+    $comment): every attestation_ref names a real attestation; a
     deployment value's byte length is measured in UTF-8 bytes, which
-    `maxLength` cannot — it counts Unicode code points. Plus one it does not
-    express yet: observed_file_access's value shape (FILE_ACCESS_VALUE_SCHEMA)
-    and its byte bound."""
+    `maxLength` cannot — it counts Unicode code points; and an
+    observed_file_access value's byte bound. The value's shape is the
+    schema's own `file_access_value`."""
     problems: list[str] = []
     attestations = {a.get("id") for a in (bundle.get("attestations") or [])}
     for name, field in (bundle.get("attributes") or {}).items():
@@ -343,21 +332,27 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
                     )
     files = (bundle.get("attributes") or {}).get("observed_file_access")
     if isinstance(files, dict) and files.get("value") is not None:
-        problems += _file_access_problems(files["value"], "attributes.observed_file_access.value")
+        problems += _file_access_byte_problems(files["value"], "attributes.observed_file_access.value")
     return problems
+
+
+def _file_access_byte_problems(value: Any, where: str) -> list[str]:
+    """observed_file_access's byte bound, which no schema keyword states."""
+    if len(json.dumps(value, separators=(",", ":"))) > FILE_ACCESS_VALUE_MAX_BYTES:
+        return [f"{where}: exceeds the {FILE_ACCESS_VALUE_MAX_BYTES}-byte bound"]
+    return []
 
 
 def _file_access_problems(value: Any, where: str) -> list[str]:
-    """observed_file_access's value against its shape and its byte bound."""
-    problems = _schema_problems(value, FILE_ACCESS_VALUE_SCHEMA, where)
-    if len(json.dumps(value, separators=(",", ":"))) > FILE_ACCESS_VALUE_MAX_BYTES:
-        problems.append(f"{where}: exceeds the {FILE_ACCESS_VALUE_MAX_BYTES}-byte bound")
-    return problems
+    """observed_file_access's value against the published shape and its byte
+    bound, for v2, whose schema carries no per-attribute shape."""
+    return (_schema_problems(value, FILE_ACCESS_VALUE_SCHEMA, where)
+            + _file_access_byte_problems(value, where))
 
 
 def contract_problems(bundle: dict[str, Any]) -> list[str]:
     """Everything in a bundle the published v1 schema would reject, plus the
-    two rules the schema itself cannot express.
+    rules the schema itself cannot express.
 
     It is the whole contract, not the consumer's lenient load gate, on
     purpose: `verify_bundle` is the guard that keeps a broken bundle from
@@ -393,8 +388,10 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
 
     check_attribute_refs((bundle.get("sandbox") or {}).get("attributes"), "sandbox.attributes")
     files = ((bundle.get("sandbox") or {}).get("attributes") or {}).get("observed_file_access")
-    if isinstance(files, dict) and files.get("value") is not None:
-        problems += _file_access_problems(files["value"], "sandbox.attributes.observed_file_access.value")
+    if isinstance(files, dict) and files.get("status") in FILE_ACCESS_VALUED_STATUSES:
+        problems += _file_access_problems(files.get("value"), "sandbox.attributes.observed_file_access.value")
+    elif isinstance(files, dict) and files.get("value") is not None:
+        problems += _file_access_byte_problems(files["value"], "sandbox.attributes.observed_file_access.value")
     agents = bundle.get("agents") or []
     keys = [agent.get("agent_key") for agent in agents if isinstance(agent, dict)]
     if len(set(keys)) != len(keys):
