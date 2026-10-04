@@ -268,8 +268,9 @@ jobs:
             || { docker logs raildash; exit 1; }
           # DR-154: a newly written path, and a write to a file that was
           # only read, is drift on observed_file_access alone; another
-          # process reading a known file is not. filesnoop lines in a
-          # mounted file.
+          # process reading a known file is not. DR-166: a second run of
+          # randomly named temp files stays aligned, and a new fixed name in
+          # /tmp is drift. filesnoop lines in a mounted file.
           mkdir -p "$RUNNER_TEMP/files"
           python3 tests/files_drift_acceptance.py \
             --raildash http://127.0.0.1:8000 --scan-raildash http://raildash:8000 \

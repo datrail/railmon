@@ -1774,7 +1774,79 @@ FILE_PATH_MAX = 1024
 MAX_FILE_LINE = 65536
 
 
-def summarize_file_access(lines: Iterable[str], now: datetime | None = None) -> dict[str, Any]:
+# Randomly named temp files (DR-166). A tempfile or mkstemp name differs on
+# every run, so kept verbatim each one would be a newly written path on every
+# scan: drift that means nothing. A file whose name matches one of these
+# patterns, in or under one of the temp dirs, is folded into one entry per
+# (directory, pattern, layer) whose path puts `*` where the random part was:
+# /tmp/tmpk3j_9xq2 and /tmp/tmp0a1b2c3d are both /tmp/tmp*. Nothing else is
+# ever folded, so a new fixed name in /tmp (/tmp/exfil.tar) stays its own
+# entry, and a template itself appears as a new entry the first time it does.
+FILE_TEMP_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
+# An optional extension the caller asked for (mkstemp's suffix, mkstemps).
+_TEMP_SUFFIX = r"(?P<suffix>\.[A-Za-z0-9]{1,8})?"
+FILE_TEMP_PATTERNS = (
+    # The file Python's tempfile writes, and removes at once, the first time a
+    # process uses it, to check it can write there: 8 of [a-z0-9_], no prefix.
+    (re.compile(r"(?P<prefix>)[a-z0-9_]{8}"), None),
+    # Python's tempfile (mkstemp, NamedTemporaryFile, ...) with its default
+    # prefix: "tmp" and 8 characters of [a-z0-9_].
+    (re.compile(r"(?P<prefix>tmp)[a-z0-9_]{8}" + _TEMP_SUFFIX), None),
+    # mkstemp(3)/mkstemps(3) (6 random [A-Za-z0-9] for the caller's XXXXXX),
+    # mktemp(1) (tmp.XXXXXXXXXX) and Go's os.CreateTemp("", "run-*"): a
+    # prefix that ends in . - or _ (or is "tmp"), then 6 to 12 random
+    # letters and digits. The random part must hold a digit or a
+    # capital, so an ordinary word after a dash (/tmp/build-output) is not
+    # taken for one.
+    (re.compile(r"(?P<prefix>[A-Za-z0-9_.-]*[._-]|tmp)(?P<random>[A-Za-z0-9]{6,12})" + _TEMP_SUFFIX),
+     re.compile(r"[A-Z0-9]")),
+    # Vim's swap files, whose last letter moves on (.swp, .swo, ...) when one
+    # is already taken.
+    (re.compile(r"(?P<prefix>\.[^/]+\.sw)[a-p]"), None),
+)
+
+
+def file_temp_dirs(env: dict[str, str] | None = None) -> tuple[str, ...]:
+    """The temp dirs whose randomly named files are folded: FILE_TEMP_DIRS,
+    plus the scanned environment's $TMPDIR when it is a plain absolute
+    directory other than the root (it is where that agent's tempfile and
+    mktemp write). Anything else in TMPDIR is ignored, never trusted."""
+    dirs = list(FILE_TEMP_DIRS)
+    tmpdir = (env or {}).get("TMPDIR")
+    if isinstance(tmpdir, str):
+        tmpdir = tmpdir.rstrip("/")
+        parts = tmpdir.split("/")
+        if (
+            tmpdir.startswith("/") and len(tmpdir) <= 256 and tmpdir.isprintable()
+            and all(part not in ("", ".", "..") for part in parts[1:])
+            and tmpdir not in dirs
+        ):
+            dirs.append(tmpdir)
+    return tuple(dirs)
+
+
+def ephemeral_file_template(path: str, temp_dirs: Iterable[str] = FILE_TEMP_DIRS) -> str | None:
+    """The templated path a randomly named temp file folds into, or None when
+    `path` is not one (see FILE_TEMP_PATTERNS). Only the file's own name is
+    templated; its directory is kept as it is, and must be one of
+    `temp_dirs` or below one."""
+    directory, _, name = path.rpartition("/")
+    if not name or len(name) > 255:
+        return None
+    if not any(directory == root or directory.startswith(root + "/") for root in temp_dirs):
+        return None
+    if any(part in ("", ".", "..") for part in directory.split("/")[1:]):
+        return None
+    for pattern, random_must in FILE_TEMP_PATTERNS:
+        match = pattern.fullmatch(name)
+        if match and (random_must is None or random_must.search(match.group("random"))):
+            return f"{directory}/{match.group('prefix')}*{match.groupdict().get('suffix') or ''}"
+    return None
+
+
+def summarize_file_access(
+    lines: Iterable[str], now: datetime | None = None, temp_dirs: Iterable[str] = FILE_TEMP_DIRS
+) -> dict[str, Any]:
     """Turn filesnoop's JSON lines into the files the sandbox opened (DR-154).
 
     filesnoop (ebpf-tls-tap, DR-152) reports the first time each process
@@ -1802,6 +1874,10 @@ def summarize_file_access(lines: Iterable[str], now: datetime | None = None) -> 
       is kept while there is room. While each class stays within
       FILE_ACCESS_TRACKED, the choice depends only on the set seen, not on
       the order of the lines;
+    - a randomly named temp file (`ephemeral_file_template`) is folded into
+      its template's entry, its access unioned in like any other open, and
+      the distinct paths folded are counted in `collapsed` (up to
+      FILE_ACCESS_TRACKED);
     - `lost` and the start/alive records mean what they do for listensnoop.
 
     Produce the file with filesnoop run in the agent's PID namespace (`-n`);
@@ -1809,6 +1885,10 @@ def summarize_file_access(lines: Iterable[str], now: datetime | None = None) -> 
     """
     files: dict[tuple[str, bool], list[bool]] = {}
     lost = unlisted = unnamed = malformed = outside = 0
+    temp_dirs = tuple(temp_dirs)
+    # Hashes of the distinct (path, layer) folded, for the feature file's
+    # count; past FILE_ACCESS_TRACKED of them it stops growing.
+    collapsed: set[int] = set()
     # Written or run entries left out or unnamed, counted apart from reads so
     # the bundle's note can say a write was lost, not just "more files".
     unlisted_write_exec = unnamed_write_exec = 0
@@ -1857,7 +1937,13 @@ def summarize_file_access(lines: Iterable[str], now: datetime | None = None) -> 
             unnamed += 1
             unnamed_write_exec += changes
             continue
-        key = (_printable(path, FILE_PATH_MAX), layer)
+        path = _printable(path, FILE_PATH_MAX)
+        template = ephemeral_file_template(path, temp_dirs)
+        if template is not None:
+            if len(collapsed) < FILE_ACCESS_TRACKED:
+                collapsed.add(hash((path, layer)))
+            path = template
+        key = (path, layer)
         seen = files.get(key)
         if seen is None:
             if (tracked_write_exec if changes else tracked_reads) >= FILE_ACCESS_TRACKED:
@@ -1901,6 +1987,7 @@ def summarize_file_access(lines: Iterable[str], now: datetime | None = None) -> 
         "unnamed": unnamed,
         "unlisted_write_exec": unlisted_write_exec,
         "unnamed_write_exec": unnamed_write_exec,
+        "collapsed": len(collapsed),
         "malformed": malformed,
         "outside_namespace": outside,
         **health.summary(now),
@@ -1933,11 +2020,12 @@ def load_listen_events(path: Path) -> dict[str, Any]:
         raise ScannerError(f"cannot read listensnoop events {path}: {exc}") from exc
 
 
-def load_file_events(path: Path) -> dict[str, Any]:
+def load_file_events(path: Path, env: dict[str, str] | None = None) -> dict[str, Any]:
     # Streamed, like listensnoop's: filesnoop appends for as long as it runs.
+    # `env` is the scanned environment, for its $TMPDIR (`file_temp_dirs`).
     try:
         with path.open(encoding="utf-8", errors="replace") as stream:
-            return summarize_file_access(_bounded_lines(stream, MAX_FILE_LINE))
+            return summarize_file_access(_bounded_lines(stream, MAX_FILE_LINE), temp_dirs=file_temp_dirs(env))
     except OSError as exc:
         raise ScannerError(f"cannot read filesnoop events {path}: {exc}") from exc
 
@@ -2057,7 +2145,7 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         identity["observed_listeners"] = load_listen_events(Path(listen_file).expanduser())
     files_file = resolve_files_file(args)
     if files_file:
-        identity["observed_file_access"] = load_file_events(Path(files_file).expanduser())
+        identity["observed_file_access"] = load_file_events(Path(files_file).expanduser(), context["env"])
     return context, payload, identity
 
 

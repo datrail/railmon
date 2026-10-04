@@ -996,8 +996,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # x-rail-spec's additions-version rule: a new attribute is a new pack,
         # which RailDash shows as CONTRACT_MISMATCH rather than drift.
         # Pack 3 added observed_ingress_peers (DR-145), pack 4
-        # observed_file_access (DR-154).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 4)
+        # observed_file_access (DR-154); pack 5 folds its random temp names
+        # (DR-166), so a pack-4 baseline is not compared against it.
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 5)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
@@ -1240,6 +1241,24 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
         self.assertEqual(first, later)
         self.assertNotRegex(first["note"], r"\d")
 
+    def test_the_note_says_when_temp_names_were_folded_without_a_count(self):
+        # DR-166: a templated path must never pass for one opened by that
+        # name, and the words, unlike a count, are the same every scan.
+        temp = {"path": "/tmp/tmp*", "read": False, "write": True, "exec": False, "layer": False}
+        plain = self.attribute(self.files([self.WROTE]))
+        folded = self.attribute(self.files([self.WROTE, temp], collapsed=3))
+        again = self.attribute(self.files([self.WROTE, temp], collapsed=40))
+        self.assertNotIn("folded", plain["note"])
+        self.assertIn("randomly named temp files are folded", folded["note"])
+        self.assertEqual((folded["status"], folded["value"]), ("ANSWERED", [self.WROTE, temp]))
+        self.assertEqual(folded, again)
+        self.assertNotRegex(folded["note"], r"\d")
+        self.assertEqual(folded["method"], plain["method"])
+        partial = self.attribute(self.files([temp], lost=1, collapsed=2))
+        self.assertEqual(partial["status"], "PARTIAL")
+        self.assertIn("files may be missing", partial["note"])
+        self.assertIn("randomly named temp files are folded", partial["note"])
+
     def test_a_newly_written_path_changes_this_value_and_nothing_else_moves(self):
         before = self.bundle(self.files([self.READ]))["attributes"]
         after = self.bundle(self.files([self.READ, self.WROTE]))["attributes"]
@@ -1413,6 +1432,38 @@ class ScannerWiringTest(unittest.TestCase):
                 self.assertEqual((field["status"], field["tier"], field["value"]),
                                  ("ANSWERED", "observed", expected))
                 self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
+    def test_the_scanned_tmpdir_folds_its_random_names_end_to_end(self):
+        # DR-166: the scanned environment's $TMPDIR is a temp dir; the count
+        # goes to the feature file, the words to the bundle's note.
+        import subprocess
+        import tempfile
+
+        def opened(path):
+            return json.dumps({"timestamp_ns": 1, "kind": "open", "pid": 7, "tid": 7, "host_pid": 7,
+                               "uid": 0, "comm": "py", "path": path, "read": False, "write": True,
+                               "exec": False, "creat": True, "trunc": False, "append": False,
+                               "dev": "0:1", "ino": 2})
+
+        lines = [json.dumps({"kind": "start", "time": "2026-10-03T08:00:00Z", "every": 0}),
+                 opened("/scratch/tmpk3j_9xq2"), opened("/scratch/tmp9zz8yy7x"), opened("/tmp/tmpqwertyui")]
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "files.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            env = {k: v for k, v in os.environ.items() if not k.startswith("RAIL_")}
+            env["TMPDIR"] = "/scratch"
+            proc = subprocess.run(
+                ["python3", str(SCANNER), "--mode", "self", "--host-id", "h-1",
+                 "--feature-output", f"{tmp}/features.json", "--evidence-bundle-output", f"{tmp}/bundle.json",
+                 "--files-file", f"{tmp}/files.jsonl"],
+                cwd=tmp, capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            features = json.loads(Path(tmp, "features.json").read_text())["observed_file_access"]
+            field = json.loads(Path(tmp, "bundle.json").read_text())["attributes"]["observed_file_access"]
+        expected = [{"path": path, "read": False, "write": True, "exec": False, "layer": False}
+                    for path in ("/scratch/tmp*", "/tmp/tmp*")]
+        self.assertEqual((features["files"], features["collapsed"]), (expected, 3))
+        self.assertEqual((field["status"], field["value"]), ("ANSWERED", expected))
+        self.assertIn("randomly named temp files are folded", field["note"])
 
     def test_an_unreadable_files_file_fails_the_scan_loudly(self):
         import tempfile

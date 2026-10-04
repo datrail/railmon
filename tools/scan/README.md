@@ -143,7 +143,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
 | `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events; and `peers`, who connected in (see [Ingress peers](#ingress-peers)) |
-| `observed_file_access` | only with `--files-file`: the files the sandbox opened, as `files` (path and read/write/exec/layer), plus counts of lost, unlisted, unnamed and malformed events (see [Observed file access](#observed-file-access-optional)) |
+| `observed_file_access` | only with `--files-file`: the files the sandbox opened, as `files` (path and read/write/exec/layer), plus counts of lost, unlisted, unnamed, collapsed (randomly named temp files folded) and malformed events (see [Observed file access](#observed-file-access-optional)) |
 
 Metadata only — never a secret value. That is what makes the file safe to
 persist and hand to a scorer. It is written `0600`: the inventory names an
@@ -432,6 +432,9 @@ the listeners, it only changes when a file is opened in a new way:
   write;
 - a path longer than 1024 characters, or one filesnoop could not resolve,
   is counted as `unnamed`, not listed;
+- randomly named temp files are folded, so a name that differs on every
+  run is not a new path on every scan (see
+  [Randomly named temp files](#randomly-named-temp-files) below);
 - the PARTIAL note names the kind of gap, never a count. A written or run
   file that was left out or unnamed has its own words in the note, so a
   baseline already PARTIAL for too many reads still drifts when a write goes
@@ -447,6 +450,54 @@ The attribute is:
   - `SIZE_CAP_EXCEEDED`: it reported lost events, the list hit its cap, or
     a path was unnamed;
 - BLIND without a file.
+
+### Randomly named temp files
+
+An agent's `tempfile.mkstemp()`, `mktemp` or editor writes a file under a
+name that is random each run. Kept as filesnoop reports it, that would be a
+newly written path, and drift, on every scan. So the scanner folds those
+names, and only those, at the source:
+
+- only a file in or below a temp dir: `/tmp`, `/var/tmp`, `/dev/shm`, and the
+  scanned environment's `$TMPDIR` (the container's in `--mode docker`, the
+  scanner's own in `--mode self`) when it is an absolute path of at most 256
+  printable characters, without `.`, `..` or empty parts, other than `/`;
+- only when the file's own name matches one of these, in full:
+
+  | Pattern | Made by | Example | Folded path |
+  | --- | --- | --- | --- |
+  | 8 of `[a-z0-9_]`, nothing else | Python's `tempfile`, which writes and at once removes one such file the first time a process uses it, to check it can write there | `/tmp/0vuw8his` | `/tmp/*` |
+  | `tmp` + 8 of `[a-z0-9_]`, then an optional `.ext` | Python's `tempfile` (`mkstemp`, `NamedTemporaryFile`, ...) with its default prefix | `/tmp/tmpk3j_9xq2.json` | `/tmp/tmp*.json` |
+  | a prefix ending in `.` `-` or `_` (or just `tmp`), then 6 to 12 of `[A-Za-z0-9]` holding at least one digit or capital, then an optional `.ext` | `mkstemp(3)`/`mkstemps(3)`'s `XXXXXX`, `mktemp(1)`'s `tmp.XXXXXXXXXX`, Go's `os.CreateTemp` with a pattern like `run-*` | `/tmp/tmp.h4Gq0ZtR2b` | `/tmp/tmp.*` |
+  | `.<name>.sw` + one of `a`-`p` | Vim's swap file | `/tmp/.notes.txt.swo` | `/tmp/.notes.txt.sw*` |
+
+  `.ext` is a dot and 1 to 8 letters or digits;
+- each match becomes the entry whose path is its directory, unchanged, and
+  the name with `*` in place of the random part. There is one entry per
+  (directory, pattern, layer), and its `read`, `write` and `exec` are the
+  union of every file folded into it, as for any path.
+
+Nothing else is folded. A new fixed name in a temp dir (`/tmp/exfil.tar`,
+`/tmp/build-output`) is its own entry and drift, and so is a random name
+outside one (`/workspace/tmpk3j_9xq2`). A template is drift the first time
+it appears too, so a baseline only accepts the random names it has seen the
+kind of: the same directory, prefix and extension. Within one, a later file
+is folded in whatever it holds, and an 8-character name such as
+`/tmp/backupdb` folds into `/tmp/*` like Python's own check file. That is the
+trade made for not reporting drift on every scan. Only the file's name is
+folded, not a directory's: a file with a fixed name inside a fresh `mkdtemp()`
+directory (`/tmp/tmpk3j_9xq2/out.json`) is still a new path each run. A 6-character
+`mkstemp(3)` name that happens to be all lower-case letters (about 1 in 180)
+is not folded either.
+
+When anything was folded, the note says "randomly named temp files are
+folded into one path per directory and name pattern, with * for the random
+part", so a templated path never passes for a file of that name. The feature
+file's `collapsed` counts the distinct paths folded. Folding is new in rule
+pack 5: RailDash shows a baseline locked under pack 4 as `CONTRACT_MISMATCH`,
+not as drift, until a pack-5 ASP is locked.
+
+### Schema and limits
 
 The published v1 schema holds an ANSWERED or PARTIAL value to that shape
 (`$defs.file_access_value` in `schemas/evidence-bundle-v1.schema.json`): five
@@ -467,7 +518,9 @@ The attribute is new in rule pack 4. RailDash shows a baseline locked under
 pack 3 as `CONTRACT_MISMATCH`, not as drift, until a pack-4 ASP is locked.
 `tests/files_drift_acceptance.py` runs the path against a real RailDash in
 CI. A newly written path, or a write to a file that was only read, is drift
-on this attribute alone.
+on this attribute alone. A second run that writes temp files under new
+random names (made by Python's `tempfile` and `mktemp`) stays aligned, and a
+new fixed name in `/tmp` is drift.
 
 ## Agent identity
 
