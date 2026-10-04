@@ -193,6 +193,13 @@ jobs:
       - name: listen and scan from the built image
         run: python3 tests/listen_image_acceptance.py --image railmon:ci
 
+      # DR-154: the same deployment for filesnoop. An agent container writes
+      # a file; `railmon files` runs filesnoop inside its PID namespace, and
+      # `railmon scan` folds the write into observed_file_access. Then the
+      # probe is killed and the bundle must go PARTIAL.
+      - name: files and scan from the built image
+        run: python3 tests/files_image_acceptance.py --image railmon:ci
+
       # DR-109 M4: this image and RailDash's, run together the way a user runs
       # them (raildash/docs/asp-v1-acceptance.md). RailDash is built from its
       # own master, so a break on either side of the seam shows up here. Not
@@ -258,6 +265,17 @@ jobs:
             --token "$token" \
             --listen-dir "$RUNNER_TEMP/listen" --scan-listen-dir /listen \
             --scan "docker run --rm --network railmon-raildash -e RAIL_RAILDASH_TOKEN -e RAIL_HOST_ID -v $RUNNER_TEMP/listen:/listen:ro railmon:ci scan" \
+            || { docker logs raildash; exit 1; }
+          # DR-154: a newly written path, and a write to a file that was
+          # only read, is drift on observed_file_access alone; another
+          # process reading a known file is not. filesnoop lines in a
+          # mounted file.
+          mkdir -p "$RUNNER_TEMP/files"
+          python3 tests/files_drift_acceptance.py \
+            --raildash http://127.0.0.1:8000 --scan-raildash http://raildash:8000 \
+            --token "$token" \
+            --files-dir "$RUNNER_TEMP/files" --scan-files-dir /files \
+            --scan "docker run --rm --network railmon-raildash -e RAIL_RAILDASH_TOKEN -e RAIL_HOST_ID -v $RUNNER_TEMP/files:/files:ro railmon:ci scan" \
             || { docker logs raildash; exit 1; }
           # DR-109: a manifest-scoped scan delivers one evidence-bundle v2
           # collection; locked as the baseline, a declared agent whose

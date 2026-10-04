@@ -143,6 +143,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
 | `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events; and `peers`, who connected in (see [Ingress peers](#ingress-peers)) |
+| `observed_file_access` | only with `--files-file`: the files the sandbox opened, as `files` (path and read/write/exec/layer), plus counts of lost, unlisted, unnamed and malformed events (see [Observed file access](#observed-file-access-optional)) |
 
 Metadata only — never a secret value. That is what makes the file safe to
 persist and hand to a scorer. It is written `0600`: the inventory names an
@@ -384,6 +385,86 @@ bridge gateway when the userland proxy carries it. The attribute is
 sandbox-scoped, like `observed_listeners`, and new in rule pack 3: RailDash
 shows a baseline locked under pack 2 as `CONTRACT_MISMATCH` until a pack-3
 ASP is locked. The drift acceptance test covers it too.
+
+## Observed file access (optional)
+
+What the sandbox actually read, wrote and ran, as the kernel saw it.
+`--files-file` (or `RAIL_FILES_FILE`) reads the JSON lines that
+[`filesnoop`](https://github.com/datrail/ebpf-tls-tap#file-opens) appends:
+one line the first time a process opens a regular file for a kind of access.
+The RailMon image ships it as `railmon files`; the
+[top-level README](../../README.md#opened-files) has the deployment, which is
+the listener one. Without the image, build it from ebpf-tls-tap and run it
+in the agent's PID namespace with `-n`, as for listensnoop above.
+
+It becomes the `observed_file_access` attribute, at tier `observed` and
+authored by nobody. It is evidence of what happened, kept apart from what a
+configuration declares and from the file access a tool call asked for. Like
+the listeners, it only changes when a file is opened in a new way:
+
+- each entry is `{path, read, write, exec, layer}`, one per path. `read`,
+  `write` and `exec` are the union of every way it was opened, so a file
+  first read and later written is one entry whose `write` turns true;
+- `path` is the path the process saw, with every non-printable character
+  (control characters, and invisible ones such as U+200B) replaced by `?`;
+  two paths that differ only there are one entry. A path that is not UTF-8 is the one filesnoop printed (U+FFFD for
+  each bad byte);
+- `layer` is filesnoop's flag for an open overlayfs made in a layer beneath,
+  for an overlay mounted from a user namespace. Its path is relative to the
+  layer (kernel 6.8 on) or the overlay's (before), and it is a separate
+  entry either way. A container root a rootful runtime mounted has none; a
+  rootless runtime's containers do, for their first opens;
+- there are no PIDs, counts or process names. A thread's name is chosen by
+  the agent (Python names its threads `Thread-8 (reader)`), so it would
+  churn;
+- an event with `pid` 0 came from outside filesnoop's PID namespace. It is
+  counted (`outside_namespace`) but not listed;
+- the list is capped at 512 entries and at 256 KiB as rendered (a path of
+  non-ASCII characters is written as `\uXXXX` escapes, so the agent could
+  otherwise push the bundle past RailDash's 1 MiB bound). Past either,
+  reads are left out first, so every write and exec is kept while there is
+  room, and an entry too large to fit is skipped rather than everything
+  after it. While each class below stays within its budget, the choice
+  depends only on the set of files, not on the order they were opened. A stdlib-only Python opens about 150 files on start,
+  and an agent with its packages more, so a busy agent does reach the cap;
+- while reading, up to 16,384 read-only paths and 16,384 written or run ones
+  are tracked, each class on its own, so a flood of reads cannot crowd out a
+  write;
+- a path longer than 1024 characters, or one filesnoop could not resolve,
+  is counted as `unnamed`, not listed;
+- the PARTIAL note names the kind of gap, never a count. A written or run
+  file that was left out or unnamed has its own words in the note, so a
+  baseline already PARTIAL for too many reads still drifts when a write goes
+  missing. The counts are in the feature file.
+
+The attribute is:
+
+- ANSWERED with the list;
+- ABSENT when no regular file was opened;
+- PARTIAL when the list may be missing a file:
+  - `NO_SOURCE_ACCESS`: filesnoop restarted, its heartbeat is stale, or it
+    never attached, exactly as for `observed_listeners`;
+  - `SIZE_CAP_EXCEEDED`: it reported lost events, the list hit its cap, or
+    a path was unnamed;
+- BLIND without a file.
+
+`verify_bundle` holds the value to that shape (`FILE_ACCESS_VALUE_SCHEMA` in
+`evidence_bundle.py`): five fields, all required, a path of 1 to 1024
+characters, at most 512 entries and 256 KiB of compact JSON. The published schema accepts any attribute
+value, and it gains this shape once RailDash's vendored copy moves with it.
+
+Not covered, because filesnoop does not see it: files already open when it
+attached, reads and writes through a descriptor opened earlier or passed in,
+`truncate(2)`, `rename` and `unlink`, directories and devices. The events are
+per PID namespace, so in a multi-agent bundle the attribute is
+sandbox-scoped. Keep the file where the agent cannot write, as for
+listensnoop's, and remember that paths can be sensitive.
+
+The attribute is new in rule pack 4. RailDash shows a baseline locked under
+pack 3 as `CONTRACT_MISMATCH`, not as drift, until a pack-4 ASP is locked.
+`tests/files_drift_acceptance.py` runs the path against a real RailDash in
+CI. A newly written path, or a write to a file that was only read, is drift
+on this attribute alone.
 
 ## Agent identity
 

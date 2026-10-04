@@ -72,7 +72,37 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # under pack 1 as CONTRACT_MISMATCH until a pack-2 ASP is locked: the ASP v1
 # design's answer to "every added field would alert at once".
 # Pack 3 adds observed_ingress_peers (DR-145), the same way.
-RULE_PACK_VERSION = 3
+# Pack 4 adds observed_file_access (DR-154), the same way.
+RULE_PACK_VERSION = 4
+
+# The value shape of observed_file_access (DR-154), in the published schema's
+# own dialect and checked by the same walker. It lives here, not in
+# schemas/evidence-bundle-v1.schema.json, for now: RailDash vendors that file
+# byte-for-byte and its CI fails the moment the two differ, so the schema
+# moves with RailDash's re-vendor (DR-154's RailDash half). Until then the
+# attribute validates against the published schema as any attribute does,
+# and `verify_bundle` holds the producer to this stricter shape.
+# Plus a bound the schema dialect cannot state: the value's compact JSON
+# (ensure_ascii, as the bundle is written) is at most this many bytes, so an
+# agent naming its files cannot push the bundle past RailDash's 1 MiB bound.
+# The scanner's FILE_ACCESS_BYTES budget keeps it there.
+FILE_ACCESS_VALUE_MAX_BYTES = 256 * 1024
+FILE_ACCESS_VALUE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "maxItems": 512,
+    "items": {
+        "type": "object",
+        "required": ["path", "read", "write", "exec", "layer"],
+        "additionalProperties": False,
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "read": {"type": "boolean"},
+            "write": {"type": "boolean"},
+            "exec": {"type": "boolean"},
+            "layer": {"type": "boolean"},
+        },
+    },
+}
 
 # ── the v2 (DR-109 multi-agent) contract, loaded the same way ──────────────
 # A second, independent document: v2 is not v1-plus-fields, so it gets its
@@ -195,7 +225,7 @@ def _resolve(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
 def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: dict[str, Any] | None = None) -> list[str]:
     """A minimal, stdlib-only walker for the slice of JSON Schema this
     contract uses: type/const/enum/required/properties/additionalProperties/
-    items/minProperties/minItems, minLength/maxLength/minimum/pattern,
+    items/minProperties/minItems/maxItems, minLength/maxLength/minimum/pattern,
     format:date-time, and allOf/if/then/else/not/$ref, and the boolean
     schemas `true`/`false` (`"value": true` marks an attribute's value as
     accepting anything).
@@ -252,6 +282,8 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: di
     if isinstance(instance, list):
         if "minItems" in schema and len(instance) < schema["minItems"]:
             problems.append(f"{where}: must have at least {schema['minItems']} item(s)")
+        if "maxItems" in schema and len(instance) > schema["maxItems"]:
+            problems.append(f"{where}: must have at most {schema['maxItems']} item(s)")
         if "items" in schema:
             for index, item in enumerate(instance):
                 problems += _schema_problems(item, schema["items"], f"{where}[{index}]", root)
@@ -290,7 +322,9 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
     """The two rules the published schema cannot express (see its top-level
     $comment): every attestation_ref names a real attestation, and a
     deployment value's byte length is measured in UTF-8 bytes, which
-    `maxLength` cannot — it counts Unicode code points."""
+    `maxLength` cannot — it counts Unicode code points. Plus one it does not
+    express yet: observed_file_access's value shape (FILE_ACCESS_VALUE_SCHEMA)
+    and its byte bound."""
     problems: list[str] = []
     attestations = {a.get("id") for a in (bundle.get("attestations") or [])}
     for name, field in (bundle.get("attributes") or {}).items():
@@ -307,6 +341,17 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
                     problems.append(
                         f"attributes.deployment.value.{key}: exceeds the {DEPLOYMENT_VALUE_MAX_BYTES}-byte bound"
                     )
+    files = (bundle.get("attributes") or {}).get("observed_file_access")
+    if isinstance(files, dict) and files.get("value") is not None:
+        problems += _file_access_problems(files["value"], "attributes.observed_file_access.value")
+    return problems
+
+
+def _file_access_problems(value: Any, where: str) -> list[str]:
+    """observed_file_access's value against its shape and its byte bound."""
+    problems = _schema_problems(value, FILE_ACCESS_VALUE_SCHEMA, where)
+    if len(json.dumps(value, separators=(",", ":"))) > FILE_ACCESS_VALUE_MAX_BYTES:
+        problems.append(f"{where}: exceeds the {FILE_ACCESS_VALUE_MAX_BYTES}-byte bound")
     return problems
 
 
@@ -347,6 +392,9 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
                 problems.append(f"{where}.{name}.attestation_ref: {field['attestation_ref']!r} points at nothing")
 
     check_attribute_refs((bundle.get("sandbox") or {}).get("attributes"), "sandbox.attributes")
+    files = ((bundle.get("sandbox") or {}).get("attributes") or {}).get("observed_file_access")
+    if isinstance(files, dict) and files.get("value") is not None:
+        problems += _file_access_problems(files["value"], "sandbox.attributes.observed_file_access.value")
     agents = bundle.get("agents") or []
     keys = [agent.get("agent_key") for agent in agents if isinstance(agent, dict)]
     if len(set(keys)) != len(keys):
@@ -681,6 +729,35 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
         return None, "PARSE_FAILED"
 
 
+def _probe_gaps(summary: dict[str, Any], probe: str) -> tuple[list[str], bool]:
+    """What makes a probe's event list incomplete, as note fragments, and
+    whether the probe was a source we could not reach (not running) rather
+    than one that delivered less than it saw.
+
+    A note names the kind of gap, not a running count: RailDash compares
+    notes, and a count that grows with every scan (or that any process can
+    inflate, as a probe's lost count can be) would be drift on every scan.
+    The counts stay in the feature file."""
+    gaps = []
+    unreachable = bool(not summary.get("starts") or summary.get("restarted") or summary.get("stale"))
+    if not summary.get("starts"):
+        gaps.append(f"no {probe} start record (it may never have attached)")
+    if summary.get("restarted"):
+        # The one count a note carries: it changes only when the probe
+        # restarts, so each restart is one drift a user can accept, and the
+        # next one is drift again rather than hidden by that accept.
+        restarts = summary["starts"] - 1
+        gaps.append(
+            f"{probe} restarted {restarts} time{'s' if restarts != 1 else ''}"
+            " (what opened while it was down is missing)"
+        )
+    if summary.get("stale"):
+        gaps.append(f"{probe} stopped reporting (its heartbeat is stale)")
+    if summary.get("lost"):
+        gaps.append(f"{probe} reported lost events")
+    return gaps, unreachable
+
+
 # The closed-set reason codes' severity, for the builder's floor: when one
 # attribute carries several failure reasons, the worst one names the
 # attribute; the rest still ride in the note.
@@ -718,6 +795,7 @@ def build_evidence_bundle(
     mcp: list[dict[str, Any]] = identity.get("mcp_servers") or []
     reach: dict[str, Any] = identity.get("observed_reach") or {}
     listening: dict[str, Any] | None = identity.get("observed_listeners")
+    file_access: dict[str, Any] | None = identity.get("observed_file_access")
     # ── inputs_attempted: the sources, and whether each was reached ──────
     raw_named = getattr(args, "config_path", []) or []
     config_paths = [Path(p).expanduser() for p in raw_named] \
@@ -746,10 +824,12 @@ def build_evidence_bundle(
         # We are the runtime observation source when the scan happens inside the
         # runtime; a docker-mode scan reads its container, not itself, so its
         # runtime source is the wire. The pack ships without a tap, so that is
-        # reached only through a file a tap wrote: an AgentSight snapshot or
-        # listensnoop events.
+        # reached only through a file a tap wrote: an AgentSight snapshot,
+        # listensnoop events or filesnoop events.
         "runtime": _source(
-            True, mode == "self" or bool(reach) or listening is not None, "NO_SOURCE_ACCESS"
+            True,
+            mode == "self" or bool(reach) or listening is not None or file_access is not None,
+            "NO_SOURCE_ACCESS",
         ),
         # A root the operator named and we could not read is the failure the
         # permissions attribute names precisely; any failure means this source
@@ -944,29 +1024,7 @@ def build_evidence_bundle(
             "listensnoop events: protocol, bound address, port (a kernel-chosen "
             "port is 'ephemeral'), process name"
         )
-        # The note names the kind of gap, not a running count: RailDash
-        # compares notes, and a count that grows with every scan (or that any
-        # process can inflate, as listensnoop's lost count can be) would be
-        # drift on every scan. The counts stay in the feature file.
-        gaps = []
-        unreachable = (
-            not listening.get("starts") or listening.get("restarted") or listening.get("stale")
-        )
-        if not listening.get("starts"):
-            gaps.append("no listensnoop start record (it may never have attached)")
-        if listening.get("restarted"):
-            # The one count a note carries: it changes only when the probe
-            # restarts, so each restart is one drift a user can accept, and
-            # the next one is drift again rather than hidden by that accept.
-            restarts = listening["starts"] - 1
-            gaps.append(
-                f"listensnoop restarted {restarts} time{'s' if restarts != 1 else ''}"
-                " (what opened while it was down is missing)"
-            )
-        if listening.get("stale"):
-            gaps.append("listensnoop stopped reporting (its heartbeat is stale)")
-        if listening.get("lost"):
-            gaps.append("listensnoop reported lost events")
+        gaps, unreachable = _probe_gaps(listening, "listensnoop")
         probe_gaps = list(gaps)  # what the peers share: everything but the listener cap
         if listening.get("unlisted"):
             gaps.append("more distinct listeners than the cap")
@@ -1031,6 +1089,56 @@ def build_evidence_bundle(
         else:
             attributes["observed_ingress_peers"] = _absent(
                 peer_method + "; no inbound connection was accepted in the window",
+                "observed",
+            )
+
+    # The files the sandbox opened (DR-154), from filesnoop: kernel-observed,
+    # so `observed`, authored by nobody, and kept apart from anything a
+    # configuration declares or a tool call asked for. No declaration names
+    # a file, so drift is the locked baseline's comparison of this list: a
+    # newly written path is a new entry, or an old entry whose `write` turned
+    # true. The same probe-health gaps as the listeners', plus its own cap
+    # and paths it could not name. A gap never reads as "nothing opened".
+    if file_access is None:
+        attributes["observed_file_access"] = _blind(
+            "NOT_COLLECTED_BY_PACK", "observed",
+            note="no filesnoop event file was provided to this scan",
+        )
+    else:
+        opened = file_access.get("files") or []
+        file_method = (
+            "filesnoop events: each regular file a process in the sandbox opened, "
+            "by the path it saw, with read, write and exec the union of how it "
+            "was opened; layer marks an overlayfs layer open"
+        )
+        file_gaps, file_unreachable = _probe_gaps(file_access, "filesnoop")
+        # A write or exec lost to the cap or an unreadable path gets its own
+        # words, so a baseline already PARTIAL for too many reads still
+        # drifts when a write is the thing that went missing.
+        if file_access.get("unlisted"):
+            file_gaps.append("more distinct files than the cap (reads are left out first)")
+        if file_access.get("unlisted_write_exec"):
+            file_gaps.append("written or run files past the cap")
+        if file_access.get("unnamed"):
+            file_gaps.append("a file whose path filesnoop could not read, or longer than the cap")
+        if file_access.get("unnamed_write_exec"):
+            file_gaps.append("a written or run file among them")
+        if file_gaps:
+            attributes["observed_file_access"] = _partial(
+                opened, "observed",
+                "NO_SOURCE_ACCESS" if file_unreachable else "SIZE_CAP_EXCEEDED",
+                authored_by="none", method=file_method,
+                note="; ".join(file_gaps) + ": files may be missing from this list",
+            )
+        elif opened:
+            attributes["observed_file_access"] = _answered(
+                opened, "observed", authored_by="none", method=file_method,
+                note="a finite window; a file opened before filesnoop started, or read "
+                "through a descriptor opened before then, is not in it",
+            )
+        else:
+            attributes["observed_file_access"] = _absent(
+                file_method + "; no regular file was opened in the window",
                 "observed",
             )
 
