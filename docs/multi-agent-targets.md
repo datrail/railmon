@@ -159,7 +159,7 @@ count them from the file, e.g.
 | `target '<k>' tap ended (…); … will retry discovery` | the probe for that one agent stopped |
 | `target '<k>' resolved again; tap restarted` | recovery, retried every 5 s under the same `agent_key` |
 | `every declared target is currently down; capture is idle …` | RailMon keeps running and retrying; it does not exit |
-| `capture analyzer panicked on captured traffic (…); stopping this tap` | malformed traffic (e.g. an HPACK block) hit the analyzer; only that tap stops and restarts |
+| `capture analyzer panicked on captured traffic (…); stopping this tap` | an analyzer panicked on captured traffic (since agentsight-capture 1.0.34 a malformed HPACK block no longer does); only that tap stops and restarts |
 | `ignoring registration state for ticket-claim resolution: <path>: <error>` | the state file fails the control-path rules, has no UUID `agent_id`, or names a different host/sandbox than the manifest |
 | `keyed capture requires …` / `… cannot be combined with --target-manifest` | a flag combination keyed mode refuses (exit 1) |
 
