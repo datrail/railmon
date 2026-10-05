@@ -420,9 +420,12 @@ pub async fn event_stream(
 /// panics on captured bytes (DR-129).
 ///
 /// The analyzers are lazy stream adapters, so their code runs inside our own
-/// poll: AgentSight's HTTPParser decodes HTTP/2 headers with `hpack` 0.3.0,
-/// which panics on a malformed dynamic-table-size update, and those bytes come
-/// from traffic the monitored agent — or any server it talks to — controls.
+/// poll, on bytes from traffic the monitored agent — or any server it talks
+/// to — controls. The panic that prompted it, `hpack` 0.3.0 on a malformed
+/// dynamic-table-size update inside HTTPParser, is gone since agentsight-capture
+/// 1.0.34 moved to loona-hpack; the guard stays for whatever panics next, since
+/// AgentSight is tracked, not pinned, and one panic would otherwise abort every
+/// keyed target.
 /// On a panic the inner stream is dropped right away, not merely no longer
 /// polled: the probe child and the status sender live in its state, so
 /// dropping it kills the probe (`kill_on_drop`) and closes the status channel,
@@ -752,8 +755,9 @@ mod tests {
     }
 
     /// A probe that emits one HTTP/2 HEADERS frame whose HPACK block is a
-    /// dynamic-table-size update too large for hpack 0.3.0 (it unwraps a
-    /// `None`), then idles. Captured bytes like these are attacker-shaped.
+    /// dynamic-table-size update too large for the table (it panicked hpack
+    /// 0.3.0, which unwrapped a `None`), then an ordinary request on another
+    /// thread, then exits. Captured bytes like these are attacker-shaped.
     fn malformed_hpack_probe(dir: &Path) -> String {
         let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         let block = [0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
@@ -761,39 +765,48 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, len as u8, 0x1, 0x4, 0, 0, 0, 1]);
         bytes.extend_from_slice(&block);
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let line = json!({
+        let malformed = json!({
             "source": "ssl", "pid": 4242, "comm": "node",
             "data": {"pid": 4242, "tid": 7, "timestamp_ns": 1, "function": "WRITE/SEND", "data": format!("HEX:{hex}")}
         });
+        let request = json!({
+            "source": "ssl", "pid": 4242, "comm": "node",
+            "data": {"pid": 4242, "tid": 8, "timestamp_ns": 2, "function": "SSL_write",
+                     "message_type": "request", "method": "POST", "path": "/ok",
+                     "headers": {"host": "example.test"}, "body": "{}"}
+        });
         let path = dir.join("agentsight");
-        std::fs::write(&path, format!("#!/bin/sh\necho '{line}'\nexec sleep 30\n"))
-            .expect("write probe");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho '{malformed}'\necho '{request}'\nexec sleep 1\n"),
+        )
+        .expect("write probe");
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .expect("chmod probe");
         path.display().to_string()
     }
 
+    /// DR-129 upstream: AgentSight 1.0.34 decodes HPACK with loona-hpack, which
+    /// rejects the block instead of panicking. The tap reads on past it, so the
+    /// next request is still captured; `contain_analyzer_panics` stays for any
+    /// other analyzer panic.
     #[tokio::test]
-    async fn malformed_hpack_from_the_wire_stops_the_tap_not_the_process() {
+    async fn malformed_hpack_from_the_wire_does_not_stop_the_tap() {
         let dir = tempfile::tempdir().expect("tempdir");
         let probe = malformed_hpack_probe(dir.path());
-        let (stream, status) = event_stream(&probe, &CaptureFilters::default())
+        let (stream, _status) = event_stream(&probe, &CaptureFilters::default())
             .await
             .expect("start fake probe");
         let events: Vec<Event> =
             tokio::time::timeout(std::time::Duration::from_secs(10), stream.collect())
                 .await
-                .expect("the stream ends instead of hanging");
+                .expect("the stream ends when the probe exits");
         assert!(
-            events.is_empty(),
-            "nothing is trusted from a parser that panicked"
+            events
+                .iter()
+                .any(|event| event.data.get("path").and_then(Value::as_str) == Some("/ok")),
+            "the request after the malformed block was captured: {events:?}"
         );
-        // The probe (sleeping 30s) was killed and its status channel closed
-        // promptly, so a keyed target's restart path is not left waiting.
-        tokio::time::timeout(std::time::Duration::from_secs(5), status)
-            .await
-            .expect("status resolves once the tap is dropped")
-            .ok();
     }
 
     /// The envelope agentsight actually emits, pinned by the Python's deleted

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Built-binary DR-129 acceptance: a malformed HPACK block in one target's
-captured HTTP/2 traffic panics hpack 0.3.0 inside AgentSight's HTTPParser.
-RailMon must contain it to that target's tap — still running, still capturing
-the other target, and restarting the one whose tap stopped — instead of the
-whole collector aborting.
+captured HTTP/2 traffic. It panicked hpack 0.3.0 inside AgentSight's
+HTTPParser, which RailMon contained to that target's tap. agentsight-capture
+1.0.34 decodes with loona-hpack, which rejects the block instead (DR-170), so
+now nothing stops: RailMon keeps running, both targets' taps stay up (the
+malformed one is never restarted), the healthy one is captured, and a
+single-target RailMon keeps running and stops cleanly. The generic panic guard
+(`contain_analyzer_panics`) stays, covered by its unit test.
 
 Root-only (distinct target UIDs via `setpriv`), like `two_agent_acceptance.py`;
 CI runs it inside the built image (see `ci.yml`), `RAILMON_BIN` picks the binary.
@@ -30,6 +33,7 @@ def main() -> None:
     root.chmod(0o700)
     agents: list[subprocess.Popen[bytes]] = []
     railmon = None
+    alone = None
     try:
         for uid in (65532, 65533):
             agents.append(
@@ -98,31 +102,27 @@ time.sleep(60)
                 ],
                 stderr=log_file,
             )
-            # Long enough for at least one 5s retry tick to restart executor.
+            # Long enough for at least one 5s retry tick, which would restart a
+            # tap that had stopped.
             deadline = time.monotonic() + 12
             executor_attempts = root / f"attempts-{agents[1].pid}"
             while time.monotonic() < deadline:
                 require(railmon.poll() is None, "RailMon died on a malformed HPACK block")
-                if executor_attempts.exists() and int(executor_attempts.read_text()) >= 2:
-                    break
                 time.sleep(0.1)
-            require(railmon.poll() is None, "RailMon died on a malformed HPACK block")
             text = log.read_text()
-            require("capture analyzer panicked" in text, "the contained panic was not logged")
+            require("capture analyzer panicked" not in text, "an analyzer still panics on a malformed HPACK block")
             require(
-                executor_attempts.exists() and int(executor_attempts.read_text()) >= 2,
-                "the panicked target's tap was not restarted",
+                executor_attempts.exists() and int(executor_attempts.read_text()) == 1,
+                "the malformed target's tap stopped and was restarted",
             )
             railmon.send_signal(signal.SIGINT)
-            require(railmon.wait(timeout=5) == 0, "RailMon did not stop cleanly after a contained panic")
+            require(railmon.wait(timeout=5) == 0, "RailMon did not stop cleanly")
         rows = [json.loads(line) for line in output.read_text().splitlines()]
         keys = [(row.get("agent_ref") or {}).get("agent_key") for row in rows]
         require("planner" in keys, "the healthy target stopped being captured")
-        require("executor" not in keys, "a panicked parser's output was trusted")
 
-        # Single-target mode has nothing to restart into, so the contained
-        # panic must surface as a failing exit a supervisor acts on — not a
-        # clean 0 that reads as healthy.
+        # Single-target mode: its only tap reads past the block and keeps
+        # running, until it is asked to stop.
         single = root / "single-probe"
         single.write_text(
             "#!/usr/bin/env python3\nimport json, time\n"
@@ -131,19 +131,22 @@ time.sleep(60)
             "time.sleep(30)\n"
         )
         single.chmod(0o700)
-        finished = subprocess.run(
+        alone = subprocess.Popen(
             [str(binary), "--agentsight", str(single), "--output", str(root / "single.jsonl")],
-            capture_output=True,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=15,
         )
-        require(finished.returncode != 0, "single-target RailMon exited 0 after its only tap stopped")
-        require("analyzer failed on captured traffic" in finished.stderr, "single-target exit gave no reason")
+        time.sleep(3)
+        require(alone.poll() is None, "single-target RailMon stopped on a malformed HPACK block")
+        alone.send_signal(signal.SIGINT)
+        _, stderr = alone.communicate(timeout=5)
+        require(alone.returncode == 0, f"single-target RailMon did not stop cleanly: {stderr}")
         print(json.dumps({"result": "PASS", "executor_tap_starts": int(executor_attempts.read_text()), "rows": len(rows)}))
     finally:
-        if railmon is not None and railmon.poll() is None:
-            railmon.kill()
-            railmon.wait(timeout=2)
+        for proc in (railmon, alone):
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
         for proc in agents:
             proc.terminate()
         for proc in agents:
