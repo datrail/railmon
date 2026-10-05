@@ -128,15 +128,22 @@ time.sleep(60)
             "#!/usr/bin/env python3\nimport json, time\n"
             f"print(json.dumps({{'source': 'ssl', 'pid': 1, 'comm': 'x', 'data': {{'pid': 1, 'tid': 1, "
             f"'timestamp_ns': 1, 'function': 'WRITE/SEND', 'data': 'HEX:{malformed.hex()}'}}}}), flush=True)\n"
+            f"open({str(root / 'single-printed')!r}, 'w').close()\n"
             "time.sleep(30)\n"
         )
         single.chmod(0o700)
+        printed = root / "single-printed"
         alone = subprocess.Popen(
             [str(binary), "--agentsight", str(single), "--output", str(root / "single.jsonl")],
             stderr=subprocess.PIPE,
             text=True,
         )
-        time.sleep(3)
+        # Past the block being printed, then long enough for RailMon to read it.
+        deadline = time.monotonic() + 10
+        while not printed.exists() and time.monotonic() < deadline and alone.poll() is None:
+            time.sleep(0.1)
+        require(printed.exists(), "single-target probe never printed the block")
+        time.sleep(2)
         require(alone.poll() is None, "single-target RailMon stopped on a malformed HPACK block")
         alone.send_signal(signal.SIGINT)
         _, stderr = alone.communicate(timeout=5)
