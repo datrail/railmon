@@ -1377,6 +1377,180 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
         self.assertTrue(any("byte bound" in p for p in problems), problems)
 
 
+class WindowMemberTest(unittest.TestCase):
+    """The optional `window` member on v2 attributes (DR-169): the schema
+    publishes it, the composer holds one table of the lists it applies to,
+    and emitting it stays off until Rail Center's ingest accepts it."""
+
+    V2 = json.loads((ROOT / "schemas" / "evidence-bundle-v2.schema.json").read_text())
+
+    # Observed lists that are not bounded by a window: the env scan reads the
+    # whole environment each time, so a credential missing from it is gone.
+    COMPLETE_OBSERVED_LISTS = frozenset({"credential_inventory"})
+
+    @staticmethod
+    def composer():
+        spec = importlib.util.spec_from_file_location(
+            "compose_evidence_bundle_v2", ROOT / "tools/scan/compose_evidence_bundle_v2.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def every_probe_bundle() -> dict:
+        """A v1 bundle with every runtime probe fed through its real
+        summarizer, so each window-bounded list comes out ANSWERED."""
+        snapshot = {
+            "network_targets": [{"host": "api.example.com", "path": "/v1", "count": 3, "error_count": 1}],
+            "tool_calls": [{"tool_name": "bash"}],
+        }
+        start = {"kind": "start", "time": "2026-10-03T08:00:00Z", "every": 0}
+        listen = [
+            json.dumps({**start, "peers": True}),
+            json.dumps({"kind": "listen", "pid": 7, "comm": "nc", "protocol": "tcp",
+                        "addr": "0.0.0.0", "port": 4444, "ephemeral": False}),
+            json.dumps({"kind": "peer", "pid": 7, "comm": "nc", "protocol": "tcp",
+                        "addr": "0.0.0.0", "port": 4444, "ephemeral": False, "peer": "8.8.4.4"}),
+        ]
+        files = [
+            json.dumps(start),
+            json.dumps({"kind": "open", "pid": 7, "path": "/data/out.txt",
+                        "read": True, "write": True, "exec": False}),
+        ]
+        return evidence_bundle.build_evidence_bundle(
+            build_args(), self_context(), dict(HOST_PAIR),
+            identity(
+                observed_reach=scanner.summarize_observed(snapshot, set()),
+                observed_listeners=scanner.summarize_listeners(listen),
+                observed_file_access=scanner.summarize_file_access(files),
+            ),
+        )
+
+    def attribute_problems(self, window) -> list:
+        attribute = {"value": [], "status": "ANSWERED", "tier": "observed", "authored_by": "none",
+                     "window": window}
+        return evidence_bundle._schema_problems(
+            attribute, self.V2["$defs"]["attribute"], "attribute", self.V2)
+
+    def test_the_v2_schema_accepts_a_window(self):
+        for window in ({}, {"ignore": ["count", "error_count"]}, {"union": ["exec", "read", "write"]},
+                       {"ignore": ["count"], "union": ["write"]}):
+            with self.subTest(window=window):
+                self.assertEqual(self.attribute_problems(window), [])
+
+    def test_the_v2_schema_rejects_a_malformed_window(self):
+        for window in ({"counting": ["count"]}, {"ignore": "count"}, {"ignore": [1]},
+                       {"union": [""]}, {"union": ["write", "write"]}, [], None):
+            with self.subTest(window=window):
+                self.assertNotEqual(self.attribute_problems(window), [])
+
+    def test_v1_has_no_window_member(self):
+        # v1 stays byte-for-byte as published: the member is v2's alone.
+        self.assertNotIn("window", SCHEMA["$defs"]["attribute"]["properties"])
+        self.assertIs(SCHEMA["$defs"]["attribute"]["additionalProperties"], False)
+
+    def test_every_window_bounded_list_is_in_the_table(self):
+        # A new probe's observed list fails here until it is named in
+        # WINDOW_LISTS, or below as a list that is complete.
+        composer = self.composer()
+        bundle = self.every_probe_bundle()
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+        observed_lists = {
+            name for name, attribute in bundle["attributes"].items()
+            if attribute["tier"] == "observed" and isinstance(attribute["value"], list)
+        }
+        self.assertEqual(observed_lists - self.COMPLETE_OBSERVED_LISTS, set(composer.WINDOW_LISTS))
+        for name in composer.WINDOW_LISTS:
+            with self.subTest(name=name):
+                self.assertEqual(bundle["attributes"][name]["status"], "ANSWERED")
+
+    def test_the_table_names_keys_the_items_actually_carry(self):
+        composer = self.composer()
+        attributes = self.every_probe_bundle()["attributes"]
+        for name, spec in composer.WINDOW_LISTS.items():
+            self.assertLessEqual(set(spec), {"ignore", "union"})
+            for item in attributes[name]["value"]:
+                with self.subTest(name=name, item=item):
+                    for key in spec.get("ignore", ()):
+                        self.assertIn(key, item)
+                    for key in spec.get("union", ()):
+                        self.assertIsInstance(item[key], bool)
+        # The files' flags are every boolean key but `layer`, which is part
+        # of the entry's identity.
+        flags = {key for key, value in attributes["observed_file_access"]["value"][0].items()
+                 if isinstance(value, bool)}
+        self.assertEqual(set(composer.WINDOW_LISTS["observed_file_access"]["union"]), flags - {"layer"})
+
+    def test_the_member_is_not_emitted_until_rail_center_accepts_it(self):
+        composer = self.composer()
+        self.assertIs(composer.EMIT_WINDOW, False)
+        attributes = self.every_probe_bundle()["attributes"]
+        self.assertIs(composer.with_window(attributes), attributes)
+        collection = composer.compose_from_scopes(
+            "h-1", "agent-container", evidence_bundle.RULE_PACK_VERSION, {},
+            {k: v for k, v in attributes.items() if k in composer.SANDBOX_ATTRIBUTES},
+            [{"agent_key": "planner", "discovery_status": "available", "inputs_attempted": {},
+              "attributes": composer.agent_scoped_attributes(attributes)}],
+        )
+        scopes = [collection["sandbox"], *collection["agents"]]
+        for scope in scopes:
+            for name, attribute in scope["attributes"].items():
+                self.assertNotIn("window", attribute, name)
+
+    def test_an_emitted_window_validates_and_marks_each_list(self):
+        composer = self.composer()
+        bundle = self.every_probe_bundle()
+        attributes = bundle["attributes"]
+        sandbox = {k: v for k, v in attributes.items() if k in composer.SANDBOX_ATTRIBUTES}
+        agent = composer.agent_scoped_attributes(attributes)
+        before = copy.deepcopy(attributes)
+        with mock.patch.object(composer, "EMIT_WINDOW", True):
+            collections = {
+                "compose_from_scopes": composer.compose_from_scopes(
+                    "h-1", "agent-container", bundle["rule_pack_version"], bundle["inputs_attempted"],
+                    sandbox,
+                    [{"agent_key": "planner", "discovery_status": "available",
+                      "inputs_attempted": bundle["inputs_attempted"], "attributes": agent}],
+                    bundle.get("attestations"),
+                ),
+                "compose": composer.compose("h-1", "agent-container", {"planner": bundle}),
+            }
+        self.assertEqual(attributes, before, "the caller's attributes must not be mutated")
+        for how, collection in collections.items():
+            with self.subTest(how=how):
+                self.assertEqual(evidence_bundle.contract_problems_v2(collection), [])
+                scoped = {**collection["sandbox"]["attributes"], **collection["agents"][0]["attributes"]}
+                self.assertEqual(set(scoped), set(attributes))
+                for name, attribute in scoped.items():
+                    if name in composer.WINDOW_LISTS:
+                        self.assertEqual(attribute["window"], composer.WINDOW_LISTS[name], name)
+                    else:
+                        self.assertNotIn("window", attribute, name)
+        # The two non-empty specs, spelled out once against the table.
+        self.assertEqual(collections["compose"]["agents"][0]["attributes"]["observed_destinations"]["window"],
+                         {"ignore": ["count", "error_count"]})
+        self.assertEqual(collections["compose"]["sandbox"]["attributes"]["observed_file_access"]["window"],
+                         {"union": ["exec", "read", "write"]})
+
+    def test_a_list_that_saw_no_window_carries_none(self):
+        composer = self.composer()
+        attributes = evidence_bundle.build_evidence_bundle(
+            build_args(), self_context(), dict(HOST_PAIR), identity())["attributes"]
+        with mock.patch.object(composer, "EMIT_WINDOW", True):
+            windowed = composer.with_window(attributes)
+        for name in composer.WINDOW_LISTS:
+            with self.subTest(name=name):
+                self.assertEqual(windowed[name]["status"], "BLIND")
+                self.assertNotIn("window", windowed[name])
+
+    def test_an_empty_window_carries_it(self):
+        composer = self.composer()
+        attribute = {"value": None, "status": "ABSENT", "tier": "observed", "method": "looked"}
+        with mock.patch.object(composer, "EMIT_WINDOW", True):
+            windowed = composer.with_window({"tool_names": attribute})
+        self.assertEqual(windowed["tool_names"]["window"], {})
+
+
 class ScannerWiringTest(unittest.TestCase):
     """Subprocess runs mirroring the registration/feature-file guarantees."""
 

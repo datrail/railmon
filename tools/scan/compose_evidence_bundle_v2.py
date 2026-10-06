@@ -42,6 +42,66 @@ SANDBOX_ATTRIBUTES = frozenset(
     }
 )
 
+# DR-169: the attributes whose value holds only what the observation window
+# saw, published as each attribute's optional `window` member (see the v2
+# schema's `$defs.attribute.properties.window`). The one table: a probe that
+# adds a window-bounded list adds it here, and test_evidence_bundle.py's
+# WindowMemberTest fails until it does. Consumers (Rail Center's alignment,
+# RailDash) hard-code this list today; the member lets them read it off the
+# bundle instead.
+#
+# - `ignore`: item keys that count traffic in the window and are not part of
+#   the item's identity. AgentSight's destinations carry `count` and
+#   `error_count` (`summarize_observed`).
+# - `union`: boolean item keys that are true if it happened at any point in
+#   the window, so one turning true is something newly seen. filesnoop's
+#   `read`, `write` and `exec` are the union of every open (`layer` is not:
+#   it is part of the entry's key, an overlayfs open is another entry).
+# Listeners and peers carry no counts and no flags; tool names and the
+# undeclared hosts are plain strings.
+WINDOW_LISTS: dict[str, dict[str, list[str]]] = {
+    "tool_names": {},
+    "observed_destinations": {"ignore": ["count", "error_count"]},
+    "undeclared_destinations": {},
+    "observed_listeners": {},
+    "observed_ingress_peers": {},
+    "observed_file_access": {"union": ["exec", "read", "write"]},
+}
+
+# The statuses that report what a window saw: a list (ANSWERED, PARTIAL) or
+# an empty window (ABSENT, "nothing seen in the window"). BLIND and FAILED
+# saw nothing, so there is no window to describe.
+WINDOWED_STATUSES = frozenset({"ANSWERED", "PARTIAL", "ABSENT"})
+
+# Off until Rail Center's ingest (POST /v1/evidence-bundles, extra="forbid")
+# accepts the member — it would reject a bundle carrying it. Flips to True in
+# DR-169 step 3, once the rail-center change that accepts it has landed.
+EMIT_WINDOW = False
+
+
+def with_window(attributes: dict[str, Any]) -> dict[str, Any]:
+    """`attributes` with the `window` member on each window-bounded list in
+    `WINDOW_LISTS` whose status reports a window, as a new dict (the caller's
+    attribute objects are not mutated). Unchanged while `EMIT_WINDOW` is off."""
+    if not EMIT_WINDOW:
+        return attributes
+    windowed: dict[str, Any] = {}
+    for name, attribute in attributes.items():
+        spec = WINDOW_LISTS.get(name)
+        if spec is not None and isinstance(attribute, dict) and attribute.get("status") in WINDOWED_STATUSES:
+            attribute = {**attribute, "window": {key: list(keys) for key, keys in spec.items()}}
+        windowed[name] = attribute
+    return windowed
+
+
+def _with_window_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not EMIT_WINDOW:
+        return entries
+    return [
+        {**entry, "attributes": with_window(entry["attributes"])} if isinstance(entry.get("attributes"), dict) else entry
+        for entry in entries
+    ]
+
 
 def agent_scoped_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     """The subset of a v1-shaped attribute dict that belongs under one
@@ -97,8 +157,8 @@ def compose_from_scopes(
         "sandbox_name": sandbox_name,
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "rule_pack_version": rule_pack_version,
-        "sandbox": {"inputs_attempted": sandbox_inputs, "attributes": sandbox_attributes},
-        "agents": sorted(agent_entries, key=lambda entry: entry["agent_key"]),
+        "sandbox": {"inputs_attempted": sandbox_inputs, "attributes": with_window(sandbox_attributes)},
+        "agents": sorted(_with_window_entries(agent_entries), key=lambda entry: entry["agent_key"]),
         "attestations": list(attestations or []),
     }
 
@@ -160,7 +220,7 @@ def compose(
                 "agent_key": key,
                 "discovery_status": discovery_status.get(key, "available"),
                 "inputs_attempted": inputs,
-                "attributes": agent_attributes,
+                "attributes": with_window(agent_attributes),
             }
         )
     return {
@@ -170,7 +230,7 @@ def compose(
         "sandbox_name": sandbox_name,
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "rule_pack_version": rule_pack,
-        "sandbox": {"inputs_attempted": shared_inputs or {}, "attributes": shared},
+        "sandbox": {"inputs_attempted": shared_inputs or {}, "attributes": with_window(shared)},
         "agents": entries,
         "attestations": [attestations[key] for key in sorted(attestations)],
     }

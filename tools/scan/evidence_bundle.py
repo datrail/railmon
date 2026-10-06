@@ -218,7 +218,8 @@ def _resolve(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
 def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: dict[str, Any] | None = None) -> list[str]:
     """A minimal, stdlib-only walker for the slice of JSON Schema this
     contract uses: type/const/enum/required/properties/additionalProperties/
-    items/minProperties/minItems/maxItems, minLength/maxLength/minimum/pattern,
+    items/minProperties/minItems/maxItems/uniqueItems,
+    minLength/maxLength/minimum/pattern,
     format:date-time, and allOf/if/then/else/not/$ref, and the boolean
     schemas `true`/`false` (`"value": true` marks an attribute's value as
     accepting anything).
@@ -277,6 +278,11 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: di
             problems.append(f"{where}: must have at least {schema['minItems']} item(s)")
         if "maxItems" in schema and len(instance) > schema["maxItems"]:
             problems.append(f"{where}: must have at most {schema['maxItems']} item(s)")
+        if schema.get("uniqueItems"):
+            # JSON equality, so key order in an object item does not matter.
+            encoded = [json.dumps(item, sort_keys=True) for item in instance]
+            if len(encoded) != len(set(encoded)):
+                problems.append(f"{where}: items must be unique")
         if "items" in schema:
             for index, item in enumerate(instance):
                 problems += _schema_problems(item, schema["items"], f"{where}[{index}]", root)

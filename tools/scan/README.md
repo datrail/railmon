@@ -601,6 +601,19 @@ attributes and sources), with siblings and the sandbox scope unchanged.
 `tests/multi_agent_drift_acceptance.py` runs that path in the image against
 a real RailDash in CI.
 
+The v2 schema also publishes an optional `window` member on an attribute
+(DR-169), for a list that holds only what the observation window saw: an
+item a quieter window did not see is not a removal. `ignore` names the item
+keys that count traffic (`observed_destinations`' `count` and
+`error_count`), and `union` the boolean keys that are true if it happened at
+any point in the window (`observed_file_access`' `read`, `write` and
+`exec`). Status is unchanged by it. The lists it applies to are one table,
+`WINDOW_LISTS` in `compose_evidence_bundle_v2.py`: `tool_names`,
+`observed_destinations`, `undeclared_destinations`, `observed_listeners`,
+`observed_ingress_peers` and `observed_file_access`. The scanner does not
+emit it yet (`EMIT_WINDOW`): Rail Center's ingest rejects a member it does
+not know, so it is switched on once Rail Center accepts it.
+
 The keyed registration state is also what the collector's multi-target
 capture reads to judge an unsigned `x-rail` ticket. Start the
 collector with `--registration-state` set to the same absolute path passed
