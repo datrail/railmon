@@ -610,9 +610,11 @@ any point in the window (`observed_file_access`' `read`, `write` and
 `exec`). Status is unchanged by it. The lists it applies to are one table,
 `WINDOW_LISTS` in `compose_evidence_bundle_v2.py`: `tool_names`,
 `observed_destinations`, `undeclared_destinations`, `observed_listeners`,
-`observed_ingress_peers` and `observed_file_access`. The scanner does not
-emit it yet (`EMIT_WINDOW`): Rail Center's ingest rejects a member it does
-not know, so it is switched on once Rail Center accepts it.
+`observed_ingress_peers` and `observed_file_access`. The scanner emits it
+on each of them whose status reports a window (`ANSWERED`, `PARTIAL` or
+`ABSENT`), never on `BLIND` or `FAILED`. Rail Center's ingest
+(`/v1/evidence-bundles`) rejects an attribute member it does not know, so
+delivering to a Rail Center that predates the member fails.
 
 The keyed registration state is also what the collector's multi-target
 capture reads to judge an unsigned `x-rail` ticket. Start the

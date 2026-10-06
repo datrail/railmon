@@ -73,18 +73,11 @@ WINDOW_LISTS: dict[str, dict[str, list[str]]] = {
 # saw nothing, so there is no window to describe.
 WINDOWED_STATUSES = frozenset({"ANSWERED", "PARTIAL", "ABSENT"})
 
-# Off until Rail Center's ingest (POST /v1/evidence-bundles, extra="forbid")
-# accepts the member — it would reject a bundle carrying it. Flips to True in
-# DR-169 step 3, once the rail-center change that accepts it has landed.
-EMIT_WINDOW = False
-
 
 def with_window(attributes: dict[str, Any]) -> dict[str, Any]:
     """`attributes` with the `window` member on each window-bounded list in
     `WINDOW_LISTS` whose status reports a window, as a new dict (the caller's
-    attribute objects are not mutated). Unchanged while `EMIT_WINDOW` is off."""
-    if not EMIT_WINDOW:
-        return attributes
+    attribute objects are not mutated)."""
     windowed: dict[str, Any] = {}
     for name, attribute in attributes.items():
         spec = WINDOW_LISTS.get(name)
@@ -95,8 +88,6 @@ def with_window(attributes: dict[str, Any]) -> dict[str, Any]:
 
 
 def _with_window_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not EMIT_WINDOW:
-        return entries
     return [
         {**entry, "attributes": with_window(entry["attributes"])} if isinstance(entry.get("attributes"), dict) else entry
         for entry in entries
