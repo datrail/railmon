@@ -1380,7 +1380,7 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
 class WindowMemberTest(unittest.TestCase):
     """The optional `window` member on v2 attributes (DR-169): the schema
     publishes it, the composer holds one table of the lists it applies to,
-    and emitting it stays off until Rail Center's ingest accepts it."""
+    and it emits the member on each of them whose status reports a window."""
 
     V2 = json.loads((ROOT / "schemas" / "evidence-bundle-v2.schema.json").read_text())
 
@@ -1481,22 +1481,6 @@ class WindowMemberTest(unittest.TestCase):
                  if isinstance(value, bool)}
         self.assertEqual(set(composer.WINDOW_LISTS["observed_file_access"]["union"]), flags - {"layer"})
 
-    def test_the_member_is_not_emitted_until_rail_center_accepts_it(self):
-        composer = self.composer()
-        self.assertIs(composer.EMIT_WINDOW, False)
-        attributes = self.every_probe_bundle()["attributes"]
-        self.assertIs(composer.with_window(attributes), attributes)
-        collection = composer.compose_from_scopes(
-            "h-1", "agent-container", evidence_bundle.RULE_PACK_VERSION, {},
-            {k: v for k, v in attributes.items() if k in composer.SANDBOX_ATTRIBUTES},
-            [{"agent_key": "planner", "discovery_status": "available", "inputs_attempted": {},
-              "attributes": composer.agent_scoped_attributes(attributes)}],
-        )
-        scopes = [collection["sandbox"], *collection["agents"]]
-        for scope in scopes:
-            for name, attribute in scope["attributes"].items():
-                self.assertNotIn("window", attribute, name)
-
     def test_an_emitted_window_validates_and_marks_each_list(self):
         composer = self.composer()
         bundle = self.every_probe_bundle()
@@ -1504,17 +1488,16 @@ class WindowMemberTest(unittest.TestCase):
         sandbox = {k: v for k, v in attributes.items() if k in composer.SANDBOX_ATTRIBUTES}
         agent = composer.agent_scoped_attributes(attributes)
         before = copy.deepcopy(attributes)
-        with mock.patch.object(composer, "EMIT_WINDOW", True):
-            collections = {
-                "compose_from_scopes": composer.compose_from_scopes(
-                    "h-1", "agent-container", bundle["rule_pack_version"], bundle["inputs_attempted"],
-                    sandbox,
-                    [{"agent_key": "planner", "discovery_status": "available",
-                      "inputs_attempted": bundle["inputs_attempted"], "attributes": agent}],
-                    bundle.get("attestations"),
-                ),
-                "compose": composer.compose("h-1", "agent-container", {"planner": bundle}),
-            }
+        collections = {
+            "compose_from_scopes": composer.compose_from_scopes(
+                "h-1", "agent-container", bundle["rule_pack_version"], bundle["inputs_attempted"],
+                sandbox,
+                [{"agent_key": "planner", "discovery_status": "available",
+                  "inputs_attempted": bundle["inputs_attempted"], "attributes": agent}],
+                bundle.get("attestations"),
+            ),
+            "compose": composer.compose("h-1", "agent-container", {"planner": bundle}),
+        }
         self.assertEqual(attributes, before, "the caller's attributes must not be mutated")
         for how, collection in collections.items():
             with self.subTest(how=how):
@@ -1536,8 +1519,7 @@ class WindowMemberTest(unittest.TestCase):
         composer = self.composer()
         attributes = evidence_bundle.build_evidence_bundle(
             build_args(), self_context(), dict(HOST_PAIR), identity())["attributes"]
-        with mock.patch.object(composer, "EMIT_WINDOW", True):
-            windowed = composer.with_window(attributes)
+        windowed = composer.with_window(attributes)
         for name in composer.WINDOW_LISTS:
             with self.subTest(name=name):
                 self.assertEqual(windowed[name]["status"], "BLIND")
@@ -1546,8 +1528,7 @@ class WindowMemberTest(unittest.TestCase):
     def test_an_empty_window_carries_it(self):
         composer = self.composer()
         attribute = {"value": None, "status": "ABSENT", "tier": "observed", "method": "looked"}
-        with mock.patch.object(composer, "EMIT_WINDOW", True):
-            windowed = composer.with_window({"tool_names": attribute})
+        windowed = composer.with_window({"tool_names": attribute})
         self.assertEqual(windowed["tool_names"]["window"], {})
 
 
