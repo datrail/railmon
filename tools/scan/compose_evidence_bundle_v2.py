@@ -45,9 +45,10 @@ SANDBOX_ATTRIBUTES = frozenset(
 # DR-169: the attributes whose value holds only what the observation window
 # saw, published as each attribute's optional `window` member (see the v2
 # schema's `$defs.attribute.properties.window`). The one table: a probe that
-# adds a window-bounded list adds it here, and test_evidence_bundle_v2 fails
-# until it does. Consumers (Rail Center's alignment, RailDash) hard-code this
-# list today; the member lets them read it off the bundle instead.
+# adds a window-bounded list adds it here, and test_evidence_bundle.py's
+# WindowMemberTest fails until it does. Consumers (Rail Center's alignment,
+# RailDash) hard-code this list today; the member lets them read it off the
+# bundle instead.
 #
 # - `ignore`: item keys that count traffic in the window and are not part of
 #   the item's identity. AgentSight's destinations carry `count` and
