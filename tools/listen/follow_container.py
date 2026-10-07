@@ -29,8 +29,10 @@ output file grows without end while the scanner re-reads all of it. With
 it sees that access to that file (DR-185), counting the records already in
 the output file, so a restarted supervisor does not append them again. The
 scanner keeps the union of each file's access with no counts, so the ASP is
-the same; only the feature file's raw event counts (`outside_namespace`)
-count distinct records instead of every one.
+the same; only the feature file's raw event counts (`outside_namespace`,
+`unnamed`, `unlisted` and their `_write_exec` parts) count distinct records
+instead of every one. Past 16,384 paths of a class, where the attribute is
+already PARTIAL, which entries are listed may differ.
 
 Needs: `--pid host`, eBPF privilege, and the Docker socket.
 """
@@ -38,6 +40,7 @@ Needs: `--pid host`, eBPF privilege, and the Docker socket.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -186,14 +189,16 @@ COMMAND = "listen"
 # Whether pid is 0 is kept, since the scanner counts those apart.
 OPEN_KEY_FIELDS = ("path", "path_hex", "path_error", "layer", "read", "write", "exec",
                    "creat", "trunc", "append")
-# Distinct records remembered. Past it, a new one is appended without being
-# remembered: never dropped, only no longer de-duplicated.
+# Distinct records remembered, each as a 16-byte digest, so an agent naming
+# its files with long paths can't grow the supervisor's memory with them
+# (~100 bytes a key; a few MB at the cap). Past it, a new one is appended
+# without being remembered: never dropped, only no longer de-duplicated.
 DISTINCT_TRACKED = 65536
 # A record longer than this is passed through, not parsed.
 DISTINCT_LINE_MAX = 64 * 1024
 
 
-def open_key(line: bytes) -> tuple | None:
+def open_key(line: bytes) -> bytes | None:
     """The de-duplication key of a filesnoop open record, or None for any
     other line (start, alive, lost, malformed), which is always kept."""
     if len(line) > DISTINCT_LINE_MAX or not line.startswith(b"{"):
@@ -204,13 +209,14 @@ def open_key(line: bytes) -> tuple | None:
         return None
     if not isinstance(record, dict) or record.get("kind") != "open":
         return None
-    return (record.get("pid") == 0,
-            *(json.dumps(record.get(name), sort_keys=True) for name in OPEN_KEY_FIELDS))
+    key = json.dumps([record.get("pid") == 0, *(record.get(name) for name in OPEN_KEY_FIELDS)],
+                     sort_keys=True, separators=(",", ":"))
+    return hashlib.blake2b(key.encode(), digest_size=16).digest()
 
 
-def seen_opens(path: str | None) -> set[tuple]:
+def seen_opens(path: str | None) -> set[bytes]:
     """The keys of the open records already in the output file."""
-    seen: set[tuple] = set()
+    seen: set[bytes] = set()
     if not path:
         return seen
     try:
@@ -227,7 +233,7 @@ def seen_opens(path: str | None) -> set[tuple]:
     return seen
 
 
-def copy_distinct(stream, sink, seen: set[tuple]) -> None:
+def copy_distinct(stream, sink, seen: set[bytes]) -> None:
     """Copy the probe's lines to `sink`, leaving out an open record whose
     key is already in `seen` (DR-185)."""
     for line in stream:
