@@ -186,6 +186,9 @@ def copy_with_snapshot(stream, sink, pid: int, probe_name: str) -> None:
     snapshotted = False
     for line in stream:
         sink.write(line)
+        # Each line reaches stdout (`docker logs`) as soon as the probe
+        # flushed it, as when the probe wrote there itself.
+        sink.flush()
         if snapshotted or not line.startswith(b'{"kind":"start"'):
             continue
         snapshotted = True
@@ -195,6 +198,7 @@ def copy_with_snapshot(stream, sink, pid: int, probe_name: str) -> None:
             log(f"cannot read the sockets already listening: {exc}")
             continue
         sink.write(b"".join(json.dumps(r, separators=(",", ":")).encode() + b"\n" for r in records))
+        sink.flush()
         log(f"{probe_name} attached; {len(records)} socket(s) were already listening")
 
 
@@ -219,9 +223,7 @@ def main() -> int:
     COMMAND = args.command
     probe_name = os.path.basename(listensnoop)
     output = args.output if args.output is not None else os.environ.get("RAIL_LISTEN_FILE")
-    # Unbuffered either way: each line reaches the file, or `docker logs`,
-    # as soon as the probe flushes it, also when it is copied from a pipe.
-    sink = open(output, "ab", buffering=0) if output else open(1, "ab", buffering=0, closefd=False)
+    sink = open(output, "ab", buffering=0) if output else sys.stdout.buffer
 
     child: subprocess.Popen | None = None
     stopping = False
