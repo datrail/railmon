@@ -1955,6 +1955,18 @@ class AlreadyListeningTest(unittest.TestCase):
              "addr": "0.0.0.0", "port": 5353, **common},
         ])
 
+    def test_a_comm_that_is_not_utf8_keeps_its_sockets(self):
+        # The agent names its own processes; listensnoop escapes each byte
+        # as \u00XX, so a byte decodes to the same one character here.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fake_proc(Path(tmp))
+            (Path(tmp) / "101" / "comm").write_bytes(b"w\xff\xc3\xa9\n")
+            (Path(tmp) / "101" / "status").write_bytes(b"Name:\tw\xff\xc3\xa9\nNSpid:\t101\t7\n")
+            records = follow_container.listening_sockets(100, proc=tmp)
+        self.assertEqual([(r["port"], r["comm"]) for r in records],
+                         [(9303, "w\xff\xc3\xa9"), (8443, "agent"), (5353, "w\xff\xc3\xa9")])
+        self.assertEqual(json.loads('"w\\u00ff\\u00c3\\u00a9"'), records[0]["comm"])
+
     def test_the_scanner_keys_them_as_it_keys_listensnoops(self):
         snapshot = {"kind": "listen", "pid": 7, "uid": 0, "comm": "worker", "protocol": "tcp",
                     "family": "ipv4", "addr": "127.0.0.1", "port": 9303, "ephemeral": False,

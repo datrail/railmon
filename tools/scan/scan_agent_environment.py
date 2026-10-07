@@ -1638,7 +1638,9 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
       trusted:
       * no start record: the probe never attached (or is older than them);
       * more than one: it `restarted`, and missed whatever opened while it
-        was down (it does not report sockets already listening);
+        was down (it does not report sockets already listening; `railmon
+        listen`'s snapshot at each attach adds those still open, as records
+        with `"snapshot": true`, but not one opened and closed meanwhile);
       * the newest start/alive more than HEARTBEAT_GRACE intervals from
         `now`, either way (a clock stepped back too): it is `stale`.
 

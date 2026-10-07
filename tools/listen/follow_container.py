@@ -64,7 +64,14 @@ def _proc_address(text: str, family: int) -> tuple[str, int]:
 def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str]]:
     """Socket inode -> (namespace PID, comm) for every process in
     `pid`'s PID namespace. A socket shared by several (a pre-forked server)
-    goes to the lowest namespace PID, usually the one that opened it."""
+    goes to the lowest namespace PID, usually the one that opened it.
+
+    The comm is the agent's to set, any bytes but NUL, so it is read as
+    bytes and decoded one character per byte, as listensnoop escapes it:
+    the same name gives the same key, and no name can make the read fail
+    and drop the process's sockets. It is the main thread's name, where
+    listensnoop has the binding thread's; they differ only for a socket
+    bound in a thread named apart."""
     owners: dict[int, tuple[int, str]] = {}
     namespace = os.readlink(f"{proc}/{pid}/ns/pid")
     for entry in os.listdir(proc):
@@ -74,10 +81,10 @@ def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str]]:
         try:
             if os.readlink(f"{base}/ns/pid") != namespace:
                 continue
-            with open(f"{base}/status") as f:
-                nspid = next(int(line.split()[-1]) for line in f if line.startswith("NSpid:"))
-            with open(f"{base}/comm") as f:
-                comm = f.read().rstrip("\n")
+            with open(f"{base}/status", "rb") as f:
+                nspid = next(int(line.split()[-1]) for line in f if line.startswith(b"NSpid:"))
+            with open(f"{base}/comm", "rb") as f:
+                comm = f.read().decode("latin-1").removesuffix("\n")
             links = [os.readlink(f"{base}/fd/{fd}") for fd in os.listdir(f"{base}/fd")]
         except (OSError, StopIteration, ValueError):
             continue  # gone meanwhile, or not ours to read
@@ -171,9 +178,11 @@ def log(message: str) -> None:
 def copy_with_snapshot(stream, sink, pid: int, probe_name: str) -> None:
     """Copy the probe's lines to `sink`, and after its start record append
     the sockets that were already listening. Taken after the probe attached,
-    so nothing opened in between is missed; a socket both report is one
-    listener to the scanner. Only an unasked-for port opened in that instant
-    can show twice, as "ephemeral" and as its number."""
+    so nothing opened in between is missed, and a socket both report is
+    usually one listener to the scanner. Not when the probe reported the
+    port as kernel-chosen ("ephemeral"), which a snapshot lists by number:
+    one opened in that instant, or one still open at a later reattach. A
+    reattach already makes the bundle PARTIAL."""
     snapshotted = False
     for line in stream:
         sink.write(line)
@@ -210,7 +219,9 @@ def main() -> int:
     COMMAND = args.command
     probe_name = os.path.basename(listensnoop)
     output = args.output if args.output is not None else os.environ.get("RAIL_LISTEN_FILE")
-    sink = open(output, "ab", buffering=0) if output else sys.stdout.buffer
+    # Unbuffered either way: each line reaches the file, or `docker logs`,
+    # as soon as the probe flushes it, also when it is copied from a pipe.
+    sink = open(output, "ab", buffering=0) if output else open(1, "ab", buffering=0, closefd=False)
 
     child: subprocess.Popen | None = None
     stopping = False

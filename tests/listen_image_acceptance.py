@@ -218,8 +218,8 @@ def main() -> int:
         )
 
         # 3. the agent container restarts
-        # It listens on EARLY_PORT at once, before the probe can follow it,
-        # and waits for the probe before listening on PORT, which the probe
+        # It listens on EARLY_PORT at once, usually before the probe can
+        # follow it, and waits for the probe before listening on PORT, which the probe
         # itself must then report.
         (sig / "pid").unlink()
         (sig / "go").unlink()
@@ -231,8 +231,13 @@ def main() -> int:
         checks["after the agent restarts, the probe records its listener again"] = (
             ours()[-1]["pid"] == int((sig / "pid").read_text())
         )
-        # One per attach: the first, after the kill, after the restart.
-        checks["and the snapshot records the port it opened at once"] = len(early()) == 3
+        # Snapshot records from the first attach and the one after the kill;
+        # after the restart, the port is recorded again, by the snapshot or,
+        # if the probe was attached before the agent bound it, by the probe.
+        lines = records()
+        after_restart = lines[max(i for i, e in enumerate(lines) if e.get("kind") == "start"):]
+        checks["and the port it opened at once, again"] = len(early()) >= 2 and any(
+            e.get("port") == EARLY_PORT and e.get("kind") == "listen" for e in after_restart)
         finished = True
     finally:
         # Every log first: removing the agent tears its namespace down and
