@@ -2000,6 +2000,85 @@ class AlreadyListeningTest(unittest.TestCase):
         self.assertIn("cannot read the sockets already listening", err.getvalue())
 
 
+class DistinctOpensTest(unittest.TestCase):
+    """filesnoop re-reports every file for each new process; with
+    --distinct-opens the supervisor appends each distinct access once, so an
+    always-on file stays bounded and the ASP is unchanged (DR-185)."""
+
+    @staticmethod
+    def opened(pid: int, path: str, *, write: bool = False, ino: int = 7, comm: str = "agent") -> bytes:
+        return (json.dumps({"timestamp_ns": pid * 1000, "kind": "open", "pid": pid, "tid": pid,
+                            "host_pid": pid + 9000, "uid": 0, "comm": comm, "path": path,
+                            "read": True, "write": write, "exec": False, "creat": False,
+                            "trunc": False, "append": False, "dev": "0:42", "ino": ino},
+                           separators=(",", ":")) + "\n").encode()
+
+    def test_a_repeat_in_a_new_process_is_left_out_and_a_new_access_is_kept(self):
+        start = b'{"kind":"start","time":"2026-10-07T00:00:00Z","every":5}\n'
+        alive = b'{"kind":"alive","time":"2026-10-07T00:00:05Z"}\n'
+        first = self.opened(10, "/app/a.py")
+        lines = [start, first, self.opened(11, "/app/a.py", ino=8, comm="Thread-2"), alive, alive,
+                 self.opened(12, "/app/a.py", write=True), self.opened(0, "/app/a.py"),
+                 self.opened(0, "/app/a.py"), b"not json\n", b"not json\n", start]
+        sink = io.BytesIO()
+        follow_container.copy_distinct(io.BytesIO(b"".join(lines)), sink, set())
+        self.assertEqual(sink.getvalue(), b"".join([
+            start, first, alive, alive, self.opened(12, "/app/a.py", write=True),
+            self.opened(0, "/app/a.py"), b"not json\n", b"not json\n", start]))
+
+    def test_the_summary_is_the_same_with_and_without_the_repeats(self):
+        lines = [b'{"kind":"start","time":"2026-10-07T00:00:00Z","every":5}\n']
+        for pid in range(10, 60):
+            lines += [self.opened(pid, "/app/a.py"), self.opened(pid, "/usr/lib/libssl.so"),
+                      self.opened(pid, "/tmp/tmpk3j_9xq2", write=True)]
+        sink = io.BytesIO()
+        follow_container.copy_distinct(io.BytesIO(b"".join(lines)), sink, set())
+        self.assertLess(len(sink.getvalue().splitlines()), 5)
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 7, 0, 0, 5, tzinfo=timezone.utc)
+        full = scanner.summarize_file_access([l.decode() for l in lines], now=now)
+        kept = scanner.summarize_file_access(sink.getvalue().decode().splitlines(), now=now)
+        self.assertEqual(kept["files"], full["files"])
+        self.assertEqual(kept["collapsed"], full["collapsed"])
+
+    def test_a_restarted_supervisor_does_not_append_what_the_file_has(self):
+        import signal
+        import subprocess
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_docker = tmp_path / "docker"
+            fake_docker.write_text("#!/bin/sh\necho 4242\n")
+            fake_nsenter = tmp_path / "nsenter"
+            fake_nsenter.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n')
+            events = tmp_path / "events.jsonl"
+            old, new = self.opened(10, "/app/a.py"), self.opened(11, "/app/b.py")
+            events.write_bytes(b'{"kind":"start"}\n' + self.opened(20, "/app/a.py") + new + new)
+            probe = tmp_path / "filesnoop"
+            probe.write_text(f'#!/bin/sh\ncat "{events}"\nexec sleep 30\n')
+            for script in (fake_docker, fake_nsenter, probe):
+                script.chmod(0o755)
+            files = tmp_path / "files.jsonl"
+            files.write_bytes(b'{"kind":"start"}\n' + old)
+            env = {**os.environ, "RAIL_DOCKER": str(fake_docker), "RAIL_NSENTER": str(fake_nsenter)}
+            supervisor = subprocess.Popen(
+                [sys.executable, str(ROOT / "tools/listen/follow_container.py"), "--command", "files",
+                 "--probe", str(probe), "--output", str(files), "--distinct-opens", "agent", "-n"],
+                env=env, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline and b"/app/b.py" not in files.read_bytes():
+                    time.sleep(0.05)
+                time.sleep(0.2)
+            finally:
+                supervisor.send_signal(signal.SIGTERM)
+                supervisor.communicate(timeout=20)
+            self.assertEqual(files.read_bytes(),
+                             b'{"kind":"start"}\n' + old + b'{"kind":"start"}\n' + new)
+            self.assertEqual(supervisor.returncode, 0)
+
+
 class RegistrationStatusTest(unittest.TestCase):
     """A scorer reading "registered" off an agent that never reached the control
     plane would be reading a lie, so the status reports the outcome."""

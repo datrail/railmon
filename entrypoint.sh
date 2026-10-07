@@ -78,12 +78,13 @@ case "$command_name" in
         # RAIL_FILES_FILE for `scan --files-file` (DR-154), or to stdout when
         # that is unset. The same shape as `listen`: eBPF privilege, -n, -H
         # (RAIL_FILES_HEARTBEAT), and with RAIL_FILES_CONTAINER the same
-        # supervisor, following that container's PID namespace.
+        # supervisor, following that container's PID namespace; it appends
+        # each distinct open once (DR-185), so an always-on file stays bounded.
         filesnoop="${FILESNOOP_PATH:-/usr/local/bin/filesnoop}"
         heartbeat="${RAIL_FILES_HEARTBEAT:-60}"
         if [ -n "${RAIL_FILES_CONTAINER:-}" ]; then
             exec python3 "$root/tools/listen/follow_container.py" \
-                --command files --probe "$filesnoop" --output "${RAIL_FILES_FILE:-}" \
+                --command files --probe "$filesnoop" --output "${RAIL_FILES_FILE:-}" --distinct-opens \
                 "$RAIL_FILES_CONTAINER" -n -H "$heartbeat" "$@"
         fi
         if [ -n "${RAIL_FILES_FILE:-}" ]; then

@@ -192,6 +192,11 @@ docker run -d --name rail-scan -v rail-listen:/data:ro \
 ```
 
 The same supervisor keeps filesnoop attached across agent restarts and kills.
+filesnoop reports each file again for every new process, so the supervisor
+appends only the first record of each distinct access (the same path, access
+and open flags), counting what the file already holds. An agent that starts a
+process per task then adds lines only when it opens something new, and the
+scan, which reads the whole file each interval, stays as fast as on day one.
 Each restart, a stale heartbeat or no start record makes the attribute
 PARTIAL, as for listeners. filesnoop does not report files already open when
 it attaches, so start `files` before the agent. It reports paths, never file
