@@ -1,5 +1,10 @@
 # RailMon
 
+> **Just want to run DatRail?** Start at
+> [datrail-project](https://github.com/datrail/datrail-project#quick-start):
+> one `docker compose up -d` runs RailMon, RailDash and a demo agent
+> together. This README covers RailMon on its own.
+
 RailMon observes an AI agent's network activity and emits structured HTTP
 interactions. It combines a Rust collector with AgentSight's eBPF TLS probe,
 plus Python commands for environment scanning, skill discovery, and forwarding
