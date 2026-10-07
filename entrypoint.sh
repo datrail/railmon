@@ -57,12 +57,14 @@ case "$command_name" in
         # With RAIL_LISTEN_CONTAINER (and --pid host plus the Docker
         # socket), a supervisor outside the agent's reach keeps the probe
         # attached to that container's PID namespace across agent restarts
-        # and kills. Without it, the probe runs in this container's own
-        # namespace (e.g. `--pid container:<agent>`) and stops with it.
+        # and kills, and records the sockets the agent was already listening
+        # on at each attach (DR-182). Without it, the probe runs in this
+        # container's own namespace (e.g. `--pid container:<agent>`) and
+        # stops with it.
         listensnoop="${LISTENSNOOP_PATH:-/usr/local/bin/listensnoop}"
         heartbeat="${RAIL_LISTEN_HEARTBEAT:-60}"
         if [ -n "${RAIL_LISTEN_CONTAINER:-}" ]; then
-            exec python3 "$root/tools/listen/follow_container.py" \
+            exec python3 "$root/tools/listen/follow_container.py" --snapshot-listeners \
                 "$RAIL_LISTEN_CONTAINER" -n -H "$heartbeat" "$@"
         fi
         if [ -n "${RAIL_LISTEN_FILE:-}" ]; then
