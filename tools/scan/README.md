@@ -324,6 +324,14 @@ listening somewhere new:
   any range, so a covert listener on one is a new entry;
 - an event with `pid` 0 came from outside listensnoop's PID namespace. It is
   counted (`outside_namespace`) but not listed;
+- a record with `"snapshot": true` is a socket that was already listening
+  when `railmon listen` attached, read from the agent's socket table. It is
+  listed like the probe's own records, so a socket both report is usually
+  one entry. Its port is a number, since the socket table does not say
+  whether the kernel chose it, so a port the probe saw as `ephemeral` shows
+  twice if it is still open at a reattach (already PARTIAL). Its process is
+  the main thread's name, so a socket bound in a thread named apart shows
+  twice too;
 - the PARTIAL note names the kind of gap, never a count, so a growing lost
   count is not drift on every scan. The counts are in the feature file.
 

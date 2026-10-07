@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
@@ -1889,6 +1890,114 @@ class FollowContainerProbeTest(unittest.TestCase):
             self.assertFalse(listen.exists())
             self.assertIn("[railmon files] attaching to agent (pid 4242)", stderr)
             self.assertEqual(supervisor.returncode, 0)
+
+
+_follow_spec = importlib.util.spec_from_file_location(
+    "follow_container", ROOT / "tools/listen/follow_container.py")
+follow_container = importlib.util.module_from_spec(_follow_spec)
+_follow_spec.loader.exec_module(follow_container)
+
+
+class AlreadyListeningTest(unittest.TestCase):
+    """listensnoop misses sockets opened before it attaches; the supervisor
+    reads them from the agent's socket table instead (DR-182)."""
+
+    HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+
+    def fake_proc(self, root: Path) -> None:
+        # Two processes in the agent's PID namespace, one outside it.
+        for pid, nspid, namespace, comm, inodes in (
+            (100, 1, "pid:[4026532001]", "agent", [14]),
+            (101, 7, "pid:[4026532001]", "worker", [11, 14, 15, 16]),
+            (200, 1, "pid:[4026532999]", "sidecar", [12]),
+        ):
+            base = root / str(pid)
+            (base / "ns").mkdir(parents=True)
+            (base / "fd").mkdir()
+            os.symlink(namespace, base / "ns" / "pid")
+            (base / "status").write_text(f"Name:\t{comm}\nNSpid:\t{pid}\t{nspid}\n")
+            (base / "comm").write_text(comm + "\n")
+            for fd, inode in enumerate(inodes, start=3):
+                os.symlink(f"socket:[{inode}]", base / "fd" / str(fd))
+            os.symlink("/dev/null", base / "fd" / "0")
+        (root / "self").mkdir()
+        net = root / "100" / "net"
+        net.mkdir()
+
+        def row(local: str, remote: str, state: str, inode: int) -> str:
+            return f"   0: {local} {remote} {state} 00000000:00000000 00:00000000 00000000  1000 0 {inode} 1\n"
+
+        (net / "tcp").write_text(self.HEADER
+                                 + row("0100007F:2457", "00000000:0000", "0A", 11)  # 127.0.0.1:9303
+                                 + row("00000000:0050", "00000000:0000", "0A", 12)  # the sidecar's :80
+                                 + row("0100007F:9C40", "0100007F:2457", "01", 17)  # a connection
+                                 + row("00000000:1F90", "00000000:0000", "0A", 99))  # nobody's
+        (net / "tcp6").write_text(self.HEADER
+                                  + row("00000000000000000000000000000000:20FB",
+                                        "00000000000000000000000000000000:0000", "0A", 14))
+        (net / "udp").write_text(self.HEADER
+                                 + row("00000000:14E9", "00000000:0000", "07", 15)  # bound, 5353
+                                 + row("0100007F:D431", "0100007F:0035", "01", 16))  # connected
+        # No udp6: an IPv6-less kernel.
+
+    def test_only_the_namespaces_listening_sockets_in_listensnoops_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fake_proc(Path(tmp))
+            records = follow_container.listening_sockets(100, proc=tmp)
+        common = {"uid": 1000, "ephemeral": False, "snapshot": True}
+        self.assertEqual(records, [
+            {"kind": "listen", "pid": 7, "comm": "worker", "protocol": "tcp", "family": "ipv4",
+             "addr": "127.0.0.1", "port": 9303, **common},
+            # Shared by both: the lower namespace PID holds it.
+            {"kind": "listen", "pid": 1, "comm": "agent", "protocol": "tcp", "family": "ipv6",
+             "addr": "::", "port": 8443, **common},
+            {"kind": "bind", "pid": 7, "comm": "worker", "protocol": "udp", "family": "ipv4",
+             "addr": "0.0.0.0", "port": 5353, **common},
+        ])
+
+    def test_a_comm_that_is_not_utf8_keeps_its_sockets(self):
+        # The agent names its own processes; listensnoop escapes each byte
+        # as \u00XX, so a byte decodes to the same one character here.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fake_proc(Path(tmp))
+            (Path(tmp) / "101" / "comm").write_bytes(b"w\xff\xc3\xa9\n")
+            (Path(tmp) / "101" / "status").write_bytes(b"Name:\tw\xff\xc3\xa9\nNSpid:\t101\t7\n")
+            records = follow_container.listening_sockets(100, proc=tmp)
+        self.assertEqual([(r["port"], r["comm"]) for r in records],
+                         [(9303, "w\xff\xc3\xa9"), (8443, "agent"), (5353, "w\xff\xc3\xa9")])
+        self.assertEqual(json.loads('"w\\u00ff\\u00c3\\u00a9"'), records[0]["comm"])
+
+    def test_the_scanner_keys_them_as_it_keys_listensnoops(self):
+        snapshot = {"kind": "listen", "pid": 7, "uid": 0, "comm": "worker", "protocol": "tcp",
+                    "family": "ipv4", "addr": "127.0.0.1", "port": 9303, "ephemeral": False,
+                    "snapshot": True}
+        probe = {**snapshot, "timestamp_ns": 1, "tid": 7, "host_pid": 4242}
+        del probe["snapshot"]
+        result = scanner.summarize_listeners([json.dumps(snapshot), json.dumps(probe)])
+        self.assertEqual(result["listeners"],
+                         [{"protocol": "tcp", "addr": "127.0.0.1", "port": 9303, "process": "worker"}])
+        self.assertEqual(result["malformed"], 0)
+
+    def test_the_snapshot_follows_the_start_record_once(self):
+        start = b'{"kind":"start","time":"2026-10-07T00:00:00Z","every":5,"peers":true}\n'
+        event = b'{"kind":"listen","port":1}\n'
+        sink = io.BytesIO()
+        found = [{"kind": "listen", "port": 9303}]
+        with mock.patch.object(follow_container, "listening_sockets", return_value=found) as read, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            follow_container.copy_with_snapshot(io.BytesIO(start + event + start), sink, 4242, "listensnoop")
+        read.assert_called_once_with(4242)
+        self.assertEqual(sink.getvalue(), start + b'{"kind":"listen","port":9303}\n' + event + start)
+        self.assertIn("1 socket(s) were already listening", err.getvalue())
+
+    def test_an_agent_gone_before_the_snapshot_leaves_the_probes_lines(self):
+        start = b'{"kind":"start"}\n'
+        sink = io.BytesIO()
+        with mock.patch.object(follow_container, "listening_sockets", side_effect=FileNotFoundError("gone")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            follow_container.copy_with_snapshot(io.BytesIO(start), sink, 4242, "listensnoop")
+        self.assertEqual(sink.getvalue(), start)
+        self.assertIn("cannot read the sockets already listening", err.getvalue())
 
 
 class RegistrationStatusTest(unittest.TestCase):

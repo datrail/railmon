@@ -134,10 +134,18 @@ The probe runs with two options:
 - `-n`, so only the agent's namespace is recorded;
 - a heartbeat every 60 seconds (`RAIL_LISTEN_HEARTBEAT`).
 
+The probe itself does not report sockets that are already listening when it
+attaches, and an agent that listens as soon as it starts usually beats it. So
+at each attach the supervisor also reads the agent's socket table and records
+every TCP socket listening and every UDP socket bound but not connected that a
+process in the agent's PID namespace holds, marked `"snapshot": true`. The
+scan treats those records like the probe's. A snapshot cannot tell whether
+the kernel chose the port, so such a port is listed by number.
+
 The agent may be able to kill the probe: it shares the probe's PID
 namespace, though a host's security profile can stop it. The probe crashes or
-restarts too, and it does not report sockets that are already listening when
-it attaches. So any restart leaves a gap, and the
+restarts too. A socket opened and closed while it was down is missed, so any
+restart leaves a gap, and the
 scan says so: `observed_listeners` goes PARTIAL, which is drift, in three
 cases:
 - a second start record;
@@ -146,9 +154,10 @@ cases:
 
 A restart never reads as "no new listeners". The note counts restarts, so
 each one is a single drift: accepting it in RailDash stays aligned until the
-next restart. Sockets that were already listening when `listen` first started
-are not recorded. Start it before the agent, or restart the agent once it is
-running. Only the `listen` container is privileged. The agent can't reach the
+next restart. Without `RAIL_LISTEN_CONTAINER` (the probe run directly, in the
+agent's namespace) there is no snapshot: sockets already listening when it
+starts are not recorded, so start it before the agent. Only the `listen`
+container is privileged. The agent can't reach the
 volume, so it can't edit its own record.
 See
 [the scanner's README](tools/scan/README.md#observed-listeners-optional)

@@ -3,8 +3,9 @@
 
 Containers from one image, deployed the way the README says:
 
-- an "agent" that waits for a go-ahead, then listens on a port it asks for
-  (and again after every restart);
+- an "agent" that listens on one port as soon as it starts, then waits for
+  a go-ahead and listens on a second port it asks for (both again after
+  every restart);
 - `railmon listen` with RAIL_LISTEN_CONTAINER: a privileged supervisor in the
   host PID namespace that runs listensnoop inside the agent's, appending to a
   volume the agent does not mount;
@@ -19,6 +20,10 @@ Checked, in order:
    PARTIAL, because the probe missed whatever opened meanwhile;
 3. the agent container restarts: the probe follows it into the new namespace
    and records the agent's listener again.
+
+And (DR-182) with 1 and 3: the port the agent opened before the probe
+attached is recorded from the agent's socket table, as a snapshot record,
+and named in the bundle.
 
 And (DR-145) between 1 and 2: a client container connects to the agent over
 the Docker network; the probe reports the client's address as a peer of the
@@ -42,9 +47,12 @@ import tempfile
 import time
 from pathlib import Path
 
-PORT = 47001
+PORT, EARLY_PORT = 47001, 47002
 AGENT = r"""
 import os, socket, time
+early = socket.socket()
+early.bind(("0.0.0.0", %d))
+early.listen()
 while not os.path.exists("/sig/go"):
     time.sleep(0.1)
 s = socket.socket()
@@ -59,7 +67,7 @@ with open("/sig/pid.tmp", "w") as f:
     f.write(str(os.getpid()))
 os.rename("/sig/pid.tmp", "/sig/pid")
 time.sleep(600)
-""" % PORT
+""" % (EARLY_PORT, PORT)
 # Kill the probe: from inside the agent, the way a misaligned agent would
 # try, or from the probe's own container (host PID namespace) to stand in
 # for a crash where the agent cannot (a host security profile can stop it,
@@ -106,7 +114,9 @@ def main() -> int:
     finished = False
 
     def attaches() -> int:
-        return docker("logs", probe, check=False).stderr.count("listensnoop: attached")
+        # Logged once the sockets already listening are written, so a port
+        # the agent opens after this is the probe's to report.
+        return docker("logs", probe, check=False).stderr.count("socket(s) were already listening")
 
     def records() -> list[dict]:
         if not listen_file.exists():
@@ -114,7 +124,11 @@ def main() -> int:
         return [json.loads(line) for line in listen_file.read_text().splitlines() if line.strip()]
 
     def ours() -> list[dict]:
-        return [e for e in records() if e.get("port") == PORT and e.get("kind") == "listen"]
+        return [e for e in records() if e.get("port") == PORT and e.get("kind") == "listen"
+                and not e.get("snapshot")]
+
+    def early() -> list[dict]:
+        return [e for e in records() if e.get("port") == EARLY_PORT and e.get("snapshot")]
 
     def scan(attribute: str = "observed_listeners") -> dict | None:
         # As this user: the scanner writes its outputs 0600, for its owner.
@@ -150,6 +164,9 @@ def main() -> int:
             mine[0]["pid"] == agent_pid and agent_pid > 1 and mine[0]["ephemeral"] is False
             and mine[0]["comm"] == "python3"
         )
+        checks["the port opened before the probe attached is a snapshot record"] = [
+            (e["kind"], e["pid"], e["comm"], e["addr"], e["ephemeral"]) for e in early()
+        ] == [("listen", agent_pid, "python3", "0.0.0.0", False)]
         checks["only the agent's namespace, one start, heartbeats"] = (
             not any(e.get("pid") == 0 for e in records())
             and sum(e.get("kind") == "start" for e in records()) == 1
@@ -159,6 +176,8 @@ def main() -> int:
         checks["the bundle names the port and process"] = bool(listeners) and (
             listeners["status"] == "ANSWERED"
             and {"protocol": "tcp", "addr": "0.0.0.0", "port": PORT, "process": "python3"}
+            in listeners["value"]
+            and {"protocol": "tcp", "addr": "0.0.0.0", "port": EARLY_PORT, "process": "python3"}
             in listeners["value"]
         )
 
@@ -199,8 +218,9 @@ def main() -> int:
         )
 
         # 3. the agent container restarts
-        # The probe cannot see sockets already listening when it attaches, so
-        # the restarted agent waits for it before listening again.
+        # It listens on EARLY_PORT at once, usually before the probe can
+        # follow it, and waits for the probe before listening on PORT, which the probe
+        # itself must then report.
         (sig / "pid").unlink()
         (sig / "go").unlink()
         docker("restart", agent)
@@ -211,6 +231,13 @@ def main() -> int:
         checks["after the agent restarts, the probe records its listener again"] = (
             ours()[-1]["pid"] == int((sig / "pid").read_text())
         )
+        # Snapshot records from the first attach and the one after the kill;
+        # after the restart, the port is recorded again, by the snapshot or,
+        # if the probe was attached before the agent bound it, by the probe.
+        lines = records()
+        after_restart = lines[max(i for i, e in enumerate(lines) if e.get("kind") == "start"):]
+        checks["and the port it opened at once, again"] = len(early()) >= 2 and any(
+            e.get("port") == EARLY_PORT and e.get("kind") == "listen" for e in after_restart)
         finished = True
     finally:
         # Every log first: removing the agent tears its namespace down and
@@ -225,7 +252,7 @@ def main() -> int:
 
     for name, passed in checks.items():
         print(("ok:   " if passed else "FAIL: ") + name)
-    if len(checks) < 10 or not all(checks.values()):  # ten checks, all passed
+    if len(checks) < 12 or not all(checks.values()):  # twelve checks, all passed
         return 1
     print(json.dumps({"result": "PASS", "port": PORT, "agent_pid": agent_pid}))
     return 0

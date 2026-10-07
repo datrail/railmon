@@ -8,10 +8,14 @@ nsenter, and runs listensnoop there, appending to the output. When listensnoop
 exits, because the agent restarted (its namespace died with it) or the agent
 killed it, the supervisor waits for the container and attaches again.
 
-Each attach starts with listensnoop's own `start` record. A second start is
-how the scanner knows the probe was down: listensnoop does not report sockets
-already listening when it attaches, so anything opened in the gap is missing,
-and the bundle says so instead of reading as "no new listeners".
+Each attach starts with listensnoop's own `start` record. listensnoop does
+not report sockets already listening when it attaches, and an agent that
+listens as soon as it starts usually beats the attach. So right after the
+start record the supervisor reads the agent's socket table and appends one
+record per socket already open to accept traffic, in listensnoop's shape with
+`"snapshot": true` (DR-182). A second start is how the scanner knows the
+probe was down: a socket opened and closed in the gap is missing, and the
+bundle says so instead of reading as "no new listeners".
 
 The same supervisor runs filesnoop for `railmon files` (DR-154): `--probe`
 names the binary and `--output` the file it appends to. Without them it is
@@ -24,13 +28,106 @@ Needs: `--pid host`, eBPF privilege, and the Docker socket.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 
 POLL_SECONDS = 1.0
+# The host's /proc: the supervisor runs in the host PID namespace.
+PROC = "/proc"
+# /proc/net socket states (include/net/tcp_states.h): a TCP socket in
+# LISTEN, and a UDP one in CLOSE, which for UDP means bound but unconnected.
+TCP_LISTEN, UDP_UNCONNECTED = "0A", "07"
+SOCKET_TABLES = (
+    ("tcp", socket.AF_INET, "tcp", TCP_LISTEN, "listen"),
+    ("tcp6", socket.AF_INET6, "tcp", TCP_LISTEN, "listen"),
+    ("udp", socket.AF_INET, "udp", UDP_UNCONNECTED, "bind"),
+    ("udp6", socket.AF_INET6, "udp", UDP_UNCONNECTED, "bind"),
+)
+
+
+def _proc_address(text: str, family: int) -> tuple[str, int]:
+    """`0100007F:1F90` -> ("127.0.0.1", 8080). The kernel prints the address
+    as 32-bit words in host byte order; inet_ntop formats it the way
+    listensnoop does, so both sources give one listener the same key."""
+    address, port = text.split(":")
+    raw = bytes.fromhex(address)
+    if sys.byteorder == "little":
+        raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+    return socket.inet_ntop(family, raw), int(port, 16)
+
+
+def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str]]:
+    """Socket inode -> (namespace PID, comm) for every process in
+    `pid`'s PID namespace. A socket shared by several (a pre-forked server)
+    goes to the lowest namespace PID, usually the one that opened it.
+
+    The comm is the agent's to set, any bytes but NUL, so it is read as
+    bytes and decoded one character per byte, as listensnoop escapes it:
+    the same name gives the same key, and no name can make the read fail
+    and drop the process's sockets. It is the main thread's name, where
+    listensnoop has the binding thread's; they differ only for a socket
+    bound in a thread named apart."""
+    owners: dict[int, tuple[int, str]] = {}
+    namespace = os.readlink(f"{proc}/{pid}/ns/pid")
+    for entry in os.listdir(proc):
+        if not entry.isdigit():
+            continue
+        base = f"{proc}/{entry}"
+        try:
+            if os.readlink(f"{base}/ns/pid") != namespace:
+                continue
+            with open(f"{base}/status", "rb") as f:
+                nspid = next(int(line.split()[-1]) for line in f if line.startswith(b"NSpid:"))
+            with open(f"{base}/comm", "rb") as f:
+                comm = f.read().decode("latin-1").removesuffix("\n")
+            links = [os.readlink(f"{base}/fd/{fd}") for fd in os.listdir(f"{base}/fd")]
+        except (OSError, StopIteration, ValueError):
+            continue  # gone meanwhile, or not ours to read
+        for link in links:
+            if link.startswith("socket:[") and link.endswith("]"):
+                inode = int(link[8:-1])
+                if inode not in owners or nspid < owners[inode][0]:
+                    owners[inode] = (nspid, comm)
+    return owners
+
+
+def listening_sockets(pid: int, proc: str = PROC) -> list[dict]:
+    """The sockets `pid`'s container already has open to accept traffic, as
+    listensnoop records with `"snapshot": true`.
+
+    Read from the network namespace of `pid` and kept only when a process in
+    its PID namespace holds the socket, so another container sharing the
+    network namespace stays out, as listensnoop's -n keeps it out. The
+    kernel no longer says whether the port was chosen for the socket, so
+    `ephemeral` is false: an unasked-for port shows as its number, which
+    is churn at worst, never a hidden listener."""
+    owners = _namespace_sockets(proc, pid)
+    records = []
+    for table, family, protocol, state, kind in SOCKET_TABLES:
+        try:
+            with open(f"{proc}/{pid}/net/{table}") as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue  # no IPv6 in this kernel
+        for row in rows:
+            fields = row.split()
+            if len(fields) < 10 or fields[3] != state:
+                continue
+            addr, port = _proc_address(fields[1], family)
+            owner = owners.get(int(fields[9]))
+            if port == 0 or owner is None:
+                continue
+            nspid, comm = owner
+            records.append({"kind": kind, "pid": nspid,
+                            "uid": int(fields[7]), "comm": comm, "protocol": protocol,
+                            "family": "ipv6" if family == socket.AF_INET6 else "ipv4",
+                            "addr": addr, "port": port, "ephemeral": False, "snapshot": True})
+    return records
 
 
 def container_pid(docker: str, container: str) -> int:
@@ -78,6 +175,33 @@ def log(message: str) -> None:
     print(f"[railmon {COMMAND}] {message}", file=sys.stderr, flush=True)
 
 
+def copy_with_snapshot(stream, sink, pid: int, probe_name: str) -> None:
+    """Copy the probe's lines to `sink`, and after its start record append
+    the sockets that were already listening. Taken after the probe attached,
+    so nothing opened in between is missed, and a socket both report is
+    usually one listener to the scanner. Not when the probe reported the
+    port as kernel-chosen ("ephemeral"), which a snapshot lists by number:
+    one opened in that instant, or one still open at a later reattach. A
+    reattach already makes the bundle PARTIAL."""
+    snapshotted = False
+    for line in stream:
+        sink.write(line)
+        # Each line reaches stdout (`docker logs`) as soon as the probe
+        # flushed it, as when the probe wrote there itself.
+        sink.flush()
+        if snapshotted or not line.startswith(b'{"kind":"start"'):
+            continue
+        snapshotted = True
+        try:
+            records = listening_sockets(pid)
+        except OSError as exc:  # the agent exited meanwhile
+            log(f"cannot read the sockets already listening: {exc}")
+            continue
+        sink.write(b"".join(json.dumps(r, separators=(",", ":")).encode() + b"\n" for r in records))
+        sink.flush()
+        log(f"{probe_name} attached; {len(records)} socket(s) were already listening")
+
+
 def main() -> int:
     global COMMAND
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -85,6 +209,9 @@ def main() -> int:
     parser.add_argument("--probe", help="probe binary (default: LISTENSNOOP_PATH, else listensnoop)")
     parser.add_argument("--output", help="file to append to; empty for stdout "
                         "(default: RAIL_LISTEN_FILE)")
+    parser.add_argument("--snapshot-listeners", action="store_true",
+                        help="after each attach, also record the sockets the agent already "
+                        "has open to accept traffic (listensnoop only)")
     parser.add_argument("container", help="agent container name or id")
     parser.add_argument("listensnoop_args", nargs=argparse.REMAINDER,
                         help="arguments passed to the probe")
@@ -127,12 +254,15 @@ def main() -> int:
         # PIDs are the agent's) but keeps this container's mounts and BPF
         # privilege. nsenter forks for -p, so its child is the one inside.
         child = subprocess.Popen([nsenter, "-t", str(pid), "-p", "--", listensnoop,
-                                  *args.listensnoop_args], stdout=sink)
+                                  *args.listensnoop_args],
+                                 stdout=subprocess.PIPE if args.snapshot_listeners else sink)
         # A signal that landed before `child` was set found nothing to stop.
         # (Not a blocked mask around Popen: the child would inherit it, and
         # listensnoop would never see the SIGTERM meant for it.)
         if stopping:
             stop_listensnoop(child)
+        if args.snapshot_listeners:
+            copy_with_snapshot(child.stdout, sink, pid, probe_name)
         code = child.wait()
         child = None
         if not stopping:
