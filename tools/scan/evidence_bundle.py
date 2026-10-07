@@ -77,7 +77,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # a pack-4 baseline holds them verbatim, so it is not comparable.
 # Pack 6 reports observed_destinations without a snapshot as BLIND, not
 # ABSENT (DR-168): a pack-5 baseline would show that as a status change.
-RULE_PACK_VERSION = 6
+# Pack 7 folds observed_file_access's /proc/<pid> paths to /proc/*/ (DR-185):
+# a pack-6 baseline holds them by number, so it is not comparable.
+RULE_PACK_VERSION = 7
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1120,8 +1122,9 @@ def build_evidence_bundle(
         opened = file_access.get("files") or []
         file_method = (
             "filesnoop events: each regular file a process in the sandbox opened, "
-            "by the path it saw, with read, write and exec the union of how it "
-            "was opened; layer marks an overlayfs layer open"
+            "by the path it saw (a /proc process or thread ID as *), with read, "
+            "write and exec the union of how it was opened; layer marks an "
+            "overlayfs layer open"
         )
         file_gaps, file_unreachable = _probe_gaps(file_access, "filesnoop")
         # A write or exec lost to the cap or an unreadable path gets its own

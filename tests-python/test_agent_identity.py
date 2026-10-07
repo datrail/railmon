@@ -1687,6 +1687,48 @@ class FileAccessTest(unittest.TestCase):
         self.assertEqual((result["unnamed"], result["malformed"], result["files"]), (1, 0, [self.entry()]))
 
 
+class ProcPidFileAccessTest(unittest.TestCase):
+    """/proc/<pid> paths fold to /proc/*/, so each new process's runtime init
+    (every `docker exec` into the agent) is not a new path (DR-185)."""
+
+    event = staticmethod(FileAccessTest.event)
+    entry = FileAccessTest.entry
+
+    def test_process_and_thread_ids_fold_and_nothing_else_does(self):
+        for path, folded in (
+            ("/proc/2266/maps", "/proc/*/maps"),
+            ("/proc/2266/task/2270/attr/apparmor/exec", "/proc/*/task/*/attr/apparmor/exec"),
+            ("/proc/2266/task", "/proc/*/task"),
+            ("/proc/1", "/proc/*"),
+            ("/proc/sys/kernel/cap_last_cap", "/proc/sys/kernel/cap_last_cap"),
+            ("/proc/12a/maps", "/proc/12a/maps"),
+            ("/proc/2266/task/abc/maps", "/proc/*/task/abc/maps"),
+            ("/srv/proc/2266/maps", "/srv/proc/2266/maps"),
+            ("/proc/filesystems", "/proc/filesystems"),
+        ):
+            self.assertEqual(scanner.fold_proc_pid(path), folded, path)
+
+    def test_the_runtime_init_of_each_exec_is_one_entry(self):
+        lines = [FileAccessTest.START]
+        for pid in range(100, 160):
+            lines += [self.event(pid=pid, comm="runc:[2:INIT]", path=f"/proc/{pid}/maps"),
+                      self.event(pid=pid, comm="runc:[2:INIT]", read=False, write=True,
+                                 path=f"/proc/{pid}/task/{pid}/attr/apparmor/exec")]
+        result = scanner.summarize_file_access(lines)
+        self.assertEqual(result["files"], [
+            self.entry("/proc/*/maps"),
+            self.entry("/proc/*/task/*/attr/apparmor/exec", read=False, write=True),
+        ])
+        self.assertEqual(result["unlisted"], 0)
+        self.assertEqual(result["collapsed"], 0)
+
+    def test_a_write_under_a_folded_path_still_shows(self):
+        result = scanner.summarize_file_access([
+            FileAccessTest.START, self.event(path="/proc/7/mem"),
+            self.event(pid=8, path="/proc/9/mem", read=False, write=True)])
+        self.assertEqual(result["files"], [self.entry("/proc/*/mem", write=True)])
+
+
 class EphemeralFileAccessTest(unittest.TestCase):
     """Randomly named temp files fold into one templated entry (DR-166)."""
 

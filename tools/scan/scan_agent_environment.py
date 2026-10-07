@@ -1848,6 +1848,26 @@ def file_temp_dirs(env: dict[str, str] | None = None) -> tuple[str, ...]:
     return tuple(dirs)
 
 
+# A procfs path named by a process or thread ID (/proc/1234/maps,
+# /proc/1234/task/1240/attr/apparmor/exec). The ID is a new number for every
+# process, so the same access by each new process would be a new path: every
+# `docker exec` into the agent, the scanner's own included, has the
+# container runtime's init read and write a few of these. They fold to
+# /proc/*/..., which no real file is named, so a folded path never passes
+# for a literal one (DR-185). The price, as for temp names: a process's own
+# /proc/self/environ and another's are one entry, and the README says so.
+_PROC_PID = re.compile(r"/proc/[0-9]+(?=/|$)(?:/task/[0-9]+(?=/|$))?")
+
+
+def fold_proc_pid(path: str) -> str:
+    """`path` with a leading /proc/<pid> and /task/<tid> made `*`."""
+    match = _PROC_PID.match(path)
+    if match is None:
+        return path
+    folded = "/proc/*" + ("/task/*" if "/task/" in match.group(0) else "")
+    return folded + path[match.end():]
+
+
 def ephemeral_file_template(path: str, temp_dirs: Iterable[str] = FILE_TEMP_DIRS) -> str | None:
     """The templated path a randomly named temp file folds into, or None when
     `path` is not one (see FILE_TEMP_PATTERNS). Only the file's own name is
@@ -1902,6 +1922,9 @@ def summarize_file_access(
       is kept while there is room. While each class stays within
       FILE_ACCESS_TRACKED, the choice depends only on the set seen, not on
       the order of the lines;
+    - a procfs path under a process or thread ID is folded to /proc/*/...
+      (`fold_proc_pid`), so each new process's runtime init is not a new
+      path;
     - a randomly named temp file (`ephemeral_file_template`) is folded into
       its template's entry, its access unioned in like any other open, and
       the distinct paths folded into entries that made the list are counted
@@ -1970,7 +1993,7 @@ def summarize_file_access(
             unnamed += 1
             unnamed_write_exec += changes
             continue
-        path = _printable(path, FILE_PATH_MAX)
+        path = fold_proc_pid(_printable(path, FILE_PATH_MAX))
         template = ephemeral_file_template(path, temp_dirs)
         key = (template if template is not None else path, layer)
         seen = files.get(key)

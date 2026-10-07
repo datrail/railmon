@@ -1023,8 +1023,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # Pack 3 added observed_ingress_peers (DR-145), pack 4
         # observed_file_access (DR-154); pack 5 folds its random temp names
         # (DR-166), so a pack-4 baseline is not compared against it; pack 6
-        # makes observed_destinations BLIND without a snapshot (DR-168).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 6)
+        # makes observed_destinations BLIND without a snapshot (DR-168);
+        # pack 7 folds observed_file_access's /proc/<pid> paths (DR-185).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 7)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
