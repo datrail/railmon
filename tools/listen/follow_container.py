@@ -22,6 +22,16 @@ names the binary and `--output` the file it appends to. Without them it is
 listensnoop (LISTENSNOOP_PATH) appending to RAIL_LISTEN_FILE, as before.
 filesnoop prints the same start records, so a restart shows the same way.
 
+filesnoop reports a file once per process, so an agent that starts a new
+process for each task re-reports the same files every time, and an always-on
+output file grows without end while the scanner re-reads all of it. With
+`--distinct-opens` the supervisor appends an open record only the first time
+it sees that access to that file (DR-185), counting the records already in
+the output file, so a restarted supervisor does not append them again. The
+scanner keeps the union of each file's access with no counts, so the ASP is
+the same; only the feature file's raw event counts (`outside_namespace`)
+count distinct records instead of every one.
+
 Needs: `--pid host`, eBPF privilege, and the Docker socket.
 """
 
@@ -170,6 +180,66 @@ def stop_listensnoop(child: subprocess.Popen) -> None:
 # by default, so existing log filters on "[railmon listen]" keep matching.
 COMMAND = "listen"
 
+# What makes two filesnoop open records the same access: everything the
+# scanner reads, and the open flags, without the per-process and per-inode
+# fields (pid, tid, comm, uid, timestamp, inode) that differ every time.
+# Whether pid is 0 is kept, since the scanner counts those apart.
+OPEN_KEY_FIELDS = ("path", "path_hex", "path_error", "layer", "read", "write", "exec",
+                   "creat", "trunc", "append")
+# Distinct records remembered. Past it, a new one is appended without being
+# remembered: never dropped, only no longer de-duplicated.
+DISTINCT_TRACKED = 65536
+# A record longer than this is passed through, not parsed.
+DISTINCT_LINE_MAX = 64 * 1024
+
+
+def open_key(line: bytes) -> tuple | None:
+    """The de-duplication key of a filesnoop open record, or None for any
+    other line (start, alive, lost, malformed), which is always kept."""
+    if len(line) > DISTINCT_LINE_MAX or not line.startswith(b"{"):
+        return None
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("kind") != "open":
+        return None
+    return (record.get("pid") == 0,
+            *(json.dumps(record.get(name), sort_keys=True) for name in OPEN_KEY_FIELDS))
+
+
+def seen_opens(path: str | None) -> set[tuple]:
+    """The keys of the open records already in the output file."""
+    seen: set[tuple] = set()
+    if not path:
+        return seen
+    try:
+        with open(path, "rb") as existing:
+            while len(seen) < DISTINCT_TRACKED:
+                line = existing.readline(DISTINCT_LINE_MAX + 1)
+                if not line:
+                    break
+                key = open_key(line)
+                if key is not None:
+                    seen.add(key)
+    except OSError:
+        pass
+    return seen
+
+
+def copy_distinct(stream, sink, seen: set[tuple]) -> None:
+    """Copy the probe's lines to `sink`, leaving out an open record whose
+    key is already in `seen` (DR-185)."""
+    for line in stream:
+        key = open_key(line)
+        if key is not None:
+            if key in seen:
+                continue
+            if len(seen) < DISTINCT_TRACKED:
+                seen.add(key)
+        sink.write(line)
+        sink.flush()
+
 
 def log(message: str) -> None:
     print(f"[railmon {COMMAND}] {message}", file=sys.stderr, flush=True)
@@ -212,6 +282,8 @@ def main() -> int:
     parser.add_argument("--snapshot-listeners", action="store_true",
                         help="after each attach, also record the sockets the agent already "
                         "has open to accept traffic (listensnoop only)")
+    parser.add_argument("--distinct-opens", action="store_true",
+                        help="append each distinct file open record once (filesnoop only)")
     parser.add_argument("container", help="agent container name or id")
     parser.add_argument("listensnoop_args", nargs=argparse.REMAINDER,
                         help="arguments passed to the probe")
@@ -224,6 +296,7 @@ def main() -> int:
     probe_name = os.path.basename(listensnoop)
     output = args.output if args.output is not None else os.environ.get("RAIL_LISTEN_FILE")
     sink = open(output, "ab", buffering=0) if output else sys.stdout.buffer
+    seen = seen_opens(output) if args.distinct_opens else set()
 
     child: subprocess.Popen | None = None
     stopping = False
@@ -255,7 +328,8 @@ def main() -> int:
         # privilege. nsenter forks for -p, so its child is the one inside.
         child = subprocess.Popen([nsenter, "-t", str(pid), "-p", "--", listensnoop,
                                   *args.listensnoop_args],
-                                 stdout=subprocess.PIPE if args.snapshot_listeners else sink)
+                                 stdout=subprocess.PIPE if args.snapshot_listeners or args.distinct_opens
+                                 else sink)
         # A signal that landed before `child` was set found nothing to stop.
         # (Not a blocked mask around Popen: the child would inherit it, and
         # listensnoop would never see the SIGTERM meant for it.)
@@ -263,6 +337,8 @@ def main() -> int:
             stop_listensnoop(child)
         if args.snapshot_listeners:
             copy_with_snapshot(child.stdout, sink, pid, probe_name)
+        elif args.distinct_opens:
+            copy_distinct(child.stdout, sink, seen)
         code = child.wait()
         child = None
         if not stopping:
