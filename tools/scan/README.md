@@ -531,6 +531,21 @@ entries; past 16,384 it is a lower bound, with at least 1 per listed template.
 Folding is new in rule pack 5: RailDash shows a baseline locked under pack 4 as
 `CONTRACT_MISMATCH`, not as drift, until a pack-5 ASP is locked.
 
+A procfs path under a process or thread ID folds the same way, with no note:
+`/proc/2266/task/2270/attr/apparmor/exec` is listed as
+`/proc/*/task/*/attr/apparmor/exec`. The ID is new for every process, and
+every `docker exec` into the agent, including the scanner's own, has the
+container runtime's init read and write a few of these in the agent's PID
+namespace, so without the fold each scan would add new paths and soon fill
+the list. No real file is named `/proc/*`, so the folded path can't pass for
+one. This fold is new in rule pack 7: RailDash shows a baseline locked under
+pack 6 as `CONTRACT_MISMATCH` until a pack-7 ASP is locked.
+
+The files those `docker exec` commands open (the runtime init's, and the
+scanner's `sh`, `id`, `env`, `hostname` and `uname`) are in the list too,
+since they run in the agent's PID namespace. They are the same on every scan,
+so they are part of the baseline and not drift.
+
 ### Schema and limits
 
 The published v1 schema holds an ANSWERED or PARTIAL value to that shape
