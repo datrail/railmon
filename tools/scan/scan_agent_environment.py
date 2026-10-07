@@ -1854,7 +1854,8 @@ def file_temp_dirs(env: dict[str, str] | None = None) -> tuple[str, ...]:
 # `docker exec` into the agent, the scanner's own included, has the
 # container runtime's init read and write a few of these. They fold to
 # /proc/*/..., which no real file is named, so a folded path never passes
-# for a literal one (DR-185).
+# for a literal one (DR-185). The price, as for temp names: a process's own
+# /proc/self/environ and another's are one entry, and the README says so.
 _PROC_PID = re.compile(r"/proc/[0-9]+(?=/|$)(?:/task/[0-9]+(?=/|$))?")
 
 

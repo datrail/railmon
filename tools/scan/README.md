@@ -538,7 +538,11 @@ every `docker exec` into the agent, including the scanner's own, has the
 container runtime's init read and write a few of these in the agent's PID
 namespace, so without the fold each scan would add new paths and soon fill
 the list. No real file is named `/proc/*`, so the folded path can't pass for
-one. This fold is new in rule pack 7: RailDash shows a baseline locked under
+one. The price is the same as for temp names: the fold doesn't tell a
+process's own `/proc/self/...` from another process's. Once
+`/proc/*/environ` is in the baseline (a library reading its own
+environment), reading another process's is aligned too; a new kind of
+access (a first write to `/proc/*/mem`) is still drift. This fold is new in rule pack 7: RailDash shows a baseline locked under
 pack 6 as `CONTRACT_MISMATCH` until a pack-7 ASP is locked.
 
 The files those `docker exec` commands open (the runtime init's, and the

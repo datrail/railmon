@@ -175,7 +175,10 @@ path is drift in RailDash. A randomly named temp file (Python's `tempfile`,
 `mkstemp`, `mktemp`, a Vim swap file) under `/tmp`, `/var/tmp`, `/dev/shm` or
 in the agent's `$TMPDIR` is first folded into one templated path such as
 `/tmp/tmp*`, so a new random name each run is not drift, while a new name
-that fits no pattern, like `/tmp/exfil.tar`, still is. The deployment is the
+that fits no pattern, like `/tmp/exfil.tar`, still is. A `/proc` path under
+a process or thread ID is listed with `*` for the ID, so the container
+runtime's init for each `docker exec` into the agent is one entry, not a new
+one per process. The deployment is the
 listener one with its own variables (`RAIL_FILES_CONTAINER`, `RAIL_FILES_FILE`,
 `RAIL_FILES_HEARTBEAT`), and the scan reads both files:
 

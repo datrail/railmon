@@ -1122,8 +1122,9 @@ def build_evidence_bundle(
         opened = file_access.get("files") or []
         file_method = (
             "filesnoop events: each regular file a process in the sandbox opened, "
-            "by the path it saw, with read, write and exec the union of how it "
-            "was opened; layer marks an overlayfs layer open"
+            "by the path it saw (a /proc process or thread ID as *), with read, "
+            "write and exec the union of how it was opened; layer marks an "
+            "overlayfs layer open"
         )
         file_gaps, file_unreachable = _probe_gaps(file_access, "filesnoop")
         # A write or exec lost to the cap or an unreadable path gets its own
