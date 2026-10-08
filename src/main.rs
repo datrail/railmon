@@ -8,6 +8,7 @@
 //! and a port that quietly renamed them would break every caller for no gain.
 
 mod auth;
+mod http1_guard;
 mod identity;
 mod interaction;
 mod pipeline;
@@ -246,7 +247,7 @@ impl PairingReport {
         }
         log::warn!(
             "{}. The probe reports threads, not connections, so a reply streamed while another \
-             connection on the same thread is active can be lost (datrail/railmon#70).",
+             HTTP connection on the same thread is active can be lost (datrail/railmon#70).",
             parts.join("; ")
         );
         self.unmatched_reported = unmatched;
