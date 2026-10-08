@@ -30,6 +30,7 @@ import copy
 import hashlib
 import json
 import os
+import platform
 import re
 import sys
 import uuid
@@ -80,7 +81,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # ABSENT (DR-168): a pack-5 baseline would show that as a status change.
 # Pack 7 folds observed_file_access's /proc/<pid> paths to /proc/*/ (DR-185):
 # a pack-6 baseline holds them by number, so it is not comparable.
-RULE_PACK_VERSION = 7
+# Pack 8 adds the registration payload's fields (DR-189): agent_type, owner,
+# llm_provider, sandbox_type, system_info and user_info.
+RULE_PACK_VERSION = 8
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1476,25 +1479,36 @@ def build_evidence_bundle(
 # can take one producer output instead of two. Every payload field has a home:
 # the envelope (host_id, sandbox_name), the agent key, an existing attribute
 # (llm_model is model_name, skills is skills_inventory), or one of the
-# attributes below. The exceptions are the fields in REGISTRATION_RUN_FIELDS.
-# They describe one scan run or one container instance, not the agent. A
+# attributes below. The exceptions are the fields in REGISTRATION_ONLY_FIELDS.
+# Most describe one scan run or one container instance, not the agent. A
 # recreated container or a restarted scan changes them, so a locked baseline
 # would read them as drift on every pass. The bundle already names its
 # container by the host_id/sandbox_name pair, which replaced the
-# hostname-derived identity.
-REGISTRATION_RUN_FIELDS: tuple[tuple[str, ...], ...] = (
+# hostname-derived identity. For the same reason the node name is cut out of
+# `uname` when the scan's own platform supplied it. proc1_cmdline is PID 1's
+# argv: command-line contents, which never reach a persisted file handed to a
+# scorer (README, "Observed reach"), however well redacted.
+REGISTRATION_ONLY_FIELDS: tuple[tuple[str, ...], ...] = (
     ("environment", "system_info", "hostname"),
     ("environment", "system_info", "fqdn"),
     ("environment", "system_info", "container", "id"),
     ("environment", "system_info", "container", "host_pid"),
     ("environment", "system_info", "process", "pid"),
     ("environment", "system_info", "process", "cwd"),
+    ("environment", "system_info", "process", "proc1_cmdline"),
 )
 
 
 def _without_run_fields(system_info: dict[str, Any]) -> dict[str, Any]:
     stable = copy.deepcopy(system_info)
-    for path in REGISTRATION_RUN_FIELDS:
+    # The fallback is " ".join(platform.uname()), whose second field is the
+    # node name; `uname -srm` in a container has none.
+    uname = stable.get("uname")
+    if isinstance(uname, str):
+        parts = uname.split(" ")
+        if len(parts) > 1 and parts[1] and parts[1] == platform.node():
+            stable["uname"] = " ".join(parts[:1] + parts[2:])
+    for path in REGISTRATION_ONLY_FIELDS:
         node: Any = stable
         for key in path[2:-1]:
             node = node.get(key) if isinstance(node, dict) else None
@@ -1525,7 +1539,9 @@ def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
     if owner and owner != "unknown":
         attributes["owner"] = _answered(
             {"owner": owner, "source": owner_source}, "declared",
-            authored_by="platform" if owner_source in ("cli", "RAIL_OWNER") else "subject",
+            # Only the scan's own flag is the operator's; every other source
+            # is read from the scanned environment.
+            authored_by="platform" if owner_source == "cli" else "subject",
             method="--owner, RAIL_OWNER, GIT_AUTHOR_EMAIL, git user.email, USER, LOGNAME, first set wins",
             note="the label the operator files the agent under; not part of its identity",
         )
@@ -1559,18 +1575,19 @@ def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
     system_info = environment.get("system_info")
     if system_info:
         attributes["system_info"] = _answered(
-            _without_run_fields(system_info), "observed", authored_by="subject",
+            _without_run_fields(system_info), "observed", authored_by="none",
             method="uname, /etc/os-release and runtime versions in the scanned runtime; "
                    "the scan's own platform otherwise",
-            note="per-run fields (hostname, fqdn, container id, host pid, the scan's pid "
-                 "and cwd) are left out: they change with every recreate and are not the agent",
+            note="per-run fields (hostname and the node name in uname, fqdn, container id, "
+                 "host pid, the scan's pid and cwd) are left out: they change with every "
+                 "recreate and are not the agent. PID 1's command line is left out as contents",
         )
     else:
         attributes["system_info"] = _absent("the scan's system probe", "observed")
 
     if user_info:
         attributes["user_info"] = _answered(
-            user_info, "observed", authored_by="subject",
+            user_info, "observed", authored_by="none",
             method="the scanning user, its git identity, and id -un/-u/-g in the container "
                    "in docker mode",
             note="the uid the agent runs as is container_uid in docker mode; "

@@ -200,12 +200,16 @@ can serve both. `type`, `owner`, `llm_provider`, `sandbox_type`,
 `system_info` and `user_info` are the `agent_type`, `owner`, `llm_provider`,
 `sandbox_type`, `system_info` and `user_info` attributes (agent-scoped in a
 v2 bundle). `llm_model` is `model_name`, `skills` is `skills_inventory`, and
-the pair and agent key are in the envelope. The exception is a field that
-changes with every scan run or container recreate: `system_info`'s
-`hostname`, `fqdn`, `container.id`, `container.host_pid`, `process.pid` and
-`process.cwd`. A locked baseline would read those as drift on every pass, so
-they stay registration-only (`REGISTRATION_RUN_FIELDS` in
-`evidence_bundle.py`; a test fails when a new payload field has no home).
+the pair and agent key are in the envelope. The exceptions stay registration-only
+(`REGISTRATION_ONLY_FIELDS` in `evidence_bundle.py`; a test fails when a new
+payload field has no home). Most change with every scan run or container
+recreate, and a locked baseline would read them as drift on every pass:
+`system_info`'s `hostname`, `fqdn`, `container.id`, `container.host_pid`,
+`process.pid` and `process.cwd`, and the node name inside `uname` when the
+scan's own platform supplied it. `process.proc1_cmdline` is PID 1's command
+line: contents, not metadata (see Observed reach). Rule pack 8 adds these
+attributes, so RailDash shows a baseline locked under pack 7 as
+`CONTRACT_MISMATCH`, not as drift, until a pack-8 ASP is locked.
 
 Attributes that are *absent* from the bundle rather than absent *on the
 agent* carry `method`: where the pack looked. The `deployment` attribute

@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import sys
 import time
 import unittest
@@ -1024,8 +1025,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # observed_file_access (DR-154); pack 5 folds its random temp names
         # (DR-166), so a pack-4 baseline is not compared against it; pack 6
         # makes observed_destinations BLIND without a snapshot (DR-168);
-        # pack 7 folds observed_file_access's /proc/<pid> paths (DR-185).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 7)
+        # pack 7 folds observed_file_access's /proc/<pid> paths (DR-185);
+        # pack 8 adds the registration payload's fields (DR-189).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 8)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
@@ -2155,13 +2157,13 @@ class RegistrationParityTest(unittest.TestCase):
     def test_every_registration_field_has_a_home_in_the_bundle(self):
         import tempfile
 
-        run_fields = set(evidence_bundle.REGISTRATION_RUN_FIELDS)
+        registration_only = set(evidence_bundle.REGISTRATION_ONLY_FIELDS)
         with tempfile.TemporaryDirectory() as tmp:
             payload, bundle = self.scan(tmp)
         attributes = bundle["attributes"]
         for path, value in self.leaves(payload):
             with self.subTest(field=".".join(path)):
-                if path in run_fields:
+                if path in registration_only:
                     continue
                 prefix = next((p for p in self.HOMES if path[:len(p)] == p), None)
                 self.assertIsNotNone(prefix, "a registration field with no home in the bundle")
@@ -2177,6 +2179,9 @@ class RegistrationParityTest(unittest.TestCase):
                 found = attribute["value"]
                 for key in (*home[1:], *path[len(prefix):]):
                     found = found[key]
+                if path == ("environment", "system_info", "uname"):
+                    # The node name is cut (see the next test); the rest stays.
+                    value = " ".join(part for part in value.split(" ") if part != platform.node())
                 self.assertEqual(found, value)
 
     def test_the_answered_registration_attributes(self):
@@ -2188,6 +2193,7 @@ class RegistrationParityTest(unittest.TestCase):
         self.assertEqual(attributes["agent_type"]["value"], "service")
         self.assertEqual(attributes["owner"]["value"], {"owner": "ops@example.com", "source": "cli"})
         self.assertEqual(attributes["owner"]["authored_by"], "platform")
+        self.assertNotIn(platform.node(), json.dumps(attributes["system_info"]["value"]))
         self.assertEqual(attributes["llm_provider"]["value"], "anthropic")
         self.assertEqual(attributes["sandbox_type"]["value"], payload["environment"]["sandbox_type"])
         for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info"):
@@ -2196,15 +2202,29 @@ class RegistrationParityTest(unittest.TestCase):
     def test_run_fields_stay_out_so_a_baseline_does_not_drift_on_them(self):
         system_info = {
             "os": "Linux", "hostname": "3f2a9c", "fqdn": "3f2a9c",
+            "uname": f"Linux {platform.node()} 6.1.0 #1 SMP x86_64 ",
             "container": {"is_container": True, "id": "3f2a9c...", "name": "agent", "host_pid": 4242},
-            "process": {"pid": 17, "cwd": "/work"},
+            "process": {"pid": 17, "cwd": "/work", "proc1_cmdline": "node app.js --dsn mysql://root:pw@db"},
         }
         attributes = evidence_bundle.registration_attributes({"environment": {"system_info": system_info}})
         self.assertEqual(
             attributes["system_info"]["value"],
-            {"os": "Linux", "container": {"is_container": True, "name": "agent"}},
+            {"os": "Linux", "uname": "Linux 6.1.0 #1 SMP x86_64 ",
+             "container": {"is_container": True, "name": "agent"}},
         )
-        self.assertEqual(system_info["process"], {"pid": 17, "cwd": "/work"}, "the payload is not mutated")
+        self.assertEqual(system_info["process"]["pid"], 17, "the payload is not mutated")
+
+    def test_a_container_uname_keeps_every_field(self):
+        attributes = evidence_bundle.registration_attributes(
+            {"environment": {"system_info": {"uname": "Linux 6.1.0 x86_64"}}}
+        )
+        self.assertEqual(attributes["system_info"]["value"], {"uname": "Linux 6.1.0 x86_64"})
+
+    def test_owner_from_the_scanned_environment_is_subject_authored(self):
+        attributes = evidence_bundle.registration_attributes(
+            {"owner": "a@example.com", "environment": {"user_info": {"owner_source": "RAIL_OWNER"}}}
+        )
+        self.assertEqual(attributes["owner"]["authored_by"], "subject")
 
     def test_an_unknown_owner_or_provider_is_absent_not_answered(self):
         attributes = evidence_bundle.registration_attributes(
