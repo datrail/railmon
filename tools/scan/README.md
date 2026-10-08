@@ -188,11 +188,12 @@ skips building it.
 The envelope names the container the bundle was collected from with
 `host_id` and `sandbox_name` — the pair the scan registers the container
 under (`RAIL_HOST_ID`, and the `rail.sandbox_name` label or the container
-name when there isn't one). Rail Center files the bundle under that
-registered agent, so the bundle lines up with the interactions Rail Center
-already matches from the x-rail ticket. The `agent_id` the registration
-returns is not in the envelope: the control plane looks the pair up, which
-keeps the builder decoupled from the scan job's output.
+name when there isn't one), so a consumer that also holds the registration
+can file the bundle under that registered agent. The `agent_id` the
+registration returns is not in the envelope: the consumer looks the pair up,
+which keeps the builder decoupled from the scan job's output. Today the
+bundle goes only to RailDash (below); RailMon does not send it to Rail
+Center, and `--register` sends the registration payload, not the bundle.
 
 Attributes that are *absent* from the bundle rather than absent *on the
 agent* carry `method`: where the pack looked. The `deployment` attribute
@@ -247,10 +248,13 @@ bundle carries no deployment pair — the same key `raildash asp load
 --agent-key` takes. RailDash's `POST /v1/evidence-bundles` reads it from that
 query parameter.
 
-RailDash is expected to run localhost-only, so no auth header is sent by
-default. `--auth-mode`/`RAIL_AUTH_MODE` (see [Authentication](#authentication))
-applies to this target too, for the rare deployment that fronts RailDash with
-its own auth.
+RailDash refuses this route without its local write token, loopback or not.
+Set `RAIL_RAILDASH_TOKEN` to RailDash's token (its `RAILDASH_TOKEN`, else its
+persisted `<db path>.token`; see the variable table in the top-level README)
+and it is sent as `X-RailDash-Token`; there is deliberately no flag for it,
+so the token stays out of `ps` output. `--auth-mode`/`RAIL_AUTH_MODE` does
+not apply to this target: those credentials are Rail Center's, and RailDash
+does not read them.
 
 A non-2xx response, an unreachable RailDash, or an evidence bundle that fails
 its own contract are all reported as scanner errors with exit code `2` —
@@ -640,8 +644,9 @@ any point in the window (`observed_file_access`' `read`, `write` and
 `observed_ingress_peers` and `observed_file_access`. The scanner emits it
 on each of them whose status reports a window (`ANSWERED`, `PARTIAL` or
 `ABSENT`), never on `BLIND` or `FAILED`. Rail Center's ingest
-(`/v1/evidence-bundles`) rejects an attribute member it does not know, so
-delivering to a Rail Center that predates the member fails.
+(`/v1/evidence-bundles`) rejects an attribute member it does not know, so a
+bundle carried to a Rail Center that predates the member fails there.
+RailMon itself does not deliver to Rail Center yet.
 
 The keyed registration state is also what the collector's multi-target
 capture reads to judge an unsigned `x-rail` ticket. Start the
