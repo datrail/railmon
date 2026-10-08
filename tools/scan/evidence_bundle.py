@@ -26,9 +26,11 @@ network or a clone of the consumer.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
+import platform
 import re
 import sys
 import uuid
@@ -79,7 +81,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # ABSENT (DR-168): a pack-5 baseline would show that as a status change.
 # Pack 7 folds observed_file_access's /proc/<pid> paths to /proc/*/ (DR-185):
 # a pack-6 baseline holds them by number, so it is not comparable.
-RULE_PACK_VERSION = 7
+# Pack 8 adds the registration payload's fields (DR-189): agent_type, owner,
+# llm_provider, sandbox_type, system_info and user_info.
+RULE_PACK_VERSION = 8
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1237,8 +1241,8 @@ def build_evidence_bundle(
     else:
         attributes["user"] = _blind(
             "NOT_COLLECTED_BY_PACK", "observed",
-            note="the process user is not reported by this pack; the uid is in the scan's "
-                 "user_info field, the sibling feature file",
+            note="the process user is not reported by this pack; the scanning user's uid "
+                 "is in the user_info attribute",
         )
 
     # ── deployment: the signal that groups copies of the same agent ─────
@@ -1448,6 +1452,8 @@ def build_evidence_bundle(
             note="no skills in the MCP config or skills files",
         )
 
+    attributes.update(registration_attributes(payload))
+
     return {
         "bundle_version": BUNDLE_VERSION,
         "bundle_id": "bnd-" + uuid.uuid4().hex[:12],
@@ -1467,6 +1473,132 @@ def build_evidence_bundle(
         "attestations": [],
         "attributes": attributes,
     }
+
+# ── the registration payload's fields (DR-189) ──────────────────────────────
+# The bundle carries everything the registration payload does, so Rail Center
+# can take one producer output instead of two. Every payload field has a home:
+# the envelope (host_id, sandbox_name), the agent key, an existing attribute
+# (llm_model is model_name, skills is skills_inventory), or one of the
+# attributes below. The exceptions are the fields in REGISTRATION_ONLY_FIELDS.
+# Most describe one scan run or one container instance, not the agent. A
+# recreated container or a restarted scan changes them, so a locked baseline
+# would read them as drift on every pass. The bundle already names its
+# container by the host_id/sandbox_name pair, which replaced the
+# hostname-derived identity. For the same reason the node name is cut out of
+# `uname` when the scan's own platform supplied it. proc1_cmdline is PID 1's
+# argv: command-line contents, which never reach a persisted file handed to a
+# scorer (README, "Observed reach"), however well redacted.
+REGISTRATION_ONLY_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("environment", "system_info", "hostname"),
+    ("environment", "system_info", "fqdn"),
+    ("environment", "system_info", "container", "id"),
+    ("environment", "system_info", "container", "host_pid"),
+    ("environment", "system_info", "process", "pid"),
+    ("environment", "system_info", "process", "cwd"),
+    ("environment", "system_info", "process", "proc1_cmdline"),
+)
+
+
+def _without_run_fields(system_info: dict[str, Any]) -> dict[str, Any]:
+    stable = copy.deepcopy(system_info)
+    # The fallback is " ".join(platform.uname()), whose second field is the
+    # node name; `uname -srm` in a container has none.
+    uname = stable.get("uname")
+    if isinstance(uname, str):
+        parts = uname.split(" ")
+        if len(parts) > 1 and parts[1] and parts[1] == platform.node():
+            stable["uname"] = " ".join(parts[:1] + parts[2:])
+    for path in REGISTRATION_ONLY_FIELDS:
+        node: Any = stable
+        for key in path[2:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            node.pop(path[-1], None)
+    for key in ("container", "process"):
+        if stable.get(key) == {}:
+            del stable[key]
+    return stable
+
+
+def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
+    """The registration payload's fields that no other attribute carries."""
+    environment = payload.get("environment") or {}
+    user_info = environment.get("user_info") or {}
+    attributes: dict[str, Any] = {}
+
+    if payload.get("type"):
+        attributes["agent_type"] = _answered(
+            payload["type"], "declared", authored_by="platform",
+            method="the scan's --agent-type (personal unless the operator says service)",
+        )
+    else:
+        attributes["agent_type"] = _absent("--agent-type", "declared")
+
+    owner = payload.get("owner")
+    owner_source = user_info.get("owner_source") or "unset"
+    if owner and owner != "unknown":
+        attributes["owner"] = _answered(
+            {"owner": owner, "source": owner_source}, "declared",
+            # Only the scan's own flag is the operator's; every other source
+            # is read from the scanned environment.
+            authored_by="platform" if owner_source == "cli" else "subject",
+            method="--owner, RAIL_OWNER, GIT_AUTHOR_EMAIL, git user.email, USER, LOGNAME, first set wins",
+            note="the label the operator files the agent under; not part of its identity",
+        )
+    else:
+        attributes["owner"] = _absent(
+            "--owner, RAIL_OWNER, GIT_AUTHOR_EMAIL, git user.email, USER, LOGNAME", "declared",
+        )
+
+    provider = environment.get("llm_provider")
+    if provider and provider != "unknown":
+        attributes["llm_provider"] = _answered(
+            provider, "declared", authored_by="subject",
+            method="--llm-provider, RAIL_LLM_PROVIDER or LLM_PROVIDER, else inferred from "
+                   "the API key names, the base URL or the model name",
+            note="where the model calls go is inference_endpoint; this is the vendor it names",
+        )
+    else:
+        attributes["llm_provider"] = _absent(
+            "provider flags and env, API key names, base URL and model name", "declared",
+        )
+
+    if environment.get("sandbox_type"):
+        attributes["sandbox_type"] = _answered(
+            environment["sandbox_type"], "declared", authored_by="subject",
+            method="--sandbox-type, RAIL_SANDBOX_TYPE or SANDBOX_TYPE, else image, "
+                   "container name, hostname and PID 1 markers",
+        )
+    else:
+        attributes["sandbox_type"] = _absent("sandbox type flags, env and markers", "declared")
+
+    system_info = environment.get("system_info")
+    if system_info:
+        attributes["system_info"] = _answered(
+            _without_run_fields(system_info), "observed", authored_by="none",
+            method="uname, /etc/os-release and runtime versions in the scanned runtime; "
+                   "the scan's own platform otherwise",
+            note="per-run fields (hostname and the node name in uname, fqdn, container id, "
+                 "host pid, the scan's pid and cwd) are left out: they change with every "
+                 "recreate and are not the agent. PID 1's command line is left out as contents",
+        )
+    else:
+        attributes["system_info"] = _absent("the scan's system probe", "observed")
+
+    if user_info:
+        attributes["user_info"] = _answered(
+            user_info, "observed", authored_by="none",
+            method="the scanning user, its git identity, and id -un/-u/-g in the container "
+                   "in docker mode",
+            note="the uid the agent runs as is container_uid in docker mode; "
+                 "the user attribute is HostConfig.User",
+        )
+    else:
+        attributes["user_info"] = _absent("the scan's user probe", "observed")
+
+    return attributes
+
+
 # ── the write path ──────────────────────────────────────────────────────────
 # Mirrors the feature file's guarantee: the bundle is written from the
 # scanner's `finally`, so it lands even when the registration fails. It is
