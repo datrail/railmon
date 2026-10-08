@@ -8,6 +8,7 @@
 //! and a port that quietly renamed them would break every caller for no gain.
 
 mod auth;
+mod http1_guard;
 mod identity;
 mod interaction;
 mod pipeline;

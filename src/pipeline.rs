@@ -7,6 +7,7 @@
 //! probe, unwrapping what it emits, pairing a request with its response, and
 //! attributing the result.
 
+use crate::http1_guard::{Http1FramingGuard, RestoreDiverted};
 use agentsight_capture::analyzers::{
     Analyzer, AuthHeaderRemover, HTTPDecompressor, HTTPParser, TimestampNormalizer,
 };
@@ -376,7 +377,11 @@ pub async fn event_stream(
     // AuthHeaderRemover scrubs only the parsed header map — so credentials
     // would survive into the record written to disk and posted onward.
     let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
+        // Keeps another connection's reads out of a chunked reply in flight
+        // on the same thread, then hands them back unchanged (#70).
+        Box::new(Http1FramingGuard::new()),
         Box::new(HTTPParser::new().disable_raw_data()),
+        Box::new(RestoreDiverted),
         Box::new(HTTPDecompressor::new()),
         // No SSEProcessor, deliberately. It is a filter_map: for a streaming
         // response it swallows the parser's response event and emits its own,
@@ -386,16 +391,12 @@ pub async fn event_stream(
         // means capturing almost nothing. The Python chain did not use it
         // either; it treated an SSE response as a response.
         //
-        // This does cost something, and it is a regression rather than
-        // something inherited: the Python kept its own `active_streams` map
-        // keyed on (pid, tid), appended every later READ/RECV to the body and
-        // finalised on the next request or at shutdown. Without that, an
-        // HTTP/1.1 streamed response is recorded from its first SSL read only —
-        // measured at 81 of 532 bytes on an Anthropic-shaped stream, losing the
-        // model's reply text — and `latency_ms` is time-to-first-byte rather
-        // than stream duration. Destination, status and the request are intact,
-        // and HTTP/2 is unaffected because the crate reassembles DATA frames
-        // per stream. Re-accumulating HTTP/1.1 bodies is its own ticket.
+        // Leaving it out costs nothing for a chunked HTTP/1.1 stream: the
+        // parser holds a chunked body until its last chunk and emits the
+        // reply whole (agentsight-capture 1.0.34; the parser test in
+        // http1_guard.rs relies on it), and HTTP/2 DATA frames are reassembled
+        // per stream. That holding buffer is per (pid, tid), which is what
+        // Http1FramingGuard protects.
         //
         // TimestampNormalizer is required, not optional: sslsniff timestamps
         // are `bpf_ktime_get_ns()`, nanoseconds since *boot*, and this is the
