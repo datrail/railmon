@@ -509,10 +509,18 @@ fn ssl_event_from_line(line: &str) -> Option<Event> {
 #[derive(Default)]
 pub struct Pairer {
     pending: HashMap<(u32, u64), VecDeque<PendingRequest>>,
+    /// Responses that arrived with no request outstanding on their thread.
+    /// Counted, not paired: there is nothing to pair them with.
+    unmatched_responses: u64,
 }
 
 struct PendingRequest {
     epoch_ms: u64,
+    /// When the pairer took it, on this process's monotonic clock. Ages are
+    /// measured on this, never on `epoch_ms`: the probe's clock is
+    /// CLOCK_MONOTONIC plus a boot time read once, so it falls behind the
+    /// wall clock by every second the host has been suspended.
+    queued: std::time::Instant,
     tid: u64,
     request: Value,
     size: usize,
@@ -540,6 +548,7 @@ impl Pairer {
                     .or_default()
                     .push_back(PendingRequest {
                         epoch_ms,
+                        queued: std::time::Instant::now(),
                         tid,
                         request: message_body(data),
                         size: body_len(data),
@@ -547,7 +556,13 @@ impl Pairer {
                 None
             }
             Some("response") => {
-                let pending = self.pending.get_mut(&key)?.pop_front()?;
+                let Some(pending) = self.pending.get_mut(&key).and_then(VecDeque::pop_front) else {
+                    self.unmatched_responses += 1;
+                    log::debug!(
+                        "pid {pid} tid {tid}: a response with no request outstanding on its thread"
+                    );
+                    return None;
+                };
                 let latency_ms = epoch_ms.checked_sub(pending.epoch_ms).map(|d| d as f64);
 
                 // Rail Center requires `method` and `path` when a `request`
@@ -591,23 +606,63 @@ impl Pairer {
         self.pending
             .drain()
             .flat_map(|((pid, _tid), queue)| {
-                queue.into_iter().map(move |pending| {
-                    json!({
-                        "timestamp": ms_to_rfc3339(pending.epoch_ms),
-                        "timestamp_ns": pending.epoch_ms.saturating_mul(1_000_000),
-                        "pid": pid,
-                        "tid": pending.tid,
-                        "request": usable_request(pending.request),
-                        "response": Value::Null,
-                        "request_size": pending.size,
-                        "response_size": 0,
-                        "latency_ms": Value::Null,
-                        "incomplete": true,
-                    })
-                })
+                queue
+                    .into_iter()
+                    .map(move |pending| incomplete(pid, pending))
             })
             .collect()
     }
+
+    /// Takes out every request that has waited longer than `max_age` for
+    /// its response, as incomplete interactions (DR-186), oldest first.
+    ///
+    /// Without this a lost response holds its request for the life of the
+    /// tap, and nothing is ever forwarded or logged for it. It is lost more
+    /// often than it sounds: AgentSight's SSL events carry a pid and tid but
+    /// no connection, and its HTTP/1 parser keeps one buffer per thread and
+    /// direction. A Node agent does all its TLS on one thread, so a second
+    /// connection read during a streamed reply resets or corrupts that
+    /// buffer and the reply never completes (datrail/railmon#70).
+    ///
+    /// A response that does arrive after its request expired finds the next
+    /// request on that thread or none at all; the bound has to sit well past
+    /// any real stream so that stays rare.
+    pub fn expire(&mut self, now: std::time::Instant, max_age: std::time::Duration) -> Vec<Value> {
+        let mut expired = Vec::new();
+        for (&(pid, _tid), queue) in self.pending.iter_mut() {
+            // FIFO per thread, so the stale ones are at the front.
+            while queue
+                .front()
+                .is_some_and(|pending| now.saturating_duration_since(pending.queued) > max_age)
+            {
+                let pending = queue.pop_front().expect("front was checked");
+                expired.push(incomplete(pid, pending));
+            }
+        }
+        self.pending.retain(|_, queue| !queue.is_empty());
+        expired.sort_by_key(|value| value["timestamp_ns"].as_u64().unwrap_or(0));
+        expired
+    }
+
+    /// Responses so far that found no request to pair with.
+    pub fn unmatched_responses(&self) -> u64 {
+        self.unmatched_responses
+    }
+}
+
+fn incomplete(pid: u32, pending: PendingRequest) -> Value {
+    json!({
+        "timestamp": ms_to_rfc3339(pending.epoch_ms),
+        "timestamp_ns": pending.epoch_ms.saturating_mul(1_000_000),
+        "pid": pid,
+        "tid": pending.tid,
+        "request": usable_request(pending.request),
+        "response": Value::Null,
+        "request_size": pending.size,
+        "response_size": 0,
+        "latency_ms": Value::Null,
+        "incomplete": true,
+    })
 }
 
 fn ms_to_rfc3339(epoch_ms: u64) -> Value {
@@ -1148,6 +1203,58 @@ mod tests {
     fn a_response_with_no_request_is_dropped_not_paired_to_a_stranger() {
         let mut p = Pairer::new();
         assert!(p.accept(1, &resp(7, 1_000_000_000, 200), 1000).is_none());
+        // Dropped, but counted, so the collector can say so (DR-186).
+        assert_eq!(p.unmatched_responses(), 1);
+    }
+
+    #[test]
+    fn a_request_past_the_timeout_comes_out_incomplete_and_a_newer_one_waits() {
+        // railmon#70: a streamed reply lost to another connection on the same
+        // thread used to leave its request pending for the life of the tap.
+        use std::time::{Duration, Instant};
+        let mut p = Pairer::new();
+        p.accept(1, &req(7, 0), 1_000);
+        p.accept(2, &req(3, 0), 2_000);
+        std::thread::sleep(Duration::from_millis(30));
+        let cut = Instant::now();
+        p.accept(1, &req(7, 0), 50_000);
+        let timeout = Duration::from_millis(10);
+
+        assert!(
+            p.expire(cut, Duration::from_secs(60)).is_empty(),
+            "nothing is old enough yet"
+        );
+
+        let expired = p.expire(cut, timeout);
+        assert_eq!(expired.len(), 2);
+        assert_eq!(expired[0]["pid"], 1, "oldest first");
+        assert_eq!(expired[1]["pid"], 2);
+        for event in &expired {
+            assert_eq!(event["incomplete"], true);
+            assert_eq!(event["response"], Value::Null);
+            assert_eq!(event["request"]["method"], "POST");
+        }
+        assert_eq!(p.outstanding(), 1);
+
+        // The newer request still pairs with the next response on its thread.
+        let out = p.accept(1, &resp(7, 0, 200), 126_000).expect("paired");
+        assert_eq!(out["timestamp_ns"], 50_000_000_000u64);
+        assert_eq!(p.outstanding(), 0);
+        assert!(p
+            .expire(Instant::now() + Duration::from_secs(3600), timeout)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_request_is_aged_on_our_clock_not_the_probes() {
+        // An event clock far behind the wall clock (a host that suspended
+        // since boot) must not make a fresh request look stale.
+        use std::time::{Duration, Instant};
+        let mut p = Pairer::new();
+        p.accept(1, &req(7, 0), 1);
+        assert!(p
+            .expire(Instant::now(), Duration::from_secs(600))
+            .is_empty());
     }
 
     #[test]

@@ -110,6 +110,13 @@ struct Args {
     #[arg(long, value_enum, default_value = "legacy-http")]
     output_format: OutputFormat,
 
+    /// Seconds a request waits for its response before it is forwarded as an
+    /// incomplete interaction (DR-186). Well past any real model stream, since
+    /// a reply that arrives after its request expired pairs with the next
+    /// request on its thread. 0 waits for ever, as before.
+    #[arg(long, default_value_t = 600.0)]
+    pending_timeout: f64,
+
     /// Session id recorded on every interaction. Generated when not given.
     #[arg(long)]
     session_id: Option<String>,
@@ -169,6 +176,75 @@ fn resolve_probe_path(explicit: Option<String>) -> String {
         return local.display().to_string();
     }
     "/usr/local/bin/agentsight".to_string()
+}
+
+/// How long a request may wait for its response, or None for ever.
+/// Clamped like `--flush-interval`, for the same reasons.
+fn pending_timeout(args: &Args) -> Option<Duration> {
+    let seconds = if args.pending_timeout.is_finite() {
+        args.pending_timeout.clamp(0.0, 86_400.0)
+    } else {
+        600.0
+    };
+    (seconds > 0.0).then(|| Duration::from_secs_f64(seconds))
+}
+
+/// Says when exchanges could not be paired, so a capture that forwards
+/// nothing is never silent about why (DR-186, datrail/railmon#70). At most
+/// one line a minute, and only when a count moved.
+#[derive(Default)]
+struct PairingReport {
+    expired: u64,
+    unmatched_reported: u64,
+    expired_reported: u64,
+    last: Option<std::time::Instant>,
+}
+
+impl PairingReport {
+    const EVERY: Duration = Duration::from_secs(60);
+
+    fn note_expired(&mut self, count: usize) {
+        self.expired += count as u64;
+    }
+
+    /// `unmatched` is the running total across live pairers. A tap that stops
+    /// takes its count with it, so the baseline only falls; responses counted
+    /// in the minute before a tap stops can go unreported. A diagnostic, so
+    /// that under-count is accepted.
+    fn maybe_log(&mut self, unmatched: u64, timeout: Option<Duration>) {
+        if self.last.is_some_and(|last| last.elapsed() < Self::EVERY) {
+            return;
+        }
+        self.log(unmatched, timeout);
+    }
+
+    /// Logs whatever moved since the last line, rate limit or not: at exit.
+    fn log(&mut self, unmatched: u64, timeout: Option<Duration>) {
+        self.unmatched_reported = self.unmatched_reported.min(unmatched);
+        if unmatched == self.unmatched_reported && self.expired == self.expired_reported {
+            return;
+        }
+        let mut parts = Vec::new();
+        let new_expired = self.expired - self.expired_reported;
+        if new_expired > 0 {
+            parts.push(format!(
+                "{new_expired} request(s) got no response within {}s and were forwarded as incomplete",
+                timeout.unwrap_or_default().as_secs_f64()
+            ));
+        }
+        let new_unmatched = unmatched - self.unmatched_reported;
+        if new_unmatched > 0 {
+            parts.push(format!("{new_unmatched} response(s) matched no request"));
+        }
+        log::warn!(
+            "{}. The probe reports threads, not connections, so a reply streamed while another \
+             connection on the same thread is active can be lost (datrail/railmon#70).",
+            parts.join("; ")
+        );
+        self.unmatched_reported = unmatched;
+        self.expired_reported = self.expired;
+        self.last = Some(std::time::Instant::now());
+    }
 }
 
 #[tokio::main]
@@ -303,6 +379,8 @@ async fn main() -> Result<()> {
     let (mut stream, stream_status) = pipeline::event_stream(&agentsight, &filters).await?;
 
     let mut pairer = Pairer::new();
+    let pending_timeout = pending_timeout(&args);
+    let mut report = PairingReport::default();
     let mut write_error: Option<anyhow::Error> = None;
     let mut stream_ended = false;
     let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
@@ -351,7 +429,33 @@ async fn main() -> Result<()> {
                 }
             }
 
-            _ = ticker.tick() => sink.flush_if_due().await,
+            _ = ticker.tick() => {
+                if let (Mode::Http, Some(timeout)) = (&args.mode, pending_timeout) {
+                    let expired = pairer.expire(std::time::Instant::now(), timeout);
+                    report.note_expired(expired.len());
+                    for paired in expired {
+                        let value = match args.output_format {
+                            OutputFormat::LegacyHttp => paired,
+                            OutputFormat::RuntimeInteraction => interaction::to_runtime_interaction(
+                                &paired,
+                                Some(&session_id),
+                                Some(&capture_start),
+                                "railmon",
+                            ),
+                        };
+                        if let Err(error) = sink.emit(&value).await {
+                            log::error!("writing interaction: {error}");
+                            write_error = Some(error);
+                            break;
+                        }
+                    }
+                    if write_error.is_some() {
+                        break;
+                    }
+                }
+                report.maybe_log(pairer.unmatched_responses(), pending_timeout);
+                sink.flush_if_due().await
+            }
 
             _ = shutdown.requested() => {
                 log::info!("interrupted");
@@ -360,6 +464,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    report.log(pairer.unmatched_responses(), pending_timeout);
     sink.shutdown().await;
     let outstanding = pairer.outstanding();
     log::info!("{} interaction(s) forwarded", sink.written());
@@ -592,7 +697,20 @@ async fn flush_target_incomplete(
     capture_start: &str,
     sink: &mut Sink,
 ) -> Result<()> {
-    for mut paired in target.pairer.flush_incomplete() {
+    let pending = target.pairer.flush_incomplete();
+    emit_target_incomplete(target, pending, registered, session_id, capture_start, sink).await
+}
+
+/// Emits a target's incomplete interactions, attributed like its paired ones.
+async fn emit_target_incomplete(
+    target: &TargetRuntime,
+    incomplete: Vec<serde_json::Value>,
+    registered: &identity::RegisteredAgents,
+    session_id: &str,
+    capture_start: &str,
+    sink: &mut Sink,
+) -> Result<()> {
+    for mut paired in incomplete {
         paired["target_pid"] = serde_json::json!(target.process.pid);
         paired["process_start_time_ticks"] = serde_json::json!(target.process.start_time_ticks);
         let value = interaction::to_attributed_runtime_interaction(
@@ -615,7 +733,18 @@ async fn flush_shared_incomplete(
     capture_start: &str,
     sink: &mut Sink,
 ) -> Result<()> {
-    for mut paired in tap.pairer.flush_incomplete() {
+    let pending = tap.pairer.flush_incomplete();
+    emit_shared_incomplete(tap, pending, session_id, capture_start, sink).await
+}
+
+async fn emit_shared_incomplete(
+    tap: &SharedTap,
+    incomplete: Vec<serde_json::Value>,
+    session_id: &str,
+    capture_start: &str,
+    sink: &mut Sink,
+) -> Result<()> {
+    for mut paired in incomplete {
         tap.stamp(&mut paired);
         sink.emit(&tap.row(&paired, session_id, capture_start))
             .await?;
@@ -921,6 +1050,8 @@ async fn run_multi_target(
     retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut write_error = None;
     let mut all_targets_down = false;
+    let pending_timeout = pending_timeout(args);
+    let mut report = PairingReport::default();
     'capture: loop {
         tokio::select! {
             biased;
@@ -1182,11 +1313,47 @@ async fn run_multi_target(
                 }
                 log_target_availability_transition(&targets, &shared, &mut all_targets_down);
             }
-            _ = ticker.tick() => sink.flush_if_due().await,
+            _ = ticker.tick() => {
+                if let Some(timeout) = pending_timeout {
+                    let now = std::time::Instant::now();
+                    for target in targets.iter_mut().flatten() {
+                        let expired = target.pairer.expire(now, timeout);
+                        report.note_expired(expired.len());
+                        if let Err(error) = emit_target_incomplete(
+                            target, expired, &registered, session_id, capture_start, sink,
+                        ).await {
+                            write_error = Some(error);
+                            break 'capture;
+                        }
+                    }
+                    for tap in shared.values_mut() {
+                        let expired = tap.pairer.expire(now, timeout);
+                        report.note_expired(expired.len());
+                        if let Err(error) = emit_shared_incomplete(tap, expired, session_id, capture_start, sink).await {
+                            write_error = Some(error);
+                            break 'capture;
+                        }
+                    }
+                }
+                let unmatched = targets.iter().flatten().map(|t| t.pairer.unmatched_responses()).sum::<u64>()
+                    + shared.values().map(|t| t.pairer.unmatched_responses()).sum::<u64>();
+                report.maybe_log(unmatched, pending_timeout);
+                sink.flush_if_due().await
+            }
             _ = shutdown.requested() => break 'capture,
         }
     }
 
+    let unmatched = targets
+        .iter()
+        .flatten()
+        .map(|t| t.pairer.unmatched_responses())
+        .sum::<u64>()
+        + shared
+            .values()
+            .map(|t| t.pairer.unmatched_responses())
+            .sum::<u64>();
+    report.log(unmatched, pending_timeout);
     if let Some(error) = write_error {
         return Err(error);
     }
