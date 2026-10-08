@@ -37,6 +37,16 @@ sudo ./target/release/railmon --agentsight bin/agentsight \
   --mode http --output capture.jsonl
 ```
 
+In `--mode http` a request is paired with the next response on its thread.
+One still unanswered after `--pending-timeout` seconds (600, ten minutes, by default) is
+written as an interaction with `"incomplete": true` and no response, and the
+collector logs how many it wrote and how many responses matched no request.
+The probe reports threads, not connections, so a streamed reply on a thread
+that is also reading another connection, which is how a Node agent does all
+its TLS, can be lost or paired with the wrong response
+([#70](https://github.com/datrail/railmon/issues/70); the fix is a connection key upstream,
+[eunomia-bpf/agentsight#208](https://github.com/eunomia-bpf/agentsight/issues/208)).
+
 `railmon` with a command (`railmon collect`, `railmon scan`, …) is the
 container image's entrypoint, so those commands work only inside the
 container, e.g. `docker run --rm --privileged --pid host railmon collect …`.
