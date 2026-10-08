@@ -42,11 +42,11 @@ One still unanswered after `--pending-timeout` seconds (600, ten minutes, by def
 written as an interaction with `"incomplete": true` and no response, and the
 collector logs how many it wrote and how many responses matched no request.
 The probe reports threads, not connections, and a Node agent does all its
-TLS on one thread. A read from another, non-HTTP connection (a WebSocket, say)
-that arrives between two chunks of a streamed reply is kept out of that reply,
+TLS on one thread. A read from another connection (a WebSocket frame, say)
+that arrives between two chunks of a chunked reply is kept out of that reply,
 so the reply still comes through whole. Two HTTP connections busy on one thread
 can still lose a reply or pair it with the wrong response, as can a foreign
-read landing in the middle of a chunk
+read landing in the middle of a chunk or a reply that is not chunked
 ([#70](https://github.com/datrail/railmon/issues/70); the fix is a connection key upstream,
 [eunomia-bpf/agentsight#208](https://github.com/eunomia-bpf/agentsight/issues/208)).
 

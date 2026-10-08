@@ -158,7 +158,7 @@ count them from the file, e.g.
 | `no declared agent resolved to a capturable process` (fatal, exit 1) | nothing in the manifest resolved to a process at startup, not even an ambiguous one; run `--print-resolved-targets` |
 | `target '<k>' exited or its PID was reused; stopping its tap …` | expected on agent restart; pending requests are written as incomplete |
 | `target '<k>' tap ended (…); … will retry discovery` | the probe for that one agent stopped |
-| `N request(s) got no response within …s and were forwarded as incomplete` / `N response(s) matched no request` | the probe reports threads, not connections; a reply streamed while another HTTP connection on the agent's thread is active (typical of Node agents) can be lost ([#70](https://github.com/datrail/railmon/issues/70)) |
+| `N request(s) got no response within …s and were forwarded as incomplete` / `N response(s) matched no request` | the probe reports threads, not connections; a reply streamed while another HTTP connection on the agent's thread is active, or a foreign read landing mid-chunk, can lose it (typical of Node agents) ([#70](https://github.com/datrail/railmon/issues/70)) |
 | `target '<k>' resolved again; tap restarted` | recovery, retried every 5 s under the same `agent_key` |
 | `every declared target is currently down; capture is idle …` | RailMon keeps running and retrying; it does not exit |
 | `capture analyzer panicked on captured traffic (…); stopping this tap` | an analyzer panicked on captured traffic (since agentsight-capture 1.0.34 a malformed HPACK block no longer does); only that tap stops and restarts |

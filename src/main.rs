@@ -247,7 +247,7 @@ impl PairingReport {
         }
         log::warn!(
             "{}. The probe reports threads, not connections, so a reply streamed while another \
-             connection on the same thread is active can be lost (datrail/railmon#70).",
+             HTTP connection on the same thread is active can be lost (datrail/railmon#70).",
             parts.join("; ")
         );
         self.unmatched_reported = unmatched;

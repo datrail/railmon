@@ -20,6 +20,12 @@
 //! Everything it cannot decide it leaves alone, exactly as today: reads inside
 //! a chunk's data, Content-Length bodies, header blocks, and a read that opens
 //! a new HTTP/1 message (the parser resyncs on those itself).
+//!
+//! A reply that stops at a chunk boundary and never resumes (a cancelled SSE
+//! stream) would otherwise keep its key guarded for good, hiding that thread's
+//! later reads, HTTP/2 frames included, from the parser. So a key whose reply
+//! has not moved for [`IDLE_RELEASE`] is let go, and the read is passed on as
+//! it would have been before this guard existed.
 
 use agentsight_capture::analyzers::Analyzer;
 use agentsight_capture::runners::EventStream;
@@ -27,6 +33,7 @@ use agentsight_capture::Event;
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Where a diverted read's payload waits while the parser runs.
 pub const DIVERTED_KEY: &str = "railmon_diverted_data";
@@ -39,17 +46,40 @@ const MAX_STREAMS: usize = 1024;
 /// long without a CRLF is not one.
 const MAX_SIZE_LINE: usize = 1024;
 
+/// How long a guarded reply may go without a byte of its own before its key
+/// is released. Model streams send keep-alive events well inside this.
+pub const IDLE_RELEASE: Duration = Duration::from_secs(60);
+
 type Key = (u32, u64, bool);
 
-#[derive(Default)]
+struct Held {
+    /// The bytes the parser is holding for this key, as it holds them.
+    buf: Vec<u8>,
+    /// When the reply last took a read.
+    moved: Instant,
+}
+
 pub struct Http1FramingGuard {
-    /// The bytes the parser is holding for each key, as it holds them.
-    streams: HashMap<Key, Vec<u8>>,
+    streams: HashMap<Key, Held>,
+    idle_release: Duration,
+}
+
+impl Default for Http1FramingGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Http1FramingGuard {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_idle_release(IDLE_RELEASE)
+    }
+
+    fn with_idle_release(idle_release: Duration) -> Self {
+        Self {
+            streams: HashMap::new(),
+            idle_release,
+        }
     }
 
     /// True when the event should be hidden from the parser.
@@ -82,23 +112,37 @@ impl Http1FramingGuard {
             return false;
         }
 
+        let now = Instant::now();
         if looks_like_http1_start(&bytes) {
-            self.streams.insert(key, bytes);
+            self.streams.insert(
+                key,
+                Held {
+                    buf: bytes,
+                    moved: now,
+                },
+            );
             self.settle(key);
             return false;
         }
 
-        let Some(buf) = self.streams.get_mut(&key) else {
+        let Some(held) = self.streams.get_mut(&key) else {
             return false;
         };
-        if cannot_continue(buf, &bytes) {
-            return true;
-        }
-        if buf.len() + bytes.len() > MAX_BODY_BYTES {
+        if cannot_continue(&held.buf, &bytes) {
+            if now.duration_since(held.moved) < self.idle_release {
+                return true;
+            }
+            // Stalled for good: the parser fails this read and forgets the
+            // reply, as it did before the guard.
             self.streams.remove(&key);
             return false;
         }
-        buf.extend_from_slice(&bytes);
+        if held.buf.len() + bytes.len() > MAX_BODY_BYTES {
+            self.streams.remove(&key);
+            return false;
+        }
+        held.buf.extend_from_slice(&bytes);
+        held.moved = now;
         self.settle(key);
         false
     }
@@ -106,7 +150,7 @@ impl Http1FramingGuard {
     /// Drop complete messages off the front, as the parser does, so the
     /// buffer always starts at the message still in flight.
     fn settle(&mut self, key: Key) {
-        let Some(buf) = self.streams.get_mut(&key) else {
+        let Some(Held { buf, .. }) = self.streams.get_mut(&key) else {
             return;
         };
         loop {
@@ -144,7 +188,7 @@ impl Analyzer for Http1FramingGuard {
         &mut self,
         stream: EventStream,
     ) -> std::result::Result<EventStream, Box<dyn std::error::Error + Send + Sync>> {
-        let mut guard = std::mem::take(self);
+        let mut guard = std::mem::replace(self, Self::with_idle_release(self.idle_release));
         Ok(Box::pin(stream.map(move |mut event| {
             if event.source == "ssl" && guard.observe(&event) {
                 if let Some(obj) = event.data.as_object_mut() {
@@ -325,8 +369,8 @@ fn message_end(buf: &[u8]) -> End {
     match head.length {
         Some(n) if buf.len() >= head.end + n => End::Complete(head.end + n),
         Some(_) => End::Incomplete,
-        // A request ends at its headers; a close-delimited response is
-        // emitted whole by the parser on this read.
+        // A request ends at its headers; the parser emits a close-delimited
+        // response from what it holds on this read and keeps nothing.
         None if head.is_response => End::Complete(buf.len()),
         None => End::Complete(head.end),
     }
@@ -463,6 +507,17 @@ mod tests {
         assert!(!g.observe(&read(1, b"0\r\n\r\n")));
         // Message complete: the thread is idle and nothing is diverted.
         assert!(!g.observe(&read(1, WS)));
+        assert!(g.streams.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_reply_releases_its_key() {
+        // A cancelled stream left at a chunk boundary must not hide the
+        // thread's later reads (an HTTP/2 frame here) for ever.
+        let mut g = Http1FramingGuard::with_idle_release(Duration::ZERO);
+        assert!(!g.observe(&read(1, HEAD)));
+        assert!(!g.observe(&read(1, &chunk(0))));
+        assert!(!g.observe(&read(1, b"\x00\x00\x08\x00\x01\x00\x00\x00\x01")));
         assert!(g.streams.is_empty());
     }
 

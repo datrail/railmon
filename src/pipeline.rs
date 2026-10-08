@@ -391,12 +391,17 @@ pub async fn event_stream(
         // means capturing almost nothing. The Python chain did not use it
         // either; it treated an SSE response as a response.
         //
-        // Leaving it out costs nothing for a chunked HTTP/1.1 stream: the
-        // parser holds a chunked body until its last chunk and emits the
-        // reply whole (agentsight-capture 1.0.34; the parser test in
-        // http1_guard.rs relies on it), and HTTP/2 DATA frames are reassembled
-        // per stream. That holding buffer is per (pid, tid), which is what
-        // Http1FramingGuard protects.
+        // What leaving it out costs, on agentsight 1.0.34. A chunked HTTP/1.1
+        // reply is held until its last chunk and emitted whole (the parser
+        // test in http1_guard.rs relies on it), and HTTP/2 DATA frames are
+        // reassembled per stream. But the response keeps the timestamp of its
+        // first read, so `latency_ms` is time-to-first-byte rather than stream
+        // duration; a chunked reply past 1 MiB is dropped whole and its
+        // request ends incomplete; and a close-delimited reply (neither
+        // Content-Length nor chunked) is recorded from its first read only.
+        // (At DR-20, on 1.0.14, chunked replies were cut to their first read
+        // too: 81 of 532 bytes on an Anthropic-shaped stream.) The holding
+        // buffer is per (pid, tid), which is what Http1FramingGuard protects.
         //
         // TimestampNormalizer is required, not optional: sslsniff timestamps
         // are `bpf_ktime_get_ns()`, nanoseconds since *boot*, and this is the
@@ -621,9 +626,11 @@ impl Pairer {
     /// tap, and nothing is ever forwarded or logged for it. It is lost more
     /// often than it sounds: AgentSight's SSL events carry a pid and tid but
     /// no connection, and its HTTP/1 parser keeps one buffer per thread and
-    /// direction. A Node agent does all its TLS on one thread, so a second
-    /// connection read during a streamed reply resets or corrupts that
-    /// buffer and the reply never completes (datrail/railmon#70).
+    /// direction. A Node agent does all its TLS on one thread. A non-HTTP
+    /// read at a chunk boundary is kept out of that buffer (Http1FramingGuard),
+    /// but a second HTTP connection, or a foreign read in the middle of a
+    /// chunk, still corrupts it and the reply never completes
+    /// (datrail/railmon#70).
     ///
     /// A response that does arrive after its request expired finds the next
     /// request on that thread or none at all; the bound has to sit well past
