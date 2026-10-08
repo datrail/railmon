@@ -2105,5 +2105,125 @@ class UnchangedBundleReuseTest(unittest.TestCase):
         self.assertEqual(stderr.getvalue().count("evidence bundle unchanged since"), 2)
 
 
+class RegistrationParityTest(unittest.TestCase):
+    """DR-189: the bundle carries every field the registration payload does,
+    so Rail Center can take one producer output. A field added to the payload
+    without a home here fails this test until it gets one."""
+
+    # Where each registration field lives in the bundle, longest prefix first.
+    # A value of None means "outside `attributes`": the envelope, or v2's
+    # agents[].agent_key.
+    HOMES: dict[tuple[str, ...], tuple[str, ...] | None] = {
+        ("type",): ("agent_type",),
+        ("owner",): ("owner", "owner"),
+        ("host_id",): None,
+        ("sandbox_name",): None,
+        ("agent_key",): None,
+        ("skills",): ("skills_inventory",),
+        ("environment", "sandbox_type"): ("sandbox_type",),
+        ("environment", "llm_provider"): ("llm_provider",),
+        ("environment", "llm_model"): ("model_name",),
+        ("environment", "system_info"): ("system_info",),
+        ("environment", "user_info"): ("user_info",),
+    }
+
+    @staticmethod
+    def leaves(value, path=()):
+        if isinstance(value, dict) and value:
+            for key, item in value.items():
+                yield from RegistrationParityTest.leaves(item, (*path, key))
+        else:
+            yield path, value
+
+    def scan(self, tmp: str) -> tuple[dict, dict]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["python3", str(SCANNER), "--mode", "self", "--host-id", "h-1",
+             "--owner", "ops@example.com", "--llm-provider", "anthropic",
+             "--llm-model", "claude-x", "--agent-type", "service",
+             "--output", f"{tmp}/payload.json",
+             "--feature-output", f"{tmp}/features.json",
+             "--evidence-bundle-output", f"{tmp}/bundle.json"],
+            cwd=tmp, capture_output=True, text=True, timeout=120,
+            env={k: v for k, v in os.environ.items() if not k.startswith("RAIL_")},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return (json.loads(Path(tmp, "payload.json").read_text()),
+                json.loads(Path(tmp, "bundle.json").read_text()))
+
+    def test_every_registration_field_has_a_home_in_the_bundle(self):
+        import tempfile
+
+        run_fields = set(evidence_bundle.REGISTRATION_RUN_FIELDS)
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, bundle = self.scan(tmp)
+        attributes = bundle["attributes"]
+        for path, value in self.leaves(payload):
+            with self.subTest(field=".".join(path)):
+                if path in run_fields:
+                    continue
+                prefix = next((p for p in self.HOMES if path[:len(p)] == p), None)
+                self.assertIsNotNone(prefix, "a registration field with no home in the bundle")
+                home = self.HOMES[prefix]
+                if home is None:
+                    self.assertEqual(bundle[path[0]], value)
+                    continue
+                attribute = attributes[home[0]]
+                if prefix in (("skills",), ("environment", "llm_model")):
+                    # Re-shaped, not copied: skills_inventory and model_name
+                    # predate this ticket and keep their own value shapes.
+                    continue
+                found = attribute["value"]
+                for key in (*home[1:], *path[len(prefix):]):
+                    found = found[key]
+                self.assertEqual(found, value)
+
+    def test_the_answered_registration_attributes(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, bundle = self.scan(tmp)
+        attributes = bundle["attributes"]
+        self.assertEqual(attributes["agent_type"]["value"], "service")
+        self.assertEqual(attributes["owner"]["value"], {"owner": "ops@example.com", "source": "cli"})
+        self.assertEqual(attributes["owner"]["authored_by"], "platform")
+        self.assertEqual(attributes["llm_provider"]["value"], "anthropic")
+        self.assertEqual(attributes["sandbox_type"]["value"], payload["environment"]["sandbox_type"])
+        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info"):
+            self.assertEqual(attributes[name]["status"], "ANSWERED", name)
+
+    def test_run_fields_stay_out_so_a_baseline_does_not_drift_on_them(self):
+        system_info = {
+            "os": "Linux", "hostname": "3f2a9c", "fqdn": "3f2a9c",
+            "container": {"is_container": True, "id": "3f2a9c...", "name": "agent", "host_pid": 4242},
+            "process": {"pid": 17, "cwd": "/work"},
+        }
+        attributes = evidence_bundle.registration_attributes({"environment": {"system_info": system_info}})
+        self.assertEqual(
+            attributes["system_info"]["value"],
+            {"os": "Linux", "container": {"is_container": True, "name": "agent"}},
+        )
+        self.assertEqual(system_info["process"], {"pid": 17, "cwd": "/work"}, "the payload is not mutated")
+
+    def test_an_unknown_owner_or_provider_is_absent_not_answered(self):
+        attributes = evidence_bundle.registration_attributes(
+            {"owner": "unknown", "environment": {"llm_provider": "unknown"}}
+        )
+        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info"):
+            self.assertEqual(attributes[name]["status"], "ABSENT", name)
+            self.assertTrue(attributes[name]["method"], name)
+
+    def test_v2_keeps_them_agent_scoped(self):
+        # system_info differs between agents in one sandbox (each has its own
+        # process), and a sandbox-scoped attribute that differs fails compose.
+        spec = importlib.util.spec_from_file_location(
+            "compose_evidence_bundle_v2", ROOT / "tools/scan/compose_evidence_bundle_v2.py")
+        composer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(composer)
+        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info"):
+            self.assertNotIn(name, composer.SANDBOX_ATTRIBUTES)
+
+
 if __name__ == "__main__":
     unittest.main()

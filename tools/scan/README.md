@@ -195,6 +195,18 @@ which keeps the builder decoupled from the scan job's output. Today the
 bundle goes only to RailDash (below); RailMon does not send it to Rail
 Center, and `--register` sends the registration payload, not the bundle.
 
+The bundle carries every field the registration payload does, so one output
+can serve both. `type`, `owner`, `llm_provider`, `sandbox_type`,
+`system_info` and `user_info` are the `agent_type`, `owner`, `llm_provider`,
+`sandbox_type`, `system_info` and `user_info` attributes (agent-scoped in a
+v2 bundle). `llm_model` is `model_name`, `skills` is `skills_inventory`, and
+the pair and agent key are in the envelope. The exception is a field that
+changes with every scan run or container recreate: `system_info`'s
+`hostname`, `fqdn`, `container.id`, `container.host_pid`, `process.pid` and
+`process.cwd`. A locked baseline would read those as drift on every pass, so
+they stay registration-only (`REGISTRATION_RUN_FIELDS` in
+`evidence_bundle.py`; a test fails when a new payload field has no home).
+
 Attributes that are *absent* from the bundle rather than absent *on the
 agent* carry `method`: where the pack looked. The `deployment` attribute
 retains the closed set of non-empty deployment fields the scanner can read:
