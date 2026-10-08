@@ -36,6 +36,13 @@ shift
 
 case "$command_name" in
     collect)
+        # With RAIL_COLLECT_CONTAINER set, a supervisor finds that container's
+        # TLS library and process session, runs the collector scoped to
+        # them, and re-attaches after the agent restarts (DR-187).
+        if [ -n "${RAIL_COLLECT_CONTAINER:-}" ]; then
+            exec python3 "$root/tools/collect/follow_container_tls.py" \
+                --collector "$collector" "$RAIL_COLLECT_CONTAINER" "$@"
+        fi
         exec "$collector" "$@"
         ;;
     scan|agent-environment-scanner)

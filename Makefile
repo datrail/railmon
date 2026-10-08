@@ -24,6 +24,7 @@ test-python:
 		tools/scan/evidence_bundle.py \
 		tools/scan/compose_evidence_bundle_v2.py \
 		tools/listen/follow_container.py \
+		tools/collect/follow_container_tls.py \
 		tools/skills/skill_scanner.py \
 		tools/forward/forward.py \
 		tools/local-demo/demo_server.py \

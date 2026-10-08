@@ -93,6 +93,14 @@ struct Args {
     #[arg(long)]
     comm: Option<String>,
 
+    /// Capture only processes in this process session (host PID namespace).
+    /// A container's processes share its init's session unless one starts
+    /// its own, so this scopes capture to one container; `railmon collect`
+    /// with RAIL_COLLECT_CONTAINER sets it (DR-187). An event whose process
+    /// has already exited is let through, since its session can't be read.
+    #[arg(long)]
+    session: Option<u32>,
+
     /// Path to the agentsight (or bare sslsniff) binary. Defaults to
     /// AGENTSIGHT_PATH, then SSLSNIFF_PATH, then ./bin/agentsight, then the
     /// container path — the same order the Python resolved.
@@ -372,7 +380,7 @@ async fn main() -> Result<()> {
         pid: args.pid,
         uid: args.uid,
         comm: args.comm.clone(),
-        process_session: None,
+        process_session: args.session,
     };
 
     log::info!("session {session_id}, agentsight at {}", agentsight);
@@ -950,8 +958,10 @@ async fn run_multi_target(
     if !matches!(args.output_format, OutputFormat::RuntimeInteraction) {
         anyhow::bail!("keyed capture requires --output-format runtime-interaction");
     }
-    if args.pid.is_some() || args.uid.is_some() || args.comm.is_some() {
-        anyhow::bail!("--pid, --uid and --comm cannot be combined with --target-manifest");
+    if args.pid.is_some() || args.uid.is_some() || args.comm.is_some() || args.session.is_some() {
+        anyhow::bail!(
+            "--pid, --uid, --comm and --session cannot be combined with --target-manifest"
+        );
     }
 
     if let Some(path) = args.registration_state.as_deref() {

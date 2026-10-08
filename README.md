@@ -47,6 +47,30 @@ its TLS, can be lost or paired with the wrong response
 ([#70](https://github.com/datrail/railmon/issues/70); the fix is a connection key upstream,
 [eunomia-bpf/agentsight#208](https://github.com/eunomia-bpf/agentsight/issues/208)).
 
+### Following a container
+
+`railmon collect` with `RAIL_COLLECT_CONTAINER=<name or id>` (and the Docker
+socket mounted, `--pid host`, `--privileged`) chooses the processes itself:
+
+- it finds the first process in the container that maps a `libssl.so`, or
+  whose executable has TLS built in — Node, Bun and other runtimes bundle
+  OpenSSL or BoringSSL, so `--comm node` finds no library to hook and
+  captures nothing;
+- it runs the collector with `--binary-path` set to the kernel's link to that
+  file (`/proc/<pid>/map_files/…` or `/proc/<pid>/exe`) and `--session` set
+  to that process's session. The agent's processes in that session that use
+  that file are captured; other sessions, the host's and `docker exec`'s
+  included, are not. A child that starts its own session, or uses a
+  different TLS library than the one found first, is not captured;
+- it attaches again when the container restarts or is recreated, so the PID
+  never has to be looked up.
+
+Its log names the process and file it chose. A collector that keeps exiting
+right after it starts ends the supervisor with the collector's status. It
+refuses `--pid`, `--uid`, `--comm`, `--binary-path`, `--session` and
+`--target-manifest`; leave `RAIL_COLLECT_CONTAINER` unset to pass those
+yourself.
+
 `railmon` with a command (`railmon collect`, `railmon scan`, …) is the
 container image's entrypoint, so those commands work only inside the
 container, e.g. `docker run --rm --privileged --pid host railmon collect …`.
@@ -239,6 +263,7 @@ The ones you are most likely to set:
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `bin/agentsight`; the image sets its own | The AgentSight probe binary. |
+| `RAIL_COLLECT_CONTAINER` | `collect` | none | Capture one container's agent: see [Following a container](#following-a-container). |
 
 A flag always wins over its variable. `scan` exits 2 when the evidence bundle
 it built fails its contract, when a delivery (`--register` or RailDash) fails,
