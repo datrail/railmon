@@ -22,10 +22,10 @@
 //! a new HTTP/1 message (the parser resyncs on those itself).
 //!
 //! A reply that stops at a chunk boundary and never resumes (a cancelled SSE
-//! stream) would otherwise keep its key guarded for good, hiding that thread's
-//! later reads, HTTP/2 frames included, from the parser. So a key whose reply
-//! has not moved for [`IDLE_RELEASE`] is let go, and the read is passed on as
-//! it would have been before this guard existed.
+//! stream) would otherwise keep its key guarded for good, keeping every later
+//! read on that thread from the parser. So a key whose reply has not moved
+//! for [`IDLE_RELEASE`] is let go, and its reads reach the parser as they did
+//! before this guard existed.
 
 use agentsight_capture::analyzers::Analyzer;
 use agentsight_capture::runners::EventStream;
@@ -132,8 +132,9 @@ impl Http1FramingGuard {
             if now.duration_since(held.moved) < self.idle_release {
                 return true;
             }
-            // Stalled for good: the parser fails this read and forgets the
-            // reply, as it did before the guard.
+            // Stalled for good: the parser takes this read into the reply it
+            // holds and drops both once the framing breaks or 1 MiB is
+            // reached, as it did before the guard.
             self.streams.remove(&key);
             return false;
         }
@@ -512,8 +513,8 @@ mod tests {
 
     #[test]
     fn a_stalled_reply_releases_its_key() {
-        // A cancelled stream left at a chunk boundary must not hide the
-        // thread's later reads (an HTTP/2 frame here) for ever.
+        // A cancelled stream left at a chunk boundary must not keep the
+        // thread's later reads (an HTTP/2 frame here) from the parser for ever.
         let mut g = Http1FramingGuard::with_idle_release(Duration::ZERO);
         assert!(!g.observe(&read(1, HEAD)));
         assert!(!g.observe(&read(1, &chunk(0))));
