@@ -258,7 +258,7 @@ fn event_bytes(event: &Event, text: &str) -> Vec<u8> {
     bytes
 }
 
-fn hex_decode(hexed: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex_decode(hexed: &str) -> Option<Vec<u8>> {
     if !hexed.len().is_multiple_of(2) {
         return None;
     }

@@ -38,6 +38,13 @@ pub struct Target {
     pub capture: Option<Capture>,
 }
 
+impl Target {
+    /// The probe binary this target's `capture` block names, if any.
+    pub fn capture_binary_path(&self) -> Option<String> {
+        self.capture.as_ref().and_then(|c| c.binary_path.clone())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Discovery {
@@ -279,7 +286,7 @@ fn summarize_target(target: &Target, outcome: &DiscoveryOutcome) -> ResolvedTarg
                     .collect()
             })
             .unwrap_or_default(),
-        binary_path: target.capture.as_ref().and_then(|c| c.binary_path.clone()),
+        binary_path: target.capture_binary_path(),
         self_asserted_agent_key: pid.and_then(read_self_asserted_agent_key),
     }
 }
@@ -408,8 +415,6 @@ impl TargetManifest {
 /// place. Pure and free of I/O so it can be exercised directly with
 /// synthetic `ProcessIncarnation`s, without needing a second real uid.
 fn mark_collisions(outcomes: &mut [DiscoveryOutcome]) {
-    use std::collections::HashMap;
-
     let mut by_incarnation: HashMap<(u32, u64), Vec<usize>> = HashMap::new();
     let mut by_session: HashMap<u32, Vec<usize>> = HashMap::new();
     let mut by_uid: HashMap<u32, Vec<usize>> = HashMap::new();
