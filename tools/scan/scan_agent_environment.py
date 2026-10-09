@@ -3453,4 +3453,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Run as a script, this module is `__main__`, and the helpers that import
+    # it lazily (`from scan_agent_environment import ScannerError`) would load
+    # a second copy with its own ScannerError class, which no `except` here
+    # catches (DR-197). One module under both names keeps it one class.
+    sys.modules.setdefault("scan_agent_environment", sys.modules[__name__])
     raise SystemExit(main())

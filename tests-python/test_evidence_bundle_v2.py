@@ -296,3 +296,35 @@ class FailedScopeBuildersTest(unittest.TestCase):
 
     def test_an_empty_template_yields_no_attributes(self):
         self.assertEqual(evidence_bundle.failed_attributes({}, frozenset()), {})
+
+
+class ScriptRunScannerErrorTest(unittest.TestCase):
+    """DR-197: run as a script, the scanner is `__main__`. A helper's lazy
+    `from scan_agent_environment import ScannerError` must reach that same
+    module, or the v2 contract failure escapes `_deliver_v2_collection` as a
+    traceback instead of exiting 2."""
+
+    def test_a_lazily_raised_scanner_error_is_the_class_the_script_catches(self):
+        import subprocess
+        import sys
+
+        script = ROOT / "tools/scan/scan_agent_environment.py"
+        probe = f"""
+import runpy, sys
+sys.path.insert(0, {str(script.parent)!r})
+sys.argv = [{str(script)!r}, "--help"]
+try:
+    runpy.run_path({str(script)!r}, run_name="__main__")
+except SystemExit:
+    pass
+scanner = sys.modules["scan_agent_environment"]
+import evidence_bundle
+try:
+    evidence_bundle.verify_bundle_v2({{}})
+except scanner.ScannerError:
+    print("caught")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(result.stdout.strip().splitlines()[-1:], ["caught"], result.stderr[-2000:])
