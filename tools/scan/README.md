@@ -1,7 +1,10 @@
 # Agent Environment Scanner
 
-Scans a running agent environment and emits JSON compatible with rail-center's
-`POST /v1/agents/register` request body.
+Scans a running agent environment and writes a feature file, an evidence
+bundle, and a registration payload in rail-center's `RegisterAgentRequest`
+shape. With `--register` it registers the agent with Rail Center by sending the
+evidence bundle to `POST /v1/agents/register` (see
+[Registration Flow](#registration-flow)); the payload is a local artifact only.
 
 This tool is meant to run before registration. It does not capture traffic and
 does not require eBPF privileges. It reads container metadata, safe environment
@@ -10,11 +13,14 @@ metadata, system/runtime information, owner identity, and optional MCP config.
 Every example below assumes the host id is set (`RAIL_HOST_ID`, or
 `--host-id`). Without one the evidence bundle fails its contract and the scan
 exits `2`; pass `--no-evidence-bundle` to scan without a bundle (and name no
-RailDash URL, which builds one for delivery regardless).
+RailDash URL and no `--register`, which build one for delivery regardless).
 
 ## Output Schema
 
-The output matches `RegisterAgentRequest` in rail-center:
+The payload (stdout, or `--output`) matches `RegisterAgentRequest` in
+rail-center. It is no longer what `--register` sends — Rail Center registers
+from the evidence bundle, which carries every one of these fields — but it is
+still printed or written exactly as before:
 
 ```json
 {
@@ -35,7 +41,9 @@ The output matches `RegisterAgentRequest` in rail-center:
 
 `host_id` and `sandbox_name` are optional; they are omitted when the scanner has
 nothing it can stand behind. See [Agent identity](#agent-identity). With
-`--agent-key` (or `RAIL_AGENT_KEY`) set, the payload also carries `agent_key`.
+`--agent-key` (or `RAIL_AGENT_KEY`) set, the payload also carries `agent_key`
+(local artifact only: see [Registration Flow](#registration-flow) for keyed
+registration).
 
 The scanner uses secret-bearing environment variables to infer the provider, but
 it only records environment variable names. API key values are not written into
@@ -48,14 +56,53 @@ state, and the feature file — is created `0600`.
 
 ## Registration Flow
 
-The registration flow is supported directly:
+The registration flow is supported directly. Rail Center takes one thing from
+RailMon, the evidence bundle (DR-188; Daniel, 2026-10-09: "RailMon could use
+RC's /register for the evidence bundle, with the same auth token"):
 
 ```text
 collect environment data + skills data
-  -> POST /v1/agents/register        (optional)
-  -> store the returned agent id     (the response token is discarded)
-  -> write the feature file          (always, and last, so it records the outcome)
+  -> build and verify the evidence bundle, render it to bytes once
+  -> POST those bytes to /v1/agents/register   (optional, --register)
+  -> store the returned agent id                (the response token is discarded)
+  -> write the feature file                     (always, after the attempt, so it records the outcome)
+  -> write the same bytes locally, POST them to RailDash (each optional)
 ```
+
+The body is the bundle's raw bytes (`Content-Type: application/json`), v1 for a
+single scan or the v2 collection under `--target-manifest`: exactly the bytes
+written to `--evidence-bundle-output` and sent to RailDash, so Rail Center can
+tell a resend from new data. The registration payload is no longer POSTed
+anywhere. Rail Center (RC-387) registers the agent the bundle describes — the
+same agent and environment fingerprint the payload from the same scan would
+have registered — and stores the bundle as `POST /v1/evidence-bundles` does. It
+answers `201` when it created an agent and `200` otherwise, with the
+registration (`agent`, `token`, `expires_at`) plus `evidence_bundle_id` and
+`duplicate`; a v2 collection gets `{agents: [registration...],
+evidence_bundle_id, duplicate}`. It refuses a bundle with `422` (contract, or
+no `agent_type` answered), `409` (a `bundle_id` it holds with other bytes) or
+`413` (too large), like its evidence-bundle ingest. This needs a Rail Center
+with RC-387; an older one refuses a bundle on this route with `422`.
+
+Each target is attempted and reported on its own. A Rail Center failure exits
+`2` but still writes the feature file and the local bundle and still delivers to
+RailDash, and the other way round. A bundle that fails to build or verify fails
+the registration too (nothing is sent). The bundle's content does not depend on
+the registration's outcome.
+
+With `--interval`, an unchanged scan re-sends the previous scan's bytes
+(DR-157), and Rail Center answers `duplicate` without registering or storing
+anything again:
+
+```text
+[agent-environment-scanner] registered with rail-center: HTTP 200 agent_id=<id> bundle=duplicate state_file=.rail/railmon/registration.json
+```
+
+A v1 bundle names no agent key, so Rail Center registers it as the sandbox's
+unkeyed agent. A single scan with `--agent-key` and `--register` is therefore
+refused (exit `2`, nothing sent) rather than registered under the wrong agent;
+keyed agents register through `--target-manifest`, whose v2 collection carries
+each key ([Multi-agent target manifest](#multi-agent-target-manifest)).
 
 Run the skills scanner first if the agent uses OpenClaw/NemoClaw `SKILL.md`
 files:
@@ -75,7 +122,8 @@ python3 tools/scan/scan_agent_environment.py \
   --center-url http://localhost:23001
 ```
 
-Rail Center must be running with database migrations applied before this POST.
+Rail Center must be running with database migrations applied, and include
+RC-387, before this POST.
 
 The scanner accepts either a raw `SkillInput[]` JSON file or a full
 `RegisterAgentRequest` JSON object with a `skills` field. It merges those skills
@@ -94,8 +142,8 @@ and evidence bundle below follow the same rule for `.rail/railscan/`. Move the
 files, or set the path explicitly, to finish the move.)
 
 The stored file contains, beside `registered_at`, `center_url`,
-`registration_url`, `status`, a `request_summary` and the response with its
-ticket stripped:
+`registration_url`, `status`, a `request_summary` (of this scan's payload) and
+the response with its ticket stripped:
 
 ```json
 {
@@ -103,9 +151,16 @@ ticket stripped:
   "sandbox_id": "a1b2c3d4e5f6",
   "host_id": "vm-7f3c",
   "sandbox_name": "openclaw-1",
-  "environment_fingerprint": "f6e5d4c3b2a1"
+  "environment_fingerprint": "f6e5d4c3b2a1",
+  "evidence_bundle_id": "01a11fba-c401-77a3-a897-8236b3513dd4",
+  "duplicate": false
 }
 ```
+
+`evidence_bundle_id` is the row Rail Center stored the bundle in, and
+`duplicate` whether this send was a resend of bytes it already held.
+`--output-register-response` prints this stored state to stdout (never the
+ticket).
 
 **No ticket is stored.** Rail Center's response carries a `token`, and the
 scanner discards it: it is a placeholder minted with a null posture, because
@@ -127,7 +182,7 @@ Use `RAIL_CENTER_URL` instead of `--center-url` when running as a service.
 The `DATRAIL_*` names it used to accept have been removed — there is no
 fallback, so a deployment still setting an old name gets no value at all rather
 than a silently ignored one.
-Rail Center unreachable errors, invalid payload responses, and invalid response
+Rail Center unreachable errors, refused bundles, and invalid response
 bodies are reported as scanner errors with exit code `2`.
 
 ## Feature file
@@ -187,7 +242,7 @@ lands even when the registration fails. A write failure is reported without
 changing the exit code — the feature file owns that. A bundle that fails its
 own contract (for example, no `host_id` because `RAIL_HOST_ID` is unset) is
 not written and fails the scan with exit code `2`; `--no-evidence-bundle`
-skips building it unless a RailDash URL asks for it (below).
+skips writing it, and skips building it unless a RailDash URL or `--register` asks for it.
 
 The envelope names the container the bundle was collected from with
 `host_id` and `sandbox_name` — the pair the scan registers the container
@@ -195,12 +250,13 @@ under (`RAIL_HOST_ID`, and the `rail.sandbox_name` label or the container
 name when there isn't one), so a consumer that also holds the registration
 can file the bundle under that registered agent. The `agent_id` the
 registration returns is not in the envelope: the consumer looks the pair up,
-which keeps the builder decoupled from the scan job's output. Today the
-bundle goes only to RailDash (below); RailMon does not send it to Rail
-Center, and `--register` sends the registration payload, not the bundle.
+which keeps the builder decoupled from the scan job's output. The bundle
+goes to RailDash (below) and, with `--register`, to Rail Center's
+`/v1/agents/register`, which registers the agent from it (DR-188) — the same
+bytes to both.
 
 The bundle carries every field the registration payload does, so one output
-can serve both. `type`, `owner`, `llm_provider`, `sandbox_type`,
+serves both, and Rail Center reads the registration back out of it. `type`, `owner`, `llm_provider`, `sandbox_type`,
 `system_info` and `user_info` are the `agent_type`, `owner`, `llm_provider`,
 `sandbox_type`, `system_info` and `user_info` attributes (agent-scoped in a
 v2 bundle). `llm_model` is `model_name`, `skills` is `skills_inventory`, and
@@ -627,9 +683,9 @@ value surface as a server error.
 `target-manifest-v1` YAML the collector reads with its own `--target-manifest`
 flag. When given, a collection is no longer just the one sandbox-wide scan
 above — it becomes that same sandbox-wide scan **plus** one agent-scoped scan
-and registration per manifest agent the collector currently resolves as
+per manifest agent the collector currently resolves as
 `available`, each scoped to that agent's `scan.config_roots` and carrying its
-`agent_key` into the registration payload, the RailDash delivery, and the
+`agent_key` into the evidence collection, the registration, and the
 local `--feature-output`/`--registration-output`/`--evidence-bundle-output`
 paths (each suffixed `.<agent_key>` so a keyed scan never overwrites the
 sandbox-wide scan's, or another key's, artifact). A declared agent the
@@ -662,6 +718,26 @@ attributes and sources), with siblings and the sandbox scope unchanged.
 `tests/multi_agent_drift_acceptance.py` runs that path in the image against
 a real RailDash in CI.
 
+With `--register`, that one v2 collection is also the registration: one POST
+to `/v1/agents/register` per collection, not one per agent, and no scan in the
+collection registers on its own (the sandbox-wide scan has no registration of
+its own). Rail Center registers one agent per `agents[]` entry and answers
+with one registration each; the scanner matches each to its agent by
+`agent.agent_key` and writes it, ticket dropped, to that agent's keyed
+`--registration-output` path (`<path>.<agent_key>`). Every feature file in the
+collection is written after that attempt: the keyed ones say whether their
+agent was registered, the sandbox-wide one whether the collection was. When no
+v2 collection can be built (the manifest does not resolve, or the sandbox scan
+cannot name its `host_id`/`sandbox_name`), the sandbox-wide scan's own v1
+bundle is written, registered and delivered instead.
+
+Rail Center (RC-387) needs every `agents[]` entry to answer `agent_type`, and
+refuses the whole collection with `422` when one does not: an agent listed as
+`not_found`/`ambiguous`, or an `available` one with no `scan.config_roots`,
+carries no `agent_type`, so while such an agent is in the collection no agent
+in it is registered (the scan reports the `422` and exits `2`; the bundle is
+still written and delivered to RailDash).
+
 The v2 schema also publishes an optional `window` member on an attribute
 (DR-169), for a list that holds only what the observation window saw: an
 item a quieter window did not see is not a removal. `ignore` names the item
@@ -676,7 +752,6 @@ on each of them whose status reports a window (`ANSWERED`, `PARTIAL` or
 `ABSENT`), never on `BLIND` or `FAILED`. Rail Center's ingest
 (`/v1/evidence-bundles`) rejects an attribute member it does not know, so a
 bundle carried to a Rail Center that predates the member fails there.
-RailMon itself does not deliver to Rail Center yet.
 
 The keyed registration state is also what the collector's multi-target
 capture reads to judge an unsigned `x-rail` ticket. Start the
@@ -695,7 +770,7 @@ the manifest; a mismatched file is logged and ignored.
 ## Authentication
 
 `RAIL_AUTH_MODE` (or `--auth-mode`) selects the credential presented when
-registering, mirroring Rail Center's `RAIL_AUTH_MODES_ACCEPTED`:
+registering (sending the evidence bundle to `/v1/agents/register`), mirroring Rail Center's `RAIL_AUTH_MODES_ACCEPTED`:
 
 - `none` (default) — sends nothing; accepted while the control plane still
   lists `none`. A token set beside it is refused as a likely misconfiguration.
@@ -871,8 +946,11 @@ python3 tools/scan/scan_agent_environment.py \
 
 ## Validate Against rail-center
 
-From the `rail-center` repository, validate a generated payload with the current
-Pydantic schema:
+`--register` sends the evidence bundle, so that is what Rail Center validates
+(`profiling.bundle.EvidenceBundle.model_validate_json` on the file's bytes, and
+`registry.bundle_registration.registrations` for the registration it derives).
+The payload still matches `RegisterAgentRequest`; from the `rail-center`
+repository, validate a generated payload with the current Pydantic schema:
 
 ```bash
 uv run --python 3.13 --with pydantic --with typing-extensions python -c '

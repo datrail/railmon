@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Agent registration environment scanner.
+"""Agent environment scanner.
 
-Builds a registration payload compatible with rail-center's
-POST /v1/agents/register schema.
+Builds the feature file, the evidence bundle and a registration payload
+(rail-center's RegisterAgentRequest shape, kept as a local artifact). With
+`--register` it registers with rail-center by sending the evidence bundle to
+POST /v1/agents/register (DR-188, RC-387); the payload is no longer sent.
 """
 
 from __future__ import annotations
@@ -2407,11 +2409,24 @@ def auth_headers(mode: str | None = None, timeout: float = 15.0) -> dict[str, st
 
 def post_registration(
     center_url: str,
-    payload: dict[str, Any],
+    data: bytes,
     timeout: float = 15.0,
     auth_mode: str | None = None,
 ) -> dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
+    """POST this scan's evidence bundle, as raw bytes, to rail-center's register route.
+
+    DR-188 (Daniel, 2026-10-09: "RailMon could use RC's /register for the
+    evidence bundle, with the same auth token"): Rail Center gets one thing
+    from RailMon, the evidence bundle, and registers the agent(s) it
+    describes from it (RC-387). `data` must be exactly the bytes written to
+    `--evidence-bundle-output` and sent to RailDash: Rail Center answers a
+    resend of the same bytes as a `duplicate`, and refuses a known
+    `bundle_id` carrying different bytes (409). The registration payload is
+    no longer sent anywhere; it is still the scan's local artifact.
+
+    The credential is `auth_headers`' (RAIL_AUTH_MODE), and a redirect is
+    refused rather than followed, so it never reaches another host.
+    """
     req = Request(
         registration_url(center_url),
         data=data,
@@ -2520,11 +2535,12 @@ def _keyed_path(path: Path, agent_key: str) -> str:
 
 def _v2_collection_requested(args: argparse.Namespace) -> bool:
     """Whether this collection needs evidence at all — the same test
-    `run_one_scan` itself uses (`not args.no_evidence_bundle or a RailDash
-    URL is configured`). When true, `run_one_collection` builds and
-    delivers exactly one evidence-bundle-v2 collection instead of letting
-    `run_one_scan` build its own (v1) bundle per scan (DR-109 M2)."""
-    return not args.no_evidence_bundle or configured_raildash_url(args) is not None
+    `run_one_scan` itself uses (`evidence_needed`: a bundle to write, a
+    RailDash URL, or `--register`, which sends rail-center the bundle). When
+    true, `run_one_collection` builds, registers and delivers exactly one
+    evidence-bundle-v2 collection instead of letting `run_one_scan` build its
+    own (v1) bundle per scan (DR-109 M2, DR-188)."""
+    return evidence_needed(args)
 
 
 def _v1_scope_from_scan_result(
@@ -2570,72 +2586,86 @@ def _deliver_v1_fallback(args: argparse.Namespace) -> int:
     """This scope's v1 evidence bundle, from the scan `run_one_scan` already
     ran — reused via `_v2_scan_result`, not a second `scan()` call — for the
     two cases where `run_one_collection` suppressed a `_v2_collection`
-    target's own v1 write (betting on a v2 collection being produced) but
+    target's own v1 handling (betting on a v2 collection being produced) but
     that bet did not pay off: the target manifest itself failed to resolve,
     or no v2 collection could be built at all because `host_id`/
     `sandbox_name` were never determined. Without this fallback the scan
     that already ran leaves no artifact anywhere — worse than the
     unkeyed-manifest single-scan path this function's docstring promises
-    never to regress. Mirrors `run_one_scan`'s own v1 evidence-bundle
-    block exactly (file write, then an optional RailDash POST), minus the
-    `scan()` call it already reused.
+    never to regress. The same `_deliver_v1` `run_one_scan` uses: the bundle
+    registered with rail-center under `--register` (DR-188), the feature file
+    it deferred, the file write and an optional RailDash POST.
     """
-    import evidence_bundle  # lazy: breaks the import cycle
-
     result = getattr(args, "_v2_scan_result", None)
     if result is None:
         return 0
+    write_feature = bool(getattr(args, "_feature_deferred", False))
+    args._feature_deferred = False
     context, payload, identity = result
-    bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
-    exit_code = 0
-    if bundle is None:
-        # Already reported: the bundle failed its own contract (DR-157).
-        exit_code = 2
-    else:
-        bundle = evidence_bundle.reuse_unchanged_bundle(bundle, configured_agent_key(args))
-    if not args.no_evidence_bundle and bundle is not None:
-        bundle_path = evidence_bundle.evidence_bundle_output_path(args)
+    try:
+        return _deliver_v1(args, context, payload, identity, write_feature=write_feature)
+    except ScannerError as exc:
+        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        return 2
+
+
+def _register_v2_collection(
+    args: argparse.Namespace,
+    data: bytes,
+    agent_entries: list[dict[str, Any]],
+    agent_scans: dict[str, argparse.Namespace],
+) -> tuple[bool, dict[str, bool]]:
+    """Register one v2 collection with rail-center: one POST for every agent.
+
+    Returns whether the POST was answered, and which agent keys had their
+    registration state stored. Each agent's state goes to the keyed path
+    `run_one_collection` computes for it, from the response's own entry for
+    that `agent_key` (RC-387 answers `{agents: [...], evidence_bundle_id,
+    duplicate}`); an agent the response does not name fails on its own.
+    """
+    registered: dict[str, bool] = {}
+    try:
+        center_url = configured_center_url(args)
+        response = post_registration(center_url, data, auth_mode=args.auth_mode)
+        by_key = registrations_by_agent_key(response)
+    except ScannerError as exc:
+        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        return False, registered
+    for entry in agent_entries:
+        agent_key = entry["agent_key"]
+        scan_args = agent_scans.get(agent_key)
+        scan_result = getattr(scan_args, "_v2_scan_result", None) if scan_args is not None else None
+        payload = scan_result[1] if scan_result is not None else {}
+        state_path = Path(_keyed_path(registration_output_path(args), agent_key))
         try:
-            store_json(bundle_path, bundle, args.compact)
-            print(f"[agent-environment-scanner] evidence bundle: {bundle_path}", file=sys.stderr)
+            if agent_key not in by_key:
+                raise ScannerError(f"rail-center registration response named no registration for agent '{agent_key}'")
+            store_registration(args, center_url, payload, by_key[agent_key], state_path)
+            registered[agent_key] = True
         except ScannerError as exc:
             print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-    raildash_url = configured_raildash_url(args)
-    if raildash_url:
-        if bundle is None:
-            exit_code = 2
-        else:
-            try:
-                data = evidence_bundle.render_bundle_bytes(bundle, args.compact)
-                agent_key = configured_agent_key(args)
-                raildash_token = configured_raildash_token(args)
-                response = post_evidence_bundle(
-                    raildash_url, data, raildash_token=raildash_token, agent_key=agent_key
-                )
-                body = response.get("body")
-                body = body if isinstance(body, dict) else {}
-                outcome = "duplicate" if body.get("duplicate") else "accepted"
-                print(
-                    f"[agent-environment-scanner] delivered evidence bundle to raildash: "
-                    f"HTTP {response['status']} {outcome} id={body.get('asp_id')}",
-                    file=sys.stderr,
-                )
-            except ScannerError as exc:
-                print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-                exit_code = 2
-    return exit_code
+    return True, registered
 
 
-def _deliver_v2_collection(args: argparse.Namespace, sandbox_v1: dict[str, Any], agent_entries: list[dict[str, Any]]) -> int:
-    """Compose, verify, and write/deliver exactly one evidence-bundle-v2
+def _deliver_v2_collection(
+    args: argparse.Namespace,
+    sandbox_v1: dict[str, Any],
+    agent_entries: list[dict[str, Any]],
+    agent_scans: dict[str, argparse.Namespace] | None = None,
+) -> tuple[int, bool, dict[str, bool]]:
+    """Compose, verify, and write/register/deliver exactly one evidence-bundle-v2
     collection — the shared `sandbox` scope from `sandbox_v1` plus every
     entry in `agent_entries` (already sorted-or-not; `compose_from_scopes`
     sorts and rejects a duplicate key). Built once as one dict and rendered
     to bytes exactly once (`evidence_bundle.render_bundle_bytes`), then
-    that identical object/bytes are reused for both the on-disk artifact
-    and the RailDash POST — the same exact-byte idempotency contract v1's
-    own `build_verified_bundle`/`render_bundle_bytes` document. Returns 0 on
-    success, 2 if any part of composing/writing/delivering failed.
+    those identical bytes go to the on-disk artifact, rail-center's register
+    route (`--register`, DR-188) and the RailDash POST — the same exact-byte
+    idempotency contract v1's `_deliver_v1` keeps. Each target is attempted
+    on its own; a collection that fails to compose or verify fails all three.
+
+    Returns `(exit_code, collection_registered, registered_agent_keys)`:
+    0 on success, 2 if any part failed; whether rail-center answered the
+    registration; and which agent keys had their registration state stored.
     """
     import compose_evidence_bundle_v2 as composer  # lazy: breaks the import cycle
     import evidence_bundle  # lazy: breaks the import cycle
@@ -2657,18 +2687,32 @@ def _deliver_v2_collection(args: argparse.Namespace, sandbox_v1: dict[str, Any],
         evidence_bundle.verify_bundle_v2(collection)
     except (ValueError, ScannerError) as exc:
         print(f"agent-environment-scanner: evidence bundle v2 composition failed: {exc}", file=sys.stderr)
-        return 2
+        if args.register:
+            print(
+                "agent-environment-scanner: rail-center registration failed: no verified evidence bundle v2 to send",
+                file=sys.stderr,
+            )
+        return 2, False, {}
     # DR-157: an interval scan whose collection has not changed re-sends the
-    # previous one, so RailDash records a duplicate rather than a new ASP.
+    # previous one, so RailDash and rail-center record a duplicate rather than
+    # a new copy.
     collection = evidence_bundle.reuse_unchanged_bundle(collection)
 
     exit_code = 0
-    # Built once above; every consumer below shares this exact dict/bytes.
+    # Built once above; every consumer below shares these exact bytes.
     data = evidence_bundle.render_bundle_bytes(collection, args.compact)
+
+    collection_registered = False
+    registered: dict[str, bool] = {}
+    if args.register:
+        collection_registered, registered = _register_v2_collection(args, data, agent_entries, agent_scans or {})
+        if not collection_registered or len(registered) != len(agent_entries):
+            exit_code = 2
+
     if not args.no_evidence_bundle:
         bundle_path = evidence_bundle.evidence_bundle_output_path(args)
         try:
-            store_json(bundle_path, collection, args.compact)
+            store_bytes(bundle_path, data)
             print(f"[agent-environment-scanner] evidence bundle v2: {bundle_path}", file=sys.stderr)
         except ScannerError as exc:
             print(f"agent-environment-scanner: {exc}", file=sys.stderr)
@@ -2681,39 +2725,43 @@ def _deliver_v2_collection(args: argparse.Namespace, sandbox_v1: dict[str, Any],
             response = post_evidence_bundle(raildash_url, data, raildash_token=raildash_token)
             body = response.get("body")
             body = body if isinstance(body, dict) else {}
-            outcome = "duplicate" if body.get("duplicate") else "accepted"
             print(
                 f"[agent-environment-scanner] delivered evidence bundle v2 to raildash: "
-                f"HTTP {response['status']} {outcome} id={body.get('asp_id')}",
+                f"HTTP {response['status']} {bundle_outcome(body)} id={body.get('asp_id')}",
                 file=sys.stderr,
             )
         except ScannerError as exc:
             print(f"agent-environment-scanner: {exc}", file=sys.stderr)
             exit_code = 2
-    return exit_code
+    return exit_code, collection_registered, registered
 
 
 def run_one_collection(args: argparse.Namespace) -> int:
     """DR-109 M2: sandbox scanning once per collection (the existing
-    single-target scan, unchanged for the feature file and registration),
-    plus agent-scoped scanning and registration once per resolved agent
+    single-target scan), plus agent-scoped scanning once per resolved agent
     key — scoped to that key's `scan.config_roots` and carrying its
-    `agent_key` into the registration payload. A declared agent that does
-    not currently resolve is logged and skipped for registration/feature-file
-    purposes, matching the collector's own `run_multi_target` (never drop a
+    `agent_key` into its feature file, its evidence entry and its
+    registration (below). A declared agent that does not currently resolve
+    is logged and skipped for scanning/feature-file purposes, matching the collector's own `run_multi_target` (never drop a
     declared agent's siblings over one bad target) — but it still gets an
     `agents[]` entry in the evidence collection below, with its real
     `discovery_status`, instead of silently vanishing from what a scorer
     reads (design §4.3).
 
-    Evidence: when this collection is configured to build or deliver
-    evidence at all (`_v2_collection_requested`), exactly one
+    Evidence: when this collection is configured to build, register or
+    deliver evidence at all (`_v2_collection_requested`), exactly one
     evidence-bundle-v2 collection is produced — one shared `sandbox` scope
     from the sandbox-wide scan plus a sorted `agents[]` array — not the N
     separate v1 bundles an earlier version of this function wrote one per
     key. Every `run_one_scan` call this function drives is told to suppress
     its own v1 evidence-bundle handling (`_v2_collection`) so that is the
     only evidence artifact/delivery a manifest-scoped run produces.
+
+    Registration (DR-188): with `--register`, that one collection is what
+    rail-center registers every keyed agent from, in one POST; no scan here
+    registers on its own. Each agent's registration state lands at its keyed
+    path, and every deferred feature file is written after that attempt, so
+    its `registration_status` reports the outcome.
     """
     build_v2 = _v2_collection_requested(args)
 
@@ -2722,6 +2770,37 @@ def run_one_collection(args: argparse.Namespace) -> int:
         sandbox_scan_args = copy.copy(args)
         sandbox_scan_args._v2_collection = True
     exit_code = run_one_scan(sandbox_scan_args)
+    # Agent-scoped scans whose feature file waits for the collection's
+    # registration attempt, by agent key; the sandbox-wide scan's waits too.
+    agent_scans: dict[str, argparse.Namespace] = {}
+    collection_registered = False
+    registered: dict[str, bool] = {}
+    try:
+        exit_code, collection_registered, registered = _collect(
+            args, build_v2, sandbox_scan_args, agent_scans, exit_code
+        )
+    finally:
+        # The fallback paths write their own; anything still deferred is
+        # written here, after whatever registration attempt was made.
+        if not _write_deferred_feature_file(sandbox_scan_args, collection_registered):
+            exit_code = 2
+        for agent_key, target_args in agent_scans.items():
+            if not _write_deferred_feature_file(target_args, registered.get(agent_key, False)):
+                exit_code = 2
+    return exit_code
+
+
+def _collect(
+    args: argparse.Namespace,
+    build_v2: bool,
+    sandbox_scan_args: argparse.Namespace,
+    agent_scans: dict[str, argparse.Namespace],
+    exit_code: int,
+) -> tuple[int, bool, dict[str, bool]]:
+    """`run_one_collection`'s body after the sandbox-wide scan. Returns the
+    exit code, whether rail-center answered the v2 collection's registration,
+    and which agent keys it registered. A scan whose feature file waits for
+    that attempt is added to `agent_scans`."""
 
     manifest_path = Path(configured_target_manifest(args)).expanduser()
     try:
@@ -2735,7 +2814,7 @@ def run_one_collection(args: argparse.Namespace) -> int:
             # here (reusing that same scan, not a second one) is the only
             # way this scope's evidence reaches an artifact at all.
             _deliver_v1_fallback(sandbox_scan_args)
-        return 2
+        return 2, False, {}
 
     sandbox_v1: dict[str, Any] | None = None
     if build_v2:
@@ -2868,7 +2947,8 @@ def run_one_collection(args: argparse.Namespace) -> int:
         # no gain. Falls through to the same keyed v1 path a non-v2 run uses.
         if build_v2 and sandbox_v1 is not None:
             target_args._v2_collection = True
-        elif not target_args.no_evidence_bundle or configured_raildash_url(target_args):
+            agent_scans[agent_key] = target_args
+        elif evidence_needed(target_args):
             import evidence_bundle  # lazy: breaks the import cycle
 
             target_args.evidence_bundle_output = _keyed_path(
@@ -2917,12 +2997,20 @@ def run_one_collection(args: argparse.Namespace) -> int:
                 "(the v2 schema requires at least one)",
                 file=sys.stderr,
             )
+            if args.register:
+                print(
+                    "agent-environment-scanner: rail-center registration failed: no evidence bundle v2 to send",
+                    file=sys.stderr,
+                )
             exit_code = 2
         else:
-            delivery_exit = _deliver_v2_collection(args, sandbox_v1, agent_entries)
+            delivery_exit, collection_registered, registered = _deliver_v2_collection(
+                args, sandbox_v1, agent_entries, agent_scans
+            )
             exit_code = delivery_exit if delivery_exit != 0 else exit_code
+            return exit_code, collection_registered, registered
 
-    return exit_code
+    return exit_code, False, {}
 
 
 def configured_raildash_token(args: argparse.Namespace) -> str | None:
@@ -3036,6 +3124,12 @@ def build_registration_state(center_url: str, payload: dict[str, Any], response:
     after the response returns — so anything that stored or forwarded it would
     pin the fleet to a posture that was never computed. The proxy fetches its own
     ticket; the scanner is the registrar, and a registrar holds no credentials.
+
+    `response` is one agent's registration: a v1 bundle's whole answer, or one
+    entry of a v2 collection's `agents` with the collection's
+    `evidence_bundle_id`/`duplicate` beside it (`registrations_by_agent_key`).
+    `payload` is this scan's local registration payload, kept only as a summary
+    of what the bundle Rail Center registered from was scanned from.
     """
     body = response.get("body")
     if not isinstance(body, dict):
@@ -3054,6 +3148,10 @@ def build_registration_state(center_url: str, payload: dict[str, Any], response:
         "host_id": agent.get("host_id"),
         "sandbox_name": agent.get("sandbox_name"),
         "environment_fingerprint": agent.get("environment_fingerprint"),
+        # DR-188: the stored evidence bundle Rail Center registered this agent from,
+        # and whether this send was a resend of bytes it already held.
+        "evidence_bundle_id": body.get("evidence_bundle_id"),
+        "duplicate": body.get("duplicate"),
         "request_summary": {
             "type": payload.get("type"),
             "owner": payload.get("owner"),
@@ -3066,8 +3164,8 @@ def build_registration_state(center_url: str, payload: dict[str, Any], response:
     }
 
 
-RESPONSE_KEYS_KEPT = ("agent",)
-AGENT_KEYS_KEPT = ("id", "sandbox_id", "host_id", "sandbox_name", "environment_fingerprint")
+RESPONSE_KEYS_KEPT = ("agent", "evidence_bundle_id", "duplicate")
+AGENT_KEYS_KEPT = ("id", "sandbox_id", "host_id", "sandbox_name", "agent_key", "environment_fingerprint")
 
 
 def strip_ticket(body: dict[str, Any]) -> dict[str, Any]:
@@ -3086,7 +3184,98 @@ def strip_ticket(body: dict[str, Any]) -> dict[str, Any]:
     return kept
 
 
+def bundle_outcome(body: Any) -> str:
+    """`duplicate` when the receiver already held these exact bytes, else `accepted`."""
+    return "duplicate" if isinstance(body, dict) and body.get("duplicate") else "accepted"
+
+
+def registrations_by_agent_key(response: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A v2 collection's answer split into one v1-shaped registration per agent key.
+
+    Rail Center answers a v2 collection with `{agents: [registration...],
+    evidence_bundle_id, duplicate}` (RC-387), one registration per keyed agent.
+    Each is matched to its agent by `agent.agent_key`, not by position, and
+    given the collection's `evidence_bundle_id`/`duplicate`, so
+    `build_registration_state` reads it exactly as it reads a v1 answer.
+    """
+    body = response.get("body")
+    agents = body.get("agents") if isinstance(body, dict) else None
+    if not isinstance(agents, list):
+        raise ScannerError("rail-center registration response did not contain an agents list")
+    found: dict[str, dict[str, Any]] = {}
+    for entry in agents:
+        agent = entry.get("agent") if isinstance(entry, dict) else None
+        key = agent.get("agent_key") if isinstance(agent, dict) else None
+        if isinstance(key, str):
+            found[key] = {
+                "status": response.get("status"),
+                "body": {
+                    **entry,
+                    "evidence_bundle_id": body.get("evidence_bundle_id"),
+                    "duplicate": body.get("duplicate"),
+                },
+            }
+    return found
+
+
+def store_registration(
+    args: argparse.Namespace,
+    center_url: str,
+    payload: dict[str, Any],
+    response: dict[str, Any],
+    state_path: Path,
+) -> None:
+    """Keep one agent's registration state (never a ticket) and report it."""
+    state = build_registration_state(center_url, payload, response)
+    store_json(state_path, state, args.compact)
+    if args.output_register_response:
+        print(render_json(state, args.compact))
+    else:
+        print(
+            f"[agent-environment-scanner] registered with rail-center: HTTP {response.get('status')} "
+            f"agent_id={state['agent_id']} bundle={bundle_outcome(state)} state_file={state_path}",
+            file=sys.stderr,
+        )
+
+
+def register_bundle(args: argparse.Namespace, data: bytes | None, payload: dict[str, Any]) -> bool:
+    """Register this scan's v1 bundle with rail-center; report, never raise.
+
+    `data` is None when the bundle failed to build or verify (already
+    reported): with nothing to send, the registration fails too.
+
+    A v1 bundle names no agent key — rail-center registers it as the
+    sandbox's unkeyed agent (RC-387) — so a keyed scan (`--agent-key`) is
+    refused rather than registered under the wrong agent. Keyed agents
+    register through `--target-manifest`, whose v2 collection carries each
+    key. (The registration payload used to carry `agent_key`; DR-188 stopped
+    sending it.)
+    """
+    try:
+        if data is None:
+            raise ScannerError("rail-center registration failed: no verified evidence bundle to send")
+        agent_key = configured_agent_key(args)
+        if agent_key:
+            raise ScannerError(
+                f"rail-center registration failed: agent key '{agent_key}' cannot be registered from a v1 "
+                "evidence bundle, which names no agent key (rail-center would register it as the sandbox's "
+                "unkeyed agent); register keyed agents with --target-manifest"
+            )
+        center_url = configured_center_url(args)
+        response = post_registration(center_url, data, auth_mode=args.auth_mode)
+        store_registration(args, center_url, payload, response, registration_output_path(args))
+        return True
+    except ScannerError as exc:
+        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        return False
+
+
 def store_json(path: Path, value: dict[str, Any], compact: bool) -> None:
+    """`store_bytes` of the value rendered as JSON (`render_json` plus a newline)."""
+    store_bytes(path, (render_json(value, compact) + "\n").encode("utf-8"))
+
+
+def store_bytes(path: Path, data: bytes) -> None:
     """Write owner-only, and owner-only from the moment the file exists.
 
     The inventory names an agent's tools, endpoints and which of its secrets sit
@@ -3101,14 +3290,14 @@ def store_json(path: Path, value: dict[str, Any], compact: bool) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "wb") as handle:
             try:
                 os.fchmod(handle.fileno(), 0o600)
             except (AttributeError, OSError):
                 # No fchmod (Windows) or a filesystem that refuses it. A file we
                 # created is already 0600; one we inherited stays as it was.
                 pass
-            handle.write(render_json(value, compact) + "\n")
+            handle.write(data)
     except OSError as exc:
         raise ScannerError(f"could not write {path}: {exc}") from exc
 
@@ -3191,7 +3380,12 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip writing the evidence bundle.",
     )
-    parser.add_argument("--register", action="store_true", help="POST the generated payload to rail-center.")
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help="Register with rail-center by POSTing this scan's evidence bundle (the same bytes written "
+        "locally and sent to RailDash) to its /v1/agents/register. The registration payload is no longer sent.",
+    )
     parser.add_argument("--center-url", help="rail-center base URL or /v1/agents/register URL.")
     parser.add_argument(
         "--auth-mode",
@@ -3206,7 +3400,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-register-response",
         action="store_true",
-        help="Print rail-center registration response/state instead of only storing it when --register is used.",
+        help="Print the stored rail-center registration state (never a ticket) instead of only storing it "
+        "when --register is used.",
     )
     parser.add_argument(
         "--raildash-url",
@@ -3287,137 +3482,158 @@ def write_feature_file(
     return True
 
 
+def evidence_needed(args: argparse.Namespace) -> bool:
+    """Whether this scan builds an evidence bundle at all: to write it, to send
+    it to RailDash, or to register with rail-center, which takes the bundle
+    as its registration (DR-188)."""
+    return not args.no_evidence_bundle or configured_raildash_url(args) is not None or bool(args.register)
+
+
+def _deliver_v1(
+    args: argparse.Namespace,
+    context: dict[str, Any],
+    payload: dict[str, Any],
+    identity: dict[str, Any],
+    write_feature: bool = True,
+) -> int:
+    """One scan's v1 evidence bundle, built once and handed to every target.
+
+    Built and verified before anything is sent, rendered to bytes once, and
+    those identical bytes go to rail-center's register route (`--register`),
+    to `--evidence-bundle-output` and to RailDash: building it twice would mint
+    two `bundle_id`s for one scan, and both receivers dedupe on exact bytes.
+    DR-157: unchanged content since this process's last scan of the same scope
+    reuses that scan's bundle whole, so an interval scan re-sends the same
+    bytes and both answer `duplicate` instead of storing a new copy per tick.
+
+    Each target is attempted and reported on its own: a rail-center failure
+    does not skip the feature file, the local bundle or RailDash, and the
+    other way round. The feature file is written after the registration
+    attempt, so its `registration_status` says what happened rather than what
+    was asked for — a scorer reading "registered" off an agent that never
+    reached the control plane would be reading a lie. The bundle's content
+    does not read `registration_status`, so registering after building it
+    changes nothing in it.
+
+    A bundle that fails its own contract fails the scan (DR-157), and with
+    nothing to send, a requested registration or RailDash delivery fails too.
+    A local bundle write failure is reported without changing the exit code
+    (the feature file owns that). Returns 0, or 2 if anything failed.
+    """
+    import evidence_bundle  # lazy: breaks the import cycle
+
+    failed = False
+    data: bytes | None = None
+    if evidence_needed(args):
+        bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
+        if bundle is None:
+            # Already reported.
+            failed = True
+        else:
+            bundle = evidence_bundle.reuse_unchanged_bundle(bundle, configured_agent_key(args))
+            data = evidence_bundle.render_bundle_bytes(bundle, args.compact)
+    try:
+        if args.register:
+            if register_bundle(args, data, payload):
+                identity["registration_status"] = "registered"
+            else:
+                failed = True
+    finally:
+        if write_feature and not args.no_feature_file:
+            failed = not write_feature_file(args, context, payload, identity) or failed
+        if data is not None and not args.no_evidence_bundle:
+            bundle_path = evidence_bundle.evidence_bundle_output_path(args)
+            try:
+                store_bytes(bundle_path, data)
+                print(f"[agent-environment-scanner] evidence bundle: {bundle_path}", file=sys.stderr)
+            except ScannerError as exc:
+                print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        raildash_url = configured_raildash_url(args)
+        if raildash_url:
+            if data is None:
+                # Already reported: the bundle failed to build or verify.
+                failed = True
+            else:
+                try:
+                    response = post_evidence_bundle(
+                        raildash_url,
+                        data,
+                        raildash_token=configured_raildash_token(args),
+                        agent_key=configured_agent_key(args),
+                    )
+                    body = response.get("body")
+                    body = body if isinstance(body, dict) else {}
+                    print(
+                        f"[agent-environment-scanner] delivered evidence bundle to raildash: "
+                        f"HTTP {response['status']} {bundle_outcome(body)} id={body.get('asp_id')}",
+                        file=sys.stderr,
+                    )
+                except ScannerError as exc:
+                    print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+                    failed = True
+    return 2 if failed else 0
+
+
 def run_one_scan(args: argparse.Namespace) -> int:
     """One scan, exactly as `main` always ran it before DR-83 — the loop in
     `main` below is the only new caller; every existing single-shot caller
-    (including this module's own tests) goes through this unchanged."""
-    feature_file_written = True
-    delivery_failed = False
-    bundle_failed = False
-    raildash_url = configured_raildash_url(args)
+    (including this module's own tests) goes through this unchanged.
+
+    DR-109 M2: `run_one_collection` sets `_v2_collection` on a scan's args when
+    it will itself compose this scan's attribute data into one shared
+    evidence-bundle-v2 collection and write, register and deliver *that*
+    exactly once. Such a scan only stashes its `(context, payload, identity)`
+    on `args._v2_scan_result` — reused by `_v1_scope_from_scan_result` and the
+    v1 fallback rather than scanning the same target twice, since two scans
+    could observe different live state and disagree — and leaves its feature
+    file to `run_one_collection`, which writes it after the collection's
+    registration attempt so `registration_status` reports its outcome.
+    """
     try:
         context, payload, identity = scan(args)
-
-        try:
-            if args.output:
-                # Through store_json like every other artifact: this payload
-                # carries the same tool, endpoint and user inventory the feature
-                # file does. Inside the try, so a bad --output path still leaves
-                # the feature file written.
-                store_json(Path(args.output).expanduser(), payload, args.compact)
-            elif not args.register:
-                print(render_json(payload, args.compact))
-
-            if args.register:
-                # Caught here, not left to propagate: a --raildash-url target
-                # below must still be attempted even when --register fails, and
-                # vice versa — the two delivery targets are independent.
-                try:
-                    center_url = configured_center_url(args)
-                    response = post_registration(center_url, payload, auth_mode=args.auth_mode)
-                    state = build_registration_state(center_url, payload, response)
-                    state_path = registration_output_path(args)
-                    store_json(state_path, state, args.compact)
-                    identity["registration_status"] = "registered"
-                    if args.output_register_response:
-                        print(render_json(state, args.compact))
-                    else:
-                        print(
-                            f"[agent-environment-scanner] registered with rail-center: HTTP {response['status']} "
-                            f"agent_id={state['agent_id']} state_file={state_path}",
-                            file=sys.stderr,
-                        )
-                except ScannerError as exc:
-                    print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-                    delivery_failed = True
-        finally:
-            # The feature file is the primary artifact and needs no control plane,
-            # so it is written even when registration fails — but only after the
-            # attempt, so registration_status reports what happened rather than
-            # what was asked for. A scorer reading "registered" off an agent that
-            # never reached the control plane would be reading a lie.
-            if not args.no_feature_file:
-                feature_file_written = write_feature_file(args, context, payload, identity)
-            # The evidence bundle rides the same guarantee: the brain's input,
-            # built even on a failed registration. Built once and shared by
-            # both consumers below — the file write and a RailDash POST both
-            # need the identical bytes, and building it twice would mint two
-            # different bundle_ids for one scan's output. A write or delivery
-            # failure is reported without changing the exit code for the file
-            # write (the feature file owns that); a RailDash delivery failure
-            # does change it, like a failed --register.
-            #
-            # DR-109 M2: `run_one_collection` sets `_v2_collection` on a
-            # target's args when it will itself compose this scan's raw
-            # attribute data into one shared evidence-bundle-v2 collection
-            # and write/deliver *that* exactly once. Without this guard a
-            # manifest-scoped run would additionally write (and, with a
-            # RailDash URL configured, separately POST) N keyed v1 bundles
-            # here — the exact "not N v1 bundles" gap this milestone closes.
-            #
-            # This scan's own `(context, payload, identity)` is stashed on
-            # `args._v2_scan_result` rather than simply skipped, so
-            # `_v1_scope_from_scan_result` (and the v1-fallback delivery for
-            # the cases where a v2 collection ultimately can't be built) can
-            # reuse this exact scan instead of calling `scan()` a second
-            # time for the same target — two independent scans of one
-            # target could observe different live state and disagree,
-            # exactly what "built once and shared" above exists to prevent.
-            if getattr(args, "_v2_collection", False):
-                args._v2_scan_result = (context, payload, identity)
-            elif not args.no_evidence_bundle or raildash_url:
-                import evidence_bundle  # lazy: breaks the import cycle
-
-                bundle = evidence_bundle.try_build_verified_bundle(args, context, payload, identity)
-                if bundle is None:
-                    # Already reported. A bundle that fails its own contract
-                    # fails the scan (DR-157), whether or not it was going
-                    # anywhere: exiting 0 here left a supervisor or CI job
-                    # believing a scan produced evidence when none was written.
-                    bundle_failed = True
-                else:
-                    # DR-157: unchanged content since this process's last
-                    # scan reuses that scan's bundle (bundle_id and all), so
-                    # an interval scan re-sends the same bytes and RailDash
-                    # dedupes them instead of storing a new ASP per tick.
-                    bundle = evidence_bundle.reuse_unchanged_bundle(bundle, configured_agent_key(args))
-
-                if not args.no_evidence_bundle and bundle is not None:
-                    bundle_path = evidence_bundle.evidence_bundle_output_path(args)
-                    try:
-                        store_json(bundle_path, bundle, args.compact)
-                        print(f"[agent-environment-scanner] evidence bundle: {bundle_path}", file=sys.stderr)
-                    except ScannerError as exc:
-                        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-
-                if raildash_url:
-                    if bundle is None:
-                        # Already reported above: the bundle failed to build
-                        # or verify, so there is nothing to deliver.
-                        delivery_failed = True
-                    else:
-                        try:
-                            data = evidence_bundle.render_bundle_bytes(bundle, args.compact)
-                            agent_key = configured_agent_key(args)
-                            raildash_token = configured_raildash_token(args)
-                            response = post_evidence_bundle(
-                                raildash_url, data, raildash_token=raildash_token, agent_key=agent_key
-                            )
-                            body = response.get("body")
-                            body = body if isinstance(body, dict) else {}
-                            outcome = "duplicate" if body.get("duplicate") else "accepted"
-                            print(
-                                f"[agent-environment-scanner] delivered evidence bundle to raildash: "
-                                f"HTTP {response['status']} {outcome} id={body.get('asp_id')}",
-                                file=sys.stderr,
-                            )
-                        except ScannerError as exc:
-                            print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-                            delivery_failed = True
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         return 2
-    return 0 if feature_file_written and not delivery_failed and not bundle_failed else 2
+
+    output_failed = False
+    try:
+        if args.output:
+            # Through store_json like every other artifact: this payload
+            # carries the same tool, endpoint and user inventory the feature
+            # file does. Its failure is reported and fails the run without
+            # skipping any target below. It is a local artifact only: rail-center
+            # registers from the evidence bundle (DR-188).
+            store_json(Path(args.output).expanduser(), payload, args.compact)
+        elif not args.register:
+            print(render_json(payload, args.compact))
+    except ScannerError as exc:
+        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        output_failed = True
+
+    if getattr(args, "_v2_collection", False):
+        args._v2_scan_result = (context, payload, identity)
+        args._feature_deferred = not args.no_feature_file
+        return 2 if output_failed else 0
+
+    try:
+        code = _deliver_v1(args, context, payload, identity)
+    except ScannerError as exc:
+        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
+        return 2
+    return 2 if output_failed or code else 0
+
+
+def _write_deferred_feature_file(scan_args: argparse.Namespace, registered: bool) -> bool:
+    """The feature file `run_one_scan` left for a `_v2_collection` scan, written
+    once the collection's registration was attempted. True when there was
+    nothing to write or it was written."""
+    if not getattr(scan_args, "_feature_deferred", False):
+        return True
+    scan_args._feature_deferred = False
+    context, payload, identity = scan_args._v2_scan_result
+    if scan_args.register and registered:
+        identity["registration_status"] = "registered"
+    return write_feature_file(scan_args, context, payload, identity)
 
 
 def main(argv: list[str] | None = None) -> int:
