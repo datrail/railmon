@@ -87,7 +87,8 @@ scanner skips an agent.
 ## Running it
 
 Keyed capture needs `--output-format runtime-interaction` and the default
-`--mode http`, and cannot be combined with `--pid`, `--uid` or `--comm`:
+`--mode http`, and cannot be combined with `--pid`, `--uid`, `--comm` or
+`--session`:
 
 ```bash
 railmon collect \
@@ -104,8 +105,9 @@ every 5 s and uses it to judge unsigned `x-rail` tickets. Without it every
 row is attributed by process target alone.
 
 All agents' rows go to the one `--output` file, interleaved; separate them by
-`attribution.target_id`, which every row carries (`agent_ref` is null on a
-conflict row). `--webhook` works too, but Rail Center's `/v1/interactions`
+`attribution.target_id`, which every row but an `ambiguous` one carries (that
+one lists its `candidate_targets` in `raw.railmon_attribution_audit`);
+`agent_ref` is null on every row that is not `attributed`. `--webhook` works too, but Rail Center's `/v1/interactions`
 stores this row shape unattributed for now, and the collector warns so. The
 file is created with
 the process umask, so tighten the umask or the directory if other local users
@@ -132,6 +134,7 @@ Per row, the output carries `agent_ref` (host, sandbox, `agent_key`) and
 | `attributed` | `process_target_with_ticket_claim` | the ticket names this target's own registered `agent_id` |
 | `conflict` | reason `TICKET_CLAIM_CONFLICT` | the ticket names a sibling's `agent_id`; `agent_ref` and `agent_id` are cleared and the claim is kept in `raw.railmon_attribution_audit` |
 | `ambiguous` | reason `MULTIPLE_TARGETS` | captured on a process session more than one target claims; `agent_ref`, `agent_id` and `target_id` are null, and `raw.railmon_attribution_audit` lists the `candidate_targets` and the discovery reason. `process` is the claimed process |
+| `unknown` | reason `PROCESS_INCARNATION_UNPINNED` | the row carries no process start time to pin the incarnation; `agent_ref`, `agent_id` and `process` are null |
 
 Rows flushed because their target stopped mid-request, or because a request
 waited longer than `--pending-timeout` (600 s by default) for its response,
@@ -155,7 +158,7 @@ count them from the file, e.g.
 | `shared ambiguous tap on session <s> ended (…); will retry discovery` | the probe for that shared session stopped |
 | `session <s> no longer collides as it did; stopping its shared ambiguous tap` | the collision cleared or changed; a target that now resolves alone gets its own tap back |
 | `target '<k>' resolved but its tap failed to start: …` | the probe for that agent (AgentSight path, `binary_path`); retried with the others |
-| `no declared agent resolved to a capturable process` (fatal, exit 1) | nothing in the manifest resolved to a process at startup, not even an ambiguous one; run `--print-resolved-targets` |
+| `no declared agent resolved to a capturable process` (fatal, exit 1) | nothing in the manifest resolved to a process whose tap started, not even an ambiguous one; run `--print-resolved-targets` |
 | `target '<k>' exited or its PID was reused; stopping its tap …` | expected on agent restart; pending requests are written as incomplete |
 | `target '<k>' tap ended (…); … will retry discovery` | the probe for that one agent stopped |
 | `N request(s) got no response within …s and were forwarded as incomplete` / `N response(s) matched no request` | the probe reports threads, not connections; a reply streamed while another HTTP connection on the agent's thread is active, or a foreign read landing mid-chunk, can lose it (typical of Node agents) ([#70](https://github.com/datrail/railmon/issues/70)) |
@@ -181,7 +184,7 @@ Drop `--target-manifest` (and `--registration-state` /
 `legacy-http` rows; unset `--target-manifest` / `RAIL_TARGET_MANIFEST` for the
 scanner. Both return to their previous behaviour unchanged: collector rows
 carry no `agent_ref` or `attribution` and read `agent_id` from the ticket as
-before, and `--pid`/`--uid`/`--comm` work again.
+before, and `--pid`/`--uid`/`--comm`/`--session` work again.
 
 The keyed files the scanner wrote (`….<agent_key>` next to the registration,
 feature and evidence-bundle outputs) are left on disk; delete them if the

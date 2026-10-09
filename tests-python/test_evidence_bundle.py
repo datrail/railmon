@@ -147,8 +147,8 @@ class BundleContractTest(unittest.TestCase):
     def test_the_module_loads_the_one_canonical_schema_file(self):
         # There is one copy of this contract now, not a mirror of it: the
         # module reads `schemas/evidence-bundle-v1.schema.json` at import
-        # time, and every closed set below (STATUSES, TIERS, ...) is derived
-        # from that object rather than a second hand-typed copy that could
+        # time, and every closed set a bundle is checked against comes from
+        # that object rather than a second hand-typed copy that could
         # drift from it. This just confirms it is the same file this test
         # loads independently.
         self.assertEqual(evidence_bundle.SCHEMA_PATH, ROOT / "schemas" / "evidence-bundle-v1.schema.json")

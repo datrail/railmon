@@ -27,12 +27,13 @@ instrument or patch the agent runtime to discover the skill inventory.
 The scanner uses this read-only flow:
 
 1. Locate skill roots.
-   - Host mode scans paths passed with `--root`, `$RAIL_SCAN_SKILL_ROOTS`, or the
-     default OpenClaw config directories.
-   - Container mode uses `docker inspect` to find host bind mounts for
-     `/home/node/.openclaw`.
-   - Container mode also uses `docker exec` to read OpenClaw's bundled install
-     paths inside the running container.
+   - Host mode scans paths passed with `--root`, or else `$RAIL_SCAN_SKILL_ROOTS`
+     plus the default OpenClaw config directories.
+   - Container mode uses `docker inspect` to find host bind mounts for the
+     container roots (`--container-root`, by default `/home/node/.openclaw`,
+     `/workdir/.openclaw` and OpenClaw's bundled install paths).
+   - Container mode also uses `docker exec` to read those roots inside the
+     running container.
 2. Find skill manifests.
    - The scanner recursively searches those roots for files named `SKILL.md`.
    - It scans the real files used by OpenClaw/NemoClaw; no mock skill fixtures
@@ -73,11 +74,14 @@ Their container images can also include bundled skills under:
 /usr/local/lib/node_modules/openclaw/dist/extensions
 ```
 
-The example Compose files mount that path from the host:
+Container mode also checks `/workdir/.openclaw`. Pass `--container-root` to
+replace these defaults.
+
+The example Compose files mount that path from a named Docker volume:
 
 ```text
-examples/openclaw-monitoring/openclaw-data  -> /home/node/.openclaw
-examples/nemoclaw-monitoring/nemoclaw-data  -> /home/node/.openclaw
+openclaw-data  -> /home/node/.openclaw   (tools/skills/examples/openclaw/)
+nemoclaw-data  -> /home/node/.openclaw   (tools/skills/examples/nemoclaw/)
 ```
 
 `skill_scanner.py` recursively finds `SKILL.md` files and extracts:
@@ -96,7 +100,8 @@ credentials embedded in documentation.
 
 `run-openclaw.sh` and `run-nemoclaw.sh` start the real agent from the Compose
 service in `examples/openclaw/` or `examples/nemoclaw/`, wait for the container,
-and scan `/home/node/.openclaw` inside it. DatRail does not publish the agent
+and scan its skill roots (`/home/node/.openclaw` and the others above) inside
+it. DatRail does not publish the agent
 images, so name a reviewed tag or digest and the provider key the service
 needs:
 
@@ -158,7 +163,7 @@ python3 tools/skills/skill_scanner.py \
 
 When `--container` is used, the scanner:
 
-1. Uses `docker inspect` to find host mounts for `/home/node/.openclaw`.
+1. Uses `docker inspect` to find host mounts for the container roots.
 2. Scans those host paths when readable.
 3. Uses `docker exec` to read `SKILL.md` files from the data directory and
    OpenClaw's bundled install paths inside the container.
@@ -171,8 +176,8 @@ Scan explicit directories:
 
 ```bash
 python3 tools/skills/skill_scanner.py \
-  --root examples/openclaw-monitoring/openclaw-data \
-  --root examples/nemoclaw-monitoring/nemoclaw-data
+  --root ~/.openclaw \
+  --root /srv/nemoclaw/.openclaw
 ```
 
 Without `--root` or `--container`, the scanner checks:

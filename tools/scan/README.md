@@ -9,7 +9,8 @@ metadata, system/runtime information, owner identity, and optional MCP config.
 
 Every example below assumes the host id is set (`RAIL_HOST_ID`, or
 `--host-id`). Without one the evidence bundle fails its contract and the scan
-exits `2`; pass `--no-evidence-bundle` to scan without a bundle.
+exits `2`; pass `--no-evidence-bundle` to scan without a bundle (and name no
+RailDash URL, which builds one for delivery regardless).
 
 ## Output Schema
 
@@ -33,7 +34,8 @@ The output matches `RegisterAgentRequest` in rail-center:
 ```
 
 `host_id` and `sandbox_name` are optional; they are omitted when the scanner has
-nothing it can stand behind. See [Agent identity](#agent-identity).
+nothing it can stand behind. See [Agent identity](#agent-identity). With
+`--agent-key` (or `RAIL_AGENT_KEY`) set, the payload also carries `agent_key`.
 
 The scanner uses secret-bearing environment variables to infer the provider, but
 it only records environment variable names. API key values are not written into
@@ -67,8 +69,8 @@ Then register the agent with Rail Center:
 ```bash
 python3 tools/scan/scan_agent_environment.py \
   --mode docker \
-  --container openclaw-monitoring-openclaw-1 \
-  --skills-file examples/openclaw-monitoring/output/openclaw-skills.json \
+  --container openclaw-openclaw-1 \
+  --skills-file tools/skills/examples/openclaw/output/openclaw-skills.json \
   --register \
   --center-url http://localhost:23001
 ```
@@ -91,7 +93,9 @@ keeps using the old location and prints a deprecation note; the feature file
 and evidence bundle below follow the same rule for `.rail/railscan/`. Move the
 files, or set the path explicitly, to finish the move.)
 
-The stored file contains:
+The stored file contains, beside `registered_at`, `center_url`,
+`registration_url`, `status`, a `request_summary` and the response with its
+ticket stripped:
 
 ```json
 {
@@ -156,8 +160,8 @@ map worth reading for anyone who wants to attack that agent.
 The feature file is written even when a registration or an `--output` write
 fails, and failing to write it is itself an exit code `2` — it is the primary
 artifact, not a side effect. A registration error is never replaced by a
-feature-file error: both are printed, the registration one last, since that is
-the one the operator has to act on.
+feature-file error: both are printed, the registration one first, as it
+happens, and either one fails the run.
 
 `secret_class` distinguishes `mount` from `reference` by asking the filesystem
 the value refers to: in `--mode docker` that is the scanned container's, so a
@@ -183,7 +187,7 @@ lands even when the registration fails. A write failure is reported without
 changing the exit code — the feature file owns that. A bundle that fails its
 own contract (for example, no `host_id` because `RAIL_HOST_ID` is unset) is
 not written and fails the scan with exit code `2`; `--no-evidence-bundle`
-skips building it.
+skips building it unless a RailDash URL asks for it (below).
 
 The envelope names the container the bundle was collected from with
 `host_id` and `sandbox_name` — the pair the scan registers the container
@@ -286,9 +290,8 @@ does not read them.
 A non-2xx response, an unreachable RailDash, or an evidence bundle that fails
 its own contract are all reported as scanner errors with exit code `2` —
 mirroring `--register`'s existing failure handling — without stopping the
-rest of the scan: the feature file, the local evidence bundle (if
-`--evidence-bundle-output` was also requested), and any `--register` attempt
-still happen.
+rest of the scan: the feature file, the local evidence bundle (unless
+`--no-evidence-bundle`), and any `--register` attempt still happen.
 
 ## Observed reach (optional)
 
@@ -424,7 +427,7 @@ The attribute is:
   listener that the whole internet can reach meets new peers all the time,
   and that is what the cap says;
 - BLIND without a file, or when the probe's newest `start` record lacks
-  `"peers": true`. That probe predates peer events, and "it didn't look" must
+  `"peers": true` and no peer event was seen. That probe predates peer events, and "it didn't look" must
   not read as "nobody connected".
 
 Only TCP peers are seen, and only once accepted. Behind NAT or a proxy, a
@@ -740,28 +743,30 @@ python3 tools/scan/scan_agent_environment.py \
 
 ## OpenClaw Integration
 
-Start the real OpenClaw example container:
+Start the real OpenClaw example container (the Compose file is vendored under
+`tools/skills/examples/openclaw/`; set `OPENCLAW_IMAGE` and `OPENAI_API_KEY`
+first, see the [skills scanner README](../skills/README.md)):
 
 ```bash
-cd examples/openclaw-monitoring
-mkdir -p openclaw-data output
+cd tools/skills/examples/openclaw
 docker compose up -d openclaw
 ```
 
 Run the scanner against the running OpenClaw container:
 
 ```bash
-cd ../..
+cd ../../../..
+mkdir -p tools/skills/examples/openclaw/output
 python3 tools/scan/scan_agent_environment.py \
   --mode docker \
-  --container openclaw-monitoring-openclaw-1 \
-  --output examples/openclaw-monitoring/output/registration-payload.json
+  --container openclaw-openclaw-1 \
+  --output tools/skills/examples/openclaw/output/registration-payload.json
 ```
 
 If Compose uses a different container name, get it with:
 
 ```bash
-docker compose -f examples/openclaw-monitoring/docker-compose.yml ps openclaw
+docker compose -f tools/skills/examples/openclaw/docker-compose.yml ps openclaw
 ```
 
 Expected detection for the bundled OpenClaw compose file:
@@ -769,7 +774,7 @@ Expected detection for the bundled OpenClaw compose file:
 | Field | Expected value |
 | --- | --- |
 | `environment.sandbox_type` | `openclaw` |
-| `environment.llm_provider` | `local` |
+| `environment.llm_provider` | `openai`, or `local` when `OPENAI_BASE_URL` points at a local endpoint |
 | `environment.llm_model` | `unknown` unless a model is configured or a capture file is provided |
 
 To infer model from an actual monitor capture:
@@ -777,34 +782,36 @@ To infer model from an actual monitor capture:
 ```bash
 python3 tools/scan/scan_agent_environment.py \
   --mode docker \
-  --container openclaw-monitoring-openclaw-1 \
-  --capture-file examples/openclaw-monitoring/output/openclaw-capture.jsonl
+  --container openclaw-openclaw-1 \
+  --capture-file tools/skills/examples/openclaw/output/openclaw-capture.jsonl
 ```
 
 ## NemoClaw Integration
 
-Start the real NemoClaw example container:
+Start the real NemoClaw example container (the Compose file is vendored under
+`tools/skills/examples/nemoclaw/`; set `NEMOCLAW_IMAGE` and `OPENAI_API_KEY`
+first, see the [skills scanner README](../skills/README.md)):
 
 ```bash
-cd examples/nemoclaw-monitoring
-mkdir -p nemoclaw-data output
+cd tools/skills/examples/nemoclaw
 docker compose up -d nemoclaw
 ```
 
 Run the scanner against the running NemoClaw container:
 
 ```bash
-cd ../..
+cd ../../../..
+mkdir -p tools/skills/examples/nemoclaw/output
 python3 tools/scan/scan_agent_environment.py \
   --mode docker \
-  --container nemoclaw-monitoring-nemoclaw-1 \
-  --output examples/nemoclaw-monitoring/output/registration-payload.json
+  --container nemoclaw-nemoclaw-1 \
+  --output tools/skills/examples/nemoclaw/output/registration-payload.json
 ```
 
 If Compose uses a different container name, get it with:
 
 ```bash
-docker compose -f examples/nemoclaw-monitoring/docker-compose.yml ps nemoclaw
+docker compose -f tools/skills/examples/nemoclaw/docker-compose.yml ps nemoclaw
 ```
 
 Expected detection for the bundled NemoClaw compose file:
@@ -812,7 +819,7 @@ Expected detection for the bundled NemoClaw compose file:
 | Field | Expected value |
 | --- | --- |
 | `environment.sandbox_type` | `nemo_claw` |
-| `environment.llm_provider` | `local` |
+| `environment.llm_provider` | `openai`, or `local` when `OPENAI_BASE_URL` points at a local endpoint |
 | `environment.llm_model` | `unknown` unless a model is configured or a capture file is provided |
 
 To infer model from an actual monitor capture:
@@ -820,8 +827,8 @@ To infer model from an actual monitor capture:
 ```bash
 python3 tools/scan/scan_agent_environment.py \
   --mode docker \
-  --container nemoclaw-monitoring-nemoclaw-1 \
-  --capture-file examples/nemoclaw-monitoring/output/nemoclaw-capture.jsonl
+  --container nemoclaw-nemoclaw-1 \
+  --capture-file tools/skills/examples/nemoclaw/output/nemoclaw-capture.jsonl
 ```
 
 ## MCP Skills
@@ -834,8 +841,11 @@ The scanner looks for MCP config in:
 ~/.mcp.json
 ```
 
-Each `mcpServers` entry becomes a registration `SkillInput` with
-`source_type: "mcp_config"`. Pass custom paths with:
+Each `mcpServers` entry becomes registration `SkillInput`s with
+`source_type: "mcp_config"`: a server with a `url` is asked for its tools and
+becomes one skill per tool it declares (or one skill marked unreachable, or
+declaring no tools); a `command` server becomes one skill. Pass custom paths
+with:
 
 ```bash
 python3 tools/scan/scan_agent_environment.py \
@@ -847,15 +857,16 @@ config file (as some Compose deployments do, one server per agent) is still
 discovered — no flag
 needed. If both `AGENT_MCP_NAME` and `AGENT_MCP_URL` are set, that server is
 added to the inventory and skills list the same way a `.mcp.json` entry would
-be, merged with any file-derived servers (a file entry with the same name
-wins). Only this one name/URL pair is read; there is no env-var equivalent of
+be, merged with any file-derived servers (a server with the same name and
+URL is listed once; skills with the same name are merged, their endpoints
+combined and the longer description kept). Only this one name/URL pair is read; there is no env-var equivalent of
 a multi-server `mcpServers` block.
 
 Merge external skills from the skills scanner:
 
 ```bash
 python3 tools/scan/scan_agent_environment.py \
-  --skills-file examples/openclaw-monitoring/output/openclaw-skills.json
+  --skills-file tools/skills/examples/openclaw/output/openclaw-skills.json
 ```
 
 ## Validate Against rail-center

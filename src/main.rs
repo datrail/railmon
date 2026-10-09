@@ -394,6 +394,16 @@ async fn main() -> Result<()> {
     let mut stream_ended = false;
     let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A paired (or expired) interaction as the chosen output format writes it.
+    let format_row = |paired: serde_json::Value| match args.output_format {
+        OutputFormat::LegacyHttp => paired,
+        OutputFormat::RuntimeInteraction => interaction::to_runtime_interaction(
+            &paired,
+            Some(&session_id),
+            Some(&capture_start),
+            "railmon",
+        ),
+    };
 
     loop {
         tokio::select! {
@@ -411,26 +421,15 @@ async fn main() -> Result<()> {
                     Mode::Raw => serde_json::to_value(&event).ok(),
                     Mode::Http => pairer
                         .accept(event.pid, &event.data, event.timestamp)
-                        .map(|paired| match args.output_format {
-                            OutputFormat::LegacyHttp => paired,
-                            OutputFormat::RuntimeInteraction => interaction::to_runtime_interaction(
-                                &paired,
-                                Some(&session_id),
-                                Some(&capture_start),
-                                "railmon",
-                            ),
-                        }),
+                        .map(format_row),
                 };
 
-                // Deliberately not `?`. Returning from here would skip
-                // shutdown() and silently drop every interaction still buffered
-                // for the webhook. A write failure is worth stopping for, but
-                // only after the buffer has been flushed.
                 if let Some(value) = emitted {
                     if let Err(error) = sink.emit(&value).await {
                         // Break rather than `?`: returning here would skip
-                        // shutdown() and drop the buffered batch. The error is
-                        // carried out and surfaced after the flush.
+                        // shutdown() and silently drop every interaction still
+                        // buffered for the webhook. The error is carried out
+                        // and surfaced after the flush.
                         log::error!("writing interaction: {error}");
                         write_error = Some(error);
                         break;
@@ -443,16 +442,7 @@ async fn main() -> Result<()> {
                     let expired = pairer.expire(std::time::Instant::now(), timeout);
                     report.note_expired(expired.len());
                     for paired in expired {
-                        let value = match args.output_format {
-                            OutputFormat::LegacyHttp => paired,
-                            OutputFormat::RuntimeInteraction => interaction::to_runtime_interaction(
-                                &paired,
-                                Some(&session_id),
-                                Some(&capture_start),
-                                "railmon",
-                            ),
-                        };
-                        if let Err(error) = sink.emit(&value).await {
+                        if let Err(error) = sink.emit(&format_row(paired)).await {
                             log::error!("writing interaction: {error}");
                             write_error = Some(error);
                             break;
@@ -520,6 +510,28 @@ struct TargetRuntime {
     agent_ref: identity::AgentRef,
     process: identity::ProcessIncarnation,
     pairer: Pairer,
+}
+
+impl TargetRuntime {
+    /// Stamps the pinned incarnation onto a paired interaction, then
+    /// attributes it to this target.
+    fn row(
+        &self,
+        mut paired: serde_json::Value,
+        registered: &identity::RegisteredAgents,
+        session_id: &str,
+        capture_start: &str,
+    ) -> serde_json::Value {
+        paired["target_pid"] = serde_json::json!(self.process.pid);
+        paired["process_start_time_ticks"] = serde_json::json!(self.process.start_time_ticks);
+        interaction::to_attributed_runtime_interaction(
+            &paired,
+            Some(session_id),
+            Some(capture_start),
+            "railmon",
+            Some((&self.agent_ref, registered)),
+        )
+    }
 }
 
 /// A tap on a process session that more than one declared target claims.
@@ -623,9 +635,7 @@ fn plan_shared_taps(
         }
         binary_paths.entry(process.session_id).or_default().push(
             manifest.agents[index]
-                .capture
-                .as_ref()
-                .and_then(|capture| capture.binary_path.clone())
+                .capture_binary_path()
                 .or_else(|| default_binary_path.cloned()),
         );
     }
@@ -719,17 +729,9 @@ async fn emit_target_incomplete(
     capture_start: &str,
     sink: &mut Sink,
 ) -> Result<()> {
-    for mut paired in incomplete {
-        paired["target_pid"] = serde_json::json!(target.process.pid);
-        paired["process_start_time_ticks"] = serde_json::json!(target.process.start_time_ticks);
-        let value = interaction::to_attributed_runtime_interaction(
-            &paired,
-            Some(session_id),
-            Some(capture_start),
-            "railmon",
-            Some((&target.agent_ref, registered)),
-        );
-        sink.emit(&value).await?;
+    for paired in incomplete {
+        sink.emit(&target.row(paired, registered, session_id, capture_start))
+            .await?;
     }
     Ok(())
 }
@@ -916,6 +918,22 @@ fn refresh_registered_agents(
     *problems = next_problems;
 }
 
+/// Responses that matched no request, across every running tap.
+fn unmatched_responses(
+    targets: &[Option<TargetRuntime>],
+    shared: &BTreeMap<u32, SharedTap>,
+) -> u64 {
+    targets
+        .iter()
+        .flatten()
+        .map(|t| t.pairer.unmatched_responses())
+        .sum::<u64>()
+        + shared
+            .values()
+            .map(|t| t.pairer.unmatched_responses())
+            .sum::<u64>()
+}
+
 /// The collector no longer exits when every target is simultaneously down
 /// (it keeps retrying discovery instead), which means an operator watching
 /// only the process's exit code would never learn that capture went fully
@@ -1009,9 +1027,7 @@ async fn run_multi_target(
         match outcome {
             identity::DiscoveryOutcome::Available(process) => {
                 let binary_path = target
-                    .capture
-                    .as_ref()
-                    .and_then(|capture| capture.binary_path.clone())
+                    .capture_binary_path()
                     .or_else(|| args.binary_path.clone());
                 // A tap-spawn failure for one target (e.g. the probe binary
                 // failed to exec) is treated the same way here as it is on
@@ -1100,16 +1116,8 @@ async fn run_multi_target(
                         // Stamp the already pinned root incarnation now,
                         // before the interaction enters the sink's
                         // asynchronous webhook queue.
-                        if let Some(mut paired) = target.pairer.accept(event.pid, &event.data, event.timestamp) {
-                            paired["target_pid"] = serde_json::json!(target.process.pid);
-                            paired["process_start_time_ticks"] = serde_json::json!(target.process.start_time_ticks);
-                            let value = interaction::to_attributed_runtime_interaction(
-                                &paired,
-                                Some(session_id),
-                                Some(capture_start),
-                                "railmon",
-                                Some((&target.agent_ref, &registered)),
-                            );
+                        if let Some(paired) = target.pairer.accept(event.pid, &event.data, event.timestamp) {
+                            let value = target.row(paired, &registered, session_id, capture_start);
                             if let Err(error) = sink.emit(&value).await {
                                 write_error = Some(error);
                                 break 'capture;
@@ -1300,9 +1308,7 @@ async fn run_multi_target(
                         };
                         let target = &manifest.agents[index];
                         let binary_path = target
-                            .capture
-                            .as_ref()
-                            .and_then(|capture| capture.binary_path.clone())
+                            .capture_binary_path()
                             .or_else(|| args.binary_path.clone());
                         let label = format!("'{}'", target.agent_key);
                         match spawn_session_tap(agentsight, binary_path, process.session_id, &label).await {
@@ -1346,25 +1352,14 @@ async fn run_multi_target(
                         }
                     }
                 }
-                let unmatched = targets.iter().flatten().map(|t| t.pairer.unmatched_responses()).sum::<u64>()
-                    + shared.values().map(|t| t.pairer.unmatched_responses()).sum::<u64>();
-                report.maybe_log(unmatched, pending_timeout);
+                report.maybe_log(unmatched_responses(&targets, &shared), pending_timeout);
                 sink.flush_if_due().await
             }
             _ = shutdown.requested() => break 'capture,
         }
     }
 
-    let unmatched = targets
-        .iter()
-        .flatten()
-        .map(|t| t.pairer.unmatched_responses())
-        .sum::<u64>()
-        + shared
-            .values()
-            .map(|t| t.pairer.unmatched_responses())
-            .sum::<u64>();
-    report.log(unmatched, pending_timeout);
+    report.log(unmatched_responses(&targets, &shared), pending_timeout);
     if let Some(error) = write_error {
         return Err(error);
     }

@@ -148,15 +148,7 @@ pub fn normalize_ssl_event(raw: &Value) -> Option<Value> {
 /// of a binary body into replacement characters and shift every offset after
 /// them.
 fn decode_hex_latin1(hexed: &str) -> Option<String> {
-    if !hexed.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut out = String::with_capacity(hexed.len() / 2);
-    for pair in hexed.as_bytes().chunks(2) {
-        let byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-        out.push(byte as char);
-    }
-    Some(out)
+    crate::http1_guard::hex_decode(hexed).map(|bytes| bytes.into_iter().map(char::from).collect())
 }
 
 /// The probe's exit status, resolved once its output ends.
@@ -180,7 +172,6 @@ impl Analyzer for ExtraCredentialRedactor {
         &mut self,
         stream: EventStream,
     ) -> std::result::Result<EventStream, Box<dyn std::error::Error + Send + Sync>> {
-        use futures::StreamExt as _;
         Ok(Box::pin(stream.map(|mut event| {
             if let Some(headers) = event.data.get_mut("headers").and_then(Value::as_object_mut) {
                 for (key, value) in headers.iter_mut() {
@@ -348,14 +339,10 @@ pub async fn event_stream(
             loop {
                 let line = match lines.next_line().await {
                     Ok(Some(line)) => line,
-                    Ok(None) => {
-                        if let Some(tx) = status_tx.take() {
-                            let _ = tx.send(child.wait().await.ok());
+                    end => {
+                        if let Err(error) = end {
+                            log::warn!("reading probe output: {error}");
                         }
-                        return None;
-                    }
-                    Err(error) => {
-                        log::warn!("reading probe output: {error}");
                         if let Some(tx) = status_tx.take() {
                             let _ = tx.send(child.wait().await.ok());
                         }
