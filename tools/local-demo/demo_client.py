@@ -13,7 +13,6 @@ from __future__ import annotations
 import http.client
 import json
 import ssl
-import sys
 import time
 
 

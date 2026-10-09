@@ -532,7 +532,7 @@ def detect_sandbox_type(context: dict[str, Any], explicit: str | None = None) ->
         )
     ).lower()
 
-    if "nemoclaw" in markers or "nvidia/nemoclaw" in markers or "openshell" in markers:
+    if "nemoclaw" in markers or "openshell" in markers:
         return "nemo_claw"
     if "openclaw" in markers or Path("/home/node/.openclaw").exists():
         return "openclaw"
@@ -757,16 +757,8 @@ def collect_mcp_inventory(mcp_configs: list[Path], env: dict[str, str] | None = 
     """
     inventory: list[dict[str, Any]] = []
     seen: set[tuple[str, str | None]] = set()
-    for path in mcp_configs:
-        if not path.exists():
-            continue
-        for entry in read_mcp_inventory(path):
-            key = (entry["name"], entry["url"])
-            if key in seen:
-                continue
-            seen.add(key)
-            inventory.append(entry)
-    for entry in read_mcp_inventory_from_env(env or {}):
+    entries = [entry for path in mcp_configs if path.exists() for entry in read_mcp_inventory(path)]
+    for entry in [*entries, *read_mcp_inventory_from_env(env or {})]:
         key = (entry["name"], entry["url"])
         if key in seen:
             continue
@@ -2897,17 +2889,16 @@ def run_one_collection(args: argparse.Namespace) -> int:
                 # scope's own template names marked FAILED, rather than
                 # silently missing as if the agent had never been declared.
                 exit_code = 2
-                if sandbox_v1 is not None:
-                    agent_entries.append(
-                        {
-                            "agent_key": agent_key,
-                            "discovery_status": "available",
-                            "inputs_attempted": evidence_bundle.failed_inputs("PARSE_FAILED"),
-                            "attributes": evidence_bundle.failed_attributes(
-                                sandbox_v1["attributes"], composer.SANDBOX_ATTRIBUTES
-                            ),
-                        }
-                    )
+                agent_entries.append(
+                    {
+                        "agent_key": agent_key,
+                        "discovery_status": "available",
+                        "inputs_attempted": evidence_bundle.failed_inputs("PARSE_FAILED"),
+                        "attributes": evidence_bundle.failed_attributes(
+                            sandbox_v1["attributes"], composer.SANDBOX_ATTRIBUTES
+                        ),
+                    }
+                )
                 continue
 
             agent_entries.append(

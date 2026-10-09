@@ -149,7 +149,8 @@ class Credential:
     def _gcp_token(self, timeout: float) -> str:
         if self._cached is not None:
             token, exp = self._cached
-            if exp is not None and time.time() + GCP_REFRESH_MARGIN_SECONDS < exp:
+            # Only a token with a readable `exp` is ever cached (below).
+            if time.time() + GCP_REFRESH_MARGIN_SECONDS < exp:
                 return token
         url = (
             f"http://{self._metadata_host}/computeMetadata/v1/instance/service-accounts/default/identity?"

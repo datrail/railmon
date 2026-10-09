@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The v1 evidence bundle: the artifact, the closed sets, and the check that keeps them.
+"""The v1 evidence bundle: the artifact, its published schema, and the check that keeps them.
 
 The bundle is the standalone input to the profile brain (the DR-107 shape,
 published in Confluence "Evidence Bundle Reason Codes" / "Agent Attribute
@@ -7,13 +7,13 @@ Availability"): one attribute per collected signal, each carrying status,
 tier, authored_by and a reason for whatever it did not answer. The envelope
 names the container it was collected from with the host_id / sandbox_name
 pair - the same pair the scan registers it under (RC-318). It carries no
-registration id: the control plane files the bundle by pair lookup, and the closed sets below are
-mirrored from that published contract; `verify_bundle` is this module's check
+registration id: the control plane files the bundle by pair lookup, and the bundle is checked
+against that published contract's schema, loaded below; `verify_bundle` is this module's check
 of an emitted bundle - the guard a guard needs, so a broken bundle is a
 ScannerError rather than a file a scorer reads.
 
-Import direction: mutual and deliberately lazy on both sides, so the closed
-sets have one home here. The scanner imports this module inside its `finally`
+Import direction: mutual and deliberately lazy on both sides, so the
+contract has one home here. The scanner imports this module inside its `finally`
 block; this module imports the scanner inside the few functions that need it
 (`verify_bundle`, `_redact_harness_values`, `build_evidence_bundle`,
 `write_evidence_bundle`) - the function-local imports are what break the
@@ -40,24 +40,15 @@ from pathlib import Path
 from typing import Any
 
 # ── the published contract ──────────────────────────────────────────────────
-# The schema is the single source of truth, loaded once here: the closed sets
+# The schema is the single source of truth, loaded once here: the values
 # below are derived from it rather than hand-mirrored copies that can drift
-# from what the consumer actually enforces. RailDash vendors this same file
+# from what the consumer actually enforces, and bundles are validated against
+# it directly. RailDash vendors this same file
 # byte-for-byte, and RC-318's control plane has been asked to validate
 # against it too.
 SCHEMA_PATH = Path(__file__).resolve().parent.parent.parent / "schemas" / "evidence-bundle-v1.schema.json"
 SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
-_ATTRIBUTE_DEF = SCHEMA["$defs"]["attribute"]
-_SOURCE_DEF = SCHEMA["$defs"]["source"]
 
-STATUSES = frozenset(_ATTRIBUTE_DEF["properties"]["status"]["enum"])
-REASONS = frozenset(SCHEMA["$defs"]["reason"]["enum"])
-TIERS = frozenset(_ATTRIBUTE_DEF["properties"]["tier"]["enum"])
-AUTHORED_BY = frozenset(_ATTRIBUTE_DEF["properties"]["authored_by"]["enum"])
-ATTRIBUTE_FIELDS = frozenset(_ATTRIBUTE_DEF["properties"])
-SOURCE_FIELDS = frozenset(_SOURCE_DEF["properties"])
-ENVELOPE_KEYS = tuple(SCHEMA["required"])
-OPTIONAL_ENVELOPE_KEYS = tuple(set(SCHEMA["properties"]) - set(SCHEMA["required"]))
 INPUT_SOURCES = tuple(SCHEMA["properties"]["inputs_attempted"]["required"])
 # Mirrored from the published schema's maxLength, which is what the consumer
 # validates against; the scanner truncates to the same numbers.
@@ -105,14 +96,10 @@ FILE_ACCESS_VALUED_STATUSES = frozenset(
 )
 
 # ── the v2 (DR-109 multi-agent) contract, loaded the same way ──────────────
-# A second, independent document: v2 is not v1-plus-fields, so it gets its
-# own closed sets rather than a diff against the v1 ones above.
+# A second, independent document: v2 is not v1-plus-fields, so a v2 bundle is
+# validated against it rather than against a diff from the v1 one above.
 SCHEMA_V2_PATH = Path(__file__).resolve().parent.parent.parent / "schemas" / "evidence-bundle-v2.schema.json"
 SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
-_AGENT_SCOPE_DEF = SCHEMA_V2["$defs"]["agent_scope"]
-REASONS_V2 = frozenset(SCHEMA_V2["$defs"]["reason"]["enum"])
-DISCOVERY_STATUSES = frozenset(_AGENT_SCOPE_DEF["properties"]["discovery_status"]["enum"])
-BUNDLE_VERSION_V2 = SCHEMA_V2["properties"]["bundle_version"]["const"]
 
 # Rail Center's profiler vocabulary is intentionally narrower than the
 # scanner's inventory vocabulary. An empty secret-shaped environment variable
@@ -799,7 +786,7 @@ def build_evidence_bundle(
 
     env = context["env"]
     mode = context["mode"]
-    docker = context.get("docker_inspect") or {} if mode == "docker" else {}
+    docker = context.get("docker_inspect") or {}
     host_config = docker.get("HostConfig") or {}
     environment = payload.get("environment") or {}
     system_info = environment.get("system_info") or {}

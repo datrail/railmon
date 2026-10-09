@@ -50,7 +50,6 @@ ENDPOINT_KEYS = {
     "urls",
 }
 
-SECRET_QUERY_RE = re.compile(r"(token|key|secret|password|credential|auth)", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s<>'\"`)\]}]+", re.IGNORECASE)
 
 
@@ -238,8 +237,6 @@ def sanitize_url(raw_url: str) -> str | None:
     path = parts.path or ""
     # Drop query/fragment entirely. SKILL.md often contains examples, and
     # query strings are the most common place for accidental secrets.
-    if parts.query and not SECRET_QUERY_RE.search(parts.query):
-        pass
     return urlunsplit((parts.scheme.lower(), netloc, path, "", ""))
 
 
@@ -364,10 +361,7 @@ def find_container_skill_paths(container: str, roots: list[str]) -> list[str]:
 
 
 def read_container_file(container: str, path: str) -> str | None:
-    output = run_command(["docker", "exec", container, "sh", "-lc", f"cat {shlex.quote(path)}"], timeout=10.0)
-    if output is None:
-        return None
-    return output
+    return run_command(["docker", "exec", container, "sh", "-lc", f"cat {shlex.quote(path)}"], timeout=10.0)
 
 
 def find_container_skill_documents(container: str, roots: list[str]) -> list[SkillDocument]:
@@ -459,7 +453,7 @@ def infer_sandbox_type(args: argparse.Namespace) -> str:
             ]
         )
     joined = " ".join(markers).lower()
-    if "nemoclaw" in joined or "nvidia/nemoclaw" in joined or "openshell" in joined:
+    if "nemoclaw" in joined or "openshell" in joined:
         return "nemo_claw"
     if "openclaw" in joined:
         return "openclaw"
