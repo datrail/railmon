@@ -83,7 +83,8 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # a pack-6 baseline holds them by number, so it is not comparable.
 # Pack 8 adds the registration payload's fields (DR-189): agent_type, owner,
 # llm_provider, sandbox_type, system_info and user_info.
-RULE_PACK_VERSION = 8
+# Pack 9 adds agent_instance (DR-193): the dynamic fields pack 8 left out.
+RULE_PACK_VERSION = 9
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1474,50 +1475,72 @@ def build_evidence_bundle(
         "attributes": attributes,
     }
 
-# ── the registration payload's fields (DR-189) ──────────────────────────────
+# ── the registration payload's fields (DR-189, DR-193) ──────────────────────
 # The bundle carries everything the registration payload does, so Rail Center
 # can take one producer output instead of two. Every payload field has a home:
 # the envelope (host_id, sandbox_name), the agent key, an existing attribute
 # (llm_model is model_name, skills is skills_inventory), or one of the
-# attributes below. The exceptions are the fields in REGISTRATION_ONLY_FIELDS.
-# Most describe one scan run or one container instance, not the agent. A
-# recreated container or a restarted scan changes them, so a locked baseline
-# would read them as drift on every pass. The bundle already names its
-# container by the host_id/sandbox_name pair, which replaced the
-# hostname-derived identity. For the same reason the node name is cut out of
-# `uname` when the scan's own platform supplied it. proc1_cmdline is PID 1's
-# argv: command-line contents, which never reach a persisted file handed to a
-# scorer (README, "Observed reach"), however well redacted.
+# attributes below. The one exception is in REGISTRATION_ONLY_FIELDS:
+# proc1_cmdline is PID 1's argv, command-line contents, which never reach a
+# persisted file handed to a scorer (README, "Observed reach"), however well
+# redacted.
 REGISTRATION_ONLY_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("environment", "system_info", "process", "proc1_cmdline"),
+)
+
+# Fields that describe where this copy runs now, not the agent: the
+# container's hostname, id and host pid, and the scan's own fqdn, pid and cwd.
+# A restarted scan, a recreated container or a move changes them. Rail
+# Center's principles for agent data (2026-10-08) make this *dynamic* data,
+# which the producer carries and a consumer leaves out of a report that has
+# no use for it.
+# They go to agent_instance, not system_info, so system_info stays static.
+INSTANCE_FIELDS: tuple[tuple[str, ...], ...] = (
     ("environment", "system_info", "hostname"),
     ("environment", "system_info", "fqdn"),
     ("environment", "system_info", "container", "id"),
     ("environment", "system_info", "container", "host_pid"),
     ("environment", "system_info", "process", "pid"),
     ("environment", "system_info", "process", "cwd"),
-    ("environment", "system_info", "process", "proc1_cmdline"),
 )
 
+# The attributes whose whole value is dynamic agent data. Published for every
+# consumer in schemas/attribute-groups.json (a test holds the two equal); an
+# attribute not named there is static.
+DYNAMIC_ATTRIBUTES = frozenset({"agent_instance"})
 
-def _without_run_fields(system_info: dict[str, Any]) -> dict[str, Any]:
+
+def _split_system_info(system_info: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """system_info's static part, and its dynamic fields for agent_instance."""
     stable = copy.deepcopy(system_info)
+    instance: dict[str, Any] = {}
     # The fallback is " ".join(platform.uname()), whose second field is the
-    # node name; `uname -srm` in a container has none.
+    # node name; `uname -srm` in a container has none. The node name is the
+    # hostname, which agent_instance carries.
     uname = stable.get("uname")
     if isinstance(uname, str):
         parts = uname.split(" ")
         if len(parts) > 1 and parts[1] and parts[1] == platform.node():
             stable["uname"] = " ".join(parts[:1] + parts[2:])
-    for path in REGISTRATION_ONLY_FIELDS:
+    for path in INSTANCE_FIELDS:
         node: Any = stable
+        target = instance
+        for key in path[2:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+            target = target.setdefault(key, {})
+        if isinstance(node, dict) and path[-1] in node:
+            target[path[-1]] = node.pop(path[-1])
+    for path in REGISTRATION_ONLY_FIELDS:
+        node = stable
         for key in path[2:-1]:
             node = node.get(key) if isinstance(node, dict) else None
         if isinstance(node, dict):
             node.pop(path[-1], None)
-    for key in ("container", "process"):
-        if stable.get(key) == {}:
-            del stable[key]
-    return stable
+    for part in (stable, instance):
+        for key in ("container", "process"):
+            if part.get(key) == {}:
+                del part[key]
+    return stable, instance
 
 
 def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1574,16 +1597,29 @@ def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
 
     system_info = environment.get("system_info")
     if system_info:
+        stable, instance = _split_system_info(system_info)
         attributes["system_info"] = _answered(
-            _without_run_fields(system_info), "observed", authored_by="none",
+            stable, "observed", authored_by="none",
             method="uname, /etc/os-release and runtime versions in the scanned runtime; "
                    "the scan's own platform otherwise",
-            note="per-run fields (hostname and the node name in uname, fqdn, container id, "
-                 "host pid, the scan's pid and cwd) are left out: they change with every "
-                 "recreate and are not the agent. PID 1's command line is left out as contents",
+            note="static: what the agent runs on. Where this copy runs now (hostname and "
+                 "the node name in uname, fqdn, container id, host pid, the scan's pid and "
+                 "cwd) is agent_instance. PID 1's command line is left out as contents",
         )
     else:
+        stable, instance = {}, {}
         attributes["system_info"] = _absent("the scan's system probe", "observed")
+
+    if instance:
+        attributes["agent_instance"] = _answered(
+            instance, "observed", authored_by="none",
+            method="the scan's system probe: hostname, the container's id and host pid; "
+                   "the scan's own host fqdn, pid and cwd",
+            note="dynamic (schemas/attribute-groups.json): where this copy runs now."
+                 " A restart, move or recreate changes it, so it is not drift",
+        )
+    else:
+        attributes["agent_instance"] = _absent("the scan's system probe", "observed")
 
     if user_info:
         attributes["user_info"] = _answered(
