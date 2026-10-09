@@ -102,7 +102,10 @@ anything again:
 A v1 bundle names no agent key, so a single scan with `--agent-key` (or
 `RAIL_AGENT_KEY`) sends it as `?agent_key=` on the register URL — joined beside
 any query the base URL carries, as for RailDash's ingest — and Rail Center
-files the registration under that key, as the payload's `agent_key` used to. A
+files the registration under that key, as the payload's `agent_key` used to.
+The key must follow the manifest key rule (`^[a-z0-9][a-z0-9._-]{0,63}$`), which
+Rail Center applies; any other key fails the registration (exit `2`, nothing
+sent) rather than being lowercased into a key RailDash does not use. A
 v2 collection carries its keys inside and is sent without one
 ([Multi-agent target manifest](#multi-agent-target-manifest)).
 

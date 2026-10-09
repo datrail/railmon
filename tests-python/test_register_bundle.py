@@ -276,6 +276,18 @@ class WireTest(unittest.TestCase):
         self.assertEqual(state["registration_url"], f"{center.url}/v1/agents/register?tenant=acme&agent_key=planner")
         self.assertEqual(self.read("features.json")["scan"]["registration_status"], "registered")
 
+    def test_a_key_outside_the_key_rule_is_refused_not_lowercased(self):
+        """Rail Center holds ?agent_key= to the manifest key rule. Lowercasing
+        here would file it under a key RailDash does not use, so it is refused,
+        nothing sent, and the rest of the scan still runs."""
+        center = self.server([(201, v1_answer())])
+        proc = self.run_scan(["--register", "--center-url", center.url, "--agent-key", "Planner"])
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(center.requests, [])
+        self.assertIn("--agent-key/RAIL_AGENT_KEY must match", proc.stderr)
+        self.assertTrue(Path(self.tmp, "bundle.json").exists())
+        self.assertEqual(self.read("features.json")["scan"]["registration_status"], "registration_failed")
+
     def test_an_unkeyed_v1_scan_sends_no_agent_key(self):
         center = self.server([(201, v1_answer())])
         proc = self.run_scan(["--register", "--center-url", center.url])

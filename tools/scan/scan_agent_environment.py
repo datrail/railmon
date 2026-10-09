@@ -3331,12 +3331,25 @@ def register_bundle(args: argparse.Namespace, data: bytes | None, payload: dict[
 
     A v1 bundle names no agent key, so a keyed scan (`--agent-key`) sends its
     key as `?agent_key=`, and rail-center files the registration under it
-    (RC-387), as the registration payload's `agent_key` used to.
+    (RC-387), as the registration payload's `agent_key` used to. A key outside
+    the manifest key rule (which Rail Center applies) is refused, nothing sent.
     """
     try:
         if data is None:
             raise ScannerError("rail-center registration failed: no verified evidence bundle to send")
         agent_key = configured_agent_key(args)
+        if agent_key is not None:
+            import compose_evidence_bundle_v2 as composer  # lazy: breaks the import cycle
+
+            if composer.KEY.fullmatch(agent_key) is None:
+                # Rail Center holds `?agent_key=` to the payload's own rule, the
+                # one manifest keys already follow. Not lowercased here: RailDash
+                # gets the key as given, and the two would file it differently.
+                raise ScannerError(
+                    "rail-center registration failed: --agent-key/RAIL_AGENT_KEY must match "
+                    f"{composer.KEY.pattern} (lowercase letters, digits, '.', '_', '-') to register; "
+                    f"got {_printable(agent_key, 80)!r}"
+                )
         center_url = configured_center_url(args)
         response = post_registration(center_url, data, auth_mode=args.auth_mode, agent_key=agent_key)
         store_registration(args, center_url, payload, response, registration_output_path(args), agent_key)
