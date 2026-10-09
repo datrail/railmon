@@ -1699,12 +1699,11 @@ def try_build_verified_bundle(
 
     `scan_agent_environment.main()` has two independent consumers of this one
     bundle (the `--evidence-bundle-output` file, a RailDash POST) and needs to
-    catch a build/verify failure once for both — but a `ScannerError` raised
-    here is this module's own lazily re-imported `scan_agent_environment`
-    class, not the identical-looking class the `__main__` script defines when
-    run directly, so `main()`'s own `except ScannerError` cannot catch it
-    reliably across that boundary. Caught here instead, symmetrically with
-    `write_evidence_bundle`.
+    catch a build/verify failure once for both. It runs from the scan's
+    `finally`, where raising would replace the error already unwinding, so it
+    is caught here, symmetrically with `write_evidence_bundle`. (Run as a
+    script, the scanner registers itself under its module name, so this lazy
+    import is the class `main()` catches too — DR-197.)
     """
     from scan_agent_environment import ScannerError  # lazy: no cycle at load
 
