@@ -183,8 +183,9 @@ The agent may be able to kill the probe: it shares the probe's PID
 namespace, though a host's security profile can stop it. The probe crashes or
 restarts too. A socket opened and closed while it was down is missed, so any
 restart leaves a gap, and the
-scan says so: `observed_listeners` goes PARTIAL, which is drift, in three
-cases:
+scan says so: `observed_listeners` goes PARTIAL, which is drift, for a
+probe gap in three cases (and also for lost events or past 256 distinct
+listeners):
 - a second start record;
 - a heartbeat older than three intervals;
 - no start record at all (the probe never attached).
@@ -253,11 +254,11 @@ The ones you are most likely to set:
 
 | Variable | Read by | Default | What it does |
 | --- | --- | --- | --- |
-| `RAIL_HOST_ID` | `scan` (`--host-id`) | none | Names the host in the evidence bundle and the registration; the same value RailProxy and the other Rail components on the host use. No fallback is invented: unset, the bundle fails its contract and `scan` exits 2 unless `--no-evidence-bundle` is given. |
-| `RAIL_AGENT_KEY` | `scan` (`--agent-key`) | none | The agent's key in RailDash, sent as `?agent_key=` with the bundle. RailDash needs it when the bundle carries no deployment pair (`RAIL_DEPLOYMENT` plus `RAIL_NAMESPACE`, or a Compose project and service). |
+| `RAIL_HOST_ID` | `scan` (`--host-id`) | none | Names the host in the evidence bundle and the registration; the same value RailProxy and the other Rail components on the host use. No fallback is invented: unset, the bundle fails its contract and `scan` exits 2 unless `--no-evidence-bundle` is given and no RailDash URL is set. |
+| `RAIL_AGENT_KEY` | `scan` (`--agent-key`) | none | The agent's key in RailDash, sent as `?agent_key=` with the bundle (and as `agent_key` in the `--register` payload). RailDash needs it when the bundle carries no deployment pair (`RAIL_DEPLOYMENT` plus `RAIL_NAMESPACE`, or a Compose project and service). |
 | `RAIL_RAILDASH_URL` | `scan` (`--raildash-url`) | none | Setting it is the request to deliver each evidence bundle to RailDash's `/v1/evidence-bundles`. |
 | `RAIL_RAILDASH_TOKEN` | `scan` | none | RailDash's local write token (`X-RailDash-Token`): the `RAILDASH_TOKEN` RailDash runs with, or else the contents of its persisted `<db path>.token`. Stable across RailDash restarts, except that an in-memory RailDash database without `RAILDASH_TOKEN` gets a new one on every start; RailDash never prints it. |
-| `RAIL_SCAN_INTERVAL_IN_SECONDS` | `scan` (`--interval`) | unset: scan once and exit | Keeps `scan` running and scans again on this interval (3600 if the value is not a number). |
+| `RAIL_SCAN_INTERVAL_IN_SECONDS` | `scan` (`--interval`) | unset: scan once and exit | Keeps `scan` running and scans again on this interval (3600 if the value is not a number). Set but empty counts as set, so it scans every 3600 seconds. |
 | `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. |
 | `RAIL_AUTH_MODE` | collector `--webhook`, `forward`, `scan --register` | `none` | The credential to present: `none`, `bearer` or `gcp`. See above for `RAIL_AUTH_TOKEN`, `RAIL_AUTH_TOKEN_FILE` and `RAIL_AUTH_AUDIENCE`. |
 | `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
@@ -265,7 +266,7 @@ The ones you are most likely to set:
 | `RAIL_FILES_FILE` | `scan` (`--files-file`), `files` | none | filesnoop's JSON lines: where `files` appends and `scan` reads. |
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
-| `AGENTSIGHT_PATH` | collector (`--agentsight`) | `bin/agentsight`; the image sets its own | The AgentSight probe binary. |
+| `AGENTSIGHT_PATH` | collector (`--agentsight`) | `SSLSNIFF_PATH`, else `bin/agentsight` if it exists, else `/usr/local/bin/agentsight`; the image sets its own | The AgentSight probe binary. |
 | `RAIL_COLLECT_CONTAINER` | `collect` | none | Capture one container's agent: see [Following a container](#following-a-container). |
 
 A flag always wins over its variable. `scan` exits 2 when the evidence bundle

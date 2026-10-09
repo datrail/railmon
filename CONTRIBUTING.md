@@ -40,7 +40,7 @@ http` and `--mode raw`.
 ## Development
 
 ```bash
-make test          # cargo fmt --check, clippy -D warnings, and the unit tests
+make test          # cargo fmt --check, clippy -D warnings, cargo test, and the Python tools' checks and tests
 make fetch-agentsight   # only needed to run outside the container
 ```
 

@@ -58,9 +58,11 @@ vulnerability here means.
   as sensitive as the traffic it captured.* It is not a sanitised artifact and
   must not be treated as one.
 
-  Bodies are, separately, often **incomplete**: an HTTP/1.1 streamed response is
-  recorded from its first SSL read only (measured at 81 of 532 bytes on one
-  Anthropic-shaped stream), and upstream caps a body at 1 MiB. Do not read
+  Bodies are, separately, often **incomplete**: an HTTP/1.1 response that is
+  neither chunked nor sized by `Content-Length` is recorded from its first SSL
+  read only, and a chunked reply past 1 MiB is dropped whole, leaving its
+  request incomplete (on agentsight 1.0.14 chunked replies were cut to their
+  first read too: 81 of 532 bytes on one Anthropic-shaped stream). Do not read
   capture as a completeness guarantee in either direction — it is neither
   redacted nor whole.
 - **`--mode raw` is not a redacted mode.** It forwards analyzer events directly.

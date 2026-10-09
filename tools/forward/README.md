@@ -59,9 +59,11 @@ date-time.
 
 Events are grouped by capture session, in batches of at most `--batch-size`
 (default 100, at most 1000) and 16 MiB of JSON. Each flush sends everything
-pending, and a flush happens every `--flush-count` events (default 1) or
-`--flush-interval` seconds, so with `--follow` raise `--flush-count` to get
-bigger batches. Rail Center answers 202 with `recorded`, `duplicates` and
+pending, and a flush happens every `--flush-count` events (default 1), or
+on the first event queued at least `--flush-interval` seconds after the last
+flush (the interval is checked when an event arrives, not on a timer), so
+with `--follow` raise `--flush-count` to get bigger batches, knowing that
+events then wait for the next one to arrive. Rail Center answers 202 with `recorded`, `duplicates` and
 `conflicts` counts, which the forwarder logs.
 
 A batch refused with 413 or 422 is halved and each half retried, so one bad
