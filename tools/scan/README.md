@@ -200,16 +200,27 @@ can serve both. `type`, `owner`, `llm_provider`, `sandbox_type`,
 `system_info` and `user_info` are the `agent_type`, `owner`, `llm_provider`,
 `sandbox_type`, `system_info` and `user_info` attributes (agent-scoped in a
 v2 bundle). `llm_model` is `model_name`, `skills` is `skills_inventory`, and
-the pair and agent key are in the envelope. The exceptions stay registration-only
-(`REGISTRATION_ONLY_FIELDS` in `evidence_bundle.py`; a test fails when a new
-payload field has no home). Most change with every scan run or container
-recreate, and a locked baseline would read them as drift on every pass:
-`system_info`'s `hostname`, `fqdn`, `container.id`, `container.host_pid`,
-`process.pid` and `process.cwd`, and the node name inside `uname` when the
-scan's own platform supplied it. `process.proc1_cmdline` is PID 1's command
-line: contents, not metadata (see Observed reach). Rule pack 8 adds these
-attributes, so RailDash shows a baseline locked under pack 7 as
-`CONTRACT_MISMATCH`, not as drift, until a pack-8 ASP is locked.
+the pair and agent key are in the envelope. A test fails when a new payload
+field has no home in the bundle.
+
+`system_info`'s fields that say where this copy runs now, not what the
+agent is, are the `agent_instance` attribute (`INSTANCE_FIELDS` in
+`evidence_bundle.py`): `hostname`, `container.id` and `container.host_pid`,
+which describe the agent's container in docker mode, and `fqdn`,
+`process.pid` and `process.cwd`, which describe the scan itself (its host's
+name, its own pid and working directory). A restarted scan, a recreated
+container or a move changes them. They are
+*dynamic* agent data, and everything else is *static*.
+`schemas/attribute-groups.json` publishes that grouping for every consumer:
+RailMon sends both groups, and a consumer such as RailDash's drift leaves the
+dynamic ones out (Rail Center's principles for agent data, 2026-10-08). The
+node name inside `uname`, when the scan's own platform supplied it, is cut
+from `system_info` for the same reason; it is the hostname. One field stays
+registration-only (`REGISTRATION_ONLY_FIELDS`): `process.proc1_cmdline`, PID
+1's command line, which is contents, not metadata (see Observed reach).
+Rule pack 8 added the registration attributes and rule pack 9 adds
+`agent_instance`, so RailDash shows a baseline locked under an older pack as
+`CONTRACT_MISMATCH`, not as drift, until a current ASP is locked.
 
 Attributes that are *absent* from the bundle rather than absent *on the
 agent* carry `method`: where the pack looked. The `deployment` attribute

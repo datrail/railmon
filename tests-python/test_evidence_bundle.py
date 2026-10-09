@@ -1026,8 +1026,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # (DR-166), so a pack-4 baseline is not compared against it; pack 6
         # makes observed_destinations BLIND without a snapshot (DR-168);
         # pack 7 folds observed_file_access's /proc/<pid> paths (DR-185);
-        # pack 8 adds the registration payload's fields (DR-189).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 8)
+        # pack 8 adds the registration payload's fields (DR-189); pack 9
+        # adds agent_instance, the dynamic ones pack 8 left out (DR-193).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 9)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
@@ -2116,6 +2117,7 @@ class RegistrationParityTest(unittest.TestCase):
     # A value of None means "outside `attributes`": the envelope, or v2's
     # agents[].agent_key.
     HOMES: dict[tuple[str, ...], tuple[str, ...] | None] = {
+        **{path: ("agent_instance", *path[2:]) for path in evidence_bundle.INSTANCE_FIELDS},
         ("type",): ("agent_type",),
         ("owner",): ("owner", "owner"),
         ("host_id",): None,
@@ -2196,10 +2198,13 @@ class RegistrationParityTest(unittest.TestCase):
         self.assertNotIn(platform.node(), json.dumps(attributes["system_info"]["value"]))
         self.assertEqual(attributes["llm_provider"]["value"], "anthropic")
         self.assertEqual(attributes["sandbox_type"]["value"], payload["environment"]["sandbox_type"])
-        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info"):
+        self.assertEqual(attributes["agent_instance"]["value"]["hostname"],
+                         payload["environment"]["system_info"]["hostname"])
+        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info",
+                     "agent_instance"):
             self.assertEqual(attributes[name]["status"], "ANSWERED", name)
 
-    def test_run_fields_stay_out_so_a_baseline_does_not_drift_on_them(self):
+    def test_run_fields_move_to_agent_instance_so_system_info_stays_static(self):
         system_info = {
             "os": "Linux", "hostname": "3f2a9c", "fqdn": "3f2a9c",
             "uname": f"Linux {platform.node()} 6.1.0 #1 SMP x86_64 ",
@@ -2212,7 +2217,30 @@ class RegistrationParityTest(unittest.TestCase):
             {"os": "Linux", "uname": "Linux 6.1.0 #1 SMP x86_64 ",
              "container": {"is_container": True, "name": "agent"}},
         )
+        self.assertEqual(
+            attributes["agent_instance"]["value"],
+            {"hostname": "3f2a9c", "fqdn": "3f2a9c",
+             "container": {"id": "3f2a9c...", "host_pid": 4242},
+             "process": {"pid": 17, "cwd": "/work"}},
+        )
+        self.assertNotIn("root:pw", json.dumps(attributes))
         self.assertEqual(system_info["process"]["pid"], 17, "the payload is not mutated")
+
+    def test_no_run_fields_is_an_absent_agent_instance(self):
+        attributes = evidence_bundle.registration_attributes(
+            {"environment": {"system_info": {"os": "Linux"}}}
+        )
+        self.assertEqual(attributes["agent_instance"]["status"], "ABSENT")
+        self.assertEqual(attributes["system_info"]["value"], {"os": "Linux"})
+
+    def test_the_published_groups_are_the_scanners(self):
+        groups = json.loads((ROOT / "schemas" / "attribute-groups.json").read_text())
+        self.assertEqual(set(groups) - {"$comment"}, {"dynamic"})
+        self.assertEqual(groups["dynamic"], sorted(evidence_bundle.DYNAMIC_ATTRIBUTES))
+        attributes = evidence_bundle.registration_attributes(
+            {"environment": {"system_info": {"hostname": "h"}}}
+        )
+        self.assertTrue(evidence_bundle.DYNAMIC_ATTRIBUTES <= set(attributes))
 
     def test_a_container_uname_keeps_every_field(self):
         attributes = evidence_bundle.registration_attributes(
@@ -2230,7 +2258,8 @@ class RegistrationParityTest(unittest.TestCase):
         attributes = evidence_bundle.registration_attributes(
             {"owner": "unknown", "environment": {"llm_provider": "unknown"}}
         )
-        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info"):
+        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info",
+                     "agent_instance"):
             self.assertEqual(attributes[name]["status"], "ABSENT", name)
             self.assertTrue(attributes[name]["method"], name)
 
@@ -2241,7 +2270,8 @@ class RegistrationParityTest(unittest.TestCase):
             "compose_evidence_bundle_v2", ROOT / "tools/scan/compose_evidence_bundle_v2.py")
         composer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(composer)
-        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info"):
+        for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info",
+                     "agent_instance"):
             self.assertNotIn(name, composer.SANDBOX_ATTRIBUTES)
 
 
