@@ -78,9 +78,10 @@ same agent and environment fingerprint the payload from the same scan would
 have registered — and stores the bundle as `POST /v1/evidence-bundles` does. It
 answers `201` when it created an agent and `200` otherwise, with the
 registration (`agent`, `token`, `expires_at`) plus `evidence_bundle_id` and
-`duplicate`; a v2 collection gets `{agents: [registration...],
-evidence_bundle_id, duplicate}`. It refuses a bundle with `422` (contract, or
-no `agent_type` answered), `409` (a `bundle_id` it holds with other bytes) or
+`duplicate`; a v2 collection gets `{agents: [registration...], skipped:
+[{agent_key, reason, attribute_reason}], evidence_bundle_id, duplicate}`. It
+refuses a bundle with `422` (contract; a v1 bundle that does not answer
+`agent_type`, or a v2 collection with no entry that does), `409` (a `bundle_id` it holds with other bytes) or
 `413` (too large), like its evidence-bundle ingest. This needs a Rail Center
 with RC-387; an older one refuses a bundle on this route with `422`.
 
@@ -98,11 +99,12 @@ anything again:
 [agent-environment-scanner] registered with rail-center: HTTP 200 agent_id=<id> bundle=duplicate state_file=.rail/railmon/registration.json
 ```
 
-A v1 bundle names no agent key, so Rail Center registers it as the sandbox's
-unkeyed agent. A single scan with `--agent-key` and `--register` is therefore
-refused (exit `2`, nothing sent) rather than registered under the wrong agent;
-keyed agents register through `--target-manifest`, whose v2 collection carries
-each key ([Multi-agent target manifest](#multi-agent-target-manifest)).
+A v1 bundle names no agent key, so a single scan with `--agent-key` (or
+`RAIL_AGENT_KEY`) sends it as `?agent_key=` on the register URL — joined beside
+any query the base URL carries, as for RailDash's ingest — and Rail Center
+files the registration under that key, as the payload's `agent_key` used to. A
+v2 collection carries its keys inside and is sent without one
+([Multi-agent target manifest](#multi-agent-target-manifest)).
 
 Run the skills scanner first if the agent uses OpenClaw/NemoClaw `SKILL.md`
 files:
@@ -731,12 +733,20 @@ v2 collection can be built (the manifest does not resolve, or the sandbox scan
 cannot name its `host_id`/`sandbox_name`), the sandbox-wide scan's own v1
 bundle is written, registered and delivered instead.
 
-Rail Center (RC-387) needs every `agents[]` entry to answer `agent_type`, and
-refuses the whole collection with `422` when one does not: an agent listed as
-`not_found`/`ambiguous`, or an `available` one with no `scan.config_roots`,
-carries no `agent_type`, so while such an agent is in the collection no agent
-in it is registered (the scan reports the `422` and exits `2`; the bundle is
-still written and delivered to RailDash).
+Rail Center (RC-387) registers only the `agents[]` entries that answer
+`agent_type` and lists the rest under `skipped` with a reason; the collection
+is still stored once. The scanner reports each skipped agent on stderr
+(`rail-center skipped agent '<key>': <reason>`) and writes no state for it. A
+placeholder — an agent listed as `not_found`/`ambiguous`, or an `available`
+one with no `scan.config_roots` — carries no `agent_type`, so skipping it is
+expected and, like that target being skipped by the scan itself, does not fail
+the collection or its siblings. An agent the collection did scan that comes
+back skipped, or not named at all, is a registration failure: its feature file
+says `registration_failed` and the scan exits `2`, while its siblings still
+register. Rail Center refuses a collection with no entry it can register, so
+when every agent in it is a placeholder the scanner sends nothing and says so
+(`not registering with rail-center: …`); like every target being not found,
+that is not a failure.
 
 The v2 schema also publishes an optional `window` member on an attribute
 (DR-169), for a list that holds only what the observation window saw: an

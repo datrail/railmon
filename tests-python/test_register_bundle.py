@@ -262,17 +262,25 @@ class WireTest(unittest.TestCase):
         self.assertEqual(printed, self.read("registration.json"))
         self.assertNotIn(TOKEN, proc.stdout)
 
-    def test_a_keyed_v1_scan_is_not_registered_as_the_unkeyed_agent(self):
-        """A v1 bundle names no agent key, so rail-center would file it under
-        the sandbox's unkeyed agent: refused, nothing sent, everything else
-        still written."""
+    def test_a_keyed_v1_scan_sends_its_key_as_a_query_parameter(self):
+        """A v1 bundle names no agent key, so a keyed scan names it on the URL,
+        and rail-center files the registration under it (RC-387)."""
         center = self.server([(201, v1_answer())])
-        proc = self.run_scan(["--register", "--center-url", center.url, "--agent-key", "planner"])
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertEqual(center.requests, [])
-        self.assertIn("register keyed agents with --target-manifest", proc.stderr)
-        self.assertTrue(Path(self.tmp, "bundle.json").exists())
-        self.assertEqual(self.read("features.json")["scan"]["registration_status"], "registration_failed")
+        proc = self.run_scan(["--register", "--center-url", f"{center.url}/?tenant=acme", "--agent-key", "planner"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        [request] = center.requests
+        self.assertEqual(request["path"], "/v1/agents/register?tenant=acme&agent_key=planner")
+        self.assertEqual(request["body"], Path(self.tmp, "bundle.json").read_bytes())
+        self.assertNotIn("agent_key", json.loads(request["body"]))
+        state = self.read("registration.json")
+        self.assertEqual(state["registration_url"], f"{center.url}/v1/agents/register?tenant=acme&agent_key=planner")
+        self.assertEqual(self.read("features.json")["scan"]["registration_status"], "registered")
+
+    def test_an_unkeyed_v1_scan_sends_no_agent_key(self):
+        center = self.server([(201, v1_answer())])
+        proc = self.run_scan(["--register", "--center-url", center.url])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(center.requests[0]["path"], "/v1/agents/register")
 
 
 class InProcessTest(unittest.TestCase):
@@ -409,6 +417,55 @@ class InProcessTest(unittest.TestCase):
         self.assertEqual(self.feature(".executor")["scan"]["registration_status"], "registration_failed")
         self.assertFalse(Path(self.tmp, "registration.json.executor").exists())
 
+    def test_a_skipped_placeholder_does_not_fail_its_siblings(self):
+        """An agent discovery did not find is a placeholder in the collection;
+        rail-center skips it, the scan reports it, and that is not a failure —
+        as a not_found target never fails the collection."""
+        targets = self.TARGETS[:1] + [{"agent_key": "critic", "status": "not_found", "reason": "no pid"}]
+        body = v2_answer(["planner"])
+        body["skipped"] = [{"agent_key": "critic", "reason": "agent_type is not ANSWERED"}]
+        args = self.args("--target-manifest", "/manifest.yaml")
+        code, post = self.collect(args, {"return_value": targets}, {"return_value": {"status": 201, "body": body}})
+
+        self.assertEqual(code, 0, self.stderr.getvalue())
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs.get("agent_key"), None)
+        sent = json.loads(post.call_args.args[1])
+        self.assertEqual([a["agent_key"] for a in sent["agents"]], ["critic", "planner"])
+        self.assertIn("rail-center skipped agent 'critic': agent_type is not ANSWERED", self.stderr.getvalue())
+        self.assertTrue(Path(self.tmp, "registration.json.planner").exists())
+        self.assertFalse(Path(self.tmp, "registration.json.critic").exists())
+        self.assertFalse(Path(self.tmp, "features.json.critic").exists())
+        self.assertEqual(self.feature(".planner")["scan"]["registration_status"], "registered")
+
+    def test_a_collection_of_only_placeholders_is_not_sent_and_not_a_failure(self):
+        """Rail Center refuses a collection with nothing to register; with every
+        declared agent not found there is nothing to register, as before."""
+        targets = [{"agent_key": "critic", "status": "not_found", "reason": "no pid"}]
+        args = self.args("--target-manifest", "/manifest.yaml")
+        code, post = self.collect(args, {"return_value": targets}, {"return_value": None})
+        self.assertEqual(code, 0, self.stderr.getvalue())
+        post.assert_not_called()
+        self.assertIn("not registering with rail-center: no agent in the collection", self.stderr.getvalue())
+        self.assertEqual(self.feature()["scan"]["registration_status"], "unregistered")
+        self.assertEqual(json.loads(Path(self.tmp, "bundle.json").read_text())["agents"][0]["agent_key"], "critic")
+
+    def test_a_skipped_scanned_agent_is_a_registration_failure(self):
+        """An agent this collection did scan should have registered; rail-center
+        skipping it fails it (and the run), without failing its sibling."""
+        body = v2_answer(["planner"])
+        body["skipped"] = [{"agent_key": "executor", "reason": "agent_type is not ANSWERED"}]
+        args = self.args("--target-manifest", "/manifest.yaml")
+        code, _ = self.collect(args, {"return_value": self.TARGETS}, {"return_value": {"status": 201, "body": body}})
+        self.assertEqual(code, 2)
+        self.assertIn(
+            "rail-center registration failed for agent 'executor': skipped: agent_type is not ANSWERED",
+            self.stderr.getvalue(),
+        )
+        self.assertEqual(self.feature(".planner")["scan"]["registration_status"], "registered")
+        self.assertEqual(self.feature(".executor")["scan"]["registration_status"], "registration_failed")
+        self.assertFalse(Path(self.tmp, "registration.json.executor").exists())
+
     def test_a_v2_registration_failure_still_writes_and_delivers_everything_else(self):
         failure = scanner.ScannerError("rail-center registration failed: HTTP 503: down")
         args = self.args("--target-manifest", "/manifest.yaml")
@@ -446,6 +503,33 @@ class RegistrationStateTest(unittest.TestCase):
         self.assertEqual(state["agent_id"], "a-a")
         self.assertIs(state["duplicate"], True)
         self.assertNotIn(TOKEN, repr(state))
+
+    def test_skipped_agents_are_read_with_their_reasons(self):
+        body = v2_answer([])
+        body["skipped"] = [
+            {"agent_key": "x", "reason": "agent_type_blind", "attribute_reason": "MULTI_AGENT_SCOPE_UNRESOLVED"},
+            {"agent_key": "y"},
+            {"agent_key": "z", "reason": "discovery_not_found", "attribute_reason": None},
+            "junk",
+        ]
+        self.assertEqual(
+            scanner.skipped_agent_keys({"body": body}),
+            {"x": "agent_type_blind (MULTI_AGENT_SCOPE_UNRESOLVED)", "y": "no reason given", "z": "discovery_not_found"},
+        )
+        self.assertEqual(scanner.skipped_agent_keys({"body": v2_answer([])}), {})
+        forged = v2_answer([])
+        forged["skipped"] = [{"agent_key": "x", "reason": "r\n[agent-environment-scanner] registered", "attribute_reason": "\x1b[2J"}]
+        self.assertEqual(
+            scanner.skipped_agent_keys({"body": forged}), {"x": "r?[agent-environment-scanner] registered (?[2J)"}
+        )
+
+    def test_the_registration_url_carries_a_key_query_safely(self):
+        self.assertEqual(scanner.registration_url("https://c", "k1"), "https://c/v1/agents/register?agent_key=k1")
+        self.assertEqual(
+            scanner.registration_url("https://c/api?tenant=a&agent_key=old", "new"),
+            "https://c/api/v1/agents/register?tenant=a&agent_key=new",
+        )
+        self.assertEqual(scanner.registration_url("https://c?tenant=a"), "https://c/v1/agents/register?tenant=a")
 
     def test_a_v1_shaped_answer_to_a_collection_is_refused(self):
         with self.assertRaises(scanner.ScannerError):

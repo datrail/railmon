@@ -2263,18 +2263,35 @@ def render_json(value: Any, compact: bool) -> str:
 REGISTRATION_PATH = "/v1/agents/register"
 
 
-def registration_url(center_url: str) -> str:
+def registration_url(center_url: str, agent_key: str | None = None) -> str:
     """The register endpoint, whether the base URL already names it or not.
 
     Appended to the parsed path rather than to the string: a base URL carrying a
     query would otherwise get the endpoint glued on after it, producing
     `…/register?x=1/v1/agents/register`.
+
+    `agent_key`, when given, rides as `?agent_key=` beside whatever query the base
+    URL already carried, replacing a stale one — the same joining
+    `evidence_bundle_ingest_url` does. Rail Center reads it for a v1 bundle, which
+    names no key of its own, and files the registration under it (RC-387); a v2
+    collection carries its keys inside and is sent without one.
     """
     parts = urlsplit(center_url)
     path = parts.path.rstrip("/")
     if not path.endswith(REGISTRATION_PATH):
         path += REGISTRATION_PATH
-    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
+    return urlunsplit((parts.scheme, parts.netloc, path, _query_with_agent_key(parts.query, agent_key), ""))
+
+
+def _query_with_agent_key(query: str, agent_key: str | None) -> str:
+    """`query` with any `agent_key` pair replaced by `agent_key`, or dropped when
+    there is none to send. An untouched query is returned byte for byte."""
+    if not agent_key and "agent_key" not in dict(parse_qsl(query, keep_blank_values=True)):
+        return query
+    pairs = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k != "agent_key"]
+    if agent_key:
+        pairs.append(("agent_key", agent_key))
+    return urlencode(pairs)
 
 
 DEFAULT_METADATA_HOST = "metadata.google.internal"
@@ -2412,6 +2429,7 @@ def post_registration(
     data: bytes,
     timeout: float = 15.0,
     auth_mode: str | None = None,
+    agent_key: str | None = None,
 ) -> dict[str, Any]:
     """POST this scan's evidence bundle, as raw bytes, to rail-center's register route.
 
@@ -2424,11 +2442,12 @@ def post_registration(
     `bundle_id` carrying different bytes (409). The registration payload is
     no longer sent anywhere; it is still the scan's local artifact.
 
-    The credential is `auth_headers`' (RAIL_AUTH_MODE), and a redirect is
-    refused rather than followed, so it never reaches another host.
+    `agent_key` is a keyed v1 scan's key, sent as `?agent_key=` (a v1 bundle
+    names none). The credential is `auth_headers`' (RAIL_AUTH_MODE), and a
+    redirect is refused rather than followed, so it never reaches another host.
     """
     req = Request(
-        registration_url(center_url),
+        registration_url(center_url, agent_key),
         data=data,
         headers={
             "Content-Type": "application/json",
@@ -2614,29 +2633,67 @@ def _register_v2_collection(
     data: bytes,
     agent_entries: list[dict[str, Any]],
     agent_scans: dict[str, argparse.Namespace],
-) -> tuple[bool, dict[str, bool]]:
+) -> tuple[bool | None, dict[str, bool], bool]:
     """Register one v2 collection with rail-center: one POST for every agent.
 
-    Returns whether the POST was answered, and which agent keys had their
-    registration state stored. Each agent's state goes to the keyed path
+    Returns whether the POST was answered (None: nothing to register, so
+    nothing was sent), which agent keys had their
+    registration state stored, and whether every agent that should have been
+    registered was. Each agent's state goes to the keyed path
     `run_one_collection` computes for it, from the response's own entry for
-    that `agent_key` (RC-387 answers `{agents: [...], evidence_bundle_id,
-    duplicate}`); an agent the response does not name fails on its own.
+    that `agent_key` (RC-387 answers `{agents: [...], skipped: [...],
+    evidence_bundle_id, duplicate}`).
+
+    An unanswered POST is a failure (`complete` False). An agent rail-center
+    lists under `skipped` is reported on stderr and gets
+    no state. When it is a placeholder — not scanned here, because discovery
+    did not find it or it declares no `scan.config_roots` — that is not a
+    failure: the scan already logs and skips such a target without failing
+    the collection, and its siblings still register. An agent this collection
+    did scan, skipped or not named at all, is a registration failure.
     """
     registered: dict[str, bool] = {}
+    if not any(entry["agent_key"] in agent_scans for entry in agent_entries):
+        # Every entry is a placeholder, which rail-center would skip, and it
+        # refuses a collection with nothing to register (422). Like a run whose
+        # every target is not found, that is nothing to register, not a failure.
+        print(
+            "[agent-environment-scanner] not registering with rail-center: no agent in the "
+            "collection was found and scanned",
+            file=sys.stderr,
+        )
+        return None, registered, True
     try:
         center_url = configured_center_url(args)
         response = post_registration(center_url, data, auth_mode=args.auth_mode)
         by_key = registrations_by_agent_key(response)
+        skipped = skipped_agent_keys(response)
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-        return False, registered
+        return False, registered, False
+    complete = True
     for entry in agent_entries:
         agent_key = entry["agent_key"]
         scan_args = agent_scans.get(agent_key)
         scan_result = getattr(scan_args, "_v2_scan_result", None) if scan_args is not None else None
+        # Scanned here: in `agent_scans`. A placeholder never was.
+        placeholder = scan_args is None
         payload = scan_result[1] if scan_result is not None else {}
         state_path = Path(_keyed_path(registration_output_path(args), agent_key))
+        if agent_key not in by_key and agent_key in skipped:
+            if placeholder:
+                print(
+                    f"[agent-environment-scanner] rail-center skipped agent '{agent_key}': {skipped[agent_key]}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"agent-environment-scanner: rail-center registration failed for agent '{agent_key}': "
+                    f"skipped: {skipped[agent_key]}",
+                    file=sys.stderr,
+                )
+                complete = False
+            continue
         try:
             if agent_key not in by_key:
                 raise ScannerError(f"rail-center registration response named no registration for agent '{agent_key}'")
@@ -2644,7 +2701,8 @@ def _register_v2_collection(
             registered[agent_key] = True
         except ScannerError as exc:
             print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-    return True, registered
+            complete = False
+    return True, registered, complete
 
 
 def _deliver_v2_collection(
@@ -2652,7 +2710,7 @@ def _deliver_v2_collection(
     sandbox_v1: dict[str, Any],
     agent_entries: list[dict[str, Any]],
     agent_scans: dict[str, argparse.Namespace] | None = None,
-) -> tuple[int, bool, dict[str, bool]]:
+) -> tuple[int, bool | None, dict[str, bool]]:
     """Compose, verify, and write/register/deliver exactly one evidence-bundle-v2
     collection — the shared `sandbox` scope from `sandbox_v1` plus every
     entry in `agent_entries` (already sorted-or-not; `compose_from_scopes`
@@ -2665,7 +2723,8 @@ def _deliver_v2_collection(
 
     Returns `(exit_code, collection_registered, registered_agent_keys)`:
     0 on success, 2 if any part failed; whether rail-center answered the
-    registration; and which agent keys had their registration state stored.
+    registration (None when there was nothing to register and nothing was
+    sent); and which agent keys had their registration state stored.
     """
     import compose_evidence_bundle_v2 as composer  # lazy: breaks the import cycle
     import evidence_bundle  # lazy: breaks the import cycle
@@ -2702,11 +2761,13 @@ def _deliver_v2_collection(
     # Built once above; every consumer below shares these exact bytes.
     data = evidence_bundle.render_bundle_bytes(collection, args.compact)
 
-    collection_registered = False
+    collection_registered: bool | None = False
     registered: dict[str, bool] = {}
     if args.register:
-        collection_registered, registered = _register_v2_collection(args, data, agent_entries, agent_scans or {})
-        if not collection_registered or len(registered) != len(agent_entries):
+        collection_registered, registered, complete = _register_v2_collection(
+            args, data, agent_entries, agent_scans or {}
+        )
+        if not complete:
             exit_code = 2
 
     if not args.no_evidence_bundle:
@@ -2773,7 +2834,7 @@ def run_one_collection(args: argparse.Namespace) -> int:
     # Agent-scoped scans whose feature file waits for the collection's
     # registration attempt, by agent key; the sandbox-wide scan's waits too.
     agent_scans: dict[str, argparse.Namespace] = {}
-    collection_registered = False
+    collection_registered: bool | None = False
     registered: dict[str, bool] = {}
     try:
         exit_code, collection_registered, registered = _collect(
@@ -2796,7 +2857,7 @@ def _collect(
     sandbox_scan_args: argparse.Namespace,
     agent_scans: dict[str, argparse.Namespace],
     exit_code: int,
-) -> tuple[int, bool, dict[str, bool]]:
+) -> tuple[int, bool | None, dict[str, bool]]:
     """`run_one_collection`'s body after the sandbox-wide scan. Returns the
     exit code, whether rail-center answered the v2 collection's registration,
     and which agent keys it registered. A scan whose feature file waits for
@@ -3041,10 +3102,7 @@ def evidence_bundle_ingest_url(raildash_url: str, agent_key: str | None = None) 
     path = parts.path.rstrip("/")
     if not path.endswith(EVIDENCE_BUNDLE_INGEST_PATH):
         path += EVIDENCE_BUNDLE_INGEST_PATH
-    query_pairs = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "agent_key"]
-    if agent_key:
-        query_pairs.append(("agent_key", agent_key))
-    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query_pairs), ""))
+    return urlunsplit((parts.scheme, parts.netloc, path, _query_with_agent_key(parts.query, agent_key), ""))
 
 
 def post_evidence_bundle(
@@ -3116,7 +3174,12 @@ def feature_output_path(args: argparse.Namespace) -> Path:
     return evidence_bundle.default_output(DEFAULT_FEATURE_OUTPUT, LEGACY_FEATURE_OUTPUT)
 
 
-def build_registration_state(center_url: str, payload: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+def build_registration_state(
+    center_url: str,
+    payload: dict[str, Any],
+    response: dict[str, Any],
+    agent_key: str | None = None,
+) -> dict[str, Any]:
     """What we keep from a registration: the agent id, and nothing that is a ticket.
 
     The response carries a `token`, and the scanner drops it on the floor. It is a
@@ -3141,7 +3204,7 @@ def build_registration_state(center_url: str, payload: dict[str, Any], response:
     return {
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "center_url": center_url.rstrip("/"),
-        "registration_url": registration_url(center_url),
+        "registration_url": registration_url(center_url, agent_key),
         "status": response.get("status"),
         "agent_id": agent.get("id"),
         "sandbox_id": agent.get("sandbox_id"),
@@ -3218,15 +3281,37 @@ def registrations_by_agent_key(response: dict[str, Any]) -> dict[str, dict[str, 
     return found
 
 
+def skipped_agent_keys(response: dict[str, Any]) -> dict[str, str]:
+    """The agents a v2 collection's answer says rail-center did not register,
+    with its reason for each: `skipped: [{agent_key, reason}]` (RC-387). A
+    placeholder entry — an agent discovery did not find, or one with nothing
+    scoped to scan — answers no `agent_type`, so it is skipped rather than
+    refusing its siblings."""
+    body = response.get("body")
+    skipped = body.get("skipped") if isinstance(body, dict) else None
+    found: dict[str, str] = {}
+    for entry in skipped if isinstance(skipped, list) else []:
+        key = entry.get("agent_key") if isinstance(entry, dict) else None
+        if isinstance(key, str):
+            # Rail Center's words, printed to stderr: made printable and bounded,
+            # so a response cannot forge a log line.
+            reason = entry.get("reason")
+            reason = _printable(reason, 120) if isinstance(reason, str) and reason else "no reason given"
+            detail = entry.get("attribute_reason")
+            found[key] = f"{reason} ({_printable(detail, 120)})" if isinstance(detail, str) and detail else reason
+    return found
+
+
 def store_registration(
     args: argparse.Namespace,
     center_url: str,
     payload: dict[str, Any],
     response: dict[str, Any],
     state_path: Path,
+    agent_key: str | None = None,
 ) -> None:
     """Keep one agent's registration state (never a ticket) and report it."""
-    state = build_registration_state(center_url, payload, response)
+    state = build_registration_state(center_url, payload, response, agent_key)
     store_json(state_path, state, args.compact)
     if args.output_register_response:
         print(render_json(state, args.compact))
@@ -3244,26 +3329,17 @@ def register_bundle(args: argparse.Namespace, data: bytes | None, payload: dict[
     `data` is None when the bundle failed to build or verify (already
     reported): with nothing to send, the registration fails too.
 
-    A v1 bundle names no agent key — rail-center registers it as the
-    sandbox's unkeyed agent (RC-387) — so a keyed scan (`--agent-key`) is
-    refused rather than registered under the wrong agent. Keyed agents
-    register through `--target-manifest`, whose v2 collection carries each
-    key. (The registration payload used to carry `agent_key`; DR-188 stopped
-    sending it.)
+    A v1 bundle names no agent key, so a keyed scan (`--agent-key`) sends its
+    key as `?agent_key=`, and rail-center files the registration under it
+    (RC-387), as the registration payload's `agent_key` used to.
     """
     try:
         if data is None:
             raise ScannerError("rail-center registration failed: no verified evidence bundle to send")
         agent_key = configured_agent_key(args)
-        if agent_key:
-            raise ScannerError(
-                f"rail-center registration failed: agent key '{agent_key}' cannot be registered from a v1 "
-                "evidence bundle, which names no agent key (rail-center would register it as the sandbox's "
-                "unkeyed agent); register keyed agents with --target-manifest"
-            )
         center_url = configured_center_url(args)
-        response = post_registration(center_url, data, auth_mode=args.auth_mode)
-        store_registration(args, center_url, payload, response, registration_output_path(args))
+        response = post_registration(center_url, data, auth_mode=args.auth_mode, agent_key=agent_key)
+        store_registration(args, center_url, payload, response, registration_output_path(args), agent_key)
         return True
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
@@ -3623,16 +3699,20 @@ def run_one_scan(args: argparse.Namespace) -> int:
     return 2 if output_failed or code else 0
 
 
-def _write_deferred_feature_file(scan_args: argparse.Namespace, registered: bool) -> bool:
+def _write_deferred_feature_file(scan_args: argparse.Namespace, registered: bool | None) -> bool:
     """The feature file `run_one_scan` left for a `_v2_collection` scan, written
-    once the collection's registration was attempted. True when there was
-    nothing to write or it was written."""
+    once the collection's registration was attempted. `registered` None means
+    there was nothing to register, so nothing was sent: `unregistered`, not a
+    failed registration. True when there was nothing to write or it was
+    written."""
     if not getattr(scan_args, "_feature_deferred", False):
         return True
     scan_args._feature_deferred = False
     context, payload, identity = scan_args._v2_scan_result
     if scan_args.register and registered:
         identity["registration_status"] = "registered"
+    elif scan_args.register and registered is None:
+        identity["registration_status"] = "unregistered"
     return write_feature_file(scan_args, context, payload, identity)
 
 
