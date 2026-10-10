@@ -51,7 +51,7 @@ The scanner uses this read-only flow:
    - Each result is emitted as a rail-center-compatible `SkillInput`.
 
 Trigger-based scanning is implemented by polling and hashing the generated
-output. When the hash changes, the scanner emits or registers the new payload.
+output. When the hash changes, the scanner emits the new payload.
 Time-based scanning uses the same scan path on a fixed interval, for example
 `--daily` for every 24 hours.
 
@@ -206,18 +206,11 @@ python3 tools/skills/skill_scanner.py \
   --llm-model tinyllama
 ```
 
-To register directly with rail-center:
-
-```bash
-python3 tools/skills/skill_scanner.py \
-  --agent openclaw \
-  --container "$OPENCLAW_CONTAINER" \
-  --register \
-  --center-url http://localhost:23001 \
-  --owner "$USER" \
-  --llm-provider local \
-  --llm-model tinyllama
-```
+The scanner does not register with Rail Center: `--register`,
+`--center-url` and `--output-register-response` are refused (exit 2). Rail
+Center takes one set of agent data per agent, the evidence bundle that
+`railmon scan --register` sends to `/v1/agents/register`, and that bundle
+carries these skills as `skills_inventory`.
 
 For richer environment detection, use
 `tools/scan/scan_agent_environment.py` and replace its

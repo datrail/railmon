@@ -22,9 +22,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
 
 
 DEFAULT_AGENT_ROOTS = (
@@ -499,7 +497,7 @@ def build_registration_payload(args: argparse.Namespace, skills: list[dict[str, 
 
 def output_object(args: argparse.Namespace) -> Any:
     skills = scan_skills(args)
-    if args.payload or args.register:
+    if args.payload:
         return build_registration_payload(args, skills)
     return skills
 
@@ -523,47 +521,8 @@ def write_output(args: argparse.Namespace, value: Any) -> None:
         print(text, end="")
 
 
-def registration_url(center_url: str) -> str:
-    cleaned = center_url.rstrip("/")
-    if cleaned.endswith("/v1/agents/register"):
-        return cleaned
-    return f"{cleaned}/v1/agents/register"
-
-
-def post_registration(center_url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(
-        registration_url(center_url),
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return {"status": resp.status, "body": json.loads(body) if body else None}
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise ScannerError(f"rail-center registration failed: HTTP {exc.code}: {body}") from exc
-    except (URLError, OSError) as exc:
-        raise ScannerError(f"rail-center registration failed: {exc}") from exc
-
-
 def emit_once(args: argparse.Namespace) -> Any:
     value = output_object(args)
-    if args.register:
-        if not isinstance(value, dict):
-            raise ScannerError("--register requires registration payload output")
-        if not args.center_url:
-            raise ScannerError("--center-url is required with --register")
-        response = post_registration(args.center_url, value)
-        if args.output_register_response:
-            value = {"registration_payload": value, "registration_response": response}
-        else:
-            print(
-                f"[skills-scanner] registered with rail-center: HTTP {response['status']}",
-                file=sys.stderr,
-            )
     write_output(args, value)
     return value
 
@@ -580,14 +539,6 @@ def run_loop(args: argparse.Namespace) -> int:
         due = args.interval_seconds > 0 and now >= next_time_scan
 
         if changed or due:
-            if args.register:
-                if not args.center_url:
-                    raise ScannerError("--center-url is required with --register")
-                response = post_registration(args.center_url, value)
-                print(
-                    f"[skills-scanner] registered with rail-center: HTTP {response['status']}",
-                    file=sys.stderr,
-                )
             write_output(args, value)
             last_hash = digest
             if args.interval_seconds > 0:
@@ -648,17 +599,17 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--agent", choices=["auto", "openclaw", "nemoclaw"], default="auto")
     parser.add_argument("--agent-type", choices=["personal", "service"], default="personal")
-    parser.add_argument("--owner", help="Owner value for --payload/--register.")
+    parser.add_argument("--owner", help="Owner value for --payload.")
     parser.add_argument("--sandbox-type", help="Sandbox override, e.g. openclaw or nemo_claw.")
-    parser.add_argument("--llm-provider", help="LLM provider for --payload/--register.")
-    parser.add_argument("--llm-model", help="LLM model for --payload/--register.")
-    parser.add_argument("--register", action="store_true", help="POST the generated payload to rail-center.")
-    parser.add_argument("--center-url", help="rail-center base URL or /v1/agents/register URL.")
-    parser.add_argument(
-        "--output-register-response",
-        action="store_true",
-        help="Include rail-center response in stdout/output when --register is used.",
-    )
+    parser.add_argument("--llm-provider", help="LLM provider for --payload.")
+    parser.add_argument("--llm-model", help="LLM model for --payload.")
+    # Kept only to refuse them by name (DR-198): Rail Center takes one set of
+    # agent data, the scan's evidence bundle, which carries these skills as
+    # skills_inventory. A second, partial registration from this tool would be
+    # a second copy of that data on the same route.
+    parser.add_argument("--register", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--center-url", help=argparse.SUPPRESS)
+    parser.add_argument("--output-register-response", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -667,8 +618,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.daily:
         args.interval_seconds = 86_400.0
-    if args.register:
-        args.payload = True
+    if args.register or args.center_url is not None or args.output_register_response:
+        print(
+            "skills-scanner: --register, --center-url and --output-register-response are retired; "
+            "`railmon scan --register` sends Rail Center the evidence bundle, which carries these "
+            "skills as skills_inventory",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         if args.watch or args.interval_seconds > 0:
