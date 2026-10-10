@@ -134,6 +134,29 @@ instead. A token set beside `none` is refused as a likely
 misconfiguration. RailDash's webhook ignores the header, so the default needs
 no change for a local stack.
 
+RailDash's own credential is separate. With `RAIL_RAILDASH_TOKEN`, or
+`RAIL_RAILDASH_TOKEN_FILE` (re-read on every batch, so a rotated token needs
+no restart; setting both is refused), every webhook batch also carries
+RailDash's local write token in `X-RailDash-Token`, beside whatever
+`RAIL_AUTH_MODE` puts in `Authorization`. RailDash's guardrails count only
+captures that carry it. It goes to whatever `--webhook` names, so set it only
+when the webhook is RailDash. The collector then also posts a heartbeat,
+`{"collector_id", "taps_attached", "sent_at"}`, every 60 s while at least one
+tap is attached, so RailDash can tell a quiet agent from a stopped collector.
+The first goes one interval after start, none goes while every manifest
+target is down, and none goes without the token, since RailDash refuses those.
+Its URL is the webhook's scheme, host and port with the path
+`/webhook/heartbeat`; a webhook path ending in `/webhook/http-interactions`
+keeps whatever prefix comes before it (`/raildash/webhook/http-interactions`
+becomes `/raildash/webhook/heartbeat`). It uses the webhook's 10 s timeout and
+follows no redirect, and presents the same `RAIL_AUTH_MODE` credential as a
+batch; a heartbeat whose credential can't be produced is skipped, never sent
+without it. A failed heartbeat (any non-2xx) is logged once until the
+outcome changes and never stops capture. A token that can't be read stops the
+collector at startup and later drops the batch, like a credential, and the
+token never appears in a log line. Logs name the heartbeat URL without its
+userinfo, query or fragment.
+
 To monitor several agents in one sandbox, each attributed separately, see
 [docs/multi-agent-targets.md](docs/multi-agent-targets.md).
 
@@ -254,10 +277,12 @@ The ones you are most likely to set:
 
 | Variable | Read by | Default | What it does |
 | --- | --- | --- | --- |
-| `RAIL_HOST_ID` | `scan` (`--host-id`) | none | Names the host in the evidence bundle and the registration; the same value RailProxy and the other Rail components on the host use. No fallback is invented: unset, the bundle fails its contract and `scan` exits 2 unless `--no-evidence-bundle` is given and no RailDash URL is set. |
+| `RAIL_HOST_ID` | `scan` (`--host-id`), collector heartbeat | none | Names the host in the evidence bundle and the registration; the same value RailProxy and the other Rail components on the host use. No fallback is invented: unset, the bundle fails its contract and `scan` exits 2 unless `--no-evidence-bundle` is given and no RailDash URL is set. The collector's heartbeat `collector_id` is it (else the hostname), `:`, and the collector's PID. |
 | `RAIL_AGENT_KEY` | `scan` (`--agent-key`) | none | The agent's key in RailDash, sent as `?agent_key=` with the bundle. With `--register` a single scan also sends it to Rail Center as `?agent_key=`, since a v1 bundle names no key; there it must match `^[a-z0-9][a-z0-9._-]{0,63}$`. RailDash needs it when the bundle carries no deployment pair (`RAIL_DEPLOYMENT` plus `RAIL_NAMESPACE`, or a Compose project and service). |
 | `RAIL_RAILDASH_URL` | `scan` (`--raildash-url`) | none | Setting it is the request to deliver each evidence bundle to RailDash's `/v1/evidence-bundles`. |
-| `RAIL_RAILDASH_TOKEN` | `scan` | none | RailDash's local write token (`X-RailDash-Token`): the `RAILDASH_TOKEN` RailDash runs with, or else the contents of its persisted `<db path>.token`. Stable across RailDash restarts, except that an in-memory RailDash database without `RAILDASH_TOKEN` gets a new one on every start; RailDash never prints it. |
+| `RAIL_RAILDASH_TOKEN` | `scan`, collector `--webhook` | none | RailDash's local write token (`X-RailDash-Token`): the `RAILDASH_TOKEN` RailDash runs with, or else the contents of its persisted `<db path>.token`. Stable across RailDash restarts, except that an in-memory RailDash database without `RAILDASH_TOKEN` gets a new one on every start; RailDash never prints it. The collector sends it on every webhook batch and heartbeat (see [Architecture](#architecture)). |
+| `RAIL_RAILDASH_TOKEN_FILE` | collector `--webhook` | none | A file holding that token instead, re-read on every batch and heartbeat. Not with `RAIL_RAILDASH_TOKEN`. |
+| `RAIL_HEARTBEAT_INTERVAL` | collector `--webhook` | `60` | Seconds between heartbeats, for tests (0.1 to 3600; anything that is not a positive number means 60). RailDash treats a collector with no heartbeat for 3 minutes as stopped. |
 | `RAIL_SCAN_INTERVAL_IN_SECONDS` | `scan` (`--interval`) | unset: scan once and exit | Keeps `scan` running and scans again on this interval (3600 if the value is not a number). Set but empty counts as set, so it scans every 3600 seconds. |
 | `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. `scan --register` sends it the evidence bundle at `/v1/agents/register` (needs Rail Center with RC-387). |
 | `RAIL_AUTH_MODE` | collector `--webhook`, `forward`, `scan --register` | `none` | The credential to present: `none`, `bearer` or `gcp`. See above for `RAIL_AUTH_TOKEN`, `RAIL_AUTH_TOKEN_FILE` and `RAIL_AUTH_AUDIENCE`. |
