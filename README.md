@@ -139,7 +139,8 @@ RailDash's own credential is separate. With `RAIL_RAILDASH_TOKEN`, or
 no restart; setting both is refused), every webhook batch also carries
 RailDash's local write token in `X-RailDash-Token`, beside whatever
 `RAIL_AUTH_MODE` puts in `Authorization`. RailDash's guardrails count only
-captures that carry it. The collector then also posts a heartbeat,
+captures that carry it. It goes to whatever `--webhook` names, so set it only
+when the webhook is RailDash. The collector then also posts a heartbeat,
 `{"collector_id", "taps_attached", "sent_at"}`, every 60 s while at least one
 tap is attached, so RailDash can tell a quiet agent from a stopped collector.
 The first goes one interval after start, none goes while every manifest
@@ -148,10 +149,13 @@ Its URL is the webhook's scheme, host and port with the path
 `/webhook/heartbeat`; a webhook path ending in `/webhook/http-interactions`
 keeps whatever prefix comes before it (`/raildash/webhook/http-interactions`
 becomes `/raildash/webhook/heartbeat`). It uses the webhook's 10 s timeout and
-follows no redirect. A failed heartbeat (any non-2xx) is logged once until the
+follows no redirect, and presents the same `RAIL_AUTH_MODE` credential as a
+batch; a heartbeat whose credential can't be produced is skipped, never sent
+without it. A failed heartbeat (any non-2xx) is logged once until the
 outcome changes and never stops capture. A token that can't be read stops the
 collector at startup and later drops the batch, like a credential, and the
-token never appears in a log line.
+token never appears in a log line. Logs name the heartbeat URL without its
+userinfo, query or fragment.
 
 To monitor several agents in one sandbox, each attributed separately, see
 [docs/multi-agent-targets.md](docs/multi-agent-targets.md).

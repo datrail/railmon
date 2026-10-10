@@ -364,7 +364,7 @@ async fn main() -> Result<()> {
             "webhook carries RailDash's write token ({}); heartbeat as {} to {} every {}s while a tap is attached",
             token.source(),
             heartbeat.collector_id(),
-            heartbeat.url(),
+            heartbeat.logged_url(),
             heartbeat.interval().as_secs_f64()
         );
     }
@@ -488,7 +488,7 @@ async fn main() -> Result<()> {
 
             // The one tap is attached for as long as its probe's output runs;
             // the loop ends with it.
-            _ = heartbeat_ticker.tick(), if sink.heartbeat_interval().is_some() => sink.heartbeat(1),
+            _ = heartbeat_ticker.tick(), if sink.heartbeat_interval().is_some() => sink.heartbeat(1).await,
 
             _ = shutdown.requested() => {
                 log::info!("interrupted");
@@ -1409,7 +1409,7 @@ async fn run_multi_target(
             // Counted from the taps actually running, not from the process:
             // with every target down this stays up and sends nothing.
             _ = heartbeat_ticker.tick(), if sink.heartbeat_interval().is_some() => {
-                sink.heartbeat(attached_taps(&targets, &shared))
+                sink.heartbeat(attached_taps(&targets, &shared)).await
             }
             _ = shutdown.requested() => break 'capture,
         }

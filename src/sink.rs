@@ -138,12 +138,41 @@ impl Sink {
         self.heartbeat.as_ref().map(Heartbeat::interval)
     }
 
-    /// One heartbeat for `taps_attached` taps, off the capture loop; nothing
-    /// with no tap attached or no token.
-    pub fn heartbeat(&mut self, taps_attached: usize) {
-        if let Some(heartbeat) = self.heartbeat.as_mut() {
-            heartbeat.send(taps_attached);
+    /// One heartbeat for `taps_attached` taps; nothing with no tap attached
+    /// or no token. It presents the webhook's `RAIL_AUTH_MODE` credential,
+    /// produced here within the webhook's deadline; one that can't be
+    /// produced skips the heartbeat rather than sending it without (RM-F2).
+    /// The POST itself runs off the capture loop.
+    pub async fn heartbeat(&mut self, taps_attached: usize) {
+        let (Some(heartbeat), Some(hook)) = (self.heartbeat.as_mut(), self.webhook.as_mut()) else {
+            return;
+        };
+        if !heartbeat.due(taps_attached) {
+            return;
         }
+        let authorization =
+            match tokio::time::timeout(WEBHOOK_FLUSH_DEADLINE, hook.credential.authorization())
+                .await
+            {
+                Ok(Ok(authorization)) => authorization,
+                Ok(Err(error)) => {
+                    heartbeat.skipped(format!(
+                        "RAIL_AUTH_MODE={} could not produce a credential, so it was not sent \
+                         without one: {error:#}",
+                        hook.credential.mode()
+                    ));
+                    return;
+                }
+                Err(_) => {
+                    heartbeat.skipped(format!(
+                        "RAIL_AUTH_MODE={} credential took over {}s, so it was not sent",
+                        hook.credential.mode(),
+                        WEBHOOK_FLUSH_DEADLINE.as_secs()
+                    ));
+                    return;
+                }
+            };
+        heartbeat.send(taps_attached, authorization.as_deref());
     }
 
     pub fn heartbeat_settings(&self) -> Option<&Heartbeat> {
@@ -305,7 +334,11 @@ impl Webhook {
                 }
                 Ok(Err(error)) => {
                     self.failures += 1;
-                    log::warn!("webhook POST failed for {count} interaction(s): {error}");
+                    // Without the URL: reqwest's would quote its userinfo.
+                    log::warn!(
+                        "webhook POST failed for {count} interaction(s): {}",
+                        error.without_url()
+                    );
                 }
                 Err(_) => {
                     let dropped = batch_count - batch_index;
@@ -557,7 +590,7 @@ mod tests {
             .with_raildash_token(None, Duration::from_secs(60))
             .unwrap();
         assert_eq!(s.heartbeat_interval(), None);
-        s.heartbeat(1);
+        s.heartbeat(1).await;
         s.emit(&json!({"id": 1})).await.unwrap();
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -596,7 +629,7 @@ mod tests {
             .unwrap();
         assert_eq!(s.heartbeat_interval(), Some(Duration::from_secs(60)));
         assert_eq!(
-            s.heartbeat_settings().map(Heartbeat::url),
+            s.heartbeat_settings().map(Heartbeat::logged_url),
             Some(format!("{origin}/webhook/heartbeat").as_str())
         );
 
@@ -613,6 +646,41 @@ mod tests {
             );
             assert!(head.contains("authorization: bearer rc-1\r\n"), "{head}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_presents_the_webhook_credential_or_is_not_sent() {
+        let (origin, seen) = crate::heartbeat::tests::fake_receiver(vec![200, 200]);
+        let dir = tempfile::tempdir().unwrap();
+        let rc_token = dir.path().join("rc-token");
+        std::fs::write(&rc_token, "rc-1\n").unwrap();
+        let credential = Credential::from_lookup(|name| match name {
+            "RAIL_AUTH_MODE" => Some("bearer".into()),
+            "RAIL_AUTH_TOKEN_FILE" => Some(rc_token.to_str().unwrap().into()),
+            _ => None,
+        })
+        .unwrap();
+        let mut s = webhook_sink(&format!("{origin}/webhook/http-interactions"))
+            .with_credential(credential)
+            .with_raildash_token(
+                Some(RailDashToken::Value("dash".into())),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        s.heartbeat(1).await;
+        s.heartbeat.as_mut().unwrap().settle().await;
+        // The credential can no longer be produced: skipped, not sent bare.
+        std::fs::remove_file(&rc_token).unwrap();
+        s.heartbeat(1).await;
+        s.heartbeat.as_mut().unwrap().settle().await;
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let head = &requests[0].0;
+        assert!(head.starts_with("post /webhook/heartbeat "), "{head}");
+        assert!(head.contains("authorization: bearer rc-1\r\n"), "{head}");
+        assert!(head.contains("x-raildash-token: dash\r\n"), "{head}");
     }
 
     #[tokio::test]

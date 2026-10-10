@@ -61,6 +61,7 @@ class Recorder(BaseHTTPRequestHandler):
         token = self.headers.get("X-RailDash-Token")
         if self.path == "/webhook/heartbeat":
             self.server.heartbeats.append((token, body))
+            self.server.heartbeat_auth.append(self.headers.get("Authorization"))
             self.send_response(self.server.heartbeat_status)
         else:
             paths = [i.get("request", {}).get("path") for i in body.get("interactions", [])]
@@ -73,7 +74,7 @@ class Run:
     def __init__(self, root: pathlib.Path):
         self.root = root
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Recorder)
-        self.server.posts, self.server.heartbeats = [], []
+        self.server.posts, self.server.heartbeats, self.server.heartbeat_auth = [], [], []
         self.server.heartbeat_status = 200
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.host = f"127.0.0.1:{self.server.server_address[1]}"
@@ -85,7 +86,7 @@ class Run:
         self.server.shutdown()
         self.server.server_close()
 
-    def start(self, **env_vars) -> subprocess.Popen:
+    def start(self, userinfo: str = "", **env_vars) -> subprocess.Popen:
         env = {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
         env.update({"RAIL_HEARTBEAT_INTERVAL": "0.5", **env_vars})
         return subprocess.Popen(
@@ -93,7 +94,7 @@ class Run:
                 str(BINARY),
                 "--agentsight", str(self.probe),
                 "--pid", str(os.getpid()),
-                "--webhook", f"http://{self.host}/webhook/http-interactions",
+                "--webhook", f"http://{userinfo}{self.host}/webhook/http-interactions",
                 "--batch-size", "1",
                 "--flush-interval", "0.2",
             ],
@@ -158,9 +159,28 @@ def case_token_beside_bearer_and_heartbeat(root: pathlib.Path) -> None:
             require(body["taps_attached"] == 1, f"body: {body}")
             require(body["collector_id"] == f"hb-host:{proc.pid}", f"body: {body}")
             require(body["sent_at"].endswith("Z"), f"body: {body}")
+        require(
+            run.server.heartbeat_auth and set(run.server.heartbeat_auth) == {"Bearer rc-s3cret"},
+            f"heartbeat credential: {run.server.heartbeat_auth}",
+        )
         require("s3cret" not in stderr, "a token reached the log")
     finally:
         run.close()
+
+
+def case_userinfo_never_logged(root: pathlib.Path) -> None:
+    run = Run(root)
+    run.server.heartbeat_status = 500
+    proc = run.start(userinfo="alice:hunter2@", RAIL_RAILDASH_TOKEN="dash")
+    try:
+        run.wait_for(proc, lambda: len(run.server.posts) >= 1 and len(run.server.heartbeats) >= 2)
+    finally:
+        run.close()  # unreachable from here on, so transport errors are logged too
+    time.sleep(4)  # the second interaction and more heartbeats fail
+    stderr = run.stop(proc)
+    require("heartbeat to http://127.0.0.1:" in stderr, f"no heartbeat line:\n{stderr}")
+    require("POST failed" in stderr, f"no transport failure logged:\n{stderr}")
+    require("hunter2" not in stderr, f"userinfo reached the log:\n{stderr}")
 
 
 def case_refused_heartbeat_never_stops_capture(root: pathlib.Path) -> None:
@@ -208,6 +228,7 @@ def main() -> None:
         case_unset_sends_no_token_and_no_heartbeat,
         case_token_beside_bearer_and_heartbeat,
         case_refused_heartbeat_never_stops_capture,
+        case_userinfo_never_logged,
         case_both_forms_refused,
     ]
     for case in cases:

@@ -8,9 +8,14 @@
 //! liveness: in manifest mode the collector stays up with every target down,
 //! and a heartbeat then would report capture that isn't happening.
 //!
+//! It also presents the webhook's `RAIL_AUTH_MODE` credential, so a RailDash
+//! behind an authenticating proxy sees the same caller; a heartbeat whose
+//! credential can't be produced is skipped, never sent without one (RM-F2).
+//!
 //! Best-effort, like a webhook batch: a failed heartbeat is logged when the
 //! outcome changes, and it never stops capture. The POST runs off the capture
-//! loop, so a hung receiver holds up no event reads.
+//! loop, so a hung receiver holds up no event reads. Logs name the URL without
+//! its userinfo, query or fragment.
 
 use crate::auth::RailDashToken;
 use anyhow::{bail, Context, Result};
@@ -25,6 +30,8 @@ const MAX_COLLECTOR_ID: usize = 128;
 
 pub struct Heartbeat {
     url: String,
+    /// `url` as logged: no userinfo, query or fragment.
+    logged_url: String,
     client: reqwest::Client,
     token: RailDashToken,
     collector_id: String,
@@ -43,8 +50,10 @@ impl Heartbeat {
         token: RailDashToken,
         interval: Duration,
     ) -> Result<Self> {
+        let url = heartbeat_url(webhook)?;
         Ok(Self {
-            url: heartbeat_url(webhook)?,
+            logged_url: redacted_url(&url),
+            url,
             client,
             token,
             collector_id: collector_id(
@@ -60,8 +69,9 @@ impl Heartbeat {
         })
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    /// The heartbeat URL as it may be logged, without userinfo.
+    pub fn logged_url(&self) -> &str {
+        &self.logged_url
     }
 
     pub fn interval(&self) -> Duration {
@@ -72,12 +82,13 @@ impl Heartbeat {
         &self.collector_id
     }
 
-    /// Posts one heartbeat for `taps_attached` taps in the background. Sends
-    /// nothing with no tap attached, or while the previous one is still in
-    /// flight (only possible with a test interval under the 10 s timeout).
-    pub fn send(&mut self, taps_attached: usize) {
+    /// Whether a heartbeat for `taps_attached` taps should go now: not with
+    /// no tap attached, nor while the previous one is still in flight (only
+    /// possible with a test interval under the 10 s timeout). The caller asks
+    /// before producing a credential for it.
+    pub fn due(&self, taps_attached: usize) -> bool {
         if !should_send(taps_attached) {
-            return;
+            return false;
         }
         if self
             .in_flight
@@ -85,28 +96,46 @@ impl Heartbeat {
             .is_some_and(|task| !task.is_finished())
         {
             log::debug!("previous heartbeat still in flight; skipping this one");
+            return false;
+        }
+        true
+    }
+
+    /// Records a heartbeat that could not be sent, logged like a failed one.
+    pub fn skipped(&self, reason: String) {
+        note_outcome(&self.last_failure, &self.logged_url, Err(reason));
+    }
+
+    /// Posts one heartbeat for `taps_attached` taps in the background, with
+    /// `authorization` (the webhook's `RAIL_AUTH_MODE` credential) when there
+    /// is one. Sends nothing unless `due`.
+    pub fn send(&mut self, taps_attached: usize, authorization: Option<&str>) {
+        if !self.due(taps_attached) {
             return;
         }
         // Re-read on every heartbeat, so a rotated token needs no restart.
         let token = match self.token.value() {
             Ok(token) => token,
             Err(error) => {
-                note_outcome(&self.last_failure, &self.url, Err(format!("{error:#}")));
+                self.skipped(format!("{error:#}"));
                 return;
             }
         };
-        let request = self
+        let mut request = self
             .client
             .post(&self.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("X-RailDash-Token", token)
-            .body(heartbeat_body(
-                &self.collector_id,
-                taps_attached,
-                chrono::Utc::now(),
-            ));
+            .header("X-RailDash-Token", token);
+        if let Some(value) = authorization {
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let request = request.body(heartbeat_body(
+            &self.collector_id,
+            taps_attached,
+            chrono::Utc::now(),
+        ));
         let last_failure = self.last_failure.clone();
-        let url = self.url.clone();
+        let url = self.logged_url.clone();
         self.in_flight = Some(tokio::spawn(async move {
             let outcome = match request.send().await {
                 Ok(resp) if resp.status().is_success() => Ok(()),
@@ -115,7 +144,8 @@ impl Heartbeat {
                     resp.status()
                 )),
                 Ok(resp) => Err(format!("returned {}", resp.status())),
-                Err(error) => Err(format!("POST failed: {error}")),
+                // Without the URL: reqwest's would quote its userinfo.
+                Err(error) => Err(format!("POST failed: {}", error.without_url())),
             };
             note_outcome(&last_failure, &url, outcome);
         }));
@@ -189,6 +219,21 @@ pub fn heartbeat_url(webhook: &str) -> Result<String> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url.into())
+}
+
+/// `url` with no userinfo, query or fragment, for logs. A URL that doesn't
+/// parse is not quoted at all.
+pub fn redacted_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.into()
+        }
+        Err(_) => "(the --webhook URL)".to_string(),
+    }
 }
 
 /// Stable for the process: `RAIL_HOST_ID`, else the hostname, then `:` and
@@ -279,6 +324,33 @@ pub(crate) mod tests {
         ] {
             assert_eq!(heartbeat_url(webhook).unwrap(), expected, "{webhook}");
         }
+    }
+
+    #[test]
+    fn the_logged_url_has_no_userinfo_query_or_fragment() {
+        assert_eq!(
+            redacted_url("http://alice:hunter2@127.0.0.1:9/webhook/heartbeat?k=v#f"),
+            "http://127.0.0.1:9/webhook/heartbeat"
+        );
+        assert_eq!(redacted_url("https://bob@h/p"), "https://h/p");
+        assert!(!redacted_url("not a url hunter2").contains("hunter2"));
+        let heartbeat = Heartbeat::new(
+            "http://alice:hunter2@127.0.0.1:9/webhook/http-interactions",
+            reqwest::Client::new(),
+            RailDashToken::Value("t".into()),
+            HEARTBEAT_INTERVAL,
+        )
+        .unwrap();
+        assert_eq!(
+            heartbeat.logged_url(),
+            "http://127.0.0.1:9/webhook/heartbeat"
+        );
+        // The request itself still carries the userinfo it was given.
+        assert!(
+            heartbeat.url.contains("alice:hunter2@"),
+            "{}",
+            heartbeat.url
+        );
     }
 
     #[test]
@@ -416,15 +488,15 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        heartbeat.send(0);
+        heartbeat.send(0, Some("Bearer rc"));
         heartbeat.settle().await;
         assert!(seen.lock().unwrap().is_empty(), "sent with no tap attached");
 
-        heartbeat.send(2);
+        heartbeat.send(2, None);
         heartbeat.settle().await;
         // Rotated: the next heartbeat reads the file again.
         std::fs::write(&path, "second\n").unwrap();
-        heartbeat.send(1);
+        heartbeat.send(1, Some("Bearer rc-1"));
         heartbeat.settle().await;
         assert_eq!(
             heartbeat.last_failure.lock().unwrap().as_deref(),
@@ -433,13 +505,22 @@ pub(crate) mod tests {
 
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        for ((head, body), (token, taps)) in requests.iter().zip([("first", 2), ("second", 1)]) {
+        for ((head, body), (token, taps, authorization)) in requests
+            .iter()
+            .zip([("first", 2, None), ("second", 1, Some("bearer rc-1"))])
+        {
             assert!(head.starts_with("post /webhook/heartbeat "), "{head}");
             assert!(
                 head.contains(&format!("x-raildash-token: {token}\r\n")),
                 "{head}"
             );
-            assert!(!head.contains("authorization"), "{head}");
+            match authorization {
+                Some(value) => assert!(
+                    head.contains(&format!("authorization: {value}\r\n")),
+                    "{head}"
+                ),
+                None => assert!(!head.contains("authorization"), "{head}"),
+            }
             let body: Value = serde_json::from_str(body).unwrap();
             assert_eq!(body["taps_attached"], taps);
             assert_eq!(body["collector_id"], heartbeat.collector_id());
@@ -457,7 +538,7 @@ pub(crate) mod tests {
             HEARTBEAT_INTERVAL,
         )
         .unwrap();
-        heartbeat.send(1);
+        heartbeat.send(1, None);
         heartbeat.settle().await;
         assert!(seen.lock().unwrap().is_empty());
         let failure = heartbeat.last_failure.lock().unwrap().clone().unwrap();
