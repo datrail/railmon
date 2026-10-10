@@ -8,6 +8,7 @@
 //! and a port that quietly renamed them would break every caller for no gain.
 
 mod auth;
+mod heartbeat;
 mod http1_guard;
 mod identity;
 mod interaction;
@@ -302,6 +303,21 @@ async fn main() -> Result<()> {
         None => auth::Credential::None,
     };
 
+    // RailDash's local write token, separate from RAIL_AUTH_MODE's: checked
+    // the same way, and read once now so an unreadable file stops here.
+    let raildash_token = match args.webhook.as_deref() {
+        Some(_) => {
+            let token = auth::RailDashToken::from_env().context("RAIL_RAILDASH_TOKEN")?;
+            if let Some(token) = token.as_ref() {
+                token
+                    .value()
+                    .context("reading the RailDash token RAIL_RAILDASH_TOKEN_FILE names")?;
+            }
+            token
+        }
+        None => None,
+    };
+
     // Fail on a missing binary before opening sinks or claiming to capture:
     // the old failure mode was a collector that looked alive and produced
     // nothing.
@@ -338,7 +354,20 @@ async fn main() -> Result<()> {
         &capture_start,
     )
     .context("configuring output")?
-    .with_credential(credential);
+    .with_credential(credential)
+    .with_raildash_token(
+        raildash_token.clone(),
+        heartbeat::interval_from_lookup(|name| std::env::var(name).ok()),
+    )?;
+    if let (Some(token), Some(heartbeat)) = (raildash_token.as_ref(), sink.heartbeat_settings()) {
+        log::info!(
+            "webhook carries RailDash's write token ({}); heartbeat as {} to {} every {}s while a tap is attached",
+            token.source(),
+            heartbeat.collector_id(),
+            heartbeat.url(),
+            heartbeat.interval().as_secs_f64()
+        );
+    }
 
     // rail-center has no RuntimeInteraction endpoint: POST /v1/interactions
     // takes HttpInteractionPayload, which is the legacy-http shape. Posting the
@@ -394,6 +423,7 @@ async fn main() -> Result<()> {
     let mut stream_ended = false;
     let mut ticker = tokio::time::interval(flush_interval.max(Duration::from_millis(100)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat_ticker = heartbeat_ticker(sink.heartbeat_interval());
     // A paired (or expired) interaction as the chosen output format writes it.
     let format_row = |paired: serde_json::Value| match args.output_format {
         OutputFormat::LegacyHttp => paired,
@@ -455,6 +485,10 @@ async fn main() -> Result<()> {
                 report.maybe_log(pairer.unmatched_responses(), pending_timeout);
                 sink.flush_if_due().await
             }
+
+            // The one tap is attached for as long as its probe's output runs;
+            // the loop ends with it.
+            _ = heartbeat_ticker.tick(), if sink.heartbeat_interval().is_some() => sink.heartbeat(1),
 
             _ = shutdown.requested() => {
                 log::info!("interrupted");
@@ -934,6 +968,22 @@ fn unmatched_responses(
             .sum::<u64>()
 }
 
+/// Taps whose probe is running: a target's own, and one per shared session.
+/// A tap leaves both collections when its probe ends or it is stopped.
+fn attached_taps(targets: &[Option<TargetRuntime>], shared: &BTreeMap<u32, SharedTap>) -> usize {
+    targets.iter().flatten().count() + shared.len()
+}
+
+/// Fires first one interval after start, not at once: a probe that cannot
+/// attach exits within that interval, so no heartbeat claims its capture.
+/// Without a heartbeat the timer is never polled (the arm's guard is false).
+fn heartbeat_ticker(every: Option<Duration>) -> tokio::time::Interval {
+    let every = every.unwrap_or(heartbeat::HEARTBEAT_INTERVAL);
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
+
 /// The collector no longer exits when every target is simultaneously down
 /// (it keeps retrying discovery instead), which means an operator watching
 /// only the process's exit code would never learn that capture went fully
@@ -944,7 +994,7 @@ fn log_target_availability_transition(
     shared: &BTreeMap<u32, SharedTap>,
     all_targets_down: &mut bool,
 ) {
-    let now = targets.iter().all(Option::is_none) && shared.is_empty();
+    let now = attached_taps(targets, shared) == 0;
     if now && !*all_targets_down {
         log::warn!(
             "every declared target is currently down; capture is idle and will keep retrying discovery every {}s",
@@ -1075,6 +1125,7 @@ async fn run_multi_target(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut retry_ticker = tokio::time::interval(TARGET_RETRY_INTERVAL);
     retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat_ticker = heartbeat_ticker(sink.heartbeat_interval());
     let mut write_error = None;
     let mut all_targets_down = false;
     let pending_timeout = pending_timeout(args);
@@ -1355,6 +1406,11 @@ async fn run_multi_target(
                 report.maybe_log(unmatched_responses(&targets, &shared), pending_timeout);
                 sink.flush_if_due().await
             }
+            // Counted from the taps actually running, not from the process:
+            // with every target down this stays up and sends nothing.
+            _ = heartbeat_ticker.tick(), if sink.heartbeat_interval().is_some() => {
+                sink.heartbeat(attached_taps(&targets, &shared))
+            }
             _ = shutdown.requested() => break 'capture,
         }
     }
@@ -1459,6 +1515,34 @@ agents:
         );
         // Different binaries in one session: the collector-wide default.
         assert_eq!(plans[&10].binary_path.as_deref(), Some("/usr/bin/default"));
+    }
+
+    #[test]
+    fn the_heartbeat_counts_running_taps_not_declared_targets() {
+        let manifest = manifest();
+        let runtime = |index: usize| TargetRuntime {
+            agent_ref: manifest.agent_ref(&manifest.agents[index]),
+            process: process(10 + index as u32, 10 + index as u32, 1000),
+            pairer: Pairer::new(),
+        };
+        let mut shared = BTreeMap::new();
+        // Every target down: the collector is up, but no heartbeat goes.
+        assert_eq!(attached_taps(&[None, None, None, None], &shared), 0);
+
+        let targets = vec![Some(runtime(0)), None, Some(runtime(2)), None];
+        assert_eq!(attached_taps(&targets, &shared), 2);
+        shared.insert(
+            30,
+            SharedTap {
+                candidates: vec!["executor".into(), "writer".into()],
+                incarnations: vec![process(30, 30, 1000)],
+                reason: "collides".into(),
+                binary_path: None,
+                pairer: Pairer::new(),
+            },
+        );
+        assert_eq!(attached_taps(&targets, &shared), 3);
+        assert_eq!(attached_taps(&[None, None, None, None], &shared), 1);
     }
 
     #[test]

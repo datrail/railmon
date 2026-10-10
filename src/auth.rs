@@ -227,6 +227,69 @@ impl GcpIdentity {
     }
 }
 
+/// RailDash's local write token (DR-184), sent as `X-RailDash-Token` beside
+/// whatever `RAIL_AUTH_MODE` puts in `Authorization`: the two are different
+/// receivers' credentials, so neither replaces the other. It comes from
+/// `RAIL_RAILDASH_TOKEN`, as for `scan`, or from the file
+/// `RAIL_RAILDASH_TOKEN_FILE` names, which is re-read on every use like
+/// `RAIL_AUTH_TOKEN_FILE`; setting both is refused. Messages name the
+/// variable, never the value, and it has no `Debug` so `{:?}` can't either.
+#[derive(Clone)]
+pub enum RailDashToken {
+    Value(String),
+    File(PathBuf),
+}
+
+impl RailDashToken {
+    /// The token the environment configures, `None` when neither variable is
+    /// set (or both are empty), or a refusal saying why.
+    pub fn from_env() -> Result<Option<Self>> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let get = |name: &str| {
+            lookup(name)
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default()
+        };
+        let token = get("RAIL_RAILDASH_TOKEN");
+        let token_file = get("RAIL_RAILDASH_TOKEN_FILE");
+        match (token.is_empty(), token_file.is_empty()) {
+            (true, true) => Ok(None),
+            (false, false) => {
+                bail!("RAIL_RAILDASH_TOKEN and RAIL_RAILDASH_TOKEN_FILE are both set; unset one")
+            }
+            (true, false) => Ok(Some(Self::File(PathBuf::from(token_file)))),
+            (false, true) => Ok(Some(Self::Value(header_safe(
+                &token,
+                "RAIL_RAILDASH_TOKEN",
+            )?))),
+        }
+    }
+
+    /// The header value, the file read afresh.
+    pub fn value(&self) -> Result<String> {
+        match self {
+            Self::Value(token) => Ok(token.clone()),
+            Self::File(path) => {
+                let raw = std::fs::read_to_string(path).with_context(|| {
+                    format!("reading RAIL_RAILDASH_TOKEN_FILE {}", path.display())
+                })?;
+                header_safe(&raw, "RAIL_RAILDASH_TOKEN_FILE")
+            }
+        }
+    }
+
+    /// Which variable configured it, for log lines that must not quote it.
+    pub fn source(&self) -> &'static str {
+        match self {
+            Self::Value(_) => "RAIL_RAILDASH_TOKEN",
+            Self::File(_) => "RAIL_RAILDASH_TOKEN_FILE",
+        }
+    }
+}
+
 /// `raw` trimmed, or a refusal naming `name` and the offending offset.
 ///
 /// Trailing whitespace is stripped because every ordinary way of writing a
@@ -497,6 +560,77 @@ mod tests {
         .unwrap();
         let message = format!("{:#}", c.authorization().await.unwrap_err());
         assert!(message.contains("404"), "{message}");
+    }
+
+    fn raildash(vars: &[(&str, &str)]) -> Result<Option<RailDashToken>> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        RailDashToken::from_lookup(|name| map.get(name).cloned())
+    }
+
+    #[test]
+    fn no_raildash_token_unless_one_is_set() {
+        assert!(raildash(&[]).unwrap().is_none());
+        assert!(raildash(&[("RAIL_RAILDASH_TOKEN", " ")]).unwrap().is_none());
+        // Independent of RAIL_AUTH_MODE, in both directions.
+        assert!(raildash(&[("RAIL_AUTH_TOKEN", "a")]).unwrap().is_none());
+        let token = raildash(&[("RAIL_RAILDASH_TOKEN", " d-1\n"), ("RAIL_AUTH_MODE", "gcp")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.value().unwrap(), "d-1");
+        assert_eq!(token.source(), "RAIL_RAILDASH_TOKEN");
+    }
+
+    #[test]
+    fn both_raildash_token_forms_are_refused() {
+        let message = format!(
+            "{:#}",
+            raildash(&[
+                ("RAIL_RAILDASH_TOKEN", "s3cret"),
+                ("RAIL_RAILDASH_TOKEN_FILE", "/run/t"),
+            ])
+            .err()
+            .unwrap()
+        );
+        assert!(message.contains("both set"), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+    }
+
+    #[test]
+    fn a_raildash_token_that_cannot_go_in_a_header_is_refused_by_offset() {
+        let message = format!(
+            "{:#}",
+            raildash(&[("RAIL_RAILDASH_TOKEN", "ab cd")]).err().unwrap()
+        );
+        assert!(message.contains("U+0020 at offset 2"), "{message}");
+        assert!(!message.contains("ab"), "{message}");
+    }
+
+    #[test]
+    fn the_raildash_token_file_is_reread_so_rotation_needs_no_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "first\n").unwrap();
+        let token = raildash(&[("RAIL_RAILDASH_TOKEN_FILE", path.to_str().unwrap())])
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.source(), "RAIL_RAILDASH_TOKEN_FILE");
+        assert_eq!(token.value().unwrap(), "first");
+        std::fs::write(&path, "second\n").unwrap();
+        assert_eq!(token.value().unwrap(), "second");
+
+        std::fs::write(&path, "bad\u{7f}\n").unwrap();
+        let message = format!("{:#}", token.value().unwrap_err());
+        assert!(
+            message.contains("RAIL_RAILDASH_TOKEN_FILE holds U+007F"),
+            "{message}"
+        );
+        assert!(!message.contains("bad"), "{message}");
+        std::fs::remove_file(&path).unwrap();
+        let message = format!("{:#}", token.value().unwrap_err());
+        assert!(message.contains("RAIL_RAILDASH_TOKEN_FILE"), "{message}");
     }
 
     #[test]

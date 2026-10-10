@@ -5,7 +5,8 @@
 //! or when the flush interval expires, so a quiet agent's last few interactions
 //! are not stranded in a buffer waiting for traffic that never comes.
 
-use crate::auth::Credential;
+use crate::auth::{Credential, RailDashToken};
+use crate::heartbeat::Heartbeat;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::Write;
@@ -23,6 +24,7 @@ const WEBHOOK_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 pub struct Sink {
     file: Option<std::fs::File>,
     webhook: Option<Webhook>,
+    heartbeat: Option<Heartbeat>,
     written: u64,
     /// Batch metadata Rail Center requires on the envelope.
     session_id: String,
@@ -38,6 +40,7 @@ struct Webhook {
     last_flush: Instant,
     failures: u64,
     credential: Credential,
+    raildash_token: Option<RailDashToken>,
 }
 
 impl Sink {
@@ -90,7 +93,9 @@ impl Sink {
                 last_flush: Instant::now(),
                 failures: 0,
                 credential: Credential::None,
+                raildash_token: None,
             }),
+            heartbeat: None,
             written: 0,
             session_id: session_id.to_string(),
             capture_start: capture_start.to_string(),
@@ -104,6 +109,45 @@ impl Sink {
             hook.credential = credential;
         }
         self
+    }
+
+    /// RailDash's local write token (DR-184): every webhook batch carries it
+    /// in `X-RailDash-Token`, and a heartbeat goes to the webhook's receiver
+    /// every `heartbeat_interval` while a tap is attached. `None` changes
+    /// nothing; so does a sink without a webhook.
+    pub fn with_raildash_token(
+        mut self,
+        token: Option<RailDashToken>,
+        heartbeat_interval: Duration,
+    ) -> Result<Self> {
+        if let (Some(hook), Some(token)) = (self.webhook.as_mut(), token) {
+            self.heartbeat = Some(Heartbeat::new(
+                &hook.url,
+                hook.client.clone(),
+                token.clone(),
+                heartbeat_interval,
+            )?);
+            hook.raildash_token = Some(token);
+        }
+        Ok(self)
+    }
+
+    /// How often the capture loop should call `heartbeat`, `None` when it
+    /// should not.
+    pub fn heartbeat_interval(&self) -> Option<Duration> {
+        self.heartbeat.as_ref().map(Heartbeat::interval)
+    }
+
+    /// One heartbeat for `taps_attached` taps, off the capture loop; nothing
+    /// with no tap attached or no token.
+    pub fn heartbeat(&mut self, taps_attached: usize) {
+        if let Some(heartbeat) = self.heartbeat.as_mut() {
+            heartbeat.send(taps_attached);
+        }
+    }
+
+    pub fn heartbeat_settings(&self) -> Option<&Heartbeat> {
+        self.heartbeat.as_ref()
     }
 
     /// True when neither destination is configured — the caller warns rather
@@ -205,6 +249,24 @@ impl Webhook {
             }
         };
 
+        // Read once per flush too, so a rotated file needs no restart. One
+        // that can't be read drops the batches, as a credential does: a
+        // capture without the token never counts toward a guardrail, and the
+        // operator asked for one.
+        let raildash_token = match self.raildash_token.as_ref().map(RailDashToken::value) {
+            None => None,
+            Some(Ok(token)) => Some(token),
+            Some(Err(error)) => {
+                self.failures += batch_count as u64;
+                log::warn!(
+                    "RailDash's write token could not be read; dropping {batch_count} webhook \
+                     batch(es) rather than sending them without it: {error:#}"
+                );
+                self.last_flush = Instant::now();
+                return;
+            }
+        };
+
         for (batch_index, interactions) in batches.into_iter().enumerate() {
             let count = interactions.len();
             let body = webhook_body(interactions, session_id, capture_start);
@@ -225,6 +287,9 @@ impl Webhook {
                 .header(reqwest::header::CONTENT_TYPE, "application/json");
             if let Some(value) = authorization.as_deref() {
                 request = request.header(reqwest::header::AUTHORIZATION, value);
+            }
+            if let Some(token) = raildash_token.as_deref() {
+                request = request.header("X-RailDash-Token", token);
             }
             let request = request.body(body).send();
             match tokio::time::timeout_at(deadline, request).await {
@@ -471,5 +536,116 @@ mod tests {
         let batches =
             split_webhook_batches(interactions, "s-1", "start", usize::MAX, usize::MAX, 1_000);
         assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [1_000, 1]);
+    }
+
+    fn webhook_sink(url: &str) -> Sink {
+        Sink::new(
+            None,
+            Some(url),
+            1,
+            Duration::from_secs(2),
+            "s-1",
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_a_raildash_token_batches_carry_no_header_and_no_heartbeat_goes() {
+        let (origin, seen) = crate::heartbeat::tests::fake_receiver(vec![200]);
+        let mut s = webhook_sink(&format!("{origin}/webhook/http-interactions"))
+            .with_raildash_token(None, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(s.heartbeat_interval(), None);
+        s.heartbeat(1);
+        s.emit(&json!({"id": 1})).await.unwrap();
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .0
+                .starts_with("post /webhook/http-interactions "),
+            "{}",
+            requests[0].0
+        );
+        assert!(
+            !requests[0].0.contains("x-raildash-token"),
+            "{}",
+            requests[0].0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_raildash_token_rides_beside_the_credential_and_is_reread() {
+        let (origin, seen) = crate::heartbeat::tests::fake_receiver(vec![200, 200]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "dash-1\n").unwrap();
+        let credential = Credential::from_lookup(|name| match name {
+            "RAIL_AUTH_MODE" => Some("bearer".into()),
+            "RAIL_AUTH_TOKEN" => Some("rc-1".into()),
+            _ => None,
+        })
+        .unwrap();
+        let mut s = webhook_sink(&format!("{origin}/webhook/http-interactions"))
+            .with_credential(credential)
+            .with_raildash_token(
+                Some(RailDashToken::File(path.clone())),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(s.heartbeat_interval(), Some(Duration::from_secs(60)));
+        assert_eq!(
+            s.heartbeat_settings().map(Heartbeat::url),
+            Some(format!("{origin}/webhook/heartbeat").as_str())
+        );
+
+        s.emit(&json!({"id": 1})).await.unwrap();
+        std::fs::write(&path, "dash-2\n").unwrap();
+        s.emit(&json!({"id": 2})).await.unwrap();
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for ((head, _), token) in requests.iter().zip(["dash-1", "dash-2"]) {
+            assert!(
+                head.contains(&format!("x-raildash-token: {token}\r\n")),
+                "{head}"
+            );
+            assert!(head.contains("authorization: bearer rc-1\r\n"), "{head}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_raildash_token_drops_the_batch_rather_than_sending_it_bare() {
+        let (origin, seen) = crate::heartbeat::tests::fake_receiver(vec![200]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = webhook_sink(&origin)
+            .with_raildash_token(
+                Some(RailDashToken::File(dir.path().join("missing"))),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        s.emit(&json!({"id": 1})).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(s.webhook.as_ref().unwrap().failures, 1);
+    }
+
+    #[tokio::test]
+    async fn a_token_without_a_webhook_changes_nothing() {
+        let s = Sink::new(
+            None,
+            None,
+            10,
+            Duration::from_secs(2),
+            "s-1",
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap()
+        .with_raildash_token(
+            Some(RailDashToken::Value("t".into())),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(s.heartbeat_interval(), None);
     }
 }
