@@ -61,7 +61,10 @@ What the collector checks beyond the schema, and what a violation looks like:
   (`control path … is owned by monitored uid N`).
 - **`scan.config_roots` for a registered agent.** The scanner skips the
   agent-scoped scan and registration of an available agent that declares none
-  (`executor` above), so its ticket claims are never corroborated.
+  (`executor` above), so its ticket claims are never corroborated. With
+  `--register`, Rail Center registers the agents of the one evidence collection
+  and skips an entry like this one (or one not found), which answers no
+  `agent_type`; the scanner reports the skip, and its siblings still register.
 - `sandbox.access` is validated but not yet used by the collector; the scanner
   still reaches the container through its own `--mode docker --container`.
 

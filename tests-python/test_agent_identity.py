@@ -898,7 +898,7 @@ class GcpAndRedirectTest(unittest.TestCase):
         fresh = _jwt(int(time.time()) + 3600)
         self.plane.identities = [(200, fresh)]
         os.environ.update(RAIL_AUTH_AUDIENCE="aud", GCE_METADATA_HOST=self.plane.host)
-        result = scanner.post_registration(f"http://{self.plane.host}", {"x": 1}, auth_mode="gcp")
+        result = scanner.post_registration(f"http://{self.plane.host}", b'{"x": 1}', auth_mode="gcp")
         self.assertEqual(result["status"], 201)
         self.assertEqual(self.plane.seen[-1], ("POST", "/v1/agents/register", f"Bearer {fresh}"))
 
@@ -906,7 +906,7 @@ class GcpAndRedirectTest(unittest.TestCase):
         self.plane.redirect = f"http://{self.plane.host}/elsewhere"
         os.environ["RAIL_AUTH_TOKEN"] = "t-1"
         with self.assertRaises(scanner.ScannerError) as caught:
-            scanner.post_registration(f"http://{self.plane.host}", {"x": 1}, auth_mode="bearer")
+            scanner.post_registration(f"http://{self.plane.host}", b'{"x": 1}', auth_mode="bearer")
         self.assertIn("HTTP 302", str(caught.exception))
         self.assertEqual(self.plane.seen, [("POST", "/v1/agents/register", "Bearer t-1")])
 
@@ -2443,6 +2443,7 @@ class RunOneCollectionTest(unittest.TestCase):
             evidence_bundle_output=None,
             no_evidence_bundle=True,
             raildash_url=None,
+            register=False,
             host_id="host-01",
             sandbox_name="shared-agents",
             compact=True,
@@ -2594,10 +2595,10 @@ class RunOneCollectionTest(unittest.TestCase):
         scope_calls = iter([(sandbox_v1, {"env": {}}), (planner_v1, {"env": {}})])
         delivered = {}
 
-        def fake_deliver(args, sandbox, agent_entries):
+        def fake_deliver(args, sandbox, agent_entries, agent_scans=None):
             delivered["sandbox"] = sandbox
             delivered["agent_entries"] = {e["agent_key"]: e for e in agent_entries}
-            return 0
+            return 0, False, {}
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
@@ -2633,10 +2634,10 @@ class RunOneCollectionTest(unittest.TestCase):
         scope_calls = iter([(None, {"env": {}}), (planner_v1, {"env": {}})])
         delivered = {}
 
-        def fake_deliver(args, sandbox, agent_entries):
+        def fake_deliver(args, sandbox, agent_entries, agent_scans=None):
             delivered["sandbox"] = sandbox
             delivered["agent_entries"] = agent_entries
-            return 0
+            return 0, False, {}
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
@@ -2702,9 +2703,9 @@ class RunOneCollectionTest(unittest.TestCase):
         scope_calls = iter([(sandbox_v1, {"env": {}}), (None, {"env": {}}), (executor_v1, {"env": {}})])
         delivered = {}
 
-        def fake_deliver(args, sandbox, agent_entries):
+        def fake_deliver(args, sandbox, agent_entries, agent_scans=None):
             delivered["agent_entries"] = {e["agent_key"]: e for e in agent_entries}
-            return 0
+            return 0, False, {}
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
@@ -2925,6 +2926,9 @@ class KeyedArtifactOwnershipTest(unittest.TestCase):
             self.assertEqual(keyed_bundle.parent.stat().st_mode & 0o777, 0o700)
 
     def test_a_keyed_registration_is_owner_only_and_drops_the_ticket(self):
+        """DR-188: the keyed agent is registered from the v2 collection's one
+        POST, and its state lands at its keyed path from the response entry
+        naming its agent_key — owner-only, and without the ticket."""
         import json
         import tempfile
         from unittest import mock
@@ -2932,8 +2936,18 @@ class KeyedArtifactOwnershipTest(unittest.TestCase):
         response = {
             "status": 201,
             "body": {
-                "agent": {"id": "a-planner", "sandbox_id": "s-1", "host_id": "host-01", "sandbox_name": "shared"},
-                "token": "x-rail-placeholder-token",
+                "agents": [
+                    {
+                        "agent": {
+                            "id": "a-planner", "sandbox_id": "s-1", "host_id": "host-01",
+                            "sandbox_name": "shared", "agent_key": "planner",
+                        },
+                        "token": "x-rail-placeholder-token",
+                        "expires_at": "2026-10-10T00:00:00Z",
+                    }
+                ],
+                "evidence_bundle_id": "eb-1",
+                "duplicate": False,
             },
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -2954,10 +2968,13 @@ class KeyedArtifactOwnershipTest(unittest.TestCase):
             targets = [{"agent_key": "planner", "status": "available", "config_roots": [tmp]}]
             with mock.patch.object(scanner, "scan", side_effect=self.fake_scan), \
                     mock.patch.object(scanner, "resolve_targets", return_value=targets), \
-                    mock.patch.object(scanner, "post_registration", return_value=response):
+                    mock.patch.object(scanner, "post_registration", return_value=response) as post, \
+                    contextlib.redirect_stderr(io.StringIO()):
                 code = scanner.run_one_collection(args)
 
             self.assertEqual(code, 0)
+            post.assert_called_once()
+            self.assertEqual(json.loads(post.call_args.args[1])["bundle_version"], 2)
             keyed_state_path = Path(registration_path + ".planner")
             self.assertTrue(keyed_state_path.exists())
             self.assertEqual(keyed_state_path.stat().st_mode & 0o777, 0o600)
@@ -2965,7 +2982,10 @@ class KeyedArtifactOwnershipTest(unittest.TestCase):
             self.assertNotIn("x-rail-placeholder-token", written)
             state = json.loads(written)
             self.assertEqual(state["agent_id"], "a-planner")
+            self.assertEqual(state["evidence_bundle_id"], "eb-1")
             self.assertNotIn("token", state["response"])
+            # The sandbox-wide scan registers nothing of its own.
+            self.assertFalse(Path(registration_path).exists())
 
 
 class MainTargetManifestDispatchTest(unittest.TestCase):
