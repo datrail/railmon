@@ -56,14 +56,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl libelf1 zlib1g openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Tracked, not pinned. AgentSight moves with us and a stale tap sees nothing —
-# the same decision the Cargo dependency makes with a caret requirement.
+# Pinned to one AgentSight release and checked against its SHA-256 (DR-204).
+# The image used to follow releases/latest, so two builds of the same commit
+# could ship different probes and an upstream release could change or break
+# the stack without a change here. Now a new AgentSight reaches the image only
+# through a commit, and the build fails, not warns, when the downloaded bytes
+# are not the ones pinned.
 #
-# Upstream publishes an x86-64 release binary only, and the URL carries no
-# architecture, so curl happily succeeds on arm64 and installs a binary that
-# cannot exec. Guarded rather than downloaded blindly: an arm64 image is short a
-# probe, which fails honestly, instead of shipping something that builds and
-# then dies at runtime. RailScan's Dockerfile makes the same call.
+# Bumping is one edit of the two ARGs below: the release tag, and the sha256
+# GitHub records for its `agentsight` asset (`gh release view <tag> --repo
+# eunomia-bpf/agentsight --json assets`, or sha256sum of the download).
+# `make fetch-agentsight` reads both from here, so the local binary and the
+# image's stay the same release. DR-170 bumps this when the release carrying
+# the listener and file capture it moves onto is cut.
+#
+# amd64 only. Upstream's plain `agentsight` asset is the x86-64 build; it now
+# also publishes `agentsight-aarch64`, but the arm64 image has never run it and
+# the README documents `collect` and `demo` as unavailable there, so arm64
+# still skips the probe — an image short a probe fails honestly, instead of
+# shipping something nobody has exercised. Taking the aarch64 asset would be
+# its own change, with its own pinned hash.
 #
 # The Docker client is the scanner's, and it is not optional: `scan --mode
 # docker` reaches the scanned container only through `docker inspect` and
@@ -76,11 +88,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # daemon and containerd for a client we invoke read-only against a mounted
 # socket. Pinned, because "latest" in an image build is a version nobody chose.
 # Callers still have to mount /var/run/docker.sock — necessary, not sufficient.
+ARG AGENTSIGHT_VERSION=v1.0.34
+ARG AGENTSIGHT_SHA256=02f8b04c0b463b3c21b12027ef3deaccccaffd265e0249dee0156ad352e3e12d
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       curl -fsSL -o /usr/local/bin/agentsight \
-        https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight \
+        "https://github.com/eunomia-bpf/agentsight/releases/download/${AGENTSIGHT_VERSION}/agentsight" \
+      && echo "${AGENTSIGHT_SHA256}  /usr/local/bin/agentsight" | sha256sum -c - \
       && chmod +x /usr/local/bin/agentsight; \
     else \
       echo "no AgentSight release for ${TARGETARCH:-this architecture}; skipping" >&2; \

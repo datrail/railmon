@@ -132,6 +132,18 @@ jobs:
       - name: Scan inside the built image
         run: docker run --rm railmon:ci scan --mode self --host-id ci --compact > /dev/null
 
+      # DR-204: the build already refuses an AgentSight download whose
+      # SHA-256 is not the pinned one; this shows the binary it kept is the
+      # pinned release and execs in this image (libelf, glibc), not merely
+      # that a file landed. The tag comes from the Dockerfile, so a bump
+      # needs no edit here.
+      - name: Pinned AgentSight inside the built image
+        run: |
+          want=$(sed -n 's/^ARG AGENTSIGHT_VERSION=v//p' Dockerfile)
+          got=$(docker run --rm --entrypoint /usr/local/bin/agentsight railmon:ci --version)
+          echo "$got"
+          [ -n "$want" ] && [ "$got" = "agentsight $want" ]
+
       # The RailScan-era command names and script paths are deprecated but
       # kept: the old paths are symlinks, which only a run in the image shows
       # survived COPY.
