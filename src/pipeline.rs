@@ -417,8 +417,8 @@ pub async fn event_stream(
 /// to — controls. The panic that prompted it, `hpack` 0.3.0 on a malformed
 /// dynamic-table-size update inside HTTPParser, is gone since agentsight-capture
 /// 1.0.34 moved to loona-hpack; the guard stays for whatever panics next, since
-/// AgentSight is tracked, not pinned, and one panic would otherwise abort every
-/// keyed target.
+/// the agentsight-capture crate is a caret requirement in Cargo.toml, not an
+/// exact pin, and one panic would otherwise abort every keyed target.
 /// On a panic the inner stream is dropped right away, not merely no longer
 /// polled: the probe child and the status sender live in its state, so
 /// dropping it kills the probe (`kill_on_drop`) and closes the status channel,

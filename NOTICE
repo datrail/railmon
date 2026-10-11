@@ -18,10 +18,12 @@ AgentSight — https://github.com/eunomia-bpf/agentsight
     * as a binary — the container image downloads the AgentSight release and
       spawns it as the probe.
 
-    Both track upstream rather than pinning to an exact version: a caret
-    requirement in Cargo.toml, and releases/latest in the Dockerfile. The
-    amd64 image carries the probe; the arm64 image does not, because upstream
-    publishes no arm64 build.
+    The library is a caret requirement in Cargo.toml, its exact version
+    recorded in Cargo.lock. The binary is pinned to one release and its
+    SHA-256 by the AGENTSIGHT_VERSION and AGENTSIGHT_SHA256 build arguments in
+    the Dockerfile. The amd64 image carries the probe; the arm64 image does
+    not, because the arm64 image has never been run with upstream's aarch64
+    build.
 
     AgentSight is a project of the eunomia-bpf organisation and is licensed
     under its own terms; see the upstream repository.

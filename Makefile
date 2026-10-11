@@ -1,6 +1,13 @@
 .PHONY: build test test-rust test-python fmt clippy docker demo clean fetch-agentsight build-ebpf
 
-AGENTSIGHT_URL ?= https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight
+# The AgentSight release the image pins (DR-204), read from the Dockerfile's
+# ARGs so a bump there is the only edit. Overriding AGENTSIGHT_URL to fetch
+# something else needs AGENTSIGHT_SHA256 to match it, or set empty to skip
+# the check.
+DOCKERFILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))Dockerfile
+AGENTSIGHT_VERSION ?= $(shell sed -n 's/^ARG AGENTSIGHT_VERSION=//p' $(DOCKERFILE))
+AGENTSIGHT_SHA256 ?= $(shell sed -n 's/^ARG AGENTSIGHT_SHA256=//p' $(DOCKERFILE))
+AGENTSIGHT_URL ?= https://github.com/eunomia-bpf/agentsight/releases/download/$(AGENTSIGHT_VERSION)/agentsight
 AGENTSIGHT_BIN := bin/agentsight
 
 build:
@@ -49,10 +56,17 @@ clippy:
 	cargo clippy --all-targets -- -D warnings
 
 # Only needed to run the collector outside the container; the image downloads
-# AgentSight itself. Unpinned on purpose — we track upstream.
+# AgentSight itself. The same pinned release as the image, verified the same
+# way; a mismatch deletes the download rather than leaving it to be run.
 fetch-agentsight:
 	mkdir -p bin
-	curl -fsSL -o $(AGENTSIGHT_BIN) $(AGENTSIGHT_URL)
+	curl -fsSL -o $(AGENTSIGHT_BIN) "$(AGENTSIGHT_URL)"
+	@if [ -n "$(AGENTSIGHT_SHA256)" ]; then \
+	  echo "$(AGENTSIGHT_SHA256)  $(AGENTSIGHT_BIN)" | sha256sum -c - \
+	    || { rm -f $(AGENTSIGHT_BIN); exit 1; }; \
+	else \
+	  echo "warning: no AGENTSIGHT_SHA256; $(AGENTSIGHT_BIN) is unverified" >&2; \
+	fi
 	chmod +x $(AGENTSIGHT_BIN)
 	$(AGENTSIGHT_BIN) --version
 
