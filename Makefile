@@ -4,8 +4,9 @@
 # ARGs so a bump there is the only edit. Overriding AGENTSIGHT_URL to fetch
 # something else needs AGENTSIGHT_SHA256 to match it, or set empty to skip
 # the check.
-AGENTSIGHT_VERSION ?= $(shell sed -n 's/^ARG AGENTSIGHT_VERSION=//p' Dockerfile)
-AGENTSIGHT_SHA256 ?= $(shell sed -n 's/^ARG AGENTSIGHT_SHA256=//p' Dockerfile)
+DOCKERFILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))Dockerfile
+AGENTSIGHT_VERSION ?= $(shell sed -n 's/^ARG AGENTSIGHT_VERSION=//p' $(DOCKERFILE))
+AGENTSIGHT_SHA256 ?= $(shell sed -n 's/^ARG AGENTSIGHT_SHA256=//p' $(DOCKERFILE))
 AGENTSIGHT_URL ?= https://github.com/eunomia-bpf/agentsight/releases/download/$(AGENTSIGHT_VERSION)/agentsight
 AGENTSIGHT_BIN := bin/agentsight
 
@@ -63,6 +64,8 @@ fetch-agentsight:
 	@if [ -n "$(AGENTSIGHT_SHA256)" ]; then \
 	  echo "$(AGENTSIGHT_SHA256)  $(AGENTSIGHT_BIN)" | sha256sum -c - \
 	    || { rm -f $(AGENTSIGHT_BIN); exit 1; }; \
+	else \
+	  echo "warning: no AGENTSIGHT_SHA256; $(AGENTSIGHT_BIN) is unverified" >&2; \
 	fi
 	chmod +x $(AGENTSIGHT_BIN)
 	$(AGENTSIGHT_BIN) --version
