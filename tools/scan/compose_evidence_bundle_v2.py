@@ -33,12 +33,14 @@ KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # sandbox attribute that differs between agents. `observed_ingress_peers`
 # (DR-145) comes from the same events and is sandbox-scoped for the same
 # reason, and so is `observed_file_access` (DR-154): filesnoop runs per PID
-# namespace too.
+# namespace too. `egress_containment` and `egress_proxy_declared` (DR-207)
+# describe the container's network and environment, which every agent in it
+# shares.
 SANDBOX_ATTRIBUTES = frozenset(
     {
         "container_identity", "image_digest", "mounts", "deployment",
         "sandbox_network_policy", "observed_listeners", "observed_ingress_peers",
-        "observed_file_access",
+        "observed_file_access", "egress_containment", "egress_proxy_declared",
     }
 )
 

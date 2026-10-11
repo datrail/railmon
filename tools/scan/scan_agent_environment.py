@@ -482,6 +482,38 @@ def docker_inspect(container: str) -> dict[str, Any]:
     return data[0]
 
 
+def _docker_inspect_json(cmd: list[str]) -> dict[str, Any] | None:
+    """One `docker inspect`-shaped object, or None when Docker can't answer."""
+    output = run_command(cmd, timeout=5.0)
+    try:
+        data = json.loads(output) if output else None
+    except json.JSONDecodeError:
+        return None
+    return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+
+def docker_host_socket() -> tuple[str, ...]:
+    """The host socket this scan talks to Docker through, when it's a Unix
+    one: a container that mounts it can drive the same daemon (DR-207)."""
+    host = os.environ.get("DOCKER_HOST") or ""
+    if host.startswith("unix://"):
+        return (host[len("unix://"):],)
+    return ()
+
+
+def collect_egress_containment(inspect: dict[str, Any]) -> dict[str, Any]:
+    """The inspect output `egress_containment.classify` reads beyond the
+    target's own: the network-namespace owner, each attached network, and
+    each internal network's other containers (DR-207)."""
+    import evidence_bundle  # lazy: breaks the import cycle
+
+    return evidence_bundle._sibling("egress_containment").collect_inputs(
+        inspect,
+        lambda ref: _docker_inspect_json(["docker", "container", "inspect", ref]),
+        lambda ref: _docker_inspect_json(["docker", "network", "inspect", ref]),
+    )
+
+
 def collect_docker_context(container: str) -> dict[str, Any]:
     inspect = docker_inspect(container)
     config = inspect.get("Config") or {}
@@ -507,6 +539,7 @@ def collect_docker_context(container: str) -> dict[str, Any]:
         "proc1_cmdline": redact_cmdline(" ".join(cmd_parts)),
         "docker_inspect": inspect,
         "docker_state_pid": state.get("Pid"),
+        "egress_inputs": collect_egress_containment(inspect),
     }
 
 

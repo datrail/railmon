@@ -78,7 +78,8 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 10 folds observed_file_access's Python bytecode-cache writes to
 # <dir>/__pycache__/*.pyc (DR-201): a pack-9 baseline holds their random
 # names verbatim, so it is not comparable.
-RULE_PACK_VERSION = 10
+# Pack 11 adds egress_containment and egress_proxy_declared (DR-207).
+RULE_PACK_VERSION = 11
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -97,6 +98,26 @@ FILE_ACCESS_VALUED_STATUSES = frozenset(
     SCHEMA["properties"]["attributes"]["properties"]["observed_file_access"]["allOf"][1]["if"]
     ["properties"]["status"]["enum"]
 )
+
+def _sibling(name: str) -> Any:
+    """A module beside this one. Imported by name when `tools/scan` is on
+    `sys.path` (a script run), else loaded by file path once, as the tests
+    load this module and the scanner."""
+    if name in sys.modules:
+        return sys.modules[name]
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# DR-207: egress_containment's value, published as `$defs.egress_containment_value`
+# for the same two statuses; v2 holds its sandbox value to it the same way.
+EGRESS_VALUE_SCHEMA: dict[str, Any] = SCHEMA["$defs"]["egress_containment_value"]
 
 # ── the v2 (DR-109 multi-agent) contract, loaded the same way ──────────────
 # A second, independent document: v2 is not v1-plus-fields, so a v2 bundle is
@@ -399,6 +420,10 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
         problems += _file_access_problems(files.get("value"), "sandbox.attributes.observed_file_access.value")
     elif isinstance(files, dict) and files.get("value") is not None:
         problems += _file_access_byte_problems(files["value"], "sandbox.attributes.observed_file_access.value")
+    egress = ((bundle.get("sandbox") or {}).get("attributes") or {}).get("egress_containment")
+    if isinstance(egress, dict) and egress.get("status") in FILE_ACCESS_VALUED_STATUSES:
+        problems += _schema_problems(egress.get("value"), EGRESS_VALUE_SCHEMA,
+                                     "sandbox.attributes.egress_containment.value")
     agents = bundle.get("agents") or []
     keys = [agent.get("agent_key") for agent in agents if isinstance(agent, dict)]
     if len(set(keys)) != len(keys):
@@ -1424,6 +1449,55 @@ def build_evidence_bundle(
     else:
         attributes["sandbox_network_policy"] = _absent(
             "container network mode not observable in this mode", "observed",
+        )
+
+    # DR-207: can the agent open a connection to any outside host itself.
+    # Observed from Docker's own view of the container, never from what it
+    # declares; the observations travel in the value. A declared proxy is
+    # kept apart, because any client can ignore one.
+    egress_containment = _sibling("egress_containment")
+    egress_method = ("docker inspect of the container, its network-namespace owner, "
+                     "its networks and their other containers")
+    if mode == "docker":
+        egress_inputs = context.get("egress_inputs")
+        if egress_inputs is None:
+            attributes["egress_containment"] = _blind("NOT_COLLECTED_BY_PACK", "observed", method=egress_method)
+        else:
+            status, value = egress_containment.classify(docker, egress_inputs, scanner.docker_host_socket())
+            if status == "ANSWERED":
+                attributes["egress_containment"] = _answered(
+                    value, "observed", authored_by="none", method=egress_method,
+                )
+            elif status == "PARTIAL":
+                attributes["egress_containment"] = _partial(
+                    value, "observed", "NO_SOURCE_ACCESS", authored_by="none", method=egress_method,
+                    note="a network that could not be inspected decided it; never assumed internal",
+                )
+            else:
+                attributes["egress_containment"] = _failed(
+                    "NO_SOURCE_ACCESS", "observed", method=egress_method,
+                    note="the container's network mode or its namespace owner could not be inspected",
+                )
+    elif scanner.in_container():
+        attributes["egress_containment"] = _blind(
+            "NO_SOURCE_ACCESS", "observed",
+            note="a scan inside a container cannot inspect its own network setting",
+        )
+    else:
+        attributes["egress_containment"] = _answered(
+            egress_containment.host_process_value(), "observed", authored_by="none",
+            method="self mode outside any container",
+        )
+    proxy = egress_containment.declared_proxy(env, scanner.redact_url)
+    if proxy:
+        attributes["egress_proxy_declared"] = _answered(
+            proxy, "declared", authored_by="subject",
+            method="container environment: *_PROXY and NO_PROXY, credentials removed",
+            note="advisory: a client can ignore it, so it never counts as containment",
+        )
+    else:
+        attributes["egress_proxy_declared"] = _absent(
+            "container environment: *_PROXY and NO_PROXY", "declared",
         )
 
     # ── text signals: agent-authored, fenced as untrusted by the consumer ─
