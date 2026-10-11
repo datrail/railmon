@@ -1864,13 +1864,13 @@ _PROC_PID = re.compile(r"/proc/[0-9]+(?=/|$)(?:/task/[0-9]+(?=/|$))?")
 # as a saved file. README says so.
 _ROOTLESS_PROC_PID = re.compile(
     r"/[0-9]+(?:/task/[0-9]+)?"
-    r"(?=/(?:setgroups|uid_map|gid_map|projid_map|attr/(?:apparmor/)?(?:current|exec))$)"
+    r"(?=/(?:setgroups|uid_map|gid_map|projid_map|attr/(?:apparmor/)?(?:current|exec))\Z)"
 )
 
 
 def fold_proc_pid(path: str) -> str:
     """`path` with a leading /proc/<pid> and /task/<tid> made `*`, and the
-    same entries named from an unmounted procfs's root (/<pid>/...) too."""
+    few files runc sets up a process with named without /proc (/<pid>/setgroups)."""
     match = _PROC_PID.match(path) or _ROOTLESS_PROC_PID.match(path)
     if match is None:
         return path
