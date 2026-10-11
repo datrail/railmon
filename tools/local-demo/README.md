@@ -10,10 +10,17 @@ checkout has nothing to show until some agent is running under it. This
 directory gives it one, self-contained and offline:
 
 - `demo_server.py` — a stdlib HTTPS server on `127.0.0.1:8443` that answers a
-  fixed JSON response.
+  fixed JSON response, and at `/mcp` a small MCP server (JSON-RPC
+  `tools/list` and `tools/call`) offering `read_doc` and `upload_file`
+  (DR-205).
 - `demo_client.py` — issues a few HTTPS requests to it, certificate
   verification off (the server's cert is a fresh, throwaway self-signed one
-  every run — see `run_local_demo.sh`).
+  every run — see `run_local_demo.sh`). It lists the MCP tools and calls
+  `read_doc`; it never uploads.
+- `demo_mcp_call.py` — the Data Guardrail demo's on-demand MCP calls: an
+  `upload_file` with a small PNG, a tool the server never listed, or a POST
+  to `/mcp` that isn't JSON-RPC (datrail-project's quick start and stack
+  test run it in the agent).
 - `run_local_demo.sh` — the orchestrator `railmon demo` execs: self-scan for
   the inventory, then start the server, start the collector tapping
   `--comm python3`, run the client, stop the collector, and report what it
@@ -25,7 +32,7 @@ only accepts one PID and the demo has two. In the few seconds the demo runs,
 this is a reasonable trade for simplicity; it is not a pattern to copy for a
 real deployment, which should filter by the actual agent's identity.
 
-**This is why three requests produce six interactions.** Both ends of each
+**This is why the client's five requests (two MCP calls, three plain POSTs) produce ten interactions.** Both ends of each
 exchange are `python3` — `demo_server.py` and `demo_client.py` — so the tap
 records each request twice, once as the client wrote it and once as the
 server read it. The two rows carry different `pid`s and share a timestamp to
