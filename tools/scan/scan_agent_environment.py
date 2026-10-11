@@ -1851,17 +1851,21 @@ def file_temp_dirs(env: dict[str, str] | None = None) -> tuple[str, ...]:
 # for a literal one (DR-185). The price, as for temp names: a process's own
 # /proc/self/environ and another's are one entry, and the README says so.
 _PROC_PID = re.compile(r"/proc/[0-9]+(?=/|$)(?:/task/[0-9]+(?=/|$))?")
-# The same files when the runtime opens them through a procfs of its own that
-# is mounted nowhere, so filesnoop names them from that procfs's root, without
-# /proc: /1003/setgroups, /1003/task/1003/attr/apparmor/exec. runc does this
-# for each `docker exec` into an OpenShell sandbox (DR-206), a new procfs
-# every time, so a write per exec. Only a process's own procfs entries fold
-# this way, from a fixed list, so a real /1003/report.txt stays itself; the
-# price is that a file the agent names /<number>/setgroups is folded too.
-_ROOTLESS_PROC_PID = re.compile(r"/([0-9]+)(?:/task/[0-9]+)?(?=/(?:" + "|".join((
-    "attr", "cgroup", "fd", "fdinfo", "gid_map", "loginuid", "maps", "mountinfo", "ns",
-    "oom_score_adj", "projid_map", "sessionid", "setgroups", "status", "uid_map",
-)) + r")(?:/|$))")
+# The same files when the runtime opens them through a procfs of its own
+# that is mounted nowhere, so filesnoop names them from that procfs's root,
+# without /proc: /1003/setgroups, /1003/task/1003/attr/apparmor/exec. runc
+# does this for each `docker exec` into an OpenShell sandbox (DR-206), a new
+# procfs every time, so a write per exec. Only the exact files runc sets up
+# a process with fold this way, nothing below or beside them, because a
+# folded path lands under /proc, which RailDash never counts as a saved
+# file: /1003/report.txt and /1003/fd/payload.tar stay themselves. The
+# price: an agent that can write to / and names a file exactly like one of
+# these (/5/setgroups) has that write folded into runc's entry, not judged
+# as a saved file. README says so.
+_ROOTLESS_PROC_PID = re.compile(
+    r"/[0-9]+(?:/task/[0-9]+)?"
+    r"(?=/(?:setgroups|uid_map|gid_map|projid_map|attr/(?:apparmor/)?(?:current|exec))$)"
+)
 
 
 def fold_proc_pid(path: str) -> str:
@@ -1965,7 +1969,8 @@ def summarize_file_access(
       the order of the lines;
     - a procfs path under a process or thread ID is folded to /proc/*/...
       (`fold_proc_pid`), so each new process's runtime init is not a new
-      path, including one named from an unmounted procfs's root;
+      path; so is one of the few files runc sets up a process with when
+      named without /proc, as from an unmounted procfs's root;
     - a randomly named temp file (`ephemeral_file_template`) is folded into
       its template's entry, its access unioned in like any other open, and
       the distinct paths folded into entries that made the list are counted

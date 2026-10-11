@@ -1709,7 +1709,14 @@ class ProcPidFileAccessTest(unittest.TestCase):
             ("/1003/setgroups", "/proc/*/setgroups"),
             ("/1003/task/1003/attr/apparmor/exec", "/proc/*/task/*/attr/apparmor/exec"),
             ("/1003/uid_map", "/proc/*/uid_map"),
-            ("/1003/fd/7", "/proc/*/fd/7"),
+            ("/1003/attr/current", "/proc/*/attr/current"),
+            # Nothing below or beside those files: a folded path is under
+            # /proc, which RailDash never judges as a saved file.
+            ("/1003/fd/7", "/1003/fd/7"),
+            ("/1003/fd/payload.tar", "/1003/fd/payload.tar"),
+            ("/1003/attr/evil.sh", "/1003/attr/evil.sh"),
+            ("/1003/setgroups/x", "/1003/setgroups/x"),
+            ("/0/ns/x", "/0/ns/x"),
             ("/1003/report.txt", "/1003/report.txt"),
             ("/1003/setgroups.bak", "/1003/setgroups.bak"),
             ("/1003", "/1003"),
