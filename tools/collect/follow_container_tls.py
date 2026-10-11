@@ -128,7 +128,8 @@ def children(pid: int, proc: str = PROC) -> list[int]:
     that forked it, and a multi-threaded init (OpenShell's sandbox, DR-206)
     starts the agent from a worker thread, not its main one."""
     try:
-        tasks = sorted(os.listdir(f"{proc}/{pid}/task"), key=lambda t: (t != str(pid), t))
+        tasks = sorted((t for t in os.listdir(f"{proc}/{pid}/task") if t.isdigit()),
+                       key=lambda t: (int(t) != pid, int(t)))
     except OSError:
         return []
     found: list[int] = []
