@@ -33,7 +33,8 @@ PNG = base64.b64encode(
 
 def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[1] == "--big" and argv[2].isdigit():
-        content = base64.b64encode(b"\x00" * int(argv[2])).decode()[: int(argv[2])]
+        # Valid base64 of about N characters (a multiple of 4).
+        content = base64.b64encode(b"\x00" * (int(argv[2]) * 3 // 4)).decode()
         body = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
                            "params": {"name": "upload_file",
                                       "arguments": {"path": "big.bin", "content": content}}}).encode()
