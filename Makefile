@@ -35,7 +35,8 @@ test-python:
 		tools/skills/skill_scanner.py \
 		tools/forward/forward.py \
 		tools/local-demo/demo_server.py \
-		tools/local-demo/demo_client.py
+		tools/local-demo/demo_client.py \
+		tools/local-demo/demo_mcp_call.py
 	sh -n tools/local-demo/run_local_demo.sh
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh scan --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills --help >/dev/null
