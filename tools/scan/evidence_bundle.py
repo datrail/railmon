@@ -75,7 +75,10 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 8 adds the registration payload's fields (DR-189): agent_type, owner,
 # llm_provider, sandbox_type, system_info and user_info.
 # Pack 9 adds agent_instance (DR-193): the dynamic fields pack 8 left out.
-RULE_PACK_VERSION = 9
+# Pack 10 folds observed_file_access's Python bytecode-cache writes to
+# <dir>/__pycache__/*.pyc (DR-201): a pack-9 baseline holds their random
+# names verbatim, so it is not comparable.
+RULE_PACK_VERSION = 10
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1135,7 +1138,8 @@ def build_evidence_bundle(
         # count is in the feature file.
         folded = (
             "; randomly named temp files are folded into one path per directory "
-            "and name pattern, with * for the random part"
+            "and name pattern, with * for the random part, and Python bytecode-cache "
+            "writes into one __pycache__/*.pyc per directory"
             if file_access.get("collapsed") else ""
         )
         if file_gaps:

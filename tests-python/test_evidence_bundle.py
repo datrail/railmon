@@ -1027,8 +1027,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # makes observed_destinations BLIND without a snapshot (DR-168);
         # pack 7 folds observed_file_access's /proc/<pid> paths (DR-185);
         # pack 8 adds the registration payload's fields (DR-189); pack 9
-        # adds agent_instance, the dynamic ones pack 8 left out (DR-193).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 9)
+        # adds agent_instance, the dynamic ones pack 8 left out (DR-193);
+        # pack 10 folds Python's bytecode-cache writes (DR-201).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 10)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
@@ -1280,6 +1281,7 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
         again = self.attribute(self.files([self.WROTE, temp], collapsed=40))
         self.assertNotIn("folded", plain["note"])
         self.assertIn("randomly named temp files are folded", folded["note"])
+        self.assertIn("Python bytecode-cache writes into one __pycache__/*.pyc per directory", folded["note"])
         self.assertEqual((folded["status"], folded["value"]), ("ANSWERED", [self.WROTE, temp]))
         self.assertEqual(folded, again)
         self.assertNotRegex(folded["note"], r"\d")

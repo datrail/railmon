@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A file the agent opens in a new way after the baseline is locked is drift (DR-154, DR-166).
+"""A file the agent opens in a new way after the baseline is locked is drift (DR-154, DR-166, DR-201).
 
 Drives the real scanner and a real RailDash end to end, the way
 listen_drift_acceptance.py does for listeners:
@@ -19,7 +19,12 @@ listen_drift_acceptance.py does for listeners:
    they arrive folded into templated paths (/tmp/tmp*, ...) and the note
    says so. Lock that ASP;
 6. a second run writes temp files under new random names: ALIGNED;
-7. a write to a new fixed name in /tmp (/tmp/exfil.tar) is DRIFT DETECTED,
+7. (DR-201) Python processes cache modules: each writes importlib's
+   bytecode-cache temp name (<module>.pyc.<id()>) in a __pycache__ dir.
+   They arrive folded into one <dir>/__pycache__/*.pyc per directory. Lock
+   that ASP;
+8. a second Python run caching the same modules under new names: ALIGNED;
+9. a write to a new fixed name in /tmp (/tmp/exfil.tar) is DRIFT DETECTED,
    on observed_file_access alone, with the path kept as it is.
 
   python3 tests/files_drift_acceptance.py --raildash http://127.0.0.1:8000 \\
@@ -33,6 +38,7 @@ and named by the path the scanner sees (a container mount).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shlex
@@ -185,6 +191,39 @@ def main() -> int:
     second_names = temp_run(21)
     checks["the second run's names differ from the first's"] = not set(first_names) & set(second_names)
     checks["a second run under new random names stays aligned"] = drift(scan())[0] == "ALIGNED"
+
+    # DR-201: bytecode-cache writes, named as importlib's _write_atomic names
+    # them: '{}.{}'.format(path, id(path)) beside the .pyc. Each run's path
+    # strings are kept alive so the next run's id()s, and names, differ.
+    cache_dirs = set()
+    kept_alive: list[str] = []
+
+    def bytecode_run(pid: int) -> list[str]:
+        made = []
+        for module in ("argparse", "gettext", "json.decoder", "importlib.abc"):
+            cache = str(importlib.util.cache_from_source(importlib.util.find_spec(module).origin))
+            cache = "".join(list(cache))  # a new str object, so a new id()
+            kept_alive.append(cache)
+            made.append("{}.{}".format(cache, id(cache)))
+            cache_dirs.add(os.path.dirname(cache))
+        append(*(event(path, read=False, write=True, pid=pid) for path in made))
+        return made
+
+    first_caches = bytecode_run(30)
+    cached = scan()
+    field = api(args.raildash, f"/api/asps/{cached}/bundle", args.token)["attributes"]["observed_file_access"]
+    paths = {entry["path"]: entry for entry in field["value"]}
+    checks["bytecode-cache writes arrive as one <dir>/__pycache__/*.pyc per directory"] = (
+        len(cache_dirs) >= 2
+        and all(paths.get(f"{directory}/*.pyc", {}).get("write") is True for directory in cache_dirs)
+        and not any(name in paths for name in first_caches)
+    )
+    checks["and the note says bytecode caches were folded"] = "Python bytecode-cache writes" in field["note"]
+    lock(cached, "files-bytecode")
+
+    second_caches = bytecode_run(31)
+    checks["the second Python run's cache names differ"] = not set(first_caches) & set(second_caches)
+    checks["a second Python run caching modules stays aligned"] = drift(scan())[0] == "ALIGNED"
 
     append(event("/tmp/exfil.tar", read=False, write=True, pid=22))
     exfil = scan()

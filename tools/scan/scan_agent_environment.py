@@ -1862,6 +1862,39 @@ def fold_proc_pid(path: str) -> str:
     return folded + path[match.end():]
 
 
+# A Python bytecode-cache write (DR-201). importlib's _write_atomic writes a
+# module's cache to '{}.{}'.format(path, id(path)), a temp name beside the
+# .pyc such as /usr/local/lib/python3.13/__pycache__/argparse.cpython-313.pyc.133606816482672,
+# then os.replace()s it onto the .pyc. A rename is not an open, so filesnoop
+# sees only the temp name: a new random path, written, every time any Python
+# process in the agent caches a module, in whatever directory the module
+# lives in. Such a write folds into one <dir>/__pycache__/*.pyc entry per
+# (directory, layer), in any directory, not just a temp dir. The rule is
+# strict: the directory's last part is exactly __pycache__, and the name is
+# a .pyc name followed by a dot and only decimal digits (id() of a str). A
+# plain x.cpython-313.pyc, x.pyc.abc, or the same name outside __pycache__
+# stays its own entry. The price, as for temp names: an agent that names a
+# file like a bytecode-cache temp in a __pycache__ dir has it folded, and
+# once that directory's template is in the baseline such a write is
+# aligned. The README says so.
+_BYTECODE_CACHE_NAME = re.compile(r"[^/]+\.pyc\.[0-9]{1,20}")
+
+
+def bytecode_cache_template(path: str) -> str | None:
+    """`<dir>/__pycache__/*.pyc` for a Python bytecode-cache temp write in
+    that directory, or None when `path` is not one (see _BYTECODE_CACHE_NAME)."""
+    directory, _, name = path.rpartition("/")
+    if not directory.startswith("/") or len(name) > 255:
+        return None
+    if directory.rpartition("/")[2] != "__pycache__":
+        return None
+    if any(part in ("", ".", "..") for part in directory.split("/")[1:]):
+        return None
+    if _BYTECODE_CACHE_NAME.fullmatch(name) is None:
+        return None
+    return f"{directory}/*.pyc"
+
+
 def ephemeral_file_template(path: str, temp_dirs: Iterable[str] = FILE_TEMP_DIRS) -> str | None:
     """The templated path a randomly named temp file folds into, or None when
     `path` is not one (see FILE_TEMP_PATTERNS). Only the file's own name is
@@ -1922,7 +1955,11 @@ def summarize_file_access(
     - a randomly named temp file (`ephemeral_file_template`) is folded into
       its template's entry, its access unioned in like any other open, and
       the distinct paths folded into entries that made the list are counted
-      in `collapsed`. Past FILE_ACCESS_TRACKED folds it is a lower bound,
+      in `collapsed`. A Python bytecode-cache write in any __pycache__
+      directory (`bytecode_cache_template`) folds the same way, into
+      <dir>/__pycache__/*.pyc, and counts in `collapsed` too. Both apply
+      after the /proc fold, and the bytecode-cache fold before the temp
+      patterns. Past FILE_ACCESS_TRACKED folds it is a lower bound,
       though every listed templated entry still counts at least 1;
     - `lost` and the start/alive records mean what they do for listensnoop.
 
@@ -1988,7 +2025,12 @@ def summarize_file_access(
             unnamed_write_exec += changes
             continue
         path = fold_proc_pid(_printable(path, FILE_PATH_MAX))
-        template = ephemeral_file_template(path, temp_dirs)
+        # A bytecode-cache write is tried before the temp patterns: in a temp
+        # dir, a short id() suffix could otherwise fold by the module's name
+        # (mkstemp's pattern), one entry per module instead of one per dir.
+        template = bytecode_cache_template(path)
+        if template is None:
+            template = ephemeral_file_template(path, temp_dirs)
         key = (template if template is not None else path, layer)
         seen = files.get(key)
         if seen is None:

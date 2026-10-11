@@ -1893,6 +1893,104 @@ class EphemeralFileAccessTest(unittest.TestCase):
         self.assertIsNone(self.template("/scratch/agent/tmpk3j_9xq2"))
 
 
+class BytecodeCacheFileAccessTest(unittest.TestCase):
+    """Python's bytecode-cache temp writes fold into <dir>/__pycache__/*.pyc (DR-201)."""
+
+    event = staticmethod(FileAccessTest.event)
+    entry = FileAccessTest.entry
+    ARGPARSE = "/usr/local/lib/python3.13/__pycache__/argparse.cpython-313.pyc.133606816482672"
+    ABC = "/usr/local/lib/python3.13/importlib/__pycache__/_abc.cpython-313.pyc.133606819898720"
+
+    def summary(self, *lines):
+        return scanner.summarize_file_access([FileAccessTest.START, *lines])
+
+    def write(self, path, **fields):
+        return self.event(path=path, read=False, write=True, **fields)
+
+    def test_the_real_names_fold_to_their_directory(self):
+        for path, expected in (
+            (self.ARGPARSE, "/usr/local/lib/python3.13/__pycache__/*.pyc"),
+            (self.ABC, "/usr/local/lib/python3.13/importlib/__pycache__/*.pyc"),
+            # One digit, twenty digits, an unoptimised or an -O cache, a name
+            # with no interpreter tag, and anywhere, not just a temp dir.
+            ("/app/__pycache__/m.cpython-313.pyc.1", "/app/__pycache__/*.pyc"),
+            ("/app/__pycache__/m.cpython-313.opt-1.pyc." + "9" * 20, "/app/__pycache__/*.pyc"),
+            ("/app/__pycache__/m.pyc.42", "/app/__pycache__/*.pyc"),
+            ("/tmp/__pycache__/m.cpython-313.pyc.1234567890", "/tmp/__pycache__/*.pyc"),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(scanner.bytecode_cache_template(path), expected)
+
+    def test_a_near_miss_is_never_folded(self):
+        for path in (
+            # The .pyc itself, written in place (or by a compileall).
+            "/app/__pycache__/m.cpython-313.pyc",
+            # The suffix must be only digits, and at most 20 of them.
+            "/app/__pycache__/m.cpython-313.pyc.abc", "/app/__pycache__/m.cpython-313.pyc.12a",
+            "/app/__pycache__/m.cpython-313.pyc." + "1" * 21, "/app/__pycache__/m.cpython-313.pyc.",
+            "/app/__pycache__/m.cpython-313.pyc.-1", "/app/__pycache__/m.cpython-313.pyc.\u0661",
+            # The stem must end .pyc, with something before it.
+            "/app/__pycache__/m.py.123", "/app/__pycache__/m.pyo.123", "/app/__pycache__/.pyc.123",
+            "/app/__pycache__/m.PYC.123", "/app/__pycache__/m.cpython-313.pyc.123.tmp",
+            # Only in a directory whose last part is exactly __pycache__.
+            "/app/m.cpython-313.pyc.123", "/app/__pycache__x/m.pyc.123",
+            "/app/my__pycache__/m.pyc.123", "/app/__pycache__/sub/m.pyc.123", "/__pycache__x/m.pyc.1",
+            "/app/__PYCACHE__/m.pyc.123",
+            # No relative, empty, `.` or `..` part.
+            "__pycache__/m.pyc.123", "/app/../__pycache__/m.pyc.123", "/app//__pycache__/m.pyc.123",
+            "/app/./__pycache__/m.pyc.123", "/app/__pycache__/",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(scanner.bytecode_cache_template(path))
+        result = self.summary(self.write("/app/__pycache__/m.cpython-313.pyc"),
+                              self.write("/app/__pycache__/m.cpython-313.pyc.abc"))
+        self.assertEqual(result["files"], [self.entry("/app/__pycache__/m.cpython-313.pyc", read=False, write=True),
+                                           self.entry("/app/__pycache__/m.cpython-313.pyc.abc",
+                                                      read=False, write=True)])
+        self.assertEqual(result["collapsed"], 0)
+
+    def test_two_modules_in_one_directory_are_one_entry_and_runs_agree(self):
+        def run(ids):
+            return self.summary(
+                self.event(path="/usr/local/lib/python3.13/argparse.py"),
+                self.write(f"/usr/local/lib/python3.13/__pycache__/argparse.cpython-313.pyc.{ids[0]}"),
+                self.write(f"/usr/local/lib/python3.13/__pycache__/gettext.cpython-313.pyc.{ids[1]}", pid=42),
+                self.write(f"/usr/local/lib/python3.13/importlib/__pycache__/_abc.cpython-313.pyc.{ids[2]}"),
+            )
+
+        first = run([133606816482672, 133606816482999, 133606819898720])
+        second = run([140001112223334, 140001112229999, 140001119999999])
+        expected = [self.entry("/usr/local/lib/python3.13/__pycache__/*.pyc", read=False, write=True),
+                    self.entry("/usr/local/lib/python3.13/argparse.py"),
+                    self.entry("/usr/local/lib/python3.13/importlib/__pycache__/*.pyc", read=False, write=True)]
+        self.assertEqual(first["files"], expected)
+        self.assertEqual(second["files"], expected)
+        self.assertEqual((first["collapsed"], second["collapsed"]), (3, 3))
+
+    def test_flags_are_unioned_and_layer_stays_apart(self):
+        result = self.summary(self.write(self.ARGPARSE),
+                              self.event(path=self.ARGPARSE.replace("672", "673")),
+                              self.write(self.ARGPARSE, layer=True))
+        directory = "/usr/local/lib/python3.13/__pycache__/*.pyc"
+        self.assertEqual(result["files"], [self.entry(directory, read=True, write=True),
+                                           self.entry(directory, read=False, write=True, layer=True)])
+        self.assertEqual(result["collapsed"], 3)
+
+    def test_in_a_temp_dir_it_folds_by_directory_not_by_module(self):
+        # mkstemp's pattern would take a 10-digit id() as its random part and
+        # fold per module (/tmp/__pycache__/a.cpython-313.pyc.*); the
+        # bytecode-cache fold is tried first.
+        result = self.summary(self.write("/tmp/__pycache__/a.cpython-313.pyc.1234567890"),
+                              self.write("/tmp/__pycache__/b.cpython-313.pyc.2234567890"))
+        self.assertEqual(result["files"], [self.entry("/tmp/__pycache__/*.pyc", read=False, write=True)])
+        self.assertEqual(result["collapsed"], 2)
+
+    def test_after_the_proc_fold(self):
+        result = self.summary(self.write("/proc/77/root/app/__pycache__/m.cpython-313.pyc.5"))
+        self.assertEqual(result["files"], [self.entry("/proc/*/root/app/__pycache__/*.pyc",
+                                                      read=False, write=True)])
+
+
 class FollowContainerProbeTest(unittest.TestCase):
     """`railmon files` reuses `listen`'s supervisor with --probe and --output (DR-154)."""
 

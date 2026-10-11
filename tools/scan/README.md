@@ -544,7 +544,8 @@ the listeners, it only changes when a file is opened in a new way:
   write;
 - a path longer than 1024 characters, or one filesnoop could not resolve,
   is counted as `unnamed`, not listed;
-- randomly named temp files are folded, so a name that differs on every
+- randomly named temp files, and Python's bytecode-cache writes in a
+  `__pycache__` directory, are folded, so a name that differs on every
   run is not a new path on every scan (see
   [Randomly named temp files](#randomly-named-temp-files) below);
 - the PARTIAL note names the kind of gap, never a count. A written or run
@@ -620,7 +621,8 @@ lower-case letters (about 1 in 180) is not folded either.
 
 When an entry in the list holds a folded file, the note says "randomly named
 temp files are folded into one path per directory and name pattern, with * for
-the random part", so a templated path never passes for a file of that name.
+the random part, and Python bytecode-cache writes into one __pycache__/*.pyc
+per directory", so a templated path never passes for a file of that name.
 The feature file's `collapsed` counts the distinct paths folded into listed
 entries; past 16,384 it is a lower bound, with at least 1 per listed template.
 Folding is new in rule pack 5: RailDash shows a baseline locked under pack 4 as
@@ -639,6 +641,28 @@ process's own `/proc/self/...` from another process's. Once
 environment), reading another process's is aligned too; a new kind of
 access (a first write to `/proc/*/mem`) is still drift. This fold is new in rule pack 7: RailDash shows a baseline locked under
 pack 6 as `CONTRACT_MISMATCH` until a pack-7 ASP is locked.
+
+A Python bytecode-cache write folds too, in any directory, not only a temp
+dir. When a Python process caches a module, importlib writes the cache to a
+temp name beside the `.pyc`, the `.pyc` path, a dot and `id()` of that path
+(`/usr/local/lib/python3.13/__pycache__/argparse.cpython-313.pyc.133606816482672`),
+and renames it onto the `.pyc`. A rename is not an open, so filesnoop sees
+only the temp name, a new written path every run, for every module cached.
+Such a write is listed as `<dir>/__pycache__/*.pyc`
+(`/usr/local/lib/python3.13/__pycache__/*.pyc`), one entry per directory and
+layer, with the flags unioned and counted in `collapsed` like a temp name.
+Only exactly that shape folds: the directory's last part is `__pycache__`, and
+the name is anything ending `.pyc`, a dot, and 1 to 20 decimal digits. A
+plain `argparse.cpython-313.pyc` written in place, `x.pyc.abc`, or the same
+name outside a `__pycache__` directory stays its own entry. The fold is tried
+after the `/proc` one and before the temp-name patterns, so in a temp dir a
+cache write folds by its directory, not by its module's name. The price: an
+agent that names a file like a bytecode-cache temp in a `__pycache__`
+directory has it folded, and once that directory's `*.pyc` is in the
+baseline, such a write is aligned; a first write into a new `__pycache__`
+directory is still drift. This fold is new in rule pack 10: RailDash shows a
+baseline locked under pack 9 as `CONTRACT_MISMATCH` until a pack-10 ASP is
+locked.
 
 The files those `docker exec` commands open (the runtime init's, and the
 scanner's `sh`, `id`, `env`, `hostname` and `uname`) are in the list too,
