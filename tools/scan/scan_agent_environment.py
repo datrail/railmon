@@ -1868,15 +1868,17 @@ def fold_proc_pid(path: str) -> str:
 # then os.replace()s it onto the .pyc. A rename is not an open, so filesnoop
 # sees only the temp name: a new random path, written, every time any Python
 # process in the agent caches a module, in whatever directory the module
-# lives in. Such a write folds into one <dir>/__pycache__/*.pyc entry per
-# (directory, layer), in any directory, not just a temp dir. The rule is
+# lives in. An open of such a name (that write, or any other access) folds
+# into one <dir>/__pycache__/*.pyc entry per (directory, layer), in any
+# directory, not just a temp dir. The rule is
 # strict: the directory's last part is exactly __pycache__, and the name is
 # a .pyc name followed by a dot and only decimal digits (id() of a str). A
 # plain x.cpython-313.pyc, x.pyc.abc, or the same name outside __pycache__
 # stays its own entry. The price, as for temp names: an agent that names a
 # file like a bytecode-cache temp in a __pycache__ dir has it folded, and
-# once that directory's template is in the baseline such a write is
-# aligned. The README says so.
+# once that directory's template is in the baseline such a write (and the
+# rename that may follow, which filesnoop does not see) is aligned. The
+# README says so.
 _BYTECODE_CACHE_NAME = re.compile(r"[^/]+\.pyc\.[0-9]{1,20}")
 
 

@@ -207,7 +207,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
 | `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events; and `peers`, who connected in (see [Ingress peers](#ingress-peers)) |
-| `observed_file_access` | only with `--files-file`: the files the sandbox opened, as `files` (path and read/write/exec/layer), plus counts of lost, unlisted, unnamed and malformed events (of distinct records when `railmon files` follows a container, which appends each distinct open once), and `collapsed`, the distinct randomly named temp files folded into listed entries (a lower bound past 16,384) (see [Observed file access](#observed-file-access-optional)) |
+| `observed_file_access` | only with `--files-file`: the files the sandbox opened, as `files` (path and read/write/exec/layer), plus counts of lost, unlisted, unnamed and malformed events (of distinct records when `railmon files` follows a container, which appends each distinct open once), and `collapsed`, the distinct randomly named temp files and Python bytecode-cache temp names folded into listed entries (a lower bound past 16,384) (see [Observed file access](#observed-file-access-optional)) |
 
 Metadata only — never a secret value. That is what makes the file safe to
 persist and hand to a scorer. It is written `0600`: the inventory names an
@@ -648,7 +648,8 @@ temp name beside the `.pyc`, the `.pyc` path, a dot and `id()` of that path
 (`/usr/local/lib/python3.13/__pycache__/argparse.cpython-313.pyc.133606816482672`),
 and renames it onto the `.pyc`. A rename is not an open, so filesnoop sees
 only the temp name, a new written path every run, for every module cached.
-Such a write is listed as `<dir>/__pycache__/*.pyc`
+An open of such a name (a write, as importlib makes it, or any other) is
+listed as `<dir>/__pycache__/*.pyc`
 (`/usr/local/lib/python3.13/__pycache__/*.pyc`), one entry per directory and
 layer, with the flags unioned and counted in `collapsed` like a temp name.
 Only exactly that shape folds: the directory's last part is `__pycache__`, and
@@ -659,8 +660,11 @@ after the `/proc` one and before the temp-name patterns, so in a temp dir a
 cache write folds by its directory, not by its module's name. The price: an
 agent that names a file like a bytecode-cache temp in a `__pycache__`
 directory has it folded, and once that directory's `*.pyc` is in the
-baseline, such a write is aligned; a first write into a new `__pycache__`
-directory is still drift. This fold is new in rule pack 10: RailDash shows a
+baseline, such a write is aligned, and so is whatever it is renamed to
+afterwards, since filesnoop sees no rename. A first write into a new
+`__pycache__` directory is still drift, and so is a first exec of a folded
+name. With `PYTHONPYCACHEPREFIX` set, Python writes its caches under that
+prefix with no `__pycache__` directory; those are not folded and still drift. This fold is new in rule pack 10: RailDash shows a
 baseline locked under pack 9 as `CONTRACT_MISMATCH` until a pack-10 ASP is
 locked.
 
