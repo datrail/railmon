@@ -383,6 +383,17 @@ class BundleTest(unittest.TestCase):
         bad = copy.deepcopy(bundle)
         bad["attributes"]["egress_containment"]["value"]["extra"] = 1
         self.assertTrue(evidence_bundle._schema_problems(bad["attributes"], schema, "attributes"))
+        for field, wrong in (("via", {"x": 1}), ("via", 5)):
+            bad = copy.deepcopy(bundle)
+            bad["attributes"]["egress_containment"]["value"][field] = wrong
+            self.assertTrue(evidence_bundle._schema_problems(bad["attributes"], schema, "attributes"), field)
+        bad = copy.deepcopy(bundle)
+        bad["attributes"]["egress_containment"]["value"]["observations"]["network_mode"] = ["none"]
+        self.assertTrue(evidence_bundle._schema_problems(bad["attributes"], schema, "attributes"))
+        # null is one of the listed types.
+        ok = copy.deepcopy(bundle)
+        ok["attributes"]["egress_containment"]["value"]["observations"]["network_mode"] = None
+        self.assertEqual(evidence_bundle._schema_problems(ok["attributes"], schema, "attributes"), [])
 
 
 class V2Test(unittest.TestCase):
