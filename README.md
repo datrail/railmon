@@ -236,7 +236,11 @@ path is drift in RailDash. A randomly named temp file (Python's `tempfile`,
 `mkstemp`, `mktemp`, a Vim swap file) under `/tmp`, `/var/tmp`, `/dev/shm` or
 in the agent's `$TMPDIR` is first folded into one templated path such as
 `/tmp/tmp*`, so a new random name each run is not drift, while a new name
-that fits no pattern, like `/tmp/exfil.tar`, still is. A `/proc` path under
+that fits no pattern, like `/tmp/exfil.tar`, still is. A Python
+bytecode-cache write (importlib's `<module>.pyc.<digits>` temp name in a
+`__pycache__` directory, in any directory) folds into
+`<dir>/__pycache__/*.pyc` the same way, so an agent that names a file like
+one there has it folded too. A `/proc` path under
 a process or thread ID is listed with `*` for the ID, so the container
 runtime's init for each `docker exec` into the agent is one entry, not a new
 one per process. The deployment is the
