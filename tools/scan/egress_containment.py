@@ -14,6 +14,19 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
+# The schema's bounds (`$defs.egress_containment_value`). A bundle past one
+# fails its contract and is not delivered at all, so the value is cut here:
+# the level is always decided on everything inspected, and the lists say how
+# much they left out.
+MAX_LIST = 64
+MAX_REASON = 1024
+# Other containers inspected per scan, over every internal network, to find
+# gateway peers: each is a `docker container inspect`, and a scan runs every
+# minute. Peers past the budget aren't checked; the level doesn't depend on them.
+PEER_INSPECT_BUDGET = 64
+# A NetworkMode that is never an internal network.
+_DEFAULT_BRIDGE_MODES = ("bridge", "default")
+
 # Ordered as the design's §4.2 walks them; the first three are contained.
 CONTAINED_LEVELS = ("allow_list_enforced", "no_network", "internal_network")
 LEVELS = (*CONTAINED_LEVELS, "open", "host_network", "host_process")
@@ -97,7 +110,7 @@ def _downgrades(inspect: dict[str, Any], extra_sockets: tuple[str, ...]) -> tupl
     reasons: list[str] = []
     sockets = runtime_socket_mounts(inspect, extra_sockets)
     if sockets:
-        reasons.append("container-runtime socket in reach: " + ", ".join(sockets))
+        reasons.append(_joined("container-runtime socket in reach: ", sockets))
     if (inspect.get("HostConfig") or {}).get("Privileged"):
         reasons.append("privileged container")
     return reasons, sockets
@@ -127,19 +140,27 @@ def collect_inputs(
         return network_cache[name]
 
     networks: dict[str, dict[str, Any] | None] = {}
+    budget = PEER_INSPECT_BUDGET
     for name in _attached_networks(subject):
         info = network(name)
         if info is None:
             networks[name] = None
             continue
-        entry: dict[str, Any] = {"internal": bool(info.get("Internal")), "gateway_peers": []}
+        entry: dict[str, Any] = {"internal": bool(info.get("Internal")), "gateway_peers": [], "unchecked": 0}
         if entry["internal"]:
             own_id = str(subject.get("Id") or "")
-            for peer_id, peer in (info.get("Containers") or {}).items():
+            members = info.get("Containers") or {}
+            for peer_id in sorted(members if isinstance(members, dict) else {}):
+                peer = members[peer_id]
                 if peer_id == own_id or not isinstance(peer, dict):
                     continue
+                if budget <= 0:
+                    entry["unchecked"] += 1
+                    continue
+                budget -= 1
                 peer_inspect = inspect_container(peer_id)
                 if peer_inspect is None:
+                    entry["unchecked"] += 1
                     continue
                 peer_mode = str((peer_inspect.get("HostConfig") or {}).get("NetworkMode") or "")
                 outside = peer_mode == "host" or any(
@@ -151,6 +172,15 @@ def collect_inputs(
             entry["gateway_peers"].sort()
         networks[name] = entry
     return {"owner": owner, "owner_wanted": mode.startswith("container:"), "networks": networks}
+
+
+def _joined(prefix: str, names: list[str]) -> str:
+    text = prefix + ", ".join(names)
+    return text if len(text) <= MAX_REASON else text[: MAX_REASON - 1] + "…"
+
+
+def _capped(items: list[Any]) -> list[Any]:
+    return items[:MAX_LIST]
 
 
 def classify(
@@ -186,6 +216,7 @@ def classify(
          "gateway_peers": list((info or {}).get("gateway_peers") or [])}
         for name, info in sorted(networks_in.items())
     ]
+    unchecked = sum(int((info or {}).get("unchecked") or 0) for info in networks_in.values())
     attached = [n["name"] for n in networks]
     status = "ANSWERED"
     enforcer = None
@@ -202,20 +233,28 @@ def classify(
             level, reasons = "no_network", ["NetworkMode none, no attached network"]
     elif not attached:
         level, reasons = "open", [f"NetworkMode {subject_mode} with no attached network"]
+    elif subject_mode in _DEFAULT_BRIDGE_MODES:
+        level, reasons = "open", [f"NetworkMode {subject_mode}: the default bridge is never internal"]
     else:
         open_nets = [n["name"] for n in networks if n["internal"] is False]
         unknown = [n["name"] for n in networks if n["internal"] is None]
         if open_nets:
-            level, reasons = "open", ["not internal: " + ", ".join(open_nets)]
+            level, reasons = "open", [_joined("not internal: ", open_nets)]
         elif unknown:
             level, status = "open", "PARTIAL"
-            reasons = ["could not inspect: " + ", ".join(unknown)]
+            reasons = [_joined("could not inspect: ", unknown)]
         else:
             level = "internal_network"
-            reasons = ["every attached network is internal: " + ", ".join(attached)]
+            reasons = [_joined("every attached network is internal: ", attached)]
             peers = sorted({p for n in networks for p in n["gateway_peers"]})
             if peers:
-                reasons.append("reaches outside only through: " + ", ".join(peers))
+                reasons.append(_joined("reaches outside only through: ", peers))
+            if unchecked:
+                reasons.append(f"{unchecked} other container(s) on these networks not checked for outside reach")
+    for n in networks:
+        n["gateway_peers"] = _capped(n["gateway_peers"])
+    if len(networks) > MAX_LIST:
+        reasons.append(f"{len(networks) - MAX_LIST} more attached network(s) not listed")
 
     value = {
         "level": level,
@@ -223,15 +262,15 @@ def classify(
         "enforcer": enforcer,
         "observations": {
             "network_mode": subject_mode,
-            "networks": networks,
+            "networks": _capped(networks),
             "openshell_labels": openshell,
             "privileged": bool(host_config.get("Privileged"))
             or bool(owner is not None and (owner.get("HostConfig") or {}).get("Privileged")),
-            "runtime_socket_mounts": sockets,
+            "runtime_socket_mounts": _capped(sockets),
         },
         "via": f"container:{_container_name(owner)}" if owner is not None else None,
         "allow_list": None,
-        "reasons": reasons,
+        "reasons": [reason[:MAX_REASON] for reason in reasons][:16],
     }
     return status, value
 

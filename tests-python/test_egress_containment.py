@@ -244,6 +244,41 @@ class UninspectedNetworkTest(unittest.TestCase):
         self.assertEqual((status, value["level"]), ("ANSWERED", "open"))
 
 
+class BoundsTest(unittest.TestCase):
+    """A real topology never makes the value break the schema: a bundle past
+    a bound would not be delivered at all (rail-review, 75)."""
+
+    def test_a_crowded_internal_network_stays_inside_the_schema(self):
+        agent = container("private", ("private",))
+        peers = [container("private", ("private", "outside"), name="relay-" + "x" * 200 + str(i), cid=f"c-{i:03}")
+                 for i in range(150)]
+        docker = Docker([agent, *peers], {"private": net(True, agent, *peers), "outside": net(False, *peers)})
+        calls = []
+        inspect = docker.container
+        docker.container = lambda ref: calls.append(ref) or inspect(ref)
+        status, value = classify(agent, docker)
+        self.assertEqual((status, value["level"]), ("ANSWERED", "internal_network"))
+        self.assertLessEqual(len(calls), egress.PEER_INSPECT_BUDGET)
+        self.assertLessEqual(len(value["observations"]["networks"][0]["gateway_peers"]), egress.MAX_LIST)
+        self.assertTrue(all(len(r) <= egress.MAX_REASON for r in value["reasons"]))
+        self.assertTrue(any("not checked" in r for r in value["reasons"]))
+        schema = evidence_bundle.EGRESS_VALUE_SCHEMA
+        self.assertEqual(evidence_bundle._schema_problems(value, schema, "value"), [])
+
+    def test_many_networks_stay_inside_the_schema(self):
+        names = [f"net-{i:03}" for i in range(80)]
+        agent = container("net-000", names)
+        docker = Docker([agent], {n: net(True, agent) for n in names})
+        status, value = classify(agent, docker)
+        self.assertEqual(value["level"], "internal_network")
+        self.assertEqual(evidence_bundle._schema_problems(value, evidence_bundle.EGRESS_VALUE_SCHEMA, "value"), [])
+
+    def test_the_default_bridge_is_open_even_when_it_cannot_be_inspected(self):
+        agent = container("bridge", ("bridge",))
+        self.assertEqual(classify(agent, Docker([agent], {}))[0:1], ("ANSWERED",))
+        self.assertEqual(classify(agent, Docker([agent], {}))[1]["level"], "open")
+
+
 class ProxyTest(unittest.TestCase):
     def test_proxy_urls_lose_their_credentials_and_no_proxy_is_kept(self):
         env = {"https_proxy": "http://user:secret@proxy.corp:3128/?token=x", "NO_PROXY": "localhost,.corp"}
@@ -325,6 +360,11 @@ class BundleTest(unittest.TestCase):
         with mock.patch.object(scanner, "in_container", return_value=True):
             attr = self.build({"mode": "self", "docker_inspect": None})["egress_containment"]
         self.assertEqual((attr["status"], attr["reason"]), ("BLIND", "NO_SOURCE_ACCESS"))
+        # Kubernetes on cgroup v2: in_container() can't tell, the environment can.
+        with mock.patch.object(scanner, "in_container", return_value=False):
+            attr = self.build({"mode": "self", "docker_inspect": None,
+                               "env": {"KUBERNETES_SERVICE_HOST": "10.0.0.1"}})["egress_containment"]
+        self.assertEqual(attr["status"], "BLIND")
 
     def test_a_docker_context_without_inputs_is_blind(self):
         attr = self.build({"mode": "docker", "docker_inspect": OPENSHELL})["egress_containment"]

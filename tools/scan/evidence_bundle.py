@@ -1478,7 +1478,9 @@ def build_evidence_bundle(
                     "NO_SOURCE_ACCESS", "observed", method=egress_method,
                     note="the container's network mode or its namespace owner could not be inspected",
                 )
-    elif scanner.in_container():
+    elif scanner.in_container() or Path("/run/.containerenv").exists() or env.get("KUBERNETES_SERVICE_HOST"):
+        # `in_container` misses Podman and Kubernetes on cgroup v2; saying
+        # "a host process" there would be a false fact, not a gap.
         attributes["egress_containment"] = _blind(
             "NO_SOURCE_ACCESS", "observed",
             note="a scan inside a container cannot inspect its own network setting",

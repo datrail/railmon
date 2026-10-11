@@ -497,7 +497,8 @@ def docker_host_socket() -> tuple[str, ...]:
     one: a container that mounts it can drive the same daemon (DR-207)."""
     host = os.environ.get("DOCKER_HOST") or ""
     if host.startswith("unix://"):
-        return (host[len("unix://"):],)
+        path = re.sub(r"/+", "/", host[len("unix://"):]).rstrip("/")
+        return (path,) if path.startswith("/") else ()
     return ()
 
 
