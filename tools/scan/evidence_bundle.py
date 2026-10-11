@@ -235,7 +235,7 @@ def _resolve(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
 
 def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: dict[str, Any] | None = None) -> list[str]:
     """A minimal, stdlib-only walker for the slice of JSON Schema this
-    contract uses: type/const/enum/required/properties/additionalProperties/
+    contract uses: type (one, or a list)/const/enum/required/properties/additionalProperties/
     items/minProperties/minItems/maxItems/uniqueItems,
     minLength/maxLength/minimum/pattern,
     format:date-time, and allOf/if/then/else/not/$ref, and the boolean
@@ -266,6 +266,20 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: di
     if "enum" in schema and instance not in schema["enum"]:
         problems.append(f"{where}: {instance!r} is not one of {schema['enum']}")
     kind = schema.get("type")
+    if isinstance(kind, list):
+        # A list of types (DR-207's nullable strings): the instance is one of
+        # them. Each is checked as the single-type branch below checks it.
+        matches = {
+            "object": isinstance(instance, dict),
+            "array": isinstance(instance, list),
+            "string": isinstance(instance, str),
+            "integer": isinstance(instance, int) and not isinstance(instance, bool),
+            "boolean": isinstance(instance, bool),
+            "null": instance is None,
+        }
+        if not any(matches.get(name, False) for name in kind):
+            problems.append(f"{where}: must be one of {', '.join(kind)}")
+        kind = None
     if kind == "object" and not isinstance(instance, dict):
         problems.append(f"{where}: must be an object")
     elif kind == "array" and not isinstance(instance, list):
