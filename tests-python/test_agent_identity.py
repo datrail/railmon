@@ -1705,6 +1705,17 @@ class ProcPidFileAccessTest(unittest.TestCase):
             ("/proc/2266/task/abc/maps", "/proc/*/task/abc/maps"),
             ("/srv/proc/2266/maps", "/srv/proc/2266/maps"),
             ("/proc/filesystems", "/proc/filesystems"),
+            # Named from the root of a procfs mounted nowhere (DR-206).
+            ("/1003/setgroups", "/proc/*/setgroups"),
+            ("/1003/task/1003/attr/apparmor/exec", "/proc/*/task/*/attr/apparmor/exec"),
+            ("/1003/uid_map", "/proc/*/uid_map"),
+            ("/1003/fd/7", "/proc/*/fd/7"),
+            ("/1003/report.txt", "/1003/report.txt"),
+            ("/1003/setgroups.bak", "/1003/setgroups.bak"),
+            ("/1003", "/1003"),
+            ("/1003/task/1003/notes", "/1003/task/1003/notes"),
+            ("/12a/setgroups", "/12a/setgroups"),
+            ("/srv/1003/setgroups", "/srv/1003/setgroups"),
         ):
             self.assertEqual(scanner.fold_proc_pid(path), folded, path)
 
@@ -1721,6 +1732,25 @@ class ProcPidFileAccessTest(unittest.TestCase):
         ])
         self.assertEqual(result["unlisted"], 0)
         self.assertEqual(result["collapsed"], 0)
+
+    def test_each_exec_into_an_openshell_sandbox_is_one_entry(self):
+        # What runc did for each `docker exec` into an OpenShell sandbox
+        # (DR-206): maps, cgroup and mountinfo through /proc, setgroups and
+        # the AppArmor exec label through a new procfs mounted nowhere.
+        lines = [FileAccessTest.START]
+        for pid in range(100, 400):
+            lines += [self.event(pid=pid, comm="runc:[2:INIT]", path=f"/proc/{pid}/maps"),
+                      self.event(pid=pid, comm="runc:[2:INIT]", read=False, write=True,
+                                 path=f"/{pid}/setgroups"),
+                      self.event(pid=pid, comm="runc:[2:INIT]", read=False, write=True,
+                                 path=f"/{pid}/task/{pid}/attr/apparmor/exec")]
+        result = scanner.summarize_file_access(lines)
+        self.assertEqual(result["files"], [
+            self.entry("/proc/*/maps"),
+            self.entry("/proc/*/setgroups", read=False, write=True),
+            self.entry("/proc/*/task/*/attr/apparmor/exec", read=False, write=True),
+        ])
+        self.assertEqual(result["unlisted"], 0)
 
     def test_a_write_under_a_folded_path_still_shows(self):
         result = scanner.summarize_file_access([
