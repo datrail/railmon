@@ -1028,8 +1028,9 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # pack 7 folds observed_file_access's /proc/<pid> paths (DR-185);
         # pack 8 adds the registration payload's fields (DR-189); pack 9
         # adds agent_instance, the dynamic ones pack 8 left out (DR-193);
-        # pack 10 folds Python's bytecode-cache writes (DR-201).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 10)
+        # pack 10 folds Python's bytecode-cache writes (DR-201); pack 11
+        # adds egress_containment and egress_proxy_declared (DR-207).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 11)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)

@@ -698,6 +698,46 @@ on this attribute alone. A second run that writes temp files under new
 random names (made by Python's `tempfile` and `mktemp`) stays aligned, and a
 new fixed name in `/tmp` is drift.
 
+## Egress containment
+
+`egress_containment` (observed) says whether the agent can open a connection to
+any outside host by itself, read from Docker's view of the container, never
+from what the container declares (DR-207; design in railxia/docs
+`design/2026-10-11-egress-containment`). One level, from the first rule that
+applies:
+
+| Level | Contained | When |
+| --- | --- | --- |
+| `host_process` | no | `self` mode outside any container |
+| `open` | no | a container-runtime socket is reachable through a bind mount (the socket file, at either end, or any directory above a known socket path such as `/var/run`), or the container is privileged |
+| `host_network` | no | `NetworkMode` is `host` |
+| `allow_list_enforced` | yes | NVIDIA OpenShell's three fixed sandbox labels **and** `NetworkMode=none` with no attached network |
+| `no_network` | yes | `NetworkMode=none` with no attached network |
+| `internal_network` | yes | at least one attached network, and every one is `Internal`; a container on it that also reaches outside is listed in `gateway_peers` |
+| `open` | no | anything else |
+
+The value carries the observations behind the level (`network_mode`, each
+network's `internal` flag and gateway peers, whether the OpenShell labels are
+there, `privileged`, the matched socket mounts), so a consumer can judge them
+itself. `allow_list` is always `null`: OpenShell keeps its allow-list in its
+own gateway, so RailMon can say one is enforced but not what is on it. In
+`container:<id>` mode the namespace's owner decides the network, and a
+downgrade on either container counts. If a network can't be inspected, it is
+never assumed internal. The attribute is `PARTIAL` (level `open`) only when
+that network decides the answer. A container or owner that can't be inspected
+is `FAILED`. A scan inside a container in `self` mode is `BLIND`. The
+attribute is closed, as `$defs.egress_containment_value` in the v1 schema, and
+sandbox-scoped in v2.
+
+`egress_proxy_declared` (declared) lists the `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY` and `NO_PROXY` the container's environment sets, with credentials
+removed. It never raises the level, because any client can ignore a proxy
+variable.
+
+Both attributes are new in rule pack 11. RailDash shows a baseline locked
+under pack 10 as `CONTRACT_MISMATCH`, not as drift, until a pack-11 ASP is
+locked.
+
 ## Agent identity
 
 | Field | Where it comes from |

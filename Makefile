@@ -30,6 +30,7 @@ test-python:
 		tools/scan/scan_agent_environment.py \
 		tools/scan/evidence_bundle.py \
 		tools/scan/compose_evidence_bundle_v2.py \
+		tools/scan/egress_containment.py \
 		tools/listen/follow_container.py \
 		tools/collect/follow_container_tls.py \
 		tools/skills/skill_scanner.py \
