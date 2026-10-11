@@ -68,10 +68,10 @@ def mcp_reply(message: object) -> dict | None:
     elif method == "tools/list":
         reply["result"] = {"tools": MCP_TOOLS}
     elif method == "tools/call" and params.get("name") == "read_doc":
-        args = params.get("arguments") or {}
+        args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         reply["result"] = {"content": [{"type": "text", "text": f"document {args.get('doc_id')}"}]}
     elif method == "tools/call" and params.get("name") == "upload_file":
-        args = params.get("arguments") or {}
+        args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         size = len(str(args.get("content", "")))
         reply["result"] = {"content": [{"type": "text", "text": f"stored {size} bytes"}]}
     elif method == "tools/call":

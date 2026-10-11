@@ -32,7 +32,7 @@ only accepts one PID and the demo has two. In the few seconds the demo runs,
 this is a reasonable trade for simplicity; it is not a pattern to copy for a
 real deployment, which should filter by the actual agent's identity.
 
-**This is why three requests produce six interactions.** Both ends of each
+**This is why the client's five requests (two MCP calls, three plain POSTs) produce ten interactions.** Both ends of each
 exchange are `python3` — `demo_server.py` and `demo_client.py` — so the tap
 records each request twice, once as the client wrote it and once as the
 server read it. The two rows carry different `pid`s and share a timestamp to
