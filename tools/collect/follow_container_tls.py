@@ -124,11 +124,22 @@ def mapped_libssl(pid: int, proc: str = PROC) -> tuple[str, str] | None:
 
 
 def children(pid: int, proc: str = PROC) -> list[int]:
+    """Every thread's children: the kernel lists a child under the thread
+    that forked it, and a multi-threaded init (OpenShell's sandbox, DR-206)
+    starts the agent from a worker thread, not its main one."""
     try:
-        with open(f"{proc}/{pid}/task/{pid}/children") as f:
-            return [int(p) for p in f.read().split()]
-    except (OSError, ValueError):
+        tasks = sorted((t for t in os.listdir(f"{proc}/{pid}/task") if t.isdigit()),
+                       key=lambda t: (int(t) != pid, int(t)))
+    except OSError:
         return []
+    found: list[int] = []
+    for task in tasks:
+        try:
+            with open(f"{proc}/{pid}/task/{task}/children") as f:
+                found.extend(int(p) for p in f.read().split())
+        except (OSError, ValueError):
+            continue
+    return found
 
 
 def session_of(pid: int, proc: str = PROC) -> int | None:

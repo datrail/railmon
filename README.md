@@ -243,7 +243,13 @@ bytecode-cache write (importlib's `<module>.pyc.<digits>` temp name in a
 one there has it folded too. A `/proc` path under
 a process or thread ID is listed with `*` for the ID, so the container
 runtime's init for each `docker exec` into the agent is one entry, not a new
-one per process. The deployment is the
+one per process. So are the few files runc sets up a process with
+(`setgroups`, the id maps, the `attr` security labels) when named without
+`/proc`, as `/1003/setgroups` is in an OpenShell sandbox, where runc opens
+them through a procfs of its own. Nothing below or beside them folds, since
+a `/proc` path is never a saved file to the Data Guardrail; an agent that
+can write to `/` and names a file exactly like one of them (`/5/setgroups`)
+has that write folded into runc's entry. The deployment is the
 listener one with its own variables (`RAIL_FILES_CONTAINER`, `RAIL_FILES_FILE`,
 `RAIL_FILES_HEARTBEAT`), and the scan reads both files:
 

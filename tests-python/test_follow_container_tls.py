@@ -30,12 +30,15 @@ class FakeProc:
         self.rootfs = base / "rootfs"
         self.rootfs.mkdir()
 
-    def process(self, pid: int, exe: str, *, children=(), maps=(), comm="x", session=1):
+    def process(self, pid: int, exe: str, *, children=(), maps=(), comm="x", session=1,
+                threads=None):
         """`maps` paths are inside the root; each becomes a `map_files` link
-        to the file in it, as the kernel's links name the mapped inode."""
+        to the file in it, as the kernel's links name the mapped inode.
+        `threads` maps other thread ids to the children each one forked."""
         d = self.base / "proc" / str(pid)
-        (d / "task" / str(pid)).mkdir(parents=True)
-        (d / "task" / str(pid) / "children").write_text(" ".join(map(str, children)))
+        for tid, forked in {pid: children, **(threads or {})}.items():
+            (d / "task" / str(tid)).mkdir(parents=True)
+            (d / "task" / str(tid) / "children").write_text(" ".join(map(str, forked)))
         (d / "map_files").mkdir()
         lines = []
         for i, path in enumerate(maps):
@@ -76,6 +79,25 @@ class ResolverTest(unittest.TestCase):
         self.assertEqual(pid, 11)
         self.assertEqual(path, f"{self.fake.proc}/11/exe")
         self.assertIn("built into", how)
+
+    def test_an_agent_forked_by_a_worker_thread_of_init_is_found(self):
+        # OpenShell's shape (DR-206): its sandbox runtime is a multi-threaded
+        # init that starts the agent's shell from a worker thread, so the
+        # main thread lists no children at all.
+        self.fake.file("/.openshell/runtime/openshell-sandbox")
+        self.fake.file("/bin/sh")
+        self.fake.file("/usr/local/bin/python3")
+        self.fake.file("/usr/lib/x86_64-linux-gnu/libssl.so.3")
+        self.fake.process(1, "/.openshell/runtime/openshell-sandbox", comm="openshell-sandb",
+                          threads={7: [], 9: [40]})
+        self.fake.process(40, "/bin/sh", children=[41], comm="sh", session=40)
+        self.fake.process(41, "/usr/local/bin/python3", comm="my-agent-bin", session=40,
+                          maps=["/usr/lib/x86_64-linux-gnu/libssl.so.3"])
+        pid, path, how = tls.find_tls_target(1, {}, proc=self.fake.proc)
+        self.assertEqual(pid, 41)
+        self.assertTrue(path.startswith(f"{self.fake.proc}/41/map_files/"))
+        self.assertIn("libssl.so.3", how)
+        self.assertEqual(tls.session_of(41, proc=self.fake.proc), 40)
 
     def test_a_needle_across_a_read_boundary_is_found(self):
         self.fake.file("/bin/agent", b"\0" * (tls.CHUNK - 4) + b"SSL_write")
