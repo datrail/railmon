@@ -9,8 +9,8 @@
 #     other agent traffic)
 #
 # Requires the same privileges `collect` always has: --privileged --pid=host,
-# a Linux kernel with BTF/CO-RE, and (per the Dockerfile) an x86_64 host —
-# AgentSight ships no other architecture. See README.md's "Platforms" section.
+# and a Linux kernel with BTF/CO-RE, on x86_64 or arm64. See README.md's
+# "Platforms" section.
 set -eu
 
 root="${RAILMON_ROOT:-/opt/railmon}"

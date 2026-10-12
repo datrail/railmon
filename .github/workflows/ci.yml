@@ -108,9 +108,8 @@ jobs:
       # that builds but fails the scan and acceptance steps below, and the arm64
       # leg costs QEMU emulation for a signal the amd64 leg already gives.
       #
-      # amd64 is also the arch that can fail *specifically*: the Dockerfile
-      # installs the AgentSight release binary on amd64 and skips it elsewhere,
-      # so the arm64 leg does not exercise that path at all.
+      # The arm64 image (AgentSight's aarch64 asset, DR-208) runs natively in
+      # datrail-project's `arm64` stack job instead.
       #
       # The cache scope is shared with container-release.yml on purpose, so the
       # multi-arch publish reuses these amd64 layers instead of rebuilding them.

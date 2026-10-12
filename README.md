@@ -318,8 +318,8 @@ scan re-sends that bundle, `bundle_id` and all, so RailDash answers
 
 Collection is Linux-only and needs root or the relevant BPF capabilities. WSL2
 works as Linux; Docker Desktop observes its Linux VM rather than native macOS
-processes. The bundled AgentSight collector is x86_64, so `collect` and `demo`
-are unavailable on arm64 while the Python commands remain usable. It is one
+processes. The image builds for x86_64 and arm64 (Apple Silicon under Docker
+Desktop, arm64 Linux) and carries AgentSight's build for each. It is one
 pinned AgentSight release, checked against its SHA-256 at build time (the
 Dockerfile's `AGENTSIGHT_VERSION`; [CONTRIBUTING.md](CONTRIBUTING.md) says how
 to bump it).

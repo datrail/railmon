@@ -6,8 +6,16 @@
 # the check.
 DOCKERFILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))Dockerfile
 AGENTSIGHT_VERSION ?= $(shell sed -n 's/^ARG AGENTSIGHT_VERSION=//p' $(DOCKERFILE))
+# The host's architecture picks the asset and its hash, as TARGETARCH does in
+# the image (DR-208).
+ifeq ($(shell uname -m),aarch64)
+AGENTSIGHT_ASSET := agentsight-aarch64
+AGENTSIGHT_SHA256 ?= $(shell sed -n 's/^ARG AGENTSIGHT_SHA256_ARM64=//p' $(DOCKERFILE))
+else
+AGENTSIGHT_ASSET := agentsight
 AGENTSIGHT_SHA256 ?= $(shell sed -n 's/^ARG AGENTSIGHT_SHA256=//p' $(DOCKERFILE))
-AGENTSIGHT_URL ?= https://github.com/eunomia-bpf/agentsight/releases/download/$(AGENTSIGHT_VERSION)/agentsight
+endif
+AGENTSIGHT_URL ?= https://github.com/eunomia-bpf/agentsight/releases/download/$(AGENTSIGHT_VERSION)/$(AGENTSIGHT_ASSET)
 AGENTSIGHT_BIN := bin/agentsight
 
 build:
