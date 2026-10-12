@@ -67,7 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # GitHub records for its `agentsight` and `agentsight-aarch64` assets (`gh
 # release view <tag> --repo eunomia-bpf/agentsight --json assets`, or
 # sha256sum of the download).
-# `make fetch-agentsight` reads both from here, so the local binary and the
+# `make fetch-agentsight` reads them from here, so the local binary and the
 # image's stay the same release. DR-170 bumps this when the release carrying
 # the listener and file capture it moves onto is cut.
 #
