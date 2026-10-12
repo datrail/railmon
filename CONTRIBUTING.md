@@ -25,10 +25,11 @@ A parsing bug most likely belongs upstream. Say so in the issue and we will
 help route it.
 
 The probe binary is a pinned AgentSight release: the Dockerfile's
-`AGENTSIGHT_VERSION` and `AGENTSIGHT_SHA256` build arguments name the tag and
-the SHA-256 of its `agentsight` asset, and the image build fails if the
-download does not match. `make fetch-agentsight` reads the same two values.
-Taking a newer release is one edit of those two lines (the hash is on the
+`AGENTSIGHT_VERSION`, `AGENTSIGHT_SHA256` and `AGENTSIGHT_SHA256_ARM64` build
+arguments name the tag and the SHA-256 of its `agentsight` (x86-64) and
+`agentsight-aarch64` assets, and the image build fails if the download does
+not match. `make fetch-agentsight` reads the same values for the host's
+architecture. Taking a newer release is one edit of those three lines (the hashes are on the
 release's asset list, `gh release view <tag> --repo eunomia-bpf/agentsight
 --json assets`), in a PR whose CI builds and runs the image with it.
 
