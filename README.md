@@ -5,15 +5,23 @@
 > one `docker compose up -d` runs RailMon, RailDash and a demo agent
 > together. This README covers RailMon on its own.
 
-RailMon observes an AI agent's network activity and emits structured HTTP
-interactions. It combines a Rust collector with AgentSight's eBPF TLS probe,
-plus Python commands for environment scanning, skill discovery, and forwarding
-captures to a webhook.
+RailMon observes what an AI agent is set up to use and what it actually
+does. It has two halves:
 
-A scan produces an evidence bundle, which
-[RailDash](https://github.com/datrail/raildash) turns into an Agent Security
-Profile (ASP): what the agent is set up to use and was observed doing. Once an
-ASP is locked as the baseline, later scans that differ from it are drift.
+- **Capture.** A Rust collector on AgentSight's eBPF TLS probe records the
+  agent's HTTPS calls, model and MCP-over-HTTPS calls included, as structured
+  interactions. Two more eBPF probes record the sockets it listens on and
+  the files it opens to read, write or run.
+- **Scan.** Python commands read the agent's environment, skills, model
+  endpoint and egress containment, together with what the probes recorded.
+  Each scan builds one evidence bundle. `--interval` repeats the scan on a
+  schedule and delivers each bundle to RailDash, Rail Center or both, so
+  nobody has to re-run it by hand.
+
+[RailDash](https://github.com/datrail/raildash) turns each evidence bundle
+into an Agent Security Profile (ASP): what the agent is set up to use and was
+observed doing. Once an ASP is locked as the baseline, later scans that
+differ from it are drift.
 These terms are defined in the
 [DatRail glossary](https://github.com/datrail/datrail-project/blob/master/docs/glossary.md).
 
@@ -294,7 +302,7 @@ The ones you are most likely to set:
 | `RAIL_RAILDASH_TOKEN_FILE` | collector `--webhook` | none | A file holding that token instead, re-read on every batch and heartbeat. Not with `RAIL_RAILDASH_TOKEN`. |
 | `RAIL_HEARTBEAT_INTERVAL` | collector `--webhook` | `60` | Seconds between heartbeats, for tests (0.1 to 3600; anything that is not a positive number means 60). RailDash treats a collector with no heartbeat for 3 minutes as stopped. |
 | `RAIL_SCAN_INTERVAL_IN_SECONDS` | `scan` (`--interval`) | unset: scan once and exit | Keeps `scan` running and scans again on this interval (3600 if the value is not a number). Set but empty counts as set, so it scans every 3600 seconds. |
-| `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. `scan --register` sends it the evidence bundle at `/v1/agents/register` (needs Rail Center with RC-387). |
+| `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. `scan --register` sends it the evidence bundle at `/v1/agents/register` (needs a Rail Center that accepts the evidence bundle there). |
 | `RAIL_AUTH_MODE` | collector `--webhook`, `forward`, `scan --register` | `none` | The credential to present: `none`, `bearer` or `gcp`. See above for `RAIL_AUTH_TOKEN`, `RAIL_AUTH_TOKEN_FILE` and `RAIL_AUTH_AUDIENCE`. |
 | `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
 | `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | listensnoop's JSON lines: where `listen` appends and `scan` reads. |
