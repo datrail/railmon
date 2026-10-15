@@ -58,6 +58,15 @@ read landing in the middle of a chunk or a reply that is not chunked
 ([#70](https://github.com/datrail/railmon/issues/70); the fix is a connection key upstream,
 [eunomia-bpf/agentsight#208](https://github.com/eunomia-bpf/agentsight/issues/208)).
 
+A compressed HTTP/1 reply (`Content-Encoding` gzip, x-gzip, deflate, br or
+zstd, chunked or sized by `Content-Length`) is de-chunked and decoded before it
+is parsed, so a streamed gzip SSE reply is recorded as the SSE text the agent's
+SDK reads. Its recorded headers are those of the decoded message: no
+`Content-Encoding` or `Transfer-Encoding`, and `Content-Length` set to the
+decoded length. A reply that cannot be decoded (a corrupt or truncated body, a
+stacked coding list, a header block split across reads, or a decoded message
+past 1 MiB) is recorded as captured, still encoded.
+
 ### Following a container
 
 `railmon collect` with `RAIL_COLLECT_CONTAINER=<name or id>` (and the Docker

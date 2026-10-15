@@ -62,9 +62,11 @@ vulnerability here means.
   neither chunked nor sized by `Content-Length` is recorded from its first SSL
   read only, and a chunked reply past 1 MiB is dropped whole, leaving its
   request incomplete (on agentsight 1.0.14 chunked replies were cut to their
-  first read too: 81 of 532 bytes on one Anthropic-shaped stream). Do not read
-  capture as a completeness guarantee in either direction — it is neither
-  redacted nor whole.
+  first read too: 81 of 532 bytes on one Anthropic-shaped stream). A
+  compressed HTTP/1 reply is decoded only while the decoded message stays
+  within 1 MiB; past that, or when it fails to decode, it is recorded still
+  encoded. Do not read capture as a completeness guarantee in either
+  direction — it is neither redacted nor whole.
 - **`--mode raw` is not a redacted mode.** It forwards analyzer events directly.
   Credential header lines in raw wire text are scrubbed, but this mode exists
   for debugging and should not be pointed at a shared sink.

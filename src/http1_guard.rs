@@ -40,8 +40,8 @@ pub const DIVERTED_KEY: &str = "railmon_diverted_data";
 const DIVERTED_HEX_KEY: &str = "railmon_diverted_data_hex";
 
 /// The parser's own bounds, so this never holds state it has already dropped.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
-const MAX_STREAMS: usize = 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_STREAMS: usize = 1024;
 /// A chunk-size line is a hex number plus optional extensions; anything this
 /// long without a CRLF is not one.
 const MAX_SIZE_LINE: usize = 1024;
@@ -236,7 +236,7 @@ impl Analyzer for RestoreDiverted {
 }
 
 /// The parser's own decoding of an SSL payload.
-fn event_bytes(event: &Event, text: &str) -> Vec<u8> {
+pub(crate) fn event_bytes(event: &Event, text: &str) -> Vec<u8> {
     if let Some(bytes) = event
         .data
         .get("data_hex")
@@ -270,7 +270,7 @@ pub(crate) fn hex_decode(hexed: &str) -> Option<Vec<u8>> {
 }
 
 /// Same rule as the parser's: resync only on a start line at offset zero.
-fn looks_like_http1_start(bytes: &[u8]) -> bool {
+pub(crate) fn looks_like_http1_start(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     let first = text.split(['\r', '\n']).next().unwrap_or("");
     if first.starts_with("HTTP/1.") {
@@ -293,7 +293,7 @@ enum End {
 }
 
 /// Where the chunked framing of the buffered message stands at its end.
-enum Position {
+pub(crate) enum Position {
     /// Waiting for (the rest of) a chunk-size line.
     SizeLine,
     /// Chunk data still to come, then CRLF.
@@ -304,23 +304,23 @@ enum Position {
     Unchecked,
 }
 
-fn find(buf: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn find(buf: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     buf.get(from..)?
         .windows(needle.len())
         .position(|w| w == needle)
         .map(|p| from + p)
 }
 
-struct Head {
-    end: usize,
-    chunked: bool,
-    length: Option<usize>,
-    is_response: bool,
+pub(crate) struct Head {
+    pub(crate) end: usize,
+    pub(crate) chunked: bool,
+    pub(crate) length: Option<usize>,
+    pub(crate) is_response: bool,
 }
 
 /// None while the header block is incomplete; Err when its framing headers
 /// are malformed (the parser drops those).
-fn header_info(buf: &[u8]) -> Result<Option<Head>, ()> {
+pub(crate) fn header_info(buf: &[u8]) -> Result<Option<Head>, ()> {
     let lead = buf
         .iter()
         .take_while(|b| **b == b'\r' || **b == b'\n')
@@ -379,7 +379,7 @@ fn message_end(buf: &[u8]) -> End {
 
 /// Walk the chunk framing from `start`; returns where it stands at the end of
 /// `buf`, or the end of the message if it is complete.
-fn chunk_position(buf: &[u8], start: usize) -> Result<(Position, Option<usize>), ()> {
+pub(crate) fn chunk_position(buf: &[u8], start: usize) -> Result<(Position, Option<usize>), ()> {
     let mut cursor = start;
     loop {
         let Some(line_end) = find(buf, b"\r\n", cursor) else {
@@ -418,7 +418,7 @@ fn chunk_position(buf: &[u8], start: usize) -> Result<(Position, Option<usize>),
     }
 }
 
-fn parse_size(line: &[u8]) -> Option<usize> {
+pub(crate) fn parse_size(line: &[u8]) -> Option<usize> {
     let end = line.iter().position(|&b| b == b';').unwrap_or(line.len());
     let digits = std::str::from_utf8(&line[..end]).ok()?;
     if digits.is_empty() {

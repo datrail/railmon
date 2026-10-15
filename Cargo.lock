@@ -1476,9 +1476,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "brotli",
+ "brotli-decompressor",
  "chrono",
  "clap",
  "env_logger",
+ "flate2",
  "futures",
  "libc",
  "log",
@@ -1491,6 +1494,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
