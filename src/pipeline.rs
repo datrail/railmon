@@ -5,7 +5,8 @@
 //! truncation, stripping `Authorization` — is AgentSight's, consumed as a
 //! library. What stays here is the part that is RailMon's own: spawning the
 //! probe, unwrapping what it emits, pairing a request with its response, and
-//! attributing the result.
+//! attributing the result, plus two byte-level stages in front of the HTTP/1
+//! parser (`http1_guard`, `http1_decode`).
 
 use crate::http1_decode::CompressedReplyDecoder;
 use crate::http1_guard::{Http1FramingGuard, RestoreDiverted};
@@ -1270,5 +1271,89 @@ mod tests {
         let text = serde_json::to_string(&out).unwrap();
         assert!(!text.contains("sk-SECRET"), "credential survived: {text}");
         assert!(!text.contains("deadbeef"));
+    }
+
+    /// datrail/railmon#93: a streamed `content-encoding: gzip` reply, chunked
+    /// the way Node frames it and read a few bytes at a time, comes out of the
+    /// whole pipeline as the SSE text the agent's SDK reads, tool call and all.
+    #[tokio::test]
+    async fn a_gzip_chunked_sse_reply_is_paired_decoded() {
+        use std::io::Write as _;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+            "\"type\":\"function\",\"function\":{\"name\":\"delivery__delivery_track_package\",",
+            "\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(sse.as_bytes()).unwrap();
+        let gz = gz.finish().unwrap();
+        let mut reply = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+            Transfer-Encoding: chunked\r\nContent-Encoding: gzip\r\n\r\n"
+            .to_vec();
+        for (i, piece) in gz.chunks(1).take(3).chain(gz[3..].chunks(37)).enumerate() {
+            let size = if i < 3 {
+                format!("{:08x}", piece.len())
+            } else {
+                format!("{:x}", piece.len())
+            };
+            reply.extend_from_slice(format!("{size}\r\n").as_bytes());
+            reply.extend_from_slice(piece);
+            reply.extend_from_slice(b"\r\n");
+        }
+        reply.extend_from_slice(b"0\r\n\r\n");
+
+        let line = |ts: u64, function: &str, bytes: &[u8]| {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            json!({"source": "ssl", "pid": 4242, "comm": "node", "data": {
+                "pid": 4242, "tid": 7, "timestamp_ns": ts, "function": function,
+                "data": format!("HEX:{hex}")}})
+            .to_string()
+        };
+        let mut lines = vec![line(
+            1,
+            "WRITE/SEND",
+            b"POST /v1beta/openai/chat/completions HTTP/1.1\r\nHost: generativelanguage.googleapis.com\r\n\
+              Content-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"stream\":true}",
+        )];
+        // The header block in one read, as a TLS record carries it; the body
+        // five bytes at a time, cutting across chunk framing.
+        let head_end = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        lines.push(line(1_000, "READ/RECV", &reply[..head_end]));
+        for (i, piece) in reply[head_end..].chunks(5).enumerate() {
+            lines.push(line(1_001 + i as u64, "READ/RECV", piece));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let capture = dir.path().join("capture.jsonl");
+        std::fs::write(&capture, lines.join("\n") + "\n").expect("write capture");
+        let probe = dir.path().join("agentsight");
+        std::fs::write(&probe, format!("#!/bin/sh\ncat '{}'\n", capture.display()))
+            .expect("write probe");
+        std::fs::set_permissions(&probe, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod probe");
+
+        let (stream, _status) =
+            event_stream(&probe.display().to_string(), &CaptureFilters::default())
+                .await
+                .expect("start fake probe");
+        let events: Vec<Event> =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.collect())
+                .await
+                .expect("the stream ends when the probe exits");
+        let mut pairer = Pairer::new();
+        let paired: Vec<Value> = events
+            .iter()
+            .filter_map(|e| pairer.accept(e.pid, &e.data, e.timestamp))
+            .collect();
+        assert_eq!(paired.len(), 1, "{events:?}");
+        let response = &paired[0]["response"];
+        assert_eq!(response["body"], json!({ "raw": sse }));
+        let raw = response["body"]["raw"].as_str().unwrap();
+        assert!(raw.contains("\"tool_calls\"") && raw.contains("delivery__delivery_track_package"));
+        let headers = response["headers"].as_object().unwrap();
+        assert!(!headers.contains_key("content-encoding"), "{headers:?}");
+        assert!(!headers.contains_key("transfer-encoding"), "{headers:?}");
+        assert_eq!(headers["content-length"], json!(sse.len().to_string()));
+        assert_eq!(headers["content-type"], json!("text/event-stream"));
     }
 }
