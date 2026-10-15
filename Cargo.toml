@@ -31,6 +31,12 @@ async-trait = "0.1"
 log = "0.4"
 env_logger = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Decoding a compressed HTTP/1 reply before AgentSight's parser turns its bytes
+# into text (src/http1_decode.rs). The same crates and versions AgentSight's
+# HTTPDecompressor already builds, so nothing new is compiled.
+flate2 = "1"
+brotli-decompressor = "4"
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

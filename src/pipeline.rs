@@ -7,6 +7,7 @@
 //! probe, unwrapping what it emits, pairing a request with its response, and
 //! attributing the result.
 
+use crate::http1_decode::CompressedReplyDecoder;
 use crate::http1_guard::{Http1FramingGuard, RestoreDiverted};
 use agentsight_capture::analyzers::{
     Analyzer, AuthHeaderRemover, HTTPDecompressor, HTTPParser, TimestampNormalizer,
@@ -367,6 +368,11 @@ pub async fn event_stream(
         // Keeps another connection's reads out of a chunked reply in flight
         // on the same thread, then hands them back unchanged (#70).
         Box::new(Http1FramingGuard::new()),
+        // Decodes a gzip/deflate/br/zstd HTTP/1 reply on its bytes, because
+        // the parser's text conversion destroys a compressed body before
+        // HTTPDecompressor can read it (#93). HTTPDecompressor stays for
+        // HTTP/2 replies.
+        Box::new(CompressedReplyDecoder::new()),
         Box::new(HTTPParser::new().disable_raw_data()),
         Box::new(RestoreDiverted),
         Box::new(HTTPDecompressor::new()),
