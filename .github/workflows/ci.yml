@@ -12,17 +12,6 @@ on:
   push:
     branches: [master]
   workflow_call:
-    inputs:
-      ref:
-        description: >-
-          Commit-ish to check out. A called workflow's `github.ref` is the
-          caller's, which on workflow_dispatch is the branch the run was
-          launched from rather than the tag being published — so the release
-          path passes the resolved tag explicitly. Empty means "whatever
-          triggered this run", which is right for pull_request and push.
-        type: string
-        required: false
-        default: ""
 
 # Declared here so this workflow is correct when triggered directly. A caller
 # may also set permissions on the calling job — those flow in, and this file
@@ -40,12 +29,7 @@ permissions:
 # way. Keyed by ref, three quick pushes to master would leave the middle commit
 # untested, which is the one case where a green master means nothing.
 #
-# `github.event_name` in a called workflow is the caller's, so the release path
-# reads `push` or `workflow_dispatch` here — never `pull_request`. Either way it
-# keys by SHA and runs to completion. Note the SHA differs between the two: a
-# tag push gives the tagged commit, a dispatch gives the HEAD of the branch the
-# run was launched from, which is why the tag itself travels through the `ref`
-# input rather than being inferred from the context here.
+# A called workflow sees the caller's context, so the release path keys by the tagged SHA.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -56,20 +40,10 @@ jobs:
     # 11-19, run by run (actions/runner-images#14748). Move on purpose (DR-133).
     runs-on: ubuntu-26.04
     steps:
-      # Submodules follow the same rule as the release workflow: off unless the
-      # repository declares RAIL_SUBMODULES, and the cross-repo PAT is only
-      # handed to a checkout that is actually fetching from another repo.
-      #
-      # This depends on the caller passing `secrets: inherit`. `vars` reach a
-      # called workflow on their own, but secrets do not — without inherit,
-      # SUBMODULE_TOKEN resolves to an empty string while RAIL_SUBMODULES still
-      # reads truthy, and the recursive checkout would go out with a token that
-      # cannot read another repository.
+      # As in the release: the image cannot build without ebpf-tls-tap.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
-          submodules: ${{ vars.RAIL_SUBMODULES || false }}
-          token: ${{ vars.RAIL_SUBMODULES && secrets.SUBMODULE_TOKEN || secrets.GITHUB_TOKEN }}
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -97,9 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
-          submodules: ${{ vars.RAIL_SUBMODULES || false }}
-          token: ${{ vars.RAIL_SUBMODULES && secrets.SUBMODULE_TOKEN || secrets.GITHUB_TOKEN }}
+          submodules: recursive
 
       - uses: docker/setup-buildx-action@v4
 
@@ -214,10 +186,9 @@ jobs:
       # DR-109 M4: this image and RailDash's, run together the way a user runs
       # them (raildash/docs/asp-v1-acceptance.md). RailDash is built from its
       # own master, so a break on either side of the seam shows up here. Not
-      # on the release path (inputs.ref set): a tag's result must not depend
-      # on whatever RailDash master is that day, so it runs on PRs and pushes.
+      # on a tag: a release must not depend on whatever RailDash master is that day.
       - name: Check out RailDash
-        if: inputs.ref == ''
+        if: "!startsWith(github.ref, 'refs/tags/')"
         uses: actions/checkout@v7
         with:
           repository: datrail/raildash
@@ -225,7 +196,7 @@ jobs:
           persist-credentials: false
 
       - name: RailMon and RailDash images together
-        if: inputs.ref == ''
+        if: "!startsWith(github.ref, 'refs/tags/')"
         run: |
           docker build -t raildash:ci raildash
           docker network create railmon-raildash
