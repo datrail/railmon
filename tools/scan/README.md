@@ -75,15 +75,15 @@ written to `--evidence-bundle-output` and sent to RailDash, so Rail Center can
 tell a resend from new data. The registration payload is no longer POSTed
 anywhere. Rail Center (RC-387) registers the agent the bundle describes — the
 same agent and environment fingerprint the payload from the same scan would
-have registered — and stores the bundle as `POST /v1/evidence-bundles` does. It
+have registered — and stores the bundle under the agents it registered. It
 answers `201` when it created an agent and `200` otherwise, with the
 registration (`agent`, `token`, `expires_at`) plus `evidence_bundle_id` and
 `duplicate`; a v2 collection gets `{agents: [registration...], skipped:
 [{agent_key, reason, attribute_reason}], evidence_bundle_id, duplicate}`. It
 refuses a bundle with `422` (contract; a v1 bundle that does not answer
 `agent_type`, or a v2 collection with no entry that does), `409` (a `bundle_id` it holds with other bytes) or
-`413` (too large), like its evidence-bundle ingest. This needs a Rail Center
-with RC-387; an older one refuses a bundle on this route with `422`.
+`413` (too large). This needs a Rail Center with RC-387; an older one refuses
+a bundle on this route with `422`.
 
 Each target is attempted and reported on its own. A Rail Center failure exits
 `2` but still writes the feature file and the local bundle and still delivers to
@@ -830,8 +830,8 @@ any point in the window (`observed_file_access`' `read`, `write` and
 `observed_destinations`, `undeclared_destinations`, `observed_listeners`,
 `observed_ingress_peers` and `observed_file_access`. The scanner emits it
 on each of them whose status reports a window (`ANSWERED`, `PARTIAL` or
-`ABSENT`), never on `BLIND` or `FAILED`. Rail Center's ingest
-(`/v1/evidence-bundles`) rejects an attribute member it does not know, so a
+`ABSENT`), never on `BLIND` or `FAILED`. Rail Center's register route
+(`/v1/agents/register`) rejects an attribute member it does not know, so a
 bundle carried to a Rail Center that predates the member fails there.
 
 The keyed registration state is also what the collector's multi-target
