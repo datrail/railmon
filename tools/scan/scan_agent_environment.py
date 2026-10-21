@@ -3277,11 +3277,11 @@ def build_registration_state(
 ) -> dict[str, Any]:
     """What we keep from a registration: the agent id, and nothing that is a ticket.
 
-    The response carries a `token`, and the scanner drops it on the floor. It is a
-    placeholder minted with a null posture — posture is scored asynchronously
-    after the response returns — so anything that stored or forwarded it would
-    pin the fleet to a posture that was never computed. The proxy fetches its own
-    ticket; the scanner is the registrar, and a registrar holds no credentials.
+    Rail Center's answer carries no ticket (RC-435): an agent's ticket comes out
+    of its ASP pipeline after the scan, and the proxy fetches it from
+    `GET /v1/tickets` itself. Only named keys are kept, so a credential a later
+    answer adds is not stored; the scanner is the registrar, and a registrar
+    holds no credentials.
 
     `response` is one agent's registration: a v1 bundle's whole answer, or one
     entry of a v2 collection's `agents` with the collection's
@@ -3329,9 +3329,10 @@ AGENT_KEYS_KEPT = ("id", "sandbox_id", "host_id", "sandbox_name", "agent_key", "
 def strip_ticket(body: dict[str, Any]) -> dict[str, Any]:
     """The response reduced to the keys we know are not credentials.
 
-    An allowlist at both levels, not a denylist: dropping the two field names a
-    ticket happens to use today would let a renamed or newly added credential
-    field ride along the next time rail-center's response grows. `agent` grows
+    An allowlist at both levels, not a denylist: dropping the field names a
+    ticket used before RC-435 (`token`, `expires_at`) would let a renamed or
+    newly added credential field ride along the next time rail-center's
+    response grows. `agent` grows
     the same way, so keeping it whole would reopen the identical hole one level
     down.
     """
