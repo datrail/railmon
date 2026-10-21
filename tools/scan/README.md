@@ -64,7 +64,7 @@ RC's /register for the evidence bundle, with the same auth token"):
 collect environment data + skills data
   -> build and verify the evidence bundle, render it to bytes once
   -> POST those bytes to /v1/agents/register   (optional, --register)
-  -> store the returned agent id                (the response token is discarded)
+  -> store the returned agent id                (no ticket is kept)
   -> write the feature file                     (always, after the attempt, so it records the outcome)
   -> write the same bytes locally, POST them to RailDash (each optional)
 ```
@@ -77,9 +77,9 @@ anywhere. Rail Center (RC-387) registers the agent the bundle describes — the
 same agent and environment fingerprint the payload from the same scan would
 have registered — and stores the bundle under the agents it registered. It
 answers `201` when it created an agent and `200` otherwise, with the
-registration (`agent`, `token`, `expires_at`) plus `evidence_bundle_id` and
-`duplicate`; a v2 collection gets `{agents: [registration...], skipped:
-[{agent_key, reason, attribute_reason}], evidence_bundle_id, duplicate}`. It
+registered `agent` plus `evidence_bundle_id` and `duplicate`; a v2 collection
+gets `{agents: [registration...], skipped: [{agent_key, reason,
+attribute_reason}], evidence_bundle_id, duplicate}`. It
 refuses a bundle with `422` (contract; a v1 bundle that does not answer
 `agent_type`, or a v2 collection with no entry that does), `409` (a `bundle_id` it holds with other bytes) or
 `413` (too large). This needs a Rail Center with RC-387; an older one refuses
@@ -167,12 +167,12 @@ the response with its ticket stripped:
 `--output-register-response` prints this stored state to stdout (never the
 ticket).
 
-**No ticket is stored.** Rail Center's response carries a `token`, and the
-scanner discards it: it is a placeholder minted with a null posture, because
-posture is scored asynchronously after the response returns. Storing or
-forwarding it would pin the fleet to a posture that was never computed. The
-proxy fetches its own ticket; the scanner is the registrar, and a registrar
-holds no credentials.
+**No ticket is stored.** Rail Center's register answer carries no ticket
+(RC-435): an agent's x-rail ticket comes out of Rail Center's ASP pipeline
+after the scan, and the proxy fetches it from `GET /v1/tickets` itself. The
+scanner keeps only the agent's identifiers and the bundle outcome from the
+answer, so a credential a future answer adds is dropped rather than stored.
+The scanner is the registrar, and a registrar holds no credentials.
 
 Override the state file with:
 
