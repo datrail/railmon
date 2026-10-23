@@ -79,7 +79,15 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # <dir>/__pycache__/*.pyc (DR-201): a pack-9 baseline holds their random
 # names verbatim, so it is not comparable.
 # Pack 11 adds egress_containment and egress_proxy_declared (DR-207).
-RULE_PACK_VERSION = 11
+# Pack 12 changes what four attributes say for an unchanged agent, so a
+# pack-11 baseline is not comparable: user reads Config.User, not the
+# HostConfig.User Docker never sets, and user_info's note names it;
+# mcp_servers_declared records each server's include_tools/exclude_tools;
+# credential_inventory leaves out a fingerprint-valued GPG_KEY and a
+# decimal token budget such as MAX_OUTPUT_TOKENS (DR-218); and a config
+# holding NaN or Infinity is PARSE_FAILED, not carried as a value no strict
+# reader accepts (DR-221).
+RULE_PACK_VERSION = 12
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -753,6 +761,8 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
     with this same cap; the classification is what the caller's note names,
     so "we looked" says what it actually found.
     """
+    import scan_agent_environment as scanner  # lazy: breaks the import cycle
+
     try:
         with path.open("rb") as f:
             raw = f.read(64_000)
@@ -760,7 +770,9 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
     except OSError:
         return None, "NO_SOURCE_ACCESS"
     try:
-        return json.loads(text), ""
+        # Strict: NaN/Infinity is PARSE_FAILED, not a value no strict
+        # reader of the bundle accepts (DR-221).
+        return scanner.strict_json_loads(text), ""
     except json.JSONDecodeError:
         if len(raw) == 64_000:
             return None, "SIZE_CAP_EXCEEDED"
@@ -1264,9 +1276,12 @@ def build_evidence_bundle(
         )
 
     if mode == "docker":
-        user = host_config.get("User") or "root"
+        # Config.User: the image's USER, or `docker run --user` over it.
+        # HostConfig has no User, so reading it there said root for every
+        # agent (DR-218).
+        user = str((docker.get("Config") or {}).get("User") or "") or "root"
         attributes["user"] = _answered(
-            user, "observed", authored_by="none", method="docker inspect: HostConfig.User",
+            user, "observed", authored_by="none", method="docker inspect: Config.User",
             note="root is the docker default when User is unset",
         )
     else:
@@ -1708,7 +1723,7 @@ def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
             method="the scanning user, its git identity, and id -un/-u/-g in the container "
                    "in docker mode",
             note="the uid the agent runs as is container_uid in docker mode; "
-                 "the user attribute is HostConfig.User",
+                 "the user attribute is Config.User",
         )
     else:
         attributes["user_info"] = _absent("the scan's user probe", "observed")

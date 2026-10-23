@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import uuid
 from datetime import datetime, timezone
@@ -229,6 +230,20 @@ def compose(
     }
 
 
+def _refuse_constant(name: str) -> Any:
+    # NaN/Infinity are not JSON: a source holding one is refused rather than
+    # composed into a bundle no strict reader accepts (DR-221).
+    raise ValueError(f"{name} is not a JSON number")
+
+
+def _finite_float(text: str) -> float:
+    # `1e999` parses to inf, which json.dumps writes back as Infinity.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is not a finite JSON number")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-id", required=True)
@@ -241,7 +256,7 @@ def main() -> int:
         key, separator, filename = spec.partition("=")
         if not separator or key in sources:
             parser.error("each --agent must be a unique KEY=V1_JSON")
-        sources[key] = json.loads(Path(filename).read_text(encoding="utf-8"))
+        sources[key] = json.loads(Path(filename).read_text(encoding="utf-8"), parse_constant=_refuse_constant, parse_float=_finite_float)
     output = compose(args.host_id, args.sandbox_name, sources)
     Path(args.output).write_text(json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0

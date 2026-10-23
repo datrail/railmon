@@ -617,6 +617,71 @@ class BundlePermissionsTest(unittest.TestCase):
         self.assertEqual(field["reason"], "NO_SOURCE_ACCESS")
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
+    def test_docker_mode_user_is_the_containers_config_user(self):
+        # DR-218: Docker puts the image's USER and `docker run --user` in
+        # Config.User; HostConfig has no User, so reading it there said root
+        # whoever the agent ran as.
+        for config_user, expected in (("app", "app"), ("1000:1000", "1000:1000"), ("", "root"), (None, "root")):
+            with self.subTest(config_user=config_user):
+                config = {"Labels": {}}
+                if config_user is not None:
+                    config["User"] = config_user
+                context = docker_context(docker_inspect={
+                    "Image": "sha256:deadbeef",
+                    "HostConfig": {"Privileged": False, "CapAdd": [], "User": "not-read"},
+                    "Config": config,
+                })
+                bundle = evidence_bundle.build_evidence_bundle(
+                    build_args(), context, {"host_id": "h-1", "sandbox_name": "agent-container"}, identity()
+                )
+                field = bundle["attributes"]["user"]
+                self.assertEqual((field["status"], field["value"]), ("ANSWERED", expected))
+                self.assertIn("Config.User", field["method"])
+                self.assertNotIn("HostConfig", field["method"])
+                self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
+    def test_mcp_allow_lists_reach_the_declared_servers(self):
+        # DR-218: two tools added to a server's allow list change the bundle.
+        import tempfile
+
+        def declared(spec):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / ".mcp.json"
+                path.write_text(json.dumps({"mcpServers": {"broker": {"url": "http://127.0.0.1:1/mcp", **spec}}}),
+                                encoding="utf-8")
+                servers = scanner.collect_mcp_inventory([path])
+            bundle = evidence_bundle.build_evidence_bundle(
+                build_args(), docker_context(), dict(HOST_PAIR), identity(mcp_servers=servers)
+            )
+            self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+            return bundle["attributes"]["mcp_servers_declared"]["value"]
+
+        before = declared({"includeTools": ["getQuote"], "excludeTools": ["buyStock", "sellStock"]})
+        after = declared({"includeTools": ["getQuote", "buyStock", "sellStock"], "excludeTools": []})
+        self.assertEqual(before[0]["include_tools"], ["getQuote"])
+        self.assertEqual(after[0]["include_tools"], ["buyStock", "getQuote", "sellStock"])
+        self.assertNotEqual(before, after)
+
+    def test_a_harness_config_holding_nan_or_infinity_is_parse_failed(self):
+        # DR-221: the agent's own JSON reader refuses these literals, so the
+        # file did not parse - it is PARSE_FAILED, not carried verbatim.
+        import tempfile
+
+        # 1e999 is a JSON number, but too large for a float: Python reads it as
+        # inf, which json.dumps writes back as Infinity.
+        for literal in ("NaN", "Infinity", "-Infinity", "1e999", "-1e999"):
+            with self.subTest(literal=literal), tempfile.TemporaryDirectory() as tmp:
+                config = Path(tmp) / "settings.json"
+                config.write_text('{"permissions": {"allow": ["Bash"], "deny": [%s]}}' % literal, encoding="utf-8")
+                self.assertEqual(evidence_bundle._read_json_capped(config), (None, "PARSE_FAILED"))
+                bundle = evidence_bundle.build_evidence_bundle(
+                    build_args(config_path=[str(config)]), docker_context(), dict(HOST_PAIR), identity()
+                )
+                field = bundle["attributes"]["permissions"]
+                self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "PARSE_FAILED"))
+                self.assertNotIn("harness", field["value"])
+                self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
     def test_self_mode_user_is_blind_with_a_reason(self):
         bundle = build_bundle(mode="self")
         field = bundle["attributes"]["user"]
@@ -1029,8 +1094,11 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # pack 8 adds the registration payload's fields (DR-189); pack 9
         # adds agent_instance, the dynamic ones pack 8 left out (DR-193);
         # pack 10 folds Python's bytecode-cache writes (DR-201); pack 11
-        # adds egress_containment and egress_proxy_declared (DR-207).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 11)
+        # adds egress_containment and egress_proxy_declared (DR-207); pack
+        # 12 reads user from Config.User, records an MCP server's tool allow
+        # list, stops counting a GPG fingerprint or a token budget as a
+        # credential (DR-218), and refuses NaN/Infinity in a config (DR-221).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 12)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
@@ -1585,6 +1653,29 @@ class ScannerWiringTest(unittest.TestCase):
                 expected = [{"protocol": "tcp", "addr": "0.0.0.0", "port": 4444, "process": "nc"}]
                 self.assertEqual(features["observed_listeners"]["listeners"], expected)
                 self.assertEqual(bundle["attributes"]["observed_listeners"]["value"], expected)
+
+    def test_a_config_holding_nan_or_infinity_emits_strict_json(self):
+        # DR-221: a harness config holding a non-JSON literal goes through
+        # the real scanner, and the bundle it writes parses with a reader that
+        # refuses those literals, as Rail Center's does.
+        import tempfile
+
+        def refuse(name):
+            raise ValueError(f"{name} is not JSON")
+
+        config = '{"permissions": {"allow": ["Bash"], "maxTurns": NaN, "deny": [Infinity, -Infinity, 1e999]}}'
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "settings.json").write_text(config, encoding="utf-8")
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1", "--sandbox-name", "s-1",
+                                       "--config-path", f"{tmp}/settings.json",
+                                       "--feature-output", f"{tmp}/features.json",
+                                       "--evidence-bundle-output", f"{tmp}/bundle.json"], tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            raw = Path(tmp, "bundle.json").read_bytes()
+        bundle = json.loads(raw, parse_constant=refuse)
+        field = bundle["attributes"]["permissions"]
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "PARSE_FAILED"))
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
     def test_a_files_file_reaches_the_feature_file_and_the_bundle(self):
         import subprocess

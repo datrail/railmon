@@ -12,6 +12,7 @@ import argparse
 import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -60,6 +61,26 @@ class SkillDocument:
 
 class ScannerError(RuntimeError):
     """Raised for user-correctable scanner errors."""
+
+
+def _refuse_non_json_constant(name: str) -> Any:
+    raise json.JSONDecodeError(f"{name} is not a JSON number", name, 0)
+
+
+def _finite_json_float(text: str) -> float:
+    # A number too large for a float (`1e999`) parses to inf, which
+    # json.dumps writes back as the literal Infinity (DR-221).
+    value = float(text)
+    if not math.isfinite(value):
+        raise json.JSONDecodeError(f"{text} is not a finite JSON number", text, 0)
+    return value
+
+
+def strict_json_loads(text: str) -> Any:
+    """`json.loads` refusing NaN/Infinity/-Infinity, which JSON does not have:
+    a skill's fields reach the evidence bundle, which strict readers parse
+    (DR-221)."""
+    return json.loads(text, parse_constant=_refuse_non_json_constant, parse_float=_finite_json_float)
 
 
 def run_command(cmd: list[str], timeout: float = 10.0) -> str | None:
@@ -171,7 +192,7 @@ def parse_simple_frontmatter(lines: list[str]) -> dict[str, Any]:
 
         if value.startswith("[") and value.endswith("]"):
             try:
-                parsed = json.loads(value)
+                parsed = strict_json_loads(value)
                 data[key] = parsed
                 continue
             except json.JSONDecodeError:
@@ -320,7 +341,7 @@ def docker_inspect(container: str) -> dict[str, Any] | None:
     if not output:
         return None
     try:
-        data = json.loads(output)
+        data = strict_json_loads(output)
     except json.JSONDecodeError:
         return None
     if not data:

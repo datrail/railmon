@@ -16,6 +16,7 @@ import getpass
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -197,6 +198,28 @@ def parse_env_lines(text: str | None) -> dict[str, str]:
     return env
 
 
+# Names the markers flag whose value, when it has a known harmless shape, is
+# not credential material (DR-218). Held to both the name and the value, so a
+# key under one of these names is still counted.
+# The official Python images set GPG_KEY to the public fingerprint their build
+# checks Python's release signature against: 40 hex digits (16 for a long id).
+GPG_FINGERPRINT_RE = re.compile(r"(?:0x)?(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{16})")
+# A token budget: MAX in the name, TOKENS last (MAX_TOKENS, MAX_OUTPUT_TOKENS,
+# CLAUDE_CODE_MAX_OUTPUT_TOKENS), no other marker, and a decimal count.
+TOKEN_BUDGET_RE = re.compile(r"(?:[A-Z0-9]+_)*MAX(?:_[A-Z0-9]+)*_TOKENS")
+
+
+def is_benign_secret_name(key: str, value: str) -> bool:
+    """Whether a marker-flagged variable is a known non-credential by its shape."""
+    upper = key.upper()
+    stripped = value.strip()
+    if upper == "GPG_KEY":
+        return bool(GPG_FINGERPRINT_RE.fullmatch(stripped.replace(" ", "")))
+    if TOKEN_BUDGET_RE.fullmatch(upper) and not looks_secret(upper[: -len("_TOKENS")]):
+        return stripped.isdigit() and stripped.isascii()
+    return False
+
+
 def looks_secret(key: str) -> bool:
     upper = key.upper()
     if upper in NON_SECRET_KEYS:
@@ -311,10 +334,35 @@ def collect_candidate_models(value: Any) -> list[str]:
         stripped = value.strip()
         if stripped.startswith("{") or stripped.startswith("["):
             try:
-                found.extend(collect_candidate_models(json.loads(stripped)))
+                found.extend(collect_candidate_models(strict_json_loads(stripped)))
             except (json.JSONDecodeError, TypeError):
                 pass
     return found
+
+
+def _refuse_non_json_constant(name: str) -> Any:
+    raise json.JSONDecodeError(f"{name} is not a JSON number", name, 0)
+
+
+def _finite_json_float(text: str) -> float:
+    # A number too large for a float (`1e999`) parses to inf, which
+    # json.dumps writes back as the literal Infinity (DR-221).
+    value = float(text)
+    if not math.isfinite(value):
+        raise json.JSONDecodeError(f"{text} is not a finite JSON number", text, 0)
+    return value
+
+
+def strict_json_loads(text: str | bytes) -> Any:
+    """`json.loads` without the three literals Python accepts and JSON does not.
+
+    `NaN`, `Infinity` and `-Infinity` parse to floats that `json.dumps` writes
+    back verbatim, so a config holding one would make a bundle no strict
+    reader (Rail Center's, an agent's own JSON.parse) accepts (DR-221). Refused
+    as a JSONDecodeError, every caller's existing parse-failure path handles
+    it: the file did not parse, as it does not for the agent.
+    """
+    return json.loads(text, parse_constant=_refuse_non_json_constant, parse_float=_finite_json_float)
 
 
 def load_json_file(path: Path) -> Any | None:
@@ -322,7 +370,7 @@ def load_json_file(path: Path) -> Any | None:
     if not text:
         return None
     try:
-        return json.loads(text)
+        return strict_json_loads(text)
     except json.JSONDecodeError:
         return None
 
@@ -337,7 +385,7 @@ def find_models_in_capture(paths: list[Path]) -> list[str]:
                     if not line:
                         continue
                     try:
-                        event = json.loads(line)
+                        event = strict_json_loads(line)
                     except json.JSONDecodeError:
                         continue
                     models.extend(collect_candidate_models(event))
@@ -396,7 +444,7 @@ def find_models_in_container_openclaw_config(container: str, roots: list[str]) -
             if not stripped:
                 continue
             try:
-                models.extend(collect_candidate_models(json.loads(stripped)))
+                models.extend(collect_candidate_models(strict_json_loads(stripped)))
             except json.JSONDecodeError:
                 continue
     return dedupe(models)
@@ -474,7 +522,7 @@ def docker_inspect(container: str) -> dict[str, Any]:
     if not output:
         raise ScannerError(f"docker inspect failed for container: {container}")
     try:
-        data = json.loads(output)
+        data = strict_json_loads(output)
     except json.JSONDecodeError as exc:
         raise ScannerError("docker inspect returned invalid JSON") from exc
     if not data:
@@ -486,7 +534,7 @@ def _docker_inspect_json(cmd: list[str]) -> dict[str, Any] | None:
     """One `docker inspect`-shaped object, or None when Docker can't answer."""
     output = run_command(cmd, timeout=5.0)
     try:
-        data = json.loads(output) if output else None
+        data = strict_json_loads(output) if output else None
     except json.JSONDecodeError:
         return None
     return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
@@ -745,9 +793,27 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
                 "url": redact_url(url) if isinstance(url, str) else None,
                 "transport": "http" if url else ("stdio" if command else "unknown"),
                 "source": path.name,
+                # Which of the server's tools the agent may use (DR-218):
+                # widening the allow list changes what it can do.
+                "include_tools": mcp_tool_list(spec.get("includeTools")),
+                "exclude_tools": mcp_tool_list(spec.get("excludeTools")),
             }
         )
     return inventory
+
+
+def mcp_tool_list(value: Any) -> list[str] | None:
+    """A server's `includeTools`/`excludeTools`, as a sorted set of tool names.
+
+    None when the config has no such list, which means no restriction and is
+    not the same as an empty one; a value that is not a list of names is not
+    turned into one. The order and repeats in the file are not part of what
+    the agent may call, so they are not kept: reordering is not drift. A name
+    is shipped like the server's, so key-shaped text is redacted.
+    """
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return sorted({redact_text(item) for item in value})
 
 
 # The per-server env convention confirmed by Kyle Liwanag for the GCP estate
@@ -775,6 +841,8 @@ def read_mcp_inventory_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
             "url": redact_url(url),
             "transport": "http",
             "source": "environment",
+            "include_tools": None,
+            "exclude_tools": None,
         }
     ]
 
@@ -983,7 +1051,7 @@ def parse_mcp_body(raw: str, content_type: str) -> Any:
         else:
             return None
     try:
-        return json.loads(raw)
+        return strict_json_loads(raw)
     except json.JSONDecodeError:
         return None
 
@@ -1258,7 +1326,7 @@ def collect_secret_hygiene(
     """One entry per secret-looking variable: name, type, class. Never a value."""
     entries = []
     for key in sorted(env):
-        if not looks_secret(key):
+        if not looks_secret(key) or is_benign_secret_name(key, env[key]):
             continue
         entries.append(
             {
@@ -1695,7 +1763,7 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
         if not line:
             continue
         try:
-            event = json.loads(line)
+            event = strict_json_loads(line)
         except json.JSONDecodeError:
             malformed += 1
             continue
@@ -2039,7 +2107,7 @@ def summarize_file_access(
         if not line:
             continue
         try:
-            event = json.loads(line)
+            event = strict_json_loads(line)
         except json.JSONDecodeError:
             malformed += 1
             continue
@@ -2187,7 +2255,7 @@ def load_snapshot(path: Path) -> dict[str, Any]:
     # 64 KB for config files; a snapshot of a real session is megabytes, and the
     # truncated read fails to parse with nothing to suggest the file was fine.
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        data = strict_json_loads(path.read_text(encoding="utf-8", errors="replace"))
     except OSError as exc:
         raise ScannerError(f"cannot read AgentSight snapshot {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
@@ -2632,7 +2700,7 @@ def resolve_targets(manifest_path: Path) -> list[dict[str, Any]]:
     if output is None:
         raise ScannerError(f"failed to resolve --target-manifest via {railmon_bin} --print-resolved-targets")
     try:
-        targets = json.loads(output)
+        targets = strict_json_loads(output)
     except json.JSONDecodeError as exc:
         raise ScannerError(f"{railmon_bin} --print-resolved-targets returned invalid JSON") from exc
     if not isinstance(targets, list):
