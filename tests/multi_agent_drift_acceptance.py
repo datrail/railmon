@@ -19,7 +19,7 @@ inside the RailMon image:
   docker run --rm --user 0 --entrypoint python3 \\
       -e RAILMON_BIN=/usr/local/bin/railmon-collector \\
       -v "$PWD/tests:/tests:ro" railmon:ci /tests/multi_agent_drift_acceptance.py \\
-      --raildash http://raildash:8000 --token "$token"
+      --raildash http://raildash:8000 --token="$token"
 """
 
 from __future__ import annotations
