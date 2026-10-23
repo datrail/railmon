@@ -15,8 +15,10 @@ directory gives it one, self-contained and offline:
   (DR-205).
 - `demo_client.py` — issues a few HTTPS requests to it, certificate
   verification off (the server's cert is a fresh, throwaway self-signed one
-  every run — see `run_local_demo.sh`). It lists the MCP tools and calls
-  `read_doc`; it never uploads.
+  every run — see `run_local_demo.sh`). Like a streamable HTTP MCP client it
+  opens a session (`initialize`), lists the tools, calls `read_doc`, opens
+  the server's GET stream and ends the session with a DELETE; it never
+  uploads.
 - `demo_mcp_call.py` — the Data Guardrail demo's on-demand MCP calls: an
   `upload_file` with a small PNG, a tool the server never listed, or a POST
   to `/mcp` that isn't JSON-RPC (datrail-project's quick start and stack
@@ -32,7 +34,7 @@ only accepts one PID and the demo has two. In the few seconds the demo runs,
 this is a reasonable trade for simplicity; it is not a pattern to copy for a
 real deployment, which should filter by the actual agent's identity.
 
-**This is why the client's five requests (two MCP calls, three plain POSTs) produce ten interactions.** Both ends of each
+**This is why the client's eight requests (five to `/mcp`, three plain POSTs) produce sixteen interactions.** Both ends of each
 exchange are `python3` — `demo_server.py` and `demo_client.py` — so the tap
 records each request twice, once as the client wrote it and once as the
 server read it. The two rows carry different `pid`s and share a timestamp to
@@ -40,6 +42,18 @@ the millisecond. That is two honest observations of one exchange, not a
 duplicate: a real deployment filtering on the agent's own identity would see
 each exchange once. Worth knowing before reading `capture.jsonl`, and worth
 not mistaking for a double-write bug.
+
+## The demo agent's MCP declaration
+
+The demo agent declares its MCP server the way an agent with one server
+does in the scanner's env convention: `AGENT_MCP_NAME=demo` and
+`AGENT_MCP_URL=https://127.0.0.1:8443/mcp` (`MCP_SERVER_NAME` and `MCP_URL`
+in `demo_server.py`). `run_local_demo.sh` sets them for its self-scan; a
+container running the demo (datrail-project's `demo-agent`) sets them in its
+environment, since `scan --mode docker` reads the container's environment,
+not files inside it. Its ASP's `mcp_servers_declared` then names `demo`, and
+RailDash shows its tools as `mcp__demo__read_doc` and
+`mcp__demo__upload_file` rather than `mcp@127.0.0.1/mcp__<tool>`.
 
 ## Two optional knobs
 

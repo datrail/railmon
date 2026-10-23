@@ -20,6 +20,7 @@ import http.server
 import json
 import ssl
 import sys
+import uuid
 
 # DR-205: the demo's MCP server, at /mcp on the same HTTPS port (so the demo
 # opens no port it didn't before). It offers one tool that reads and one
@@ -27,6 +28,15 @@ import sys
 # classifies `upload_file` as an upload (its name, and its base64 `content`)
 # and proposes a guardrail that blocks it until allowed -- the KubeCon demo.
 MCP_PATH = "/mcp"
+# DR-237: the demo agent's own declaration of this server, which every way
+# the demo agent is started sets in its environment (AGENT_MCP_NAME and
+# AGENT_MCP_URL, the scanner's env convention; `scan --mode docker` reads a
+# container's environment, not files inside it). Its ASP's
+# `mcp_servers_declared` then names `demo` at this URL, and RailDash lines
+# the calls to the URL's host and path up as `mcp__demo__<tool>`.
+MCP_SERVER_NAME = "demo"
+MCP_URL = f"https://127.0.0.1:8443{MCP_PATH}"
+SESSION_HEADER = "Mcp-Session-Id"
 MCP_TOOLS = [
     {
         "name": "read_doc",
@@ -87,10 +97,48 @@ class DemoHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass
 
+    def do_GET(self) -> None:  # noqa: N802
+        """The streamable HTTP transport's server-to-client stream (DR-237).
+
+        The demo server has nothing to push, so the stream carries one
+        comment and ends; it is there so the capture holds the GET a real
+        MCP client opens, which carries no call."""
+        if self.path != MCP_PATH:
+            self._reply(404, {"error": "not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(b": demo stream, nothing to push\n\n")
+        self.close_connection = True
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        """Ending a session (DR-237): no call, no body."""
+        if self.path != MCP_PATH:
+            self._reply(404, {"error": "not found"})
+        elif not self.headers.get(SESSION_HEADER):
+            self._reply(400, {"error": f"{SESSION_HEADER} required"})
+        else:
+            self._reply(204, None)
+
+    def _reply(self, status: int, payload: object, headers: dict[str, str] | None = None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        if status != 204:
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if status != 204:
+            self.wfile.write(body)
+
     def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler's naming)
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         status = 200
+        headers: dict[str, str] = {}
         if self.path == MCP_PATH:
             try:
                 message = json.loads(raw)
@@ -101,16 +149,15 @@ class DemoHandler(http.server.BaseHTTPRequestHandler):
                     payload = [r for r in (mcp_reply(m) for m in message) if r is not None]
                 else:
                     payload = mcp_reply(message)
+                    if isinstance(message, dict) and message.get("method") == "initialize":
+                        # A session for the client's later requests, its
+                        # GET stream and its DELETE (DR-237).
+                        headers[SESSION_HEADER] = uuid.uuid4().hex
                 if payload is None or payload == []:
                     status, payload = 202, None
         else:
             payload = {"ok": True, "path": self.path}
-        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._reply(status, payload, headers)
 
 
 def main(argv: list[str]) -> int:
