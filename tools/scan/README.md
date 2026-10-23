@@ -819,10 +819,15 @@ with one registration each; the scanner matches each to its agent by
 `agent.agent_key` and writes it, ticket dropped, to that agent's keyed
 `--registration-output` path (`<path>.<agent_key>`). Every feature file in the
 collection is written after that attempt: the keyed ones say whether their
-agent was registered, the sandbox-wide one whether the collection was. When no
-v2 collection can be built (the manifest does not resolve, or the sandbox scan
-cannot name its `host_id`/`sandbox_name`), the sandbox-wide scan's own v1
-bundle is written, registered and delivered instead.
+agent was registered, the sandbox-wide one whether the collection was.
+
+A configured manifest disables the single-agent fallback. When no v2
+collection can be built (the manifest does not resolve, or the sandbox scan
+cannot name its `host_id`/`sandbox_name`), the sandbox-wide scan's unkeyed v1
+bundle is not written, registered or sent to RailDash in its place: the scan
+logs `MULTI_AGENT_KEY_REQUIRED: …` on stderr and exits `2`, and an
+`--interval` run keeps running and tries again on the next tick. In the second
+case each scanned agent still delivers its own keyed v1 bundle (`?agent_key=`).
 
 Rail Center (RC-387) registers only the `agents[]` entries that answer
 `agent_type` and lists the rest under `skipped` with a reason; the collection

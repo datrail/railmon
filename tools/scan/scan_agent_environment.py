@@ -2764,31 +2764,25 @@ def _v1_scope_from_scan_result(
     return bundle, context
 
 
-def _deliver_v1_fallback(args: argparse.Namespace) -> int:
-    """This scope's v1 evidence bundle, from the scan `run_one_scan` already
-    ran — reused via `_v2_scan_result`, not a second `scan()` call — for the
-    two cases where `run_one_collection` suppressed a `_v2_collection`
-    target's own v1 handling (betting on a v2 collection being produced) but
-    that bet did not pay off: the target manifest itself failed to resolve,
-    or no v2 collection could be built at all because `host_id`/
-    `sandbox_name` were never determined. Without this fallback the scan
-    that already ran leaves no artifact anywhere — worse than the
-    unkeyed-manifest single-scan path this function's docstring promises
-    never to regress. The same `_deliver_v1` `run_one_scan` uses: the bundle
-    registered with rail-center under `--register` (DR-188), the feature file
-    it deferred, the file write and an optional RailDash POST.
+MULTI_AGENT_KEY_REQUIRED = "MULTI_AGENT_KEY_REQUIRED"
+
+
+def _refuse_unkeyed_fallback(reason: str) -> None:
+    """Design §5 (DR-234): a configured target manifest disables the
+    single-agent fallback. When `run_one_collection` cannot build its v2
+    collection — the manifest failed to resolve, or the shared scan never
+    named a `host_id`/`sandbox_name` — the sandbox scan's own unkeyed v1
+    bundle is not delivered in its place: not written, not registered with
+    rail-center, not sent to RailDash. A partially configured multi-agent
+    container that quietly reports as one unkeyed agent is the failure that
+    most resembles success. The run reports it here and fails (exit 2); an
+    `--interval` run tries again on the next tick, like any failed delivery.
     """
-    result = getattr(args, "_v2_scan_result", None)
-    if result is None:
-        return 0
-    write_feature = bool(getattr(args, "_feature_deferred", False))
-    args._feature_deferred = False
-    context, payload, identity = result
-    try:
-        return _deliver_v1(args, context, payload, identity, write_feature=write_feature)
-    except ScannerError as exc:
-        print(f"agent-environment-scanner: {exc}", file=sys.stderr)
-        return 2
+    print(
+        f"agent-environment-scanner: {MULTI_AGENT_KEY_REQUIRED}: a target manifest is configured but {reason}; "
+        "no unkeyed evidence bundle was written, registered with rail-center or sent to RailDash",
+        file=sys.stderr,
+    )
 
 
 def _register_v2_collection(
@@ -3004,8 +2998,9 @@ def run_one_collection(args: argparse.Namespace) -> int:
             args, build_v2, sandbox_scan_args, agent_scans, exit_code
         )
     finally:
-        # The fallback paths write their own; anything still deferred is
-        # written here, after whatever registration attempt was made.
+        # Every deferred feature file is written here, after whatever
+        # registration attempt was made (none, when the collection failed
+        # closed: then it reports the registration as not done).
         if not _write_deferred_feature_file(sandbox_scan_args, collection_registered):
             exit_code = 2
         for agent_key, target_args in agent_scans.items():
@@ -3032,12 +3027,10 @@ def _collect(
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         if build_v2:
-            # The sandbox scan above already ran and had its own v1 write
-            # suppressed on the bet that a v2 collection would follow — a
-            # bet a broken manifest just lost. Delivering the v1 fallback
-            # here (reusing that same scan, not a second one) is the only
-            # way this scope's evidence reaches an artifact at all.
-            _deliver_v1_fallback(sandbox_scan_args)
+            # The sandbox scan above already ran with its own v1 delivery
+            # suppressed; a broken manifest means no key, so it stays
+            # suppressed (design §5, DR-234).
+            _refuse_unkeyed_fallback("it failed to resolve")
         return 2, False, {}
 
     sandbox_v1: dict[str, Any] | None = None
@@ -3076,16 +3069,17 @@ def _collect(
                 # `scan()` failed before even a host_id/sandbox_name could be
                 # named — no schema-legal v2 collection can be built at all,
                 # since both are required non-empty fields at the bundle's
-                # top level, not just inside the sandbox scope. Deliver this
-                # scope's v1 fallback (reusing the same scan) rather than
-                # losing it outright, the same as the broken-manifest case.
+                # top level, not just inside the sandbox scope. The sandbox
+                # scope's unkeyed v1 bundle is refused, as for a broken
+                # manifest (design §5, DR-234); each scanned agent below
+                # still delivers under its own key.
                 print(
                     "agent-environment-scanner: shared evidence collection failed before "
                     "host_id/sandbox_name could be determined; no evidence-bundle-v2 will "
                     "be produced for this run",
                     file=sys.stderr,
                 )
-                _deliver_v1_fallback(sandbox_scan_args)
+                _refuse_unkeyed_fallback("the shared scan named no host_id/sandbox_name")
             exit_code = 2
 
     agent_entries: list[dict[str, Any]] = []
@@ -3836,8 +3830,8 @@ def run_one_scan(args: argparse.Namespace) -> int:
     it will itself compose this scan's attribute data into one shared
     evidence-bundle-v2 collection and write, register and deliver *that*
     exactly once. Such a scan only stashes its `(context, payload, identity)`
-    on `args._v2_scan_result` — reused by `_v1_scope_from_scan_result` and the
-    v1 fallback rather than scanning the same target twice, since two scans
+    on `args._v2_scan_result` — reused by `_v1_scope_from_scan_result`
+    rather than scanning the same target twice, since two scans
     could observe different live state and disagree — and leaves its feature
     file to `run_one_collection`, which writes it after the collection's
     registration attempt so `registration_status` reports its outcome.

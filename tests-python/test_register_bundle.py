@@ -489,22 +489,90 @@ class InProcessTest(unittest.TestCase):
             self.assertEqual(self.feature(suffix)["scan"]["registration_status"], "registration_failed")
         self.assertFalse(list(Path(self.tmp).glob("registration.json*")))
 
-    def test_the_v1_fallback_registers_its_v1_bundle(self):
-        """A manifest that fails to resolve loses the v2 bet; the sandbox
-        scan's own v1 bundle is then what is written and registered."""
-        args = self.args("--target-manifest", "/manifest.yaml")
-        code, post = self.collect(
-            args,
-            {"side_effect": scanner.ScannerError("manifest unreadable")},
-            {"return_value": {"status": 201, "body": v1_answer()}},
+    # ── DR-234: a configured manifest fails closed ────────────────────────
+
+    RAILDASH = "http://raildash.internal:8080"
+
+    def collect_everywhere(self, args, targets, sandbox_scope=None):
+        """`collect`, with a RailDash URL too, recording every rail-center
+        and RailDash send. `sandbox_scope`, when given, replaces the sandbox
+        scope's (first) `_v1_scope_from_scan_result` answer."""
+        real_scope = scanner._v1_scope_from_scan_result
+        calls = {"n": 0}
+
+        def scope(target_args):
+            calls["n"] += 1
+            if sandbox_scope is not None and calls["n"] == 1:
+                return sandbox_scope
+            return real_scope(target_args)
+
+        answer = {"status": 201, "body": v2_answer(["planner", "executor"])}
+        dash = {"status": 201, "body": {"asp_id": "asp-1", "bundle": "accepted"}}
+        with mock.patch.object(scanner, "scan", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "resolve_targets", **targets), \
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", side_effect=scope), \
+                mock.patch.object(scanner, "post_registration", return_value=answer) as center, \
+                mock.patch.object(scanner, "post_evidence_bundle", return_value=dash) as raildash:
+            code = scanner.run_one_collection(args)
+        return code, center, raildash
+
+    def assert_nothing_unkeyed_sent(self, center, raildash):
+        for call in center.call_args_list + raildash.call_args_list:
+            bundle = json.loads(call.args[1])
+            self.assertTrue(
+                bundle["bundle_version"] == 2 or call.kwargs.get("agent_key"),
+                f"an unkeyed v1 bundle was sent to {call.args[0]}",
+            )
+        self.assertFalse(Path(self.tmp, "bundle.json").exists(), "an unkeyed v1 bundle was written")
+
+    def test_a_manifest_that_fails_to_resolve_sends_no_unkeyed_v1_bundle(self):
+        """Design §5: a configured manifest disables the single-agent
+        fallback. The sandbox scan already ran; its v1 bundle goes nowhere,
+        and the run says why."""
+        args = self.args("--target-manifest", "/manifest.yaml", "--raildash-url", self.RAILDASH)
+        code, center, raildash = self.collect_everywhere(
+            args, {"side_effect": scanner.ScannerError("manifest unreadable")}
         )
-        self.assertEqual(code, 2)  # the manifest failure itself
-        post.assert_called_once()
-        sent = post.call_args.args[1]
-        self.assertEqual(json.loads(sent)["bundle_version"], 1)
-        self.assertEqual(sent, Path(self.tmp, "bundle.json").read_bytes())
-        self.assertEqual(json.loads(Path(self.tmp, "registration.json").read_text())["agent_id"], "a-1")
-        self.assertEqual(self.feature()["scan"]["registration_status"], "registered")
+        self.assertEqual(code, 2)
+        center.assert_not_called()
+        raildash.assert_not_called()
+        self.assert_nothing_unkeyed_sent(center, raildash)
+        self.assertFalse(Path(self.tmp, "registration.json").exists())
+        self.assertIn("MULTI_AGENT_KEY_REQUIRED", self.stderr.getvalue())
+        self.assertIn("manifest unreadable", self.stderr.getvalue())
+        self.assertEqual(self.feature()["scan"]["registration_status"], "registration_failed")
+
+    def test_a_shared_scan_that_cannot_name_its_sandbox_sends_no_unkeyed_v1_bundle(self):
+        """The early shared-scan failure: no host_id/sandbox_name, so no v2
+        collection is possible. The sandbox scope's v1 bundle is refused;
+        each scanned agent still delivers under its own key."""
+        args = self.args("--target-manifest", "/manifest.yaml", "--raildash-url", self.RAILDASH)
+        code, center, raildash = self.collect_everywhere(
+            args, {"return_value": self.TARGETS}, sandbox_scope=(None, None)
+        )
+        self.assertEqual(code, 2)
+        self.assert_nothing_unkeyed_sent(center, raildash)
+        self.assertEqual(
+            sorted(call.kwargs.get("agent_key") for call in raildash.call_args_list), ["executor", "planner"]
+        )
+        self.assertIn("MULTI_AGENT_KEY_REQUIRED", self.stderr.getvalue())
+        self.assertFalse(Path(self.tmp, "registration.json").exists())
+        self.assertEqual(self.feature()["scan"]["registration_status"], "registration_failed")
+
+    def test_a_well_formed_manifest_scan_is_unchanged(self):
+        """The fail-closed path never touches a well-formed collection: one
+        v2 collection, the same bytes on disk, at rail-center and at RailDash,
+        no refusal logged."""
+        args = self.args("--target-manifest", "/manifest.yaml", "--raildash-url", self.RAILDASH)
+        code, center, raildash = self.collect_everywhere(args, {"return_value": self.TARGETS})
+        self.assertEqual(code, 0, self.stderr.getvalue())
+        written = Path(self.tmp, "bundle.json").read_bytes()
+        center.assert_called_once()
+        raildash.assert_called_once()
+        self.assertEqual(center.call_args.args[1], written)
+        self.assertEqual(raildash.call_args.args[1], written)
+        self.assertEqual(json.loads(written)["bundle_version"], 2)
+        self.assertNotIn("MULTI_AGENT_KEY_REQUIRED", self.stderr.getvalue())
 
 
 class RegistrationStateTest(unittest.TestCase):
