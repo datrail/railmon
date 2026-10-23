@@ -166,8 +166,8 @@ jobs:
       # supervisor in the host PID namespace, runs AgentSight's process probe
       # scoped to the agent's (DR-170) and appends to a volume the agent does
       # not mount, and
-      # `railmon scan` reads it into the bundle. Then the agent kills the
-      # probe (the bundle must go PARTIAL) and restarts (the probe must
+      # `railmon scan` reads it into the bundle. Then the probe is killed
+      # (the bundle must go PARTIAL) and the agent restarts (the probe must
       # follow). The privilege is the listen container's alone.
       - name: listen and scan from the built image
         run: python3 tests/listen_image_acceptance.py --image railmon:ci

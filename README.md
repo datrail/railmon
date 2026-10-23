@@ -220,7 +220,8 @@ scan treats those records like the probe's. A snapshot cannot tell whether
 the kernel chose the port, so such a port is listed by number.
 
 The probe can still crash or restart, and anyone who can reach the host's
-PID namespace can kill it. A socket opened and closed while it was down is
+PID namespace can kill it; without the supervisor (below) it runs in the
+agent's PID namespace, where the agent can kill it too. A socket opened and closed while it was down is
 missed, so any restart leaves a gap, and the
 scan says so: `observed_listeners` goes PARTIAL, which is drift, for a
 probe gap in three cases (and also for lost events or past 256 distinct

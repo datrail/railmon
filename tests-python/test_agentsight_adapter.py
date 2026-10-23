@@ -449,6 +449,38 @@ class WiringTest(unittest.TestCase):
         self.assertIn("[railmon files] attaching to agent (pid 4343)", stderr)
         self.assertEqual(supervisor.returncode, 0)
 
+    def test_one_failed_inspect_does_not_restart_the_probe(self):
+        # A restart makes every attribute PARTIAL (drift in RailDash), so the
+        # watcher stops AgentSight only on another PID, or after
+        # WATCH_MISSES polls in a row without an answer.
+        class Child:
+            def __init__(self):
+                self.stopped = self.by_watcher = False
+
+            def poll(self):
+                return 0 if self.stopped else None
+
+        def run(answers, misses=3):
+            child, seen = Child(), iter(answers)
+
+            def stop(c):
+                c.stopped = c.by_watcher = True
+
+            def inspect(*_):
+                try:
+                    return next(seen)
+                except StopIteration:
+                    child.stopped = True  # the probe exited by itself
+                    return 4242
+            with mock.patch.object(SUPERVISOR_MODULE, "POLL_SECONDS", 0), \
+                    mock.patch.object(SUPERVISOR_MODULE, "container_pid", side_effect=inspect) as calls:
+                SUPERVISOR_MODULE.watch_container("docker", "agent", 4242, child, stop, misses=misses)
+            return calls.call_count, child.by_watcher
+
+        self.assertEqual(run([4242, 0, 4242, 0, 0, 4242]), (7, False))  # misses apart: left running
+        self.assertEqual(run([4242, 0, 4343]), (3, True))  # stopped on the new PID
+        self.assertEqual(run([0, 0, 0, 4242]), (3, True))  # three misses in a row
+
     def test_the_entrypoint_runs_agentsight_by_default(self):
         listen = self.dir / "listen.jsonl"
         env = {k: v for k, v in self.env.items() if k not in ("RAIL_LISTEN_SOURCE", "RAIL_LISTEN_CONTAINER")}

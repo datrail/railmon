@@ -193,14 +193,27 @@ def stop_agentsight(child: subprocess.Popen) -> None:
         pass
 
 
+# Consecutive polls without an answer (container stopped, or docker
+# inspect failing) before the probe is stopped anyway. One failed inspect
+# must not restart it: the restart makes every attribute PARTIAL, which
+# RailDash shows as drift for an agent that did not change.
+WATCH_MISSES = 10
+
+
 def watch_container(docker: str, container: str, pid: int, child: subprocess.Popen,
-                    stop) -> None:
-    """Stop `child` once `container` is no longer running as `pid`.
-    AgentSight's --pidns-of pins the namespace it started in, and outlives
-    an agent restart that listensnoop, inside the namespace, dies with."""
+                    stop, misses: int = WATCH_MISSES) -> None:
+    """Stop `child` once `container` is running as another PID, or has not
+    answered for `misses` polls in a row. AgentSight's --pidns-of pins the
+    namespace it started in, and outlives an agent restart that
+    listensnoop, inside the namespace, dies with."""
+    missed = 0
     while child.poll() is None:
         time.sleep(POLL_SECONDS)
-        if child.poll() is None and container_pid(docker, container) != pid:
+        if child.poll() is not None:
+            return
+        current = container_pid(docker, container)
+        missed = missed + 1 if not current else 0
+        if (current and current != pid) or missed >= misses:
             stop(child)
             return
 
