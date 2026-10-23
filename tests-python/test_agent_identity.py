@@ -3005,52 +3005,52 @@ class RunOneCollectionTest(unittest.TestCase):
         # against would have produced.
         self.assertEqual(calls["n"], 2)
 
-    def test_a_resolve_failure_still_delivers_the_sandbox_v1_fallback(self):
-        """A rail-review finding: suppressing the sandbox scan's own v1
-        write on the bet that a v2 collection would follow means a broken
-        manifest — caught only after that scan already ran — used to lose
-        the sandbox's evidence outright. `_deliver_v1_fallback` must run
-        with the exact args object `run_one_scan` was called with, so it
-        can reuse that same scan's stashed result."""
+    def test_a_resolve_failure_fails_closed_without_a_v1_fallback(self):
+        """DR-234 (design §5): a broken manifest used to deliver the sandbox
+        scan's unkeyed v1 bundle instead. A configured manifest disables
+        that fallback: nothing is delivered, and the run says
+        MULTI_AGENT_KEY_REQUIRED."""
+        import contextlib
+        import io
         from unittest import mock
 
         args = self.base_args()
         args.no_evidence_bundle = False
-        fallback = mock.Mock()
-
-        with mock.patch.object(scanner, "run_one_scan", return_value=0) as run_scan, \
+        captured = io.StringIO()
+        with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", side_effect=scanner.ScannerError("boom")), \
-                mock.patch.object(scanner, "_deliver_v1_fallback", fallback):
+                mock.patch.object(scanner, "_deliver_v1") as deliver, \
+                contextlib.redirect_stderr(captured):
             code = scanner.run_one_collection(args)
 
         self.assertEqual(code, 2)
-        fallback.assert_called_once()
-        (fallback_args,), _ = fallback.call_args
-        (scan_args,), _ = run_scan.call_args
-        self.assertIs(fallback_args, scan_args)
+        deliver.assert_not_called()
+        self.assertIn("MULTI_AGENT_KEY_REQUIRED", captured.getvalue())
 
-    def test_host_id_undetermined_still_calls_v1_fallback(self):
-        """The other half of the same finding: when `scan()` fails before
-        even a `host_id`/`sandbox_name` can be named, no v2 collection is
-        schema-legal — but the scan that already ran should still fall back
-        to a v1 delivery rather than vanishing."""
+    def test_host_id_undetermined_fails_closed_without_a_v1_fallback(self):
+        """The other half: when `scan()` fails before even a
+        `host_id`/`sandbox_name` can be named, no v2 collection is
+        schema-legal, and the sandbox scope's unkeyed v1 bundle is refused
+        rather than delivered in its place."""
+        import contextlib
+        import io
         from unittest import mock
 
         args = self.base_args()
         args.no_evidence_bundle = False
         targets = [{"agent_key": "planner", "status": "available", "config_roots": ["/srv/planner"]}]
-        planner_v1 = self.v1_scope({"model_name": {"value": "claude", "status": "ANSWERED", "tier": "observed"}})
-        scope_calls = iter([(None, None), (planner_v1, {"env": {}})])
-        fallback = mock.Mock()
+        captured = io.StringIO()
 
         with mock.patch.object(scanner, "run_one_scan", return_value=0), \
                 mock.patch.object(scanner, "resolve_targets", return_value=targets), \
-                mock.patch.object(scanner, "_v1_scope_from_scan_result", side_effect=lambda a: next(scope_calls)), \
-                mock.patch.object(scanner, "_deliver_v1_fallback", fallback):
+                mock.patch.object(scanner, "_v1_scope_from_scan_result", return_value=(None, None)), \
+                mock.patch.object(scanner, "_deliver_v1") as deliver, \
+                contextlib.redirect_stderr(captured):
             code = scanner.run_one_collection(args)
 
         self.assertEqual(code, 2)
-        fallback.assert_called_once()
+        deliver.assert_not_called()
+        self.assertIn("MULTI_AGENT_KEY_REQUIRED", captured.getvalue())
 
     def test_agents_fall_back_to_normal_v1_path_when_no_v2_collection_possible(self):
         """The regression this finding named directly: when the sandbox
