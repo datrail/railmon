@@ -229,6 +229,12 @@ def compose(
     }
 
 
+def _refuse_constant(name: str) -> Any:
+    # NaN/Infinity are not JSON: a source holding one is refused rather than
+    # composed into a bundle no strict reader accepts (DR-221).
+    raise ValueError(f"{name} is not a JSON number")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-id", required=True)
@@ -241,7 +247,7 @@ def main() -> int:
         key, separator, filename = spec.partition("=")
         if not separator or key in sources:
             parser.error("each --agent must be a unique KEY=V1_JSON")
-        sources[key] = json.loads(Path(filename).read_text(encoding="utf-8"))
+        sources[key] = json.loads(Path(filename).read_text(encoding="utf-8"), parse_constant=_refuse_constant)
     output = compose(args.host_id, args.sandbox_name, sources)
     Path(args.output).write_text(json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0

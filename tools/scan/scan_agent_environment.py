@@ -311,10 +311,26 @@ def collect_candidate_models(value: Any) -> list[str]:
         stripped = value.strip()
         if stripped.startswith("{") or stripped.startswith("["):
             try:
-                found.extend(collect_candidate_models(json.loads(stripped)))
+                found.extend(collect_candidate_models(strict_json_loads(stripped)))
             except (json.JSONDecodeError, TypeError):
                 pass
     return found
+
+
+def _refuse_non_json_constant(name: str) -> Any:
+    raise json.JSONDecodeError(f"{name} is not a JSON number", name, 0)
+
+
+def strict_json_loads(text: str | bytes) -> Any:
+    """`json.loads` without the three literals Python accepts and JSON does not.
+
+    `NaN`, `Infinity` and `-Infinity` parse to floats that `json.dumps` writes
+    back verbatim, so a config holding one would make a bundle no strict
+    reader (Rail Center's, an agent's own JSON.parse) accepts (DR-221). Refused
+    as a JSONDecodeError, every caller's existing parse-failure path handles
+    it: the file did not parse, as it does not for the agent.
+    """
+    return json.loads(text, parse_constant=_refuse_non_json_constant)
 
 
 def load_json_file(path: Path) -> Any | None:
@@ -322,7 +338,7 @@ def load_json_file(path: Path) -> Any | None:
     if not text:
         return None
     try:
-        return json.loads(text)
+        return strict_json_loads(text)
     except json.JSONDecodeError:
         return None
 
@@ -337,7 +353,7 @@ def find_models_in_capture(paths: list[Path]) -> list[str]:
                     if not line:
                         continue
                     try:
-                        event = json.loads(line)
+                        event = strict_json_loads(line)
                     except json.JSONDecodeError:
                         continue
                     models.extend(collect_candidate_models(event))
@@ -396,7 +412,7 @@ def find_models_in_container_openclaw_config(container: str, roots: list[str]) -
             if not stripped:
                 continue
             try:
-                models.extend(collect_candidate_models(json.loads(stripped)))
+                models.extend(collect_candidate_models(strict_json_loads(stripped)))
             except json.JSONDecodeError:
                 continue
     return dedupe(models)
@@ -474,7 +490,7 @@ def docker_inspect(container: str) -> dict[str, Any]:
     if not output:
         raise ScannerError(f"docker inspect failed for container: {container}")
     try:
-        data = json.loads(output)
+        data = strict_json_loads(output)
     except json.JSONDecodeError as exc:
         raise ScannerError("docker inspect returned invalid JSON") from exc
     if not data:
@@ -486,7 +502,7 @@ def _docker_inspect_json(cmd: list[str]) -> dict[str, Any] | None:
     """One `docker inspect`-shaped object, or None when Docker can't answer."""
     output = run_command(cmd, timeout=5.0)
     try:
-        data = json.loads(output) if output else None
+        data = strict_json_loads(output) if output else None
     except json.JSONDecodeError:
         return None
     return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
@@ -983,7 +999,7 @@ def parse_mcp_body(raw: str, content_type: str) -> Any:
         else:
             return None
     try:
-        return json.loads(raw)
+        return strict_json_loads(raw)
     except json.JSONDecodeError:
         return None
 
@@ -1695,7 +1711,7 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
         if not line:
             continue
         try:
-            event = json.loads(line)
+            event = strict_json_loads(line)
         except json.JSONDecodeError:
             malformed += 1
             continue
@@ -2039,7 +2055,7 @@ def summarize_file_access(
         if not line:
             continue
         try:
-            event = json.loads(line)
+            event = strict_json_loads(line)
         except json.JSONDecodeError:
             malformed += 1
             continue
@@ -2187,7 +2203,7 @@ def load_snapshot(path: Path) -> dict[str, Any]:
     # 64 KB for config files; a snapshot of a real session is megabytes, and the
     # truncated read fails to parse with nothing to suggest the file was fine.
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        data = strict_json_loads(path.read_text(encoding="utf-8", errors="replace"))
     except OSError as exc:
         raise ScannerError(f"cannot read AgentSight snapshot {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
@@ -2632,7 +2648,7 @@ def resolve_targets(manifest_path: Path) -> list[dict[str, Any]]:
     if output is None:
         raise ScannerError(f"failed to resolve --target-manifest via {railmon_bin} --print-resolved-targets")
     try:
-        targets = json.loads(output)
+        targets = strict_json_loads(output)
     except json.JSONDecodeError as exc:
         raise ScannerError(f"{railmon_bin} --print-resolved-targets returned invalid JSON") from exc
     if not isinstance(targets, list):

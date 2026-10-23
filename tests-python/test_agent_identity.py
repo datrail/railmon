@@ -626,6 +626,40 @@ class McpInventoryTest(unittest.TestCase):
         self.assertEqual(hosted["description"], "MCP server configured via .mcp.json: unreachable")
 
 
+class StrictJsonTest(unittest.TestCase):
+    """DR-221: NaN, Infinity and -Infinity are not JSON. A file holding one
+    does not parse, as it does not for the agent's own JSON reader, rather
+    than carrying a float no strict reader accepts into the bundle."""
+
+    LITERALS = ("NaN", "Infinity", "-Infinity")
+
+    def test_a_config_file_holding_one_does_not_parse(self):
+        import tempfile
+
+        for literal in self.LITERALS:
+            with self.subTest(literal=literal), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / ".mcp.json"
+                path.write_text('{"mcpServers": {"a": {"url": "http://x/mcp", "timeout": %s}}}' % literal,
+                                encoding="utf-8")
+                self.assertIsNone(scanner.load_json_file(path))
+                self.assertEqual(scanner.read_mcp_inventory(path), [])
+
+    def test_a_model_in_a_capture_line_holding_one_is_not_read(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.jsonl"
+            path.write_text('{"model": "gpt-x", "temperature": NaN}\n{"model": "gpt-y"}\n', encoding="utf-8")
+            self.assertEqual(scanner.find_models_in_capture([path]), ["gpt-y"])
+
+    def test_ordinary_json_still_parses(self):
+        self.assertEqual(scanner.strict_json_loads('{"a": [1, 2.5, -3e2, null, true]}'),
+                         {"a": [1, 2.5, -300.0, None, True]})
+        for literal in self.LITERALS:
+            with self.subTest(literal=literal), self.assertRaises(json.JSONDecodeError):
+                scanner.strict_json_loads('{"a": %s}' % literal)
+
+
 class McpEnvInventoryTest(unittest.TestCase):
     """The per-server env convention (DR-123): `AGENT_MCP_NAME`/`AGENT_MCP_URL`, no config file."""
 

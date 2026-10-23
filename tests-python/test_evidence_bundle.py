@@ -617,6 +617,24 @@ class BundlePermissionsTest(unittest.TestCase):
         self.assertEqual(field["reason"], "NO_SOURCE_ACCESS")
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
+    def test_a_harness_config_holding_nan_or_infinity_is_parse_failed(self):
+        # DR-221: the agent's own JSON reader refuses these literals, so the
+        # file did not parse - it is PARSE_FAILED, not carried verbatim.
+        import tempfile
+
+        for literal in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(literal=literal), tempfile.TemporaryDirectory() as tmp:
+                config = Path(tmp) / "settings.json"
+                config.write_text('{"permissions": {"allow": ["Bash"], "deny": [%s]}}' % literal, encoding="utf-8")
+                self.assertEqual(evidence_bundle._read_json_capped(config), (None, "PARSE_FAILED"))
+                bundle = evidence_bundle.build_evidence_bundle(
+                    build_args(config_path=[str(config)]), docker_context(), dict(HOST_PAIR), identity()
+                )
+                field = bundle["attributes"]["permissions"]
+                self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "PARSE_FAILED"))
+                self.assertNotIn("harness", field["value"])
+                self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
     def test_self_mode_user_is_blind_with_a_reason(self):
         bundle = build_bundle(mode="self")
         field = bundle["attributes"]["user"]
@@ -1585,6 +1603,29 @@ class ScannerWiringTest(unittest.TestCase):
                 expected = [{"protocol": "tcp", "addr": "0.0.0.0", "port": 4444, "process": "nc"}]
                 self.assertEqual(features["observed_listeners"]["listeners"], expected)
                 self.assertEqual(bundle["attributes"]["observed_listeners"]["value"], expected)
+
+    def test_a_config_holding_nan_or_infinity_emits_strict_json(self):
+        # DR-221: a harness config holding a non-JSON literal goes through
+        # the real scanner, and the bundle it writes parses with a reader that
+        # refuses those literals, as Rail Center's does.
+        import tempfile
+
+        def refuse(name):
+            raise ValueError(f"{name} is not JSON")
+
+        config = '{"permissions": {"allow": ["Bash"], "maxTurns": NaN, "deny": [Infinity, -Infinity]}}'
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "settings.json").write_text(config, encoding="utf-8")
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1", "--sandbox-name", "s-1",
+                                       "--config-path", f"{tmp}/settings.json",
+                                       "--feature-output", f"{tmp}/features.json",
+                                       "--evidence-bundle-output", f"{tmp}/bundle.json"], tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            raw = Path(tmp, "bundle.json").read_bytes()
+        bundle = json.loads(raw, parse_constant=refuse)
+        field = bundle["attributes"]["permissions"]
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "PARSE_FAILED"))
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
     def test_a_files_file_reaches_the_feature_file_and_the_bundle(self):
         import subprocess

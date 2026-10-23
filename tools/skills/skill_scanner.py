@@ -62,6 +62,17 @@ class ScannerError(RuntimeError):
     """Raised for user-correctable scanner errors."""
 
 
+def _refuse_non_json_constant(name: str) -> Any:
+    raise json.JSONDecodeError(f"{name} is not a JSON number", name, 0)
+
+
+def strict_json_loads(text: str) -> Any:
+    """`json.loads` refusing NaN/Infinity/-Infinity, which JSON does not have:
+    a skill's fields reach the evidence bundle, which strict readers parse
+    (DR-221)."""
+    return json.loads(text, parse_constant=_refuse_non_json_constant)
+
+
 def run_command(cmd: list[str], timeout: float = 10.0) -> str | None:
     try:
         proc = subprocess.run(
@@ -171,7 +182,7 @@ def parse_simple_frontmatter(lines: list[str]) -> dict[str, Any]:
 
         if value.startswith("[") and value.endswith("]"):
             try:
-                parsed = json.loads(value)
+                parsed = strict_json_loads(value)
                 data[key] = parsed
                 continue
             except json.JSONDecodeError:
@@ -320,7 +331,7 @@ def docker_inspect(container: str) -> dict[str, Any] | None:
     if not output:
         return None
     try:
-        data = json.loads(output)
+        data = strict_json_loads(output)
     except json.JSONDecodeError:
         return None
     if not data:

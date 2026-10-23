@@ -753,6 +753,8 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
     with this same cap; the classification is what the caller's note names,
     so "we looked" says what it actually found.
     """
+    import scan_agent_environment as scanner  # lazy: breaks the import cycle
+
     try:
         with path.open("rb") as f:
             raw = f.read(64_000)
@@ -760,7 +762,9 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
     except OSError:
         return None, "NO_SOURCE_ACCESS"
     try:
-        return json.loads(text), ""
+        # Strict: NaN/Infinity is PARSE_FAILED, not a value no strict
+        # reader of the bundle accepts (DR-221).
+        return scanner.strict_json_loads(text), ""
     except json.JSONDecodeError:
         if len(raw) == 64_000:
             return None, "SIZE_CAP_EXCEEDED"
