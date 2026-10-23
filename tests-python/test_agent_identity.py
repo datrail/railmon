@@ -557,6 +557,40 @@ class SecretMarkerGateTest(unittest.TestCase):
         self.assertIn("PWD", scanner.safe_env_keys(env))
         self.assertNotIn("DB_PWD", scanner.safe_env_keys(env))
 
+    def test_a_gpg_fingerprint_and_a_token_budget_are_not_credentials(self):
+        """DR-218: the Python image's GPG_KEY is the public fingerprint its build
+        checks Python's signature against, and MAX_OUTPUT_TOKENS is a count.
+        Their names match the markers; their values say what they are."""
+        env = {
+            "GPG_KEY": "7169605F62C751356D054A26A821E680E5FA6305",
+            "MAX_OUTPUT_TOKENS": "8192",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+            "MAX_TOKENS": " 4096 ",
+            "OPENAI_API_KEY": "sk-supersecret",
+        }
+        keys = {entry["key"] for entry in scanner.collect_secret_hygiene(env)}
+        self.assertEqual(keys, {"OPENAI_API_KEY"})
+
+    def test_the_exclusion_is_held_to_the_value_and_the_name(self):
+        """Only a fingerprint-shaped GPG_KEY and a decimal token budget are let
+        through: anything else under those names, or a budget-looking name
+        with another marker in it, is still counted."""
+        env = {
+            # Armoured key material, not a fingerprint.
+            "GPG_KEY": "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+            # A token under a budget-looking name.
+            "MAX_OUTPUT_TOKENS": "sk-live-abc123def456",
+            # Another marker besides the budget's TOKENS.
+            "API_KEY_MAX_TOKENS": "4096",
+            "SECRET_MAX_TOKENS": "4096",
+            # TOKENS that is not a budget: no MAX in the name.
+            "GITHUB_TOKENS": "1234",
+            # A fingerprint under a name other than GPG_KEY.
+            "SIGNING_KEY": "7169605F62C751356D054A26A821E680E5FA6305",
+        }
+        keys = {entry["key"] for entry in scanner.collect_secret_hygiene(env)}
+        self.assertEqual(keys, set(env))
+
 
 class McpInventoryTest(unittest.TestCase):
     def test_url_is_redacted_and_command_loses_its_arguments(self):
@@ -594,6 +628,37 @@ class McpInventoryTest(unittest.TestCase):
             inventory = scanner.read_mcp_inventory(path)
 
         self.assertNotIn("sk-live-abc123def456ghi789", repr(inventory))
+
+    def test_a_servers_tool_allow_list_is_recorded(self):
+        """DR-218: adding tools to a server's allow list widens what the agent
+        can do, so it changes the inventory. The lists are sets: order and
+        repeats in the file are not a change."""
+        import json
+        import tempfile
+
+        def inventory(spec):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / ".mcp.json"
+                path.write_text(json.dumps({"mcpServers": {"broker": {"url": "http://127.0.0.1:1/mcp", **spec}}}),
+                                encoding="utf-8")
+                return scanner.read_mcp_inventory(path)[0]
+
+        narrow = inventory({"includeTools": ["getQuote"], "excludeTools": ["buyStock", "sellStock"]})
+        self.assertEqual(narrow["include_tools"], ["getQuote"])
+        self.assertEqual(narrow["exclude_tools"], ["buyStock", "sellStock"])
+        wide = inventory({"includeTools": ["sellStock", "getQuote", "buyStock", "getQuote"], "excludeTools": []})
+        self.assertEqual(wide["include_tools"], ["buyStock", "getQuote", "sellStock"])
+        self.assertEqual(wide["exclude_tools"], [])
+        self.assertNotEqual(narrow, wide)
+        # No list in the file is "no restriction", which is not an empty list.
+        unrestricted = inventory({})
+        self.assertIsNone(unrestricted["include_tools"])
+        self.assertIsNone(unrestricted["exclude_tools"])
+        # A malformed list is not invented into one.
+        self.assertIsNone(inventory({"includeTools": "buyStock"})["include_tools"])
+        # A tool name is shipped like a server name: key-shaped text redacted.
+        leaked = inventory({"includeTools": ["sk-live-abc123def456ghi789"]})
+        self.assertNotIn("sk-live-abc123def456ghi789", repr(leaked))
 
     def test_the_skills_view_of_the_same_file_is_redacted_too(self):
         """These skills are POSTed to the control plane, not just written locally.

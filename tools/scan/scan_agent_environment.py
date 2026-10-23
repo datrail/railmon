@@ -197,6 +197,28 @@ def parse_env_lines(text: str | None) -> dict[str, str]:
     return env
 
 
+# Names the markers flag whose value, when it has a known harmless shape, is
+# not credential material (DR-218). Held to both the name and the value, so a
+# key under one of these names is still counted.
+# The official Python images set GPG_KEY to the public fingerprint their build
+# checks Python's release signature against: 40 hex digits (16 for a long id).
+GPG_FINGERPRINT_RE = re.compile(r"(?:0x)?(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{16})")
+# A token budget: MAX in the name, TOKENS last (MAX_TOKENS, MAX_OUTPUT_TOKENS,
+# CLAUDE_CODE_MAX_OUTPUT_TOKENS), no other marker, and a decimal count.
+TOKEN_BUDGET_RE = re.compile(r"(?:[A-Z0-9]+_)*MAX(?:_[A-Z0-9]+)*_TOKENS")
+
+
+def is_benign_secret_name(key: str, value: str) -> bool:
+    """Whether a marker-flagged variable is a known non-credential by its shape."""
+    upper = key.upper()
+    stripped = value.strip()
+    if upper == "GPG_KEY":
+        return bool(GPG_FINGERPRINT_RE.fullmatch(stripped.replace(" ", "")))
+    if TOKEN_BUDGET_RE.fullmatch(upper) and not looks_secret(upper[: -len("_TOKENS")]):
+        return stripped.isdigit() and stripped.isascii()
+    return False
+
+
 def looks_secret(key: str) -> bool:
     upper = key.upper()
     if upper in NON_SECRET_KEYS:
@@ -761,9 +783,27 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
                 "url": redact_url(url) if isinstance(url, str) else None,
                 "transport": "http" if url else ("stdio" if command else "unknown"),
                 "source": path.name,
+                # Which of the server's tools the agent may use (DR-218):
+                # widening the allow list changes what it can do.
+                "include_tools": mcp_tool_list(spec.get("includeTools")),
+                "exclude_tools": mcp_tool_list(spec.get("excludeTools")),
             }
         )
     return inventory
+
+
+def mcp_tool_list(value: Any) -> list[str] | None:
+    """A server's `includeTools`/`excludeTools`, as a sorted set of tool names.
+
+    None when the config has no such list, which means no restriction and is
+    not the same as an empty one; a value that is not a list of names is not
+    turned into one. The order and repeats in the file are not part of what
+    the agent may call, so they are not kept: reordering is not drift. A name
+    is shipped like the server's, so key-shaped text is redacted.
+    """
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return sorted({redact_text(item) for item in value})
 
 
 # The per-server env convention confirmed by Kyle Liwanag for the GCP estate
@@ -791,6 +831,8 @@ def read_mcp_inventory_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
             "url": redact_url(url),
             "transport": "http",
             "source": "environment",
+            "include_tools": None,
+            "exclude_tools": None,
         }
     ]
 
@@ -1274,7 +1316,7 @@ def collect_secret_hygiene(
     """One entry per secret-looking variable: name, type, class. Never a value."""
     entries = []
     for key in sorted(env):
-        if not looks_secret(key):
+        if not looks_secret(key) or is_benign_secret_name(key, env[key]):
             continue
         entries.append(
             {

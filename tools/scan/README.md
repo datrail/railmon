@@ -203,7 +203,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `secrets_hygiene` | env key *names*, plus one entry per secret-looking variable with its `secret_type` and `secret_class` (`plaintext` / `reference` / `mount`) |
 | `model_and_egress` | provider, model, `base_url` and whether it is `canonical`, `local` or an `unknown_proxy` |
 | | URLs are recorded with userinfo, query strings, fragments and key-shaped path segments redacted — gateways routinely carry the key in the URL. A path segment is key-shaped if it is 20 characters or longer, or matches a known vendor key format (`sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, …) at any length |
-| `tool_and_mcp_reach` | MCP inventory: name, the command's executable (not its arguments, which carry tokens), redacted url, transport |
+| `tool_and_mcp_reach` | MCP inventory: name, the command's executable (not its arguments, which carry tokens), redacted url, transport, and the server's tool allow list: `includeTools`/`excludeTools` as `include_tools`/`exclude_tools`, each a sorted set of names, `null` when the config has none (no restriction) |
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
 | `observed_listeners` | only with `--listen-file`: sockets the agent opened to accept inbound traffic — protocol, bound address, port (or `ephemeral`) and process name — plus counts of lost, unlisted and malformed events; and `peers`, who connected in (see [Ingress peers](#ingress-peers)) |
@@ -300,8 +300,28 @@ is `ABSENT`; arbitrary labels and image names are never grouping signals.
 
 `credential_inventory` uses the profiler's closed credential classes:
 `secret_plaintext`, `secret_ref`, and `mount`. Empty secret-shaped environment
-variables are omitted because they contain no credential. Values are never
-collected or written to the bundle.
+variables are omitted because they contain no credential. So are two names
+the markers flag whose value shows they are not one: `GPG_KEY` holding a key
+fingerprint (the official Python images set it to the one their build checks
+Python's signature against), and a token budget, a name with `MAX` in it,
+`TOKENS` last and no other marker (`MAX_OUTPUT_TOKENS`,
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), holding a decimal count. Any other value
+under those names is still counted. Values are never collected or written to
+the bundle.
+
+In docker mode `user` is the container's `Config.User`, the image's `USER`
+or `docker run --user` over it, and `root` when that is empty.
+`mcp_servers_declared` carries each server's `include_tools` and
+`exclude_tools` as in the feature file, so widening an allow list is drift.
+A harness, MCP or model config holding `NaN`, `Infinity` or `-Infinity`,
+which JSON does not have, does not parse: the bundle names it `PARSE_FAILED`,
+as for any other unparsable file, and never carries a value a strict reader
+refuses.
+
+All of the paragraph above is new in rule pack 12, with the credential
+exclusion before it: each changes what the bundle says for an unchanged
+agent, so RailDash shows a baseline locked under pack 11 as
+`CONTRACT_MISMATCH`, not as drift, until a pack-12 ASP is locked.
 
 ## RailDash delivery
 

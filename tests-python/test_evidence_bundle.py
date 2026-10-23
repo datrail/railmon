@@ -617,6 +617,51 @@ class BundlePermissionsTest(unittest.TestCase):
         self.assertEqual(field["reason"], "NO_SOURCE_ACCESS")
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
 
+    def test_docker_mode_user_is_the_containers_config_user(self):
+        # DR-218: Docker puts the image's USER and `docker run --user` in
+        # Config.User; HostConfig has no User, so reading it there said root
+        # whoever the agent ran as.
+        for config_user, expected in (("app", "app"), ("1000:1000", "1000:1000"), ("", "root"), (None, "root")):
+            with self.subTest(config_user=config_user):
+                config = {"Labels": {}}
+                if config_user is not None:
+                    config["User"] = config_user
+                context = docker_context(docker_inspect={
+                    "Image": "sha256:deadbeef",
+                    "HostConfig": {"Privileged": False, "CapAdd": [], "User": "not-read"},
+                    "Config": config,
+                })
+                bundle = evidence_bundle.build_evidence_bundle(
+                    build_args(), context, {"host_id": "h-1", "sandbox_name": "agent-container"}, identity()
+                )
+                field = bundle["attributes"]["user"]
+                self.assertEqual((field["status"], field["value"]), ("ANSWERED", expected))
+                self.assertIn("Config.User", field["method"])
+                self.assertNotIn("HostConfig", field["method"])
+                self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+
+    def test_mcp_allow_lists_reach_the_declared_servers(self):
+        # DR-218: two tools added to a server's allow list change the bundle.
+        import tempfile
+
+        def declared(spec):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / ".mcp.json"
+                path.write_text(json.dumps({"mcpServers": {"broker": {"url": "http://127.0.0.1:1/mcp", **spec}}}),
+                                encoding="utf-8")
+                servers = scanner.collect_mcp_inventory([path])
+            bundle = evidence_bundle.build_evidence_bundle(
+                build_args(), docker_context(), dict(HOST_PAIR), identity(mcp_servers=servers)
+            )
+            self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+            return bundle["attributes"]["mcp_servers_declared"]["value"]
+
+        before = declared({"includeTools": ["getQuote"], "excludeTools": ["buyStock", "sellStock"]})
+        after = declared({"includeTools": ["getQuote", "buyStock", "sellStock"], "excludeTools": []})
+        self.assertEqual(before[0]["include_tools"], ["getQuote"])
+        self.assertEqual(after[0]["include_tools"], ["buyStock", "getQuote", "sellStock"])
+        self.assertNotEqual(before, after)
+
     def test_a_harness_config_holding_nan_or_infinity_is_parse_failed(self):
         # DR-221: the agent's own JSON reader refuses these literals, so the
         # file did not parse - it is PARSE_FAILED, not carried verbatim.
@@ -1047,8 +1092,11 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # pack 8 adds the registration payload's fields (DR-189); pack 9
         # adds agent_instance, the dynamic ones pack 8 left out (DR-193);
         # pack 10 folds Python's bytecode-cache writes (DR-201); pack 11
-        # adds egress_containment and egress_proxy_declared (DR-207).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 11)
+        # adds egress_containment and egress_proxy_declared (DR-207); pack
+        # 12 reads user from Config.User, records an MCP server's tool allow
+        # list, stops counting a GPG fingerprint or a token budget as a
+        # credential (DR-218), and refuses NaN/Infinity in a config (DR-221).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 12)
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)
