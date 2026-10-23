@@ -7,15 +7,16 @@ Containers from one image, deployed the way the README says:
   a go-ahead and listens on a second port it asks for (both again after
   every restart);
 - `railmon listen` with RAIL_LISTEN_CONTAINER: a privileged supervisor in the
-  host PID namespace that runs listensnoop inside the agent's, appending to a
-  volume the agent does not mount;
+  host PID namespace that runs AgentSight's process probe scoped to the
+  agent's (DR-170), appending to a volume the agent does not mount;
 - `railmon scan`, reading that volume read-only into a bundle.
 
 Checked, in order:
 
-1. the event carries the agent's own PID (as its namespace numbers it) and an
-   asked-for port, and the bundle's observed_listeners names port and process;
-2. listensnoop is killed (by the agent where the host lets it, else from
+1. the event carries the agent's PID (the host's, as AgentSight reports it)
+   and an asked-for port, the start record names AgentSight, and the
+   bundle's observed_listeners names port and process, and the probe;
+2. the probe is killed (by the agent where the host lets it, else from
    outside, as a crash): the supervisor attaches again, and the bundle goes
    PARTIAL, because the probe missed whatever opened meanwhile;
 3. the agent container restarts: the probe follows it into the new namespace
@@ -77,7 +78,7 @@ import os, signal
 for pid in os.listdir("/proc"):
     if pid.isdigit():
         try:
-            if open(f"/proc/{pid}/comm").read().strip() == "listensnoop":
+            if open(f"/proc/{pid}/comm").read().strip() == "agentsight":
                 os.kill(int(pid), signal.SIGKILL)
                 print(pid)
         except OSError:
@@ -96,6 +97,25 @@ def wait_for(what: str, ready, timeout: float = 60) -> None:
             return
         time.sleep(0.5)
     raise TimeoutError(what)
+
+
+def host_pid(container: str, namespace_pid: int) -> int:
+    """The host PID of the process `container`'s namespace numbers
+    `namespace_pid`, a child of its init (--init): the PID AgentSight's
+    events carry (DR-170). This test runs in the host PID namespace."""
+    init = int(docker("inspect", "-f", "{{.State.Pid}}", container).stdout.strip())
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/status") as f:
+                fields = dict(line.split(":", 1) for line in f if ":" in line)
+        except OSError:
+            continue
+        if (int(fields.get("PPid", "0")) == init
+                and fields.get("NSpid", "").split()[-1:] == [str(namespace_pid)]):
+            return int(entry)
+    return 0
 
 
 def main() -> int:
@@ -151,25 +171,25 @@ def main() -> int:
                "-v", "/var/run/docker.sock:/var/run/docker.sock", "-v", f"{data}:/data",
                "-e", f"RAIL_LISTEN_CONTAINER={agent}", "-e", "RAIL_LISTEN_FILE=/data/listen.jsonl",
                "-e", "RAIL_LISTEN_HEARTBEAT=2", args.image, "listen")
-        wait_for("listensnoop to attach", lambda: attaches() >= 1)
+        wait_for("the probe to attach", lambda: attaches() >= 1)
         (sig / "go").touch()
         wait_for("the agent to listen", (sig / "pid").exists)
-        agent_pid = int((sig / "pid").read_text())
+        agent_pid = host_pid(agent, int((sig / "pid").read_text()))
         wait_for("the event", lambda: len(ours()) >= 1, timeout=30)
 
         # 1. the event and the bundle
         mine = ours()
         checks["listen wrote one event for the agent's port"] = len(mine) == 1
-        checks["with the agent's own PID and an asked-for port"] = (
+        checks["with the agent's PID and an asked-for port"] = (
             mine[0]["pid"] == agent_pid and agent_pid > 1 and mine[0]["ephemeral"] is False
             and mine[0]["comm"] == "python3"
         )
         checks["the port opened before the probe attached is a snapshot record"] = [
             (e["kind"], e["pid"], e["comm"], e["addr"], e["ephemeral"]) for e in early()
         ] == [("listen", agent_pid, "python3", "0.0.0.0", False)]
-        checks["only the agent's namespace, one start, heartbeats"] = (
+        checks["only the agent's namespace, one start, by AgentSight"] = (
             not any(e.get("pid") == 0 for e in records())
-            and sum(e.get("kind") == "start" for e in records()) == 1
+            and [e.get("probe") for e in records() if e.get("kind") == "start"] == ["agentsight"]
         )
         wait_for("a heartbeat", lambda: any(e.get("kind") == "alive" for e in records()), timeout=15)
         listeners = scan()
@@ -179,6 +199,7 @@ def main() -> int:
             in listeners["value"]
             and {"protocol": "tcp", "addr": "0.0.0.0", "port": EARLY_PORT, "process": "python3"}
             in listeners["value"]
+            and listeners["method"].startswith("AgentSight's process probe events:")
         )
 
         # 1b. a client on the Docker network connects in (DR-145)
@@ -229,7 +250,7 @@ def main() -> int:
         wait_for("the agent to listen again", (sig / "pid").exists)
         wait_for("the second event", lambda: len(ours()) >= 2, timeout=30)
         checks["after the agent restarts, the probe records its listener again"] = (
-            ours()[-1]["pid"] == int((sig / "pid").read_text())
+            ours()[-1]["pid"] == host_pid(agent, int((sig / "pid").read_text())) != 0
         )
         # Snapshot records from the first attach and the one after the kill;
         # after the restart, the port is recorded again, by the snapshot or,

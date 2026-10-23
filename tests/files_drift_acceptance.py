@@ -4,7 +4,7 @@
 Drives the real scanner and a real RailDash end to end, the way
 listen_drift_acceptance.py does for listeners:
 
-1. scan with a filesnoop file holding one read; lock that ASP as the
+1. scan with a `railmon files` file holding one read; lock that ASP as the
    baseline and make it active;
 2. scan again after another process read the same file (another PID, thread
    name and time): ALIGNED. The value has no counts, PIDs or process names,
@@ -53,7 +53,8 @@ AGENT_KEY = "files-acceptance-agent"
 
 
 def event(path: str, *, read: bool = True, write: bool = False, pid: int = 7, comm: str = "agent") -> str:
-    # A line as filesnoop (ebpf-tls-tap 7b6da87) prints it.
+    # A line in filesnoop's shape (ebpf-tls-tap 7b6da87), which `railmon
+    # files` writes from AgentSight's process probe since DR-170.
     return json.dumps({
         "timestamp_ns": time.monotonic_ns(), "kind": "open", "pid": pid, "tid": pid,
         "host_pid": 7000 + pid, "uid": 1000, "comm": comm, "path": path, "read": read,
@@ -124,8 +125,9 @@ def main() -> int:
 
     checks: dict[str, bool] = {}
     # A real probe's file opens with its start record; no -H ("every": 0).
+    # "probe": AgentSight's, as `railmon files` runs it (DR-170).
     start = json.dumps({"kind": "start", "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "every": 0})
+                        "every": 0, "probe": "agentsight"})
     files_file.write_text("", encoding="utf-8")
     append(start, event("/workspace/config.json"))
 
@@ -135,6 +137,7 @@ def main() -> int:
         field["status"] == "ANSWERED" and field["tier"] == "observed"
         and field["value"] == [{"path": "/workspace/config.json", "read": True, "write": False,
                                 "exec": False, "layer": False}]
+        and field["method"].startswith("AgentSight's process probe events:")
     )
     lock(baseline, "files")
 

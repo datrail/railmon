@@ -87,7 +87,11 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # decimal token budget such as MAX_OUTPUT_TOKENS (DR-218); and a config
 # holding NaN or Infinity is PARSE_FAILED, not carried as a value no strict
 # reader accepts (DR-221).
-RULE_PACK_VERSION = 12
+# Pack 13 moves observed_listeners, observed_ingress_peers and
+# observed_file_access onto AgentSight's process probe and the image's
+# AgentSight from v1.0.34 to v1.0.35 (DR-170): their method and notes name
+# the probe that observed them, so a pack-12 baseline is not comparable.
+RULE_PACK_VERSION = 13
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -784,6 +788,16 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
         return None, "PARSE_FAILED"
 
 
+# How the bundle names the probe that wrote an event file, from its
+# summary's `source` (the scanner's PROBE_NAMES; DR-170).
+PROBE_LABELS = {"agentsight": "AgentSight's process probe"}
+
+
+def _probe_label(summary: dict[str, Any], default: str) -> str:
+    source = summary.get("source")
+    return PROBE_LABELS.get(source, source if isinstance(source, str) and source else default)
+
+
 def _probe_gaps(summary: dict[str, Any], probe: str) -> tuple[list[str], bool]:
     """What makes a probe's event list incomplete, as note fragments, and
     whether the probe was a source we could not reach (not running) rather
@@ -880,7 +894,7 @@ def build_evidence_bundle(
         # runtime; a docker-mode scan reads its container, not itself, so its
         # runtime source is the wire. The pack ships without a tap, so that is
         # reached only through a file a tap wrote: an AgentSight snapshot,
-        # listensnoop events or filesnoop events.
+        # or the listener or file-open events `railmon listen`/`files` wrote.
         "runtime": _source(
             True,
             mode == "self" or bool(reach) or listening is not None or file_access is not None,
@@ -1076,15 +1090,16 @@ def build_evidence_bundle(
     if listening is None:
         attributes["observed_listeners"] = _blind(
             "NOT_COLLECTED_BY_PACK", "observed",
-            note="no listensnoop event file was provided to this scan",
+            note="no listener event file (railmon listen) was provided to this scan",
         )
     else:
         heard = listening.get("listeners") or []
+        listen_probe = _probe_label(listening, "listensnoop")
         method = (
-            "listensnoop events: protocol, bound address, port (a kernel-chosen "
+            f"{listen_probe} events: protocol, bound address, port (a kernel-chosen "
             "port is 'ephemeral'), process name"
         )
-        gaps, unreachable = _probe_gaps(listening, "listensnoop")
+        gaps, unreachable = _probe_gaps(listening, listen_probe)
         probe_gaps = list(gaps)  # what the peers share: everything but the listener cap
         if listening.get("unlisted"):
             gaps.append("more distinct listeners than the cap")
@@ -1100,7 +1115,7 @@ def build_evidence_bundle(
         elif heard:
             attributes["observed_listeners"] = _answered(
                 heard, "observed", authored_by="none", method=method,
-                note="a finite window; a listener opened before listensnoop started is not in it",
+                note=f"a finite window; a listener opened before {listen_probe} started is not in it",
             )
         else:
             attributes["observed_listeners"] = _absent(
@@ -1117,17 +1132,18 @@ def build_evidence_bundle(
     if listening is None:
         attributes["observed_ingress_peers"] = _blind(
             "NOT_COLLECTED_BY_PACK", "observed",
-            note="no listensnoop event file was provided to this scan",
+            note="no listener event file (railmon listen) was provided to this scan",
         )
     elif not listening.get("peers_reported") and not listening.get("peers"):
         attributes["observed_ingress_peers"] = _blind(
             "NOT_COLLECTED_BY_PACK", "observed",
-            note="this listensnoop does not report accepted peers (it predates them, or never attached)",
+            note=f"this {_probe_label(listening, 'listensnoop')} does not report accepted peers "
+            "(it predates them, or never attached)",
         )
     else:
         met = listening.get("peers") or []
         peer_method = (
-            "listensnoop peer events: each remote address a process accepted a TCP "
+            f"{listen_probe} peer events: each remote address a process accepted a TCP "
             "connection from, per listener (protocol, bound address, port, process), "
             "with its scope (loopback, link-local, private, public, other)"
         )
@@ -1152,7 +1168,7 @@ def build_evidence_bundle(
                 "observed",
             )
 
-    # The files the sandbox opened (DR-154), from filesnoop: kernel-observed,
+    # The files the sandbox opened (DR-154), from `railmon files`: kernel-observed,
     # so `observed`, authored by nobody, and kept apart from anything a
     # configuration declares or a tool call asked for. No declaration names
     # a file, so drift is the locked baseline's comparison of this list: a
@@ -1162,17 +1178,18 @@ def build_evidence_bundle(
     if file_access is None:
         attributes["observed_file_access"] = _blind(
             "NOT_COLLECTED_BY_PACK", "observed",
-            note="no filesnoop event file was provided to this scan",
+            note="no file-open event file (railmon files) was provided to this scan",
         )
     else:
         opened = file_access.get("files") or []
+        file_probe = _probe_label(file_access, "filesnoop")
         file_method = (
-            "filesnoop events: each regular file a process in the sandbox opened, "
+            f"{file_probe} events: each regular file a process in the sandbox opened, "
             "by the path it saw (a /proc process or thread ID as *), with read, "
             "write and exec the union of how it was opened; layer marks an "
             "overlayfs layer open"
         )
-        file_gaps, file_unreachable = _probe_gaps(file_access, "filesnoop")
+        file_gaps, file_unreachable = _probe_gaps(file_access, file_probe)
         # A write or exec lost to the cap or an unreadable path gets its own
         # words, so a baseline already PARTIAL for too many reads still
         # drifts when a write is the thing that went missing.
@@ -1181,7 +1198,7 @@ def build_evidence_bundle(
         if file_access.get("unlisted_write_exec"):
             file_gaps.append("written or run files past the cap")
         if file_access.get("unnamed"):
-            file_gaps.append("a file whose path filesnoop could not read, or longer than the cap")
+            file_gaps.append(f"a file whose path {file_probe} could not read, or longer than the cap")
         if file_access.get("unnamed_write_exec"):
             file_gaps.append("a written or run file among them")
         # Said whenever it happened, so a templated path never passes for
@@ -1203,7 +1220,7 @@ def build_evidence_bundle(
         elif opened:
             attributes["observed_file_access"] = _answered(
                 opened, "observed", authored_by="none", method=file_method,
-                note="a finite window; a file opened before filesnoop started, or read "
+                note=f"a finite window; a file opened before {file_probe} started, or read "
                 "through a descriptor opened before then, is not in it" + folded,
             )
         else:

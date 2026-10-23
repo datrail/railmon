@@ -6,19 +6,22 @@ Containers from one image, deployed the way the README says:
 - an "agent" that waits for a go-ahead, then writes a file inside its own
   container;
 - `railmon files` with RAIL_FILES_CONTAINER: the same privileged supervisor
-  as `railmon listen`, in the host PID namespace, running filesnoop inside
-  the agent's and appending to a volume the agent does not mount;
+  as `railmon listen`, in the host PID namespace, running AgentSight's
+  process probe scoped to the agent's (DR-170) and appending to a volume
+  the agent does not mount;
 - `railmon scan`, reading that volume read-only into a bundle. The scan
   exits non-zero on a bundle that fails its contract, so a bundle here is
   one that passed it.
 
 Checked, in order:
 
-1. the write event carries the agent's own PID (as its namespace numbers
-   it), the path as the agent sees it, and no layer events: the container's
-   root is an overlay the runtime mounted, whose layer opens filesnoop skips;
-2. the bundle's observed_file_access names the path as written, ANSWERED;
-3. filesnoop is killed (by the agent where the host lets it, else from
+1. the write event carries the agent's PID (the host's, as AgentSight
+   reports it), the path as the agent sees it, and no layer events: the
+   container's root is an overlay the runtime mounted, whose layer opens
+   the probe skips; the start record names AgentSight;
+2. the bundle's observed_file_access names the path as written, ANSWERED,
+   and the probe;
+3. the probe is killed (by the agent where the host lets it, else from
    outside, as a crash): the supervisor attaches again, and the bundle goes
    PARTIAL, because the probe missed whatever was opened meanwhile.
 
@@ -56,7 +59,7 @@ import os, signal
 for pid in os.listdir("/proc"):
     if pid.isdigit():
         try:
-            if open(f"/proc/{pid}/comm").read().strip() == "filesnoop":
+            if open(f"/proc/{pid}/comm").read().strip() == "agentsight":
                 os.kill(int(pid), signal.SIGKILL)
                 print(pid)
         except OSError:
@@ -78,6 +81,25 @@ def wait_for(what: str, ready, timeout: float = 60) -> None:
     raise TimeoutError(what)
 
 
+def host_pid(container: str, namespace_pid: int) -> int:
+    """The host PID of the process `container`'s namespace numbers
+    `namespace_pid`, a child of its init (--init): the PID AgentSight's
+    events carry (DR-170). This test runs in the host PID namespace."""
+    init = int(docker("inspect", "-f", "{{.State.Pid}}", container).stdout.strip())
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/status") as f:
+                fields = dict(line.split(":", 1) for line in f if ":" in line)
+        except OSError:
+            continue
+        if (int(fields.get("PPid", "0")) == init
+                and fields.get("NSpid", "").split()[-1:] == [str(namespace_pid)]):
+            return int(entry)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--image", required=True)
@@ -95,7 +117,7 @@ def main() -> int:
     agent_pid = 0
 
     def attaches() -> int:
-        return docker("logs", probe, check=False).stderr.count("filesnoop: attached")
+        return docker("logs", probe, check=False).stderr.count("agentsight attached")
 
     def records() -> list[dict]:
         if not files_file.exists():
@@ -134,22 +156,22 @@ def main() -> int:
                "-v", "/var/run/docker.sock:/var/run/docker.sock", "-v", f"{data}:/data",
                "-e", f"RAIL_FILES_CONTAINER={agent}", "-e", "RAIL_FILES_FILE=/data/files.jsonl",
                "-e", "RAIL_FILES_HEARTBEAT=2", args.image, "files")
-        wait_for("filesnoop to attach", lambda: attaches() >= 1)
+        wait_for("the probe to attach", lambda: attaches() >= 1)
         (sig / "go").touch()
         wait_for("the agent to write", (sig / "pid").exists)
-        agent_pid = int((sig / "pid").read_text())
+        agent_pid = host_pid(agent, int((sig / "pid").read_text()))
         wait_for("the event", lambda: len(ours()) >= 1, timeout=30)
 
         # 1. the event
         mine = ours()
         checks["files wrote one event for the agent's write"] = len(mine) == 1
-        checks["with the agent's own PID, the path it saw, write access"] = bool(mine) and (
+        checks["with the agent's PID, the path it saw, write access"] = bool(mine) and (
             mine[0]["pid"] == agent_pid and agent_pid > 1 and mine[0]["comm"] == "python3"
             and (mine[0]["read"], mine[0]["write"], mine[0]["exec"]) == (False, True, False)
         )
-        checks["only the agent's namespace, one start, no layer opens"] = (
+        checks["only the agent's namespace, one start by AgentSight, no layer opens"] = (
             not any(e.get("pid") == 0 for e in records())
-            and sum(e.get("kind") == "start" for e in records()) == 1
+            and [e.get("probe") for e in records() if e.get("kind") == "start"] == ["agentsight"]
             and not any(e.get("layer") for e in records())
         )
         wait_for("a heartbeat", lambda: any(e.get("kind") == "alive" for e in records()), timeout=15)
@@ -159,6 +181,7 @@ def main() -> int:
         checks["the bundle names the written path, observed"] = bool(field) and (
             field["status"] == "ANSWERED" and field["tier"] == "observed"
             and EXPECTED in field["value"]
+            and field["method"].startswith("AgentSight's process probe events:")
         )
 
         # 3. the probe is killed

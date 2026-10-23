@@ -1,4 +1,4 @@
-{"kind":"start","time":"2026-10-08T10:00:00Z","every":2,"peers":true}
+{"kind":"start","time":"2026-10-08T10:00:00Z","every":2,"peers":true,"probe":"agentsight"}
 {"timestamp_ns":10200000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"127.0.0.1","port":18170,"ephemeral":false}
 {"timestamp_ns":10220000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"0.0.0.0","port":41589,"ephemeral":true}
 {"timestamp_ns":10230000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"0.0.0.0","port":38743,"ephemeral":true}

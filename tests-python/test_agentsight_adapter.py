@@ -1,7 +1,8 @@
 """AgentSight's process probe as `railmon listen`/`files`' source (DR-170).
 
-Pending an AgentSight release with eunomia-bpf/agentsight#237 and a fix for #238, so
-the source is opt-in (RAIL_LISTEN_SOURCE / RAIL_FILES_SOURCE) and off by default. The
+The default source since AgentSight v1.0.35, the first release with
+eunomia-bpf/agentsight#237 and the fix for #238. tests/fixtures/agentsight-v1.0.35
+is a real capture by that release beside listensnoop and filesnoop. The synthetic
 fixtures under tests/fixtures/agentsight-adapter model the 2026-10-08 parity run on
 #237's head: `*.agentsight.jsonl` is the probe's output (the event shapes on
 agentsight master: bpf/process.c, bpf/process_ext/map_flush.h), `*.expected.jsonl`
@@ -28,6 +29,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "agentsight-adapter"
+RELEASE = ROOT / "tests" / "fixtures" / "agentsight-v1.0.35"
 ADAPTER = ROOT / "tools" / "listen" / "agentsight_adapter.py"
 SUPERVISOR = ROOT / "tools" / "listen" / "follow_container.py"
 
@@ -81,6 +83,60 @@ EXEC = raw(timestamp=2, event="EXEC", comm="srv", pid=100)
 SNAPSHOT_FIELDS = ("listeners", "peers", "peers_reported", "lost", "unlisted", "peers_unlisted",
                    "malformed", "outside_namespace", "starts", "restarted", "last_alive", "stale")
 
+
+class ReleaseParityTest(unittest.TestCase):
+    """The real v1.0.35 capture (tests/fixtures/agentsight-v1.0.35/README.md):
+    the scanner reads the same listeners, peers and files from it, adapted,
+    as from listensnoop's and filesnoop's files for the same run, including
+    a nested PID namespace's (agentsight#238), a child forked from a worker
+    thread (#240), a process entered later, and nothing from outside."""
+
+    @staticmethod
+    def read(name: str) -> list[str]:
+        return (RELEASE / name).read_bytes().decode("utf-8", "surrogateescape").splitlines()
+
+    @staticmethod
+    def adapted(mode: str) -> list[str]:
+        lines = (RELEASE / "process.agentsight.jsonl").read_bytes().splitlines(keepends=True)
+        return [line.decode("utf-8", "surrogateescape") for line in adapt(lines, mode)]
+
+    @staticmethod
+    def at_last_beat(summarize, lines):
+        # Each probe's file read as of its own last heartbeat: the references
+        # stopped when the workload's namespace ended, AgentSight later.
+        result = summarize(lines, now=datetime(2026, 10, 23, tzinfo=timezone.utc))
+        now = datetime.fromisoformat(result["last_alive"].replace("Z", "+00:00"))
+        return summarize(lines, now=now)
+
+    def test_listeners_and_peers(self):
+        ours = self.at_last_beat(scanner.summarize_listeners, self.read("listen.listensnoop.jsonl"))
+        theirs = self.at_last_beat(scanner.summarize_listeners, self.adapted("listen"))
+        same = [k for k in SNAPSHOT_FIELDS if k != "last_alive"]
+        self.assertEqual({k: theirs[k] for k in same}, {k: ours[k] for k in same})
+        self.assertEqual((theirs["source"], ours["source"]), ("agentsight", "listensnoop"))
+        ports = {entry["port"] for entry in theirs["listeners"]}
+        # 7000 the nested namespace's, 7001 the thread-forked child's, 7002 the
+        # entered process's; 7003 (outside) in neither.
+        self.assertTrue({18170, 18171, 18172, 7000, 7001, 7002} <= ports, ports)
+        self.assertNotIn(7003, ports)
+        self.assertEqual(sum(entry["port"] == "ephemeral" for entry in theirs["listeners"]), 2)
+        self.assertEqual(sorted(p["peer"] for p in theirs["peers"]), ["127.0.0.1", "::1"])
+        self.assertEqual((theirs["stale"], theirs["lost"], theirs["outside_namespace"]), (False, 0, 0))
+
+    def test_files(self):
+        ours = self.at_last_beat(scanner.summarize_file_access, self.read("files.filesnoop.jsonl"))
+        theirs = self.at_last_beat(scanner.summarize_file_access, self.adapted("files"))
+        for result in (ours, theirs):
+            result.pop("last_alive")
+        self.assertEqual((theirs.pop("source"), ours.pop("source")), ("agentsight", "filesnoop"))
+        self.assertEqual(theirs, ours)
+        paths = {entry["path"] for entry in theirs["files"]}
+        for name in ("nested.txt", "thread-child.txt", "exec.txt", "out.txt"):
+            self.assertIn(f"/tmp/dr170w/{name}", paths)
+        self.assertNotIn("/tmp/dr170w/control.txt", paths)
+        self.assertEqual(sum(len(path) > 600 for path in paths), 1)  # the long path, whole
+        # The two non-UTF-8 names print as one U+FFFD path, as filesnoop's do.
+        self.assertEqual(sum(path.startswith("/tmp/dr170w/n\ufffd") for path in paths), 1)
 
 class GoldenTest(unittest.TestCase):
     """The adapter's exact lines for the parity workload."""
@@ -137,6 +193,7 @@ class ParityTest(unittest.TestCase):
             [line.decode() for line in fixture("files.filesnoop.jsonl")], now=NOW)
         theirs = scanner.summarize_file_access(
             [line.decode() for line in adapt(fixture("files.agentsight.jsonl"), "files")], now=NOW)
+        self.assertEqual((theirs.pop("source"), ours.pop("source")), ("agentsight", "filesnoop"))
         self.assertEqual(theirs, ours)
         self.assertEqual((theirs["unnamed"], theirs["lost"], theirs["starts"]), (1, 2, 1))
 
@@ -148,22 +205,6 @@ class ParityTest(unittest.TestCase):
         theirs = adapt(fixture("files.agentsight.jsonl"), "files")
         self.assertEqual(len(keys(theirs)), len(keys(ours)))
         self.assertEqual(len(keys(theirs)), 9)  # the two non-UTF-8 names stay two
-
-    def test_nested_pid_namespace_is_pending_agentsight_238(self):
-        # A sandboxed tool call runs in a PID namespace nested inside the
-        # agent's. listensnoop -n keeps it; AgentSight's --pidns-of drops it
-        # (eunomia-bpf/agentsight#238), so its listener is in neither the
-        # capture nor the adapter's output. This blocks switching the default.
-        nested = raw(timestamp_ns=10290000000, kind="listen", pid=9, tid=9, host_pid=284800,
-                     uid=4242, comm="tool", protocol="tcp", family="ipv4", addr="0.0.0.0",
-                     port=7000, ephemeral=False)
-        reference = [line.decode() for line in fixture("listen.listensnoop.jsonl")]
-        reference.insert(6, nested.decode())
-        ours = scanner.summarize_listeners(reference, now=NOW)
-        theirs = scanner.summarize_listeners(
-            [line.decode() for line in adapt(fixture("listen.agentsight.jsonl"), "listen")], now=NOW)
-        missing = [entry for entry in ours["listeners"] if entry not in theirs["listeners"]]
-        self.assertEqual(missing, [{"protocol": "tcp", "addr": "0.0.0.0", "port": 7000, "process": "tool"}])
 
     def test_udp_send_without_bind_is_an_accepted_gap(self):
         # listensnoop's `autobind` (a UDP socket's first sendto() without a
@@ -192,7 +233,8 @@ class ListenerMappingTest(unittest.TestCase):
         family = raw(timestamp=1, event="SUMMARY", comm="srv", pid=100, process_start_ns=7,
                      type="NET_BIND", detail="family=1", count=1, port=0)
         self.assertEqual(records(adapt([START, bare, family], "listen")),
-                         [{"kind": "start", "time": "2026-10-08T10:00:00Z", "every": 2, "peers": True}])
+                         [{"kind": "start", "time": "2026-10-08T10:00:00Z", "every": 2, "peers": True,
+                           "probe": "agentsight"}])
 
     def test_datagram_protocols_listensnoop_names_are_binds(self):
         out = records(adapt([summary("NET_BIND", 5353, protocol=p, address="0.0.0.0")
@@ -361,7 +403,7 @@ exec sleep 30
 
 
 class WiringTest(unittest.TestCase):
-    """The opt-in selectors, the supervisor, and the default left alone."""
+    """The selectors, the supervisor, and AgentSight as the default."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -407,33 +449,98 @@ class WiringTest(unittest.TestCase):
         self.assertIn("[railmon files] attaching to agent (pid 4343)", stderr)
         self.assertEqual(supervisor.returncode, 0)
 
-    def test_the_entrypoint_selects_agentsight_only_when_asked(self):
+    def test_tracefs_is_mounted_only_when_missing_and_a_refusal_is_logged(self):
+        # A privileged container has no tracefs, and the process probe's
+        # tracepoints need it (the image job's -ENOENT).
+        mounted, missing = self.dir / "mounted", self.dir / "missing"
+        (mounted / "events").mkdir(parents=True)
+        missing.mkdir()
+        mount = self.dir / "mount"
+        mount.write_text('#!/bin/sh\necho "$*" >> "$FAKE_ARGS"\nmkdir -p "$4/events"\n')
+        mount.chmod(0o755)
+        refuse = self.dir / "refuse"
+        refuse.write_text('#!/bin/sh\necho "permission denied" >&2\nexit 32\n')
+        refuse.chmod(0o755)
+        logged: list[str] = []
+        with mock.patch.dict(os.environ, {"FAKE_ARGS": str(self.args)}):
+            self.assertTrue(adapter.ensure_tracefs(logged.append, [str(missing), str(mounted)], str(mount)))
+            self.assertFalse(self.args.exists())  # one already has tracepoints
+            self.assertTrue(adapter.ensure_tracefs(logged.append, [str(missing)], str(mount)))
+            self.assertEqual(self.args.read_text(), f"-t tracefs tracefs {missing}\n")
+            other = self.dir / "other"
+            other.mkdir()
+            self.assertFalse(adapter.ensure_tracefs(logged.append, [str(other)], str(refuse)))
+        self.assertEqual(logged, [f"cannot mount tracefs at {other}: permission denied"])
+
+    def test_one_failed_inspect_does_not_restart_the_probe(self):
+        # A restart makes every attribute PARTIAL (drift in RailDash), so the
+        # watcher stops AgentSight only on another PID, or after
+        # WATCH_MISSES polls in a row without an answer.
+        class Child:
+            def __init__(self):
+                self.stopped = self.by_watcher = False
+
+            def poll(self):
+                return 0 if self.stopped else None
+
+        def run(answers, misses=3):
+            child, seen = Child(), iter(answers)
+
+            def stop(c):
+                c.stopped = c.by_watcher = True
+
+            def inspect(*_):
+                try:
+                    return next(seen)
+                except StopIteration:
+                    child.stopped = True  # the probe exited by itself
+                    return 4242
+            with mock.patch.object(SUPERVISOR_MODULE, "POLL_SECONDS", 0), \
+                    mock.patch.object(SUPERVISOR_MODULE, "container_pid", side_effect=inspect) as calls:
+                SUPERVISOR_MODULE.watch_container("docker", "agent", 4242, child, stop, misses=misses)
+            return calls.call_count, child.by_watcher
+
+        self.assertEqual(run([4242, 0, 4242, 0, 0, 4242]), (7, False))  # misses apart: left running
+        self.assertEqual(run([4242, 0, 4343]), (3, True))  # stopped on the new PID
+        self.assertEqual(run([0, 0, 0, 4242]), (3, True))  # three misses in a row
+
+    def test_the_entrypoint_runs_agentsight_by_default(self):
         listen = self.dir / "listen.jsonl"
+        env = {k: v for k, v in self.env.items() if k not in ("RAIL_LISTEN_SOURCE", "RAIL_LISTEN_CONTAINER")}
         run = subprocess.run([str(ROOT / "entrypoint.sh"), "listen"],
-                             env={**self.env, "RAIL_LISTEN_SOURCE": "agentsight", "FAKE_EXIT": "1",
+                             env={**env, "FAKE_EXIT": "1",
                                   "RAIL_LISTEN_FILE": str(listen), "RAIL_LISTEN_HEARTBEAT": "5"},
                              capture_output=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(records(listen.read_bytes().splitlines()),
-                         [{"kind": "start", "time": "2026-10-08T10:00:00Z", "every": 5, "peers": True}])
+                         [{"kind": "start", "time": "2026-10-08T10:00:00Z", "every": 5, "peers": True,
+                           "probe": "agentsight"}])
         args = self.args.read_text().split()
         # Its own PID namespace, as listensnoop -n: the agent's under --pid container:.
         self.assertEqual(args[:3] + args[4:], ["-m", "0", "--pidns-of", "--trace-net", "--heartbeat", "5"])
         self.assertTrue(args[3].isdigit())
 
-    def test_the_default_source_is_still_listensnoop_and_filesnoop(self):
-        for command, probe_var in (("listen", "LISTENSNOOP_PATH"), ("files", "FILESNOOP_PATH")):
+    def test_an_operators_own_listensnoop_or_filesnoop_runs_when_asked(self):
+        for command, var, source, probe_var in (
+                ("listen", "RAIL_LISTEN_SOURCE", "listensnoop", "LISTENSNOOP_PATH"),
+                ("files", "RAIL_FILES_SOURCE", "filesnoop", "FILESNOOP_PATH")):
             probe = self.dir / command
             probe.write_text('#!/bin/sh\necho "probe $*"\n')
             probe.chmod(0o755)
             env = {k: v for k, v in self.env.items()
-                   if k not in ("RAIL_LISTEN_SOURCE", "RAIL_FILES_SOURCE", "RAIL_LISTEN_CONTAINER",
-                                "RAIL_FILES_CONTAINER", "RAIL_LISTEN_FILE", "RAIL_FILES_FILE")}
-            run = subprocess.run([str(ROOT / "entrypoint.sh"), command], env={**env, probe_var: str(probe)},
+                   if k not in ("RAIL_LISTEN_CONTAINER", "RAIL_FILES_CONTAINER", "RAIL_LISTEN_FILE",
+                                "RAIL_FILES_FILE", "LISTENSNOOP_PATH", "FILESNOOP_PATH")}
+            run = subprocess.run([str(ROOT / "entrypoint.sh"), command],
+                                 env={**env, var: source, probe_var: str(probe)},
                                  capture_output=True, text=True, timeout=30)
+            # The image ships neither, so without a path it is refused.
+            missing = subprocess.run([str(ROOT / "entrypoint.sh"), command], env={**env, var: source},
+                                     capture_output=True, text=True, timeout=30)
             with self.subTest(command=command):
                 self.assertEqual(run.stdout, "probe -n -H 60\n")
                 self.assertFalse(self.args.exists())
+                self.assertEqual(missing.returncode, 64)
+                self.assertIn(f"needs {probe_var}", missing.stderr)
 
     def test_an_unknown_source_is_refused(self):
         for command, var in (("listen", "RAIL_LISTEN_SOURCE"), ("files", "RAIL_FILES_SOURCE")):

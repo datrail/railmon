@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Keep listensnoop attached to one agent container's PID namespace (DR-143).
+"""Keep a listener or file-open probe attached to one agent container's PID namespace (DR-143).
 
 `railmon listen` with RAIL_LISTEN_CONTAINER set runs this. The supervisor
 itself sits in the host PID namespace, so the agent cannot see or signal it.
-Each round it asks Docker for the container's PID, enters that namespace with
-nsenter, and runs listensnoop there, appending to the output. When listensnoop
-exits, because the agent restarted (its namespace died with it) or the agent
-killed it, the supervisor waits for the container and attaches again.
+Each round it asks Docker for the container's PID and runs AgentSight's
+process probe with `--pidns-of` that PID (DR-170), its events written in
+listensnoop's lines by `agentsight_adapter.py`, appending to the output.
+--pidns-of pins the namespace when the probe starts and does not die with
+the agent, so the supervisor watches the container's PID and restarts the
+probe when that changes. When the probe exits, because the agent restarted
+or the probe was killed, the supervisor waits for the container and
+attaches again.
 
-Each attach starts with listensnoop's own `start` record. listensnoop does
+Each attach starts with the probe's own `start` record. The probe does
 not report sockets already listening when it attaches, and an agent that
 listens as soon as it starts usually beats the attach. So right after the
 start record the supervisor reads the agent's socket table and appends one
@@ -17,12 +21,12 @@ record per socket already open to accept traffic, in listensnoop's shape with
 probe was down: a socket opened and closed in the gap is missing, and the
 bundle says so instead of reading as "no new listeners".
 
-The same supervisor runs filesnoop for `railmon files` (DR-154): `--probe`
-names the binary and `--output` the file it appends to. Without them it is
-listensnoop (LISTENSNOOP_PATH) appending to RAIL_LISTEN_FILE, as before.
-filesnoop prints the same start records, so a restart shows the same way.
+The same supervisor runs the probe for `railmon files` (DR-154), written in
+filesnoop's lines: `--command files` picks the mode and `--output` the file
+it appends to (default RAIL_LISTEN_FILE). Its start records are the same, so
+a restart shows the same way.
 
-filesnoop reports a file once per process, so an agent that starts a new
+The probe reports a file once per process, so an agent that starts a new
 process for each task re-reports the same files every time, and an always-on
 output file grows without end while the scanner re-reads all of it. With
 `--distinct-opens` the supervisor appends an open record only the first time
@@ -34,13 +38,10 @@ the same; only the feature file's raw event counts (`outside_namespace`,
 instead of every one. Past 16,384 paths of a class, where the attribute is
 already PARTIAL, which entries are listed may differ.
 
-With `--source agentsight` (DR-170, pending an AgentSight release; off by
-default) the probe is AgentSight's process probe instead, run from here with
-`--pidns-of` the container's PID rather than entered with nsenter, its events
-written in listensnoop's or filesnoop's shape by `agentsight_adapter.py`, so
-everything after (the snapshot, distinct opens, the scanner) is unchanged.
-It pins the namespace when it starts and does not die with the agent, so the
-supervisor watches the container's PID and restarts it when that changes.
+With `--source probe` the probe is an operator's own listensnoop or
+filesnoop binary instead (`--probe`, else LISTENSNOOP_PATH): entered with
+nsenter into the agent's PID namespace, it dies with the agent, and
+everything after (the snapshot, distinct opens, the scanner) is the same.
 
 Needs: `--pid host`, eBPF privilege, and the Docker socket.
 """
@@ -84,8 +85,8 @@ def _proc_address(text: str, family: int) -> tuple[str, int]:
     return socket.inet_ntop(family, raw), int(port, 16)
 
 
-def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str]]:
-    """Socket inode -> (namespace PID, comm) for every process in
+def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str, int]]:
+    """Socket inode -> (namespace PID, comm, host PID) for every process in
     `pid`'s PID namespace. A socket shared by several (a pre-forked server)
     goes to the lowest namespace PID, usually the one that opened it.
 
@@ -95,7 +96,7 @@ def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str]]:
     and drop the process's sockets. It is the main thread's name, where
     listensnoop has the binding thread's; they differ only for a socket
     bound in a thread named apart."""
-    owners: dict[int, tuple[int, str]] = {}
+    owners: dict[int, tuple[int, str, int]] = {}
     namespace = os.readlink(f"{proc}/{pid}/ns/pid")
     for entry in os.listdir(proc):
         if not entry.isdigit():
@@ -115,13 +116,16 @@ def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str]]:
             if link.startswith("socket:[") and link.endswith("]"):
                 inode = int(link[8:-1])
                 if inode not in owners or nspid < owners[inode][0]:
-                    owners[inode] = (nspid, comm)
+                    owners[inode] = (nspid, comm, int(entry))
     return owners
 
 
-def listening_sockets(pid: int, proc: str = PROC) -> list[dict]:
+def listening_sockets(pid: int, proc: str = PROC, host_pids: bool = False) -> list[dict]:
     """The sockets `pid`'s container already has open to accept traffic, as
-    listensnoop records with `"snapshot": true`.
+    listensnoop records with `"snapshot": true`. Each record's pid is as the
+    container's namespace numbers it, as listensnoop writes it, or with
+    `host_pids` the host's, as the AgentSight adapter writes it, so one file
+    never mixes the two.
 
     Read from the network namespace of `pid` and kept only when a process in
     its PID namespace holds the socket, so another container sharing the
@@ -145,8 +149,8 @@ def listening_sockets(pid: int, proc: str = PROC) -> list[dict]:
             owner = owners.get(int(fields[9]))
             if port == 0 or owner is None:
                 continue
-            nspid, comm = owner
-            records.append({"kind": kind, "pid": nspid,
+            nspid, comm, host_pid = owner
+            records.append({"kind": kind, "pid": host_pid if host_pids else nspid,
                             "uid": int(fields[7]), "comm": comm, "protocol": protocol,
                             "family": "ipv6" if family == socket.AF_INET6 else "ipv4",
                             "addr": addr, "port": port, "ephemeral": False, "snapshot": True})
@@ -189,14 +193,27 @@ def stop_agentsight(child: subprocess.Popen) -> None:
         pass
 
 
+# Consecutive polls without an answer (container stopped, or docker
+# inspect failing) before the probe is stopped anyway. One failed inspect
+# must not restart it: the restart makes every attribute PARTIAL, which
+# RailDash shows as drift for an agent that did not change.
+WATCH_MISSES = 10
+
+
 def watch_container(docker: str, container: str, pid: int, child: subprocess.Popen,
-                    stop) -> None:
-    """Stop `child` once `container` is no longer running as `pid`.
-    AgentSight's --pidns-of pins the namespace it started in, and outlives
-    an agent restart that listensnoop, inside the namespace, dies with."""
+                    stop, misses: int = WATCH_MISSES) -> None:
+    """Stop `child` once `container` is running as another PID, or has not
+    answered for `misses` polls in a row. AgentSight's --pidns-of pins the
+    namespace it started in, and outlives an agent restart that
+    listensnoop, inside the namespace, dies with."""
+    missed = 0
     while child.poll() is None:
         time.sleep(POLL_SECONDS)
-        if child.poll() is None and container_pid(docker, container) != pid:
+        if child.poll() is not None:
+            return
+        current = container_pid(docker, container)
+        missed = missed + 1 if not current else 0
+        if (current and current != pid) or missed >= misses:
             stop(child)
             return
 
@@ -294,7 +311,17 @@ def log(message: str) -> None:
     print(f"[railmon {COMMAND}] {message}", file=sys.stderr, flush=True)
 
 
-def copy_with_snapshot(stream, sink, pid: int, probe_name: str, on_snapshot=None) -> None:
+def announce_attach(stream, probe_name: str):
+    """Pass the probe's lines on, logging each start record as an attach:
+    AgentSight's own log does not say so in words, as filesnoop's did."""
+    for line in stream:
+        if line.startswith(b'{"kind":"start"'):
+            log(f"{probe_name} attached")
+        yield line
+
+
+def copy_with_snapshot(stream, sink, pid: int, probe_name: str, on_snapshot=None,
+                       host_pids: bool = False) -> None:
     """Copy the probe's lines to `sink`, and after its start record append
     the sockets that were already listening. Taken after the probe attached,
     so nothing opened in between is missed, and a socket both report is
@@ -312,7 +339,7 @@ def copy_with_snapshot(stream, sink, pid: int, probe_name: str, on_snapshot=None
             continue
         snapshotted = True
         try:
-            records = listening_sockets(pid)
+            records = listening_sockets(pid, host_pids=host_pids)
         except OSError as exc:  # the agent exited meanwhile
             log(f"cannot read the sockets already listening: {exc}")
             continue
@@ -327,18 +354,18 @@ def main() -> int:
     global COMMAND
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--command", default=COMMAND, help="railmon command, for the log prefix")
-    parser.add_argument("--probe", help="probe binary (default: LISTENSNOOP_PATH, else listensnoop)")
+    parser.add_argument("--probe", help="probe binary for --source probe (default: LISTENSNOOP_PATH)")
     parser.add_argument("--output", help="file to append to; empty for stdout "
                         "(default: RAIL_LISTEN_FILE)")
     parser.add_argument("--snapshot-listeners", action="store_true",
                         help="after each attach, also record the sockets the agent already "
                         "has open to accept traffic (listensnoop only)")
     parser.add_argument("--distinct-opens", action="store_true",
-                        help="append each distinct file open record once (filesnoop only)")
-    parser.add_argument("--source", choices=("probe", "agentsight"), default="probe",
-                        help="probe: --probe under nsenter (default); agentsight: AgentSight's "
-                        "process probe with --pidns-of, adapted to the probe's lines (DR-170, "
-                        "pending an AgentSight release)")
+                        help="append each distinct file open record once (files only)")
+    parser.add_argument("--source", choices=("agentsight", "probe"), default="agentsight",
+                        help="agentsight: AgentSight's process probe with --pidns-of, adapted "
+                        "to listensnoop's or filesnoop's lines (DR-170, default); probe: an "
+                        "operator's own --probe under nsenter")
     parser.add_argument("--heartbeat", type=int, default=60,
                         help="AgentSight's --heartbeat (--source agentsight only)")
     parser.add_argument("container", help="agent container name or id")
@@ -348,10 +375,14 @@ def main() -> int:
 
     docker = os.environ.get("RAIL_DOCKER", "docker")
     nsenter = os.environ.get("RAIL_NSENTER", "nsenter")
-    listensnoop = args.probe or os.environ.get("LISTENSNOOP_PATH", "/usr/local/bin/listensnoop")
+    listensnoop = args.probe or os.environ.get("LISTENSNOOP_PATH", "")
     COMMAND = args.command
     agentsight = args.source == "agentsight"
+    if not agentsight and not listensnoop:
+        parser.error("--source probe needs --probe or LISTENSNOOP_PATH")
     adapter_module = load_adapter() if agentsight else None
+    if agentsight:
+        adapter_module.ensure_tracefs(log)
     mode = "files" if args.command == "files" else "listen"
     probe_name = "agentsight" if agentsight else os.path.basename(listensnoop)
     stop_probe = stop_agentsight if agentsight else stop_listensnoop
@@ -410,8 +441,10 @@ def main() -> int:
             adapter = adapter_module.Adapter(mode)
             on_snapshot = adapter.note_listeners
             stream = adapter_module.adapt_stream(child.stdout, adapter)
+        if agentsight and not args.snapshot_listeners:
+            stream = announce_attach(stream, probe_name)
         if args.snapshot_listeners:
-            copy_with_snapshot(stream, sink, pid, probe_name, on_snapshot)
+            copy_with_snapshot(stream, sink, pid, probe_name, on_snapshot, host_pids=agentsight)
         elif args.distinct_opens:
             copy_distinct(stream, sink, seen)
         elif agentsight:

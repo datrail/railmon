@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Turn AgentSight's process-probe events into listensnoop/filesnoop lines (DR-170).
 
-PENDING AN AGENTSIGHT RELEASE. Not the default source: `railmon listen` and
-`railmon files` use AgentSight only with RAIL_LISTEN_SOURCE=agentsight or
-RAIL_FILES_SOURCE=agentsight. Until a release carries eunomia-bpf/agentsight
-#237 (the `--pidns-of` scope and streamed liveness) and a fix for #238, the
-pinned AgentSight (v1.0.34) cannot run what this reads; see the README.
+`railmon listen` and `railmon files` run AgentSight this way by default
+since AgentSight v1.0.35, the first release with the `--pidns-of` scope and
+streamed liveness (eunomia-bpf/agentsight#237) and nested PID namespaces
+kept (#238); see the README.
 
 `agentsight debug process -- -m 0 --pidns-of PID --trace-net --heartbeat N`
 prints one JSON line per probe event, either raw (`{"event": ...}`) or
@@ -15,7 +14,8 @@ listen`) and filesnoop (`--mode files`), so `scan --listen-file` and `scan
 --files-file` read either source unchanged:
 
 - liveness: PROBE_LIVENESS start/alive, by `wall_time_ns`, become the
-  probes' `{"kind":"start"|"alive","time":...,"every":N}`. A start whose
+  probes' `{"kind":"start"|"alive","time":...,"every":N}`, and a start
+  names its probe, `"probe":"agentsight"`, which the bundle repeats. A start whose
   `--trace-net` is off is not a listener probe, so in listen mode its
   liveness is withheld: the file then has no start record and the scanner
   says the probe may never have attached, never "no listeners". A probe
@@ -56,12 +56,11 @@ than filled in, so pid is the host PID (the scanner only reads whether it
 is 0, and --pidns-of already leaves other namespaces out), and tid and uid
 are not written.
 
-Known gaps against listensnoop/filesnoop, recorded on DR-170:
-- a process in a PID namespace nested inside the agent's (a sandboxed tool
-  call) is dropped by --pidns-of: eunomia-bpf/agentsight#238, which blocks
-  the switch;
-- a UDP socket that sends without binding (listensnoop's `autobind`) is not
-  reported, by AgentSight's design since #229. Accepted.
+Known gap against listensnoop/filesnoop, recorded on DR-170: a UDP socket
+that sends without binding (listensnoop's `autobind`) is not reported, by
+AgentSight's design since #229. Accepted. A process in a PID namespace
+nested inside the agent's (a sandboxed tool call) is kept since v1.0.35
+(#238), as listensnoop -n keeps it.
 """
 
 from __future__ import annotations
@@ -254,11 +253,14 @@ class Adapter:
             return []
         if kind == "start":
             self.net_traced = record.get("trace_net") is True
+        # A start names its probe, so the bundle says which one observed
+        # (the scanner's PROBE_NAMES); an alive needs no name.
+        named = {"probe": "agentsight"} if kind == "start" else {}
         if self.mode == "files":
-            return [{"kind": kind, "time": stamp, "every": every}]
+            return [{"kind": kind, "time": stamp, "every": every, **named}]
         if self.net_traced is False:
             return []  # not a listener probe: no start, so never "no listeners"
-        return [{"kind": kind, "time": stamp, "every": every, "peers": True}]
+        return [{"kind": kind, "time": stamp, "every": every, "peers": True, **named}]
 
     def _summary(self, record: dict[str, Any]) -> None:
         if self.mode != "listen":
@@ -393,6 +395,34 @@ def adapt_stream(stream, adapter: Adapter, idle: float = IDLE_SECONDS) -> Iterat
 # ── running the probe ─────────────────────────────────────────────────────
 
 
+# The two places libbpf reads a tracepoint's ID from. The process probe
+# attaches sched/sched_process_exec and the syscall tracepoints, so without
+# a mounted tracefs it fails to attach (-ENOENT). A privileged container
+# gets sysfs but not tracefs; `collect`'s TLS uprobes never needed it.
+TRACEFS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
+
+
+def ensure_tracefs(log=lambda message: print(message, file=sys.stderr, flush=True),
+                   roots: Iterable[str] = TRACEFS, mount: str = "mount") -> bool:
+    """Mount tracefs at the first of `roots` when none has tracepoints yet.
+    True when one has them. A refused mount (no CAP_SYS_ADMIN) is logged,
+    not raised: AgentSight then fails to attach, writes no start record, and
+    the scan says the probe never attached."""
+    roots = list(roots)
+    if any(os.path.isdir(os.path.join(root, "events")) for root in roots):
+        return True
+    try:
+        done = subprocess.run([mount, "-t", "tracefs", "tracefs", roots[0]],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"cannot mount tracefs at {roots[0]}: {exc}")
+        return False
+    if done.returncode != 0:
+        log(f"cannot mount tracefs at {roots[0]}: {done.stderr.strip() or done.returncode}")
+        return False
+    return os.path.isdir(os.path.join(roots[0], "events"))
+
+
 def probe_command(pid: int, heartbeat: int, mode: str, extra: Iterable[str] = ()) -> list[str]:
     """AgentSight's process probe scoped to `pid`'s PID namespace.
     RAIL_AGENTSIGHT_PROCESS overrides how it is run (default `$AGENTSIGHT_PATH
@@ -431,6 +461,7 @@ def main() -> int:
 
     extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
     command = probe_command(args.pidns_of or os.getpid(), args.heartbeat, args.mode, extra)
+    ensure_tracefs()
     child = subprocess.Popen(command, stdout=subprocess.PIPE)
 
     def stop(signo, _frame):

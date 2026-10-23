@@ -106,9 +106,6 @@ docker run --rm railmon skills --help
 docker run --rm railmon forward --help
 ```
 
-The image builds from the ebpf-tls-tap submodule, so clone with
-`--recursive` (or run `git submodule update --init --recursive`) first.
-
 `scan` needs a host id (`RAIL_HOST_ID` or `--host-id`) to build its evidence
 bundle; without one it exits 2 (see [Configuration](#configuration)).
 
@@ -124,10 +121,8 @@ flowchart LR
   agent[Agent process] -->|TLS calls| probe[AgentSight eBPF probe]
   probe --> collector[RailMon collector]
   scanner[Environment and skill scanners] --> output[Local observations]
-  agent -->|listen, bind| listen[listensnoop eBPF probe]
-  listen -->|JSONL| scanner
-  agent -->|open, execve| files[filesnoop eBPF probe]
-  files -->|JSONL| scanner
+  agent -->|listen, bind, accept, open, execve| process[AgentSight process probe]
+  process -->|listen, files JSONL| scanner
   collector -->|JSONL| file[Capture file]
   collector -->|webhook| dash[RailDash or Rail Center]
 ```
@@ -180,8 +175,10 @@ To monitor several agents in one sandbox, each attributed separately, see
 ### Listening sockets
 
 An agent that opens a port is offering a service nobody declared.
-`railmon listen` runs [listensnoop](https://github.com/datrail/ebpf-tls-tap#listening-sockets)
-in the agent's PID namespace. It appends one line per socket the agent opens
+`railmon listen` runs AgentSight's process probe scoped to the agent's PID
+namespace (`--pidns-of`), and writes its events in the lines of
+[listensnoop](https://github.com/datrail/ebpf-tls-tap#listening-sockets).
+It appends one line per socket the agent opens
 to accept traffic to `RAIL_LISTEN_FILE`, which an interval scan turns into
 the bundle's `observed_listeners`, and a line per new client address that
 connects in, which becomes `observed_ingress_peers`. A new listener, or a new
@@ -201,14 +198,17 @@ docker run -d --name rail-scan -v rail-listen:/data:ro \
 ```
 
 With `RAIL_LISTEN_CONTAINER`, a supervisor in the host PID namespace waits for
-the agent container, enters its PID namespace with `nsenter` and runs the
-probe there. The agent cannot see or signal the supervisor. When the probe
-exits, because the agent restarted or killed it, the supervisor attaches
-again. Start `listen` before the scan: it creates the file, and a scan fails
-while the file is missing.
+the agent container and runs the probe beside itself, scoped to the
+container's PID namespace. The agent sees and can signal neither. When the
+container's PID changes (the agent restarted) the supervisor restarts the
+probe on the new namespace, and when the probe exits it attaches again.
+Start `listen` before the scan: it creates the file, and a scan fails while
+the file is missing.
 
 The probe runs with two options:
-- `-n`, so only the agent's namespace is recorded;
+- `--pidns-of` the agent, so only the agent's namespace is recorded,
+  including a PID namespace nested inside it (a sandboxed tool call) and a
+  process `docker exec` starts there;
 - a heartbeat every 60 seconds (`RAIL_LISTEN_HEARTBEAT`).
 
 The probe itself does not report sockets that are already listening when it
@@ -219,10 +219,10 @@ process in the agent's PID namespace holds, marked `"snapshot": true`. The
 scan treats those records like the probe's. A snapshot cannot tell whether
 the kernel chose the port, so such a port is listed by number.
 
-The agent may be able to kill the probe: it shares the probe's PID
-namespace, though a host's security profile can stop it. The probe crashes or
-restarts too. A socket opened and closed while it was down is missed, so any
-restart leaves a gap, and the
+The probe can still crash or restart, and anyone who can reach the host's
+PID namespace can kill it; without the supervisor (below) it runs in the
+agent's PID namespace, where the agent can kill it too. A socket opened and closed while it was down is
+missed, so any restart leaves a gap, and the
 scan says so: `observed_listeners` goes PARTIAL, which is drift, for a
 probe gap in three cases (and also for lost events or past 256 distinct
 listeners):
@@ -232,9 +232,10 @@ listeners):
 
 A restart never reads as "no new listeners". The note counts restarts, so
 each one is a single drift: accepting it in RailDash stays aligned until the
-next restart. Without `RAIL_LISTEN_CONTAINER` (the probe run directly, in the
-agent's namespace) there is no snapshot: sockets already listening when it
-starts are not recorded, so start it before the agent. Only the `listen`
+next restart. Without `RAIL_LISTEN_CONTAINER` (the probe scoped to the
+namespace `listen` itself runs in, e.g. `--pid container:<agent>`) there is
+no snapshot: sockets already listening when it starts are not recorded, so
+start it before the agent. Only the `listen`
 container is privileged. The agent can't reach the
 volume, so it can't edit its own record.
 See
@@ -243,10 +244,10 @@ for what the attribute holds.
 
 ### Opened files
 
-`railmon files` does the same for files. It runs
-[filesnoop](https://github.com/datrail/ebpf-tls-tap#file-opens) in the agent's PID
-namespace, which appends a line the first time a process opens a regular file
-to read, write or run it. An interval scan turns those lines into the bundle's
+`railmon files` does the same for files, from the same AgentSight probe,
+written in the lines of
+[filesnoop](https://github.com/datrail/ebpf-tls-tap#file-opens): a line the
+first time a process opens a regular file to read, write or run it. An interval scan turns those lines into the bundle's
 `observed_file_access`: what the kernel saw the sandbox open, kept apart from
 anything a configuration declares or a tool call asked for. A newly written
 path is drift in RailDash. A randomly named temp file (Python's `tempfile`,
@@ -282,43 +283,40 @@ docker run -d --name rail-scan -v rail-listen:/data:ro \
   railmon scan --mode docker --container my-agent --interval 300
 ```
 
-The same supervisor keeps filesnoop attached across agent restarts and kills.
-filesnoop reports each file again for every new process, so the supervisor
+The same supervisor keeps the probe attached across agent restarts and kills.
+The probe reports each file again for every new process, so the supervisor
 appends only the first record of each distinct access (the same path, access
 and open flags), counting what the file already holds. An agent that starts a
 process per task then adds lines only when it opens something new, and the
 scan, which reads the whole file each interval, stays as fast as on day one.
 Each restart, a stale heartbeat or no start record makes the attribute
-PARTIAL, as for listeners. filesnoop does not report files already open when
+PARTIAL, as for listeners. The probe does not report files already open when
 it attaches, so start `files` before the agent. It reports paths, never file
 content, but paths can be sensitive; the volume holding them should be as
 private as the agent's own files. See
 [the scanner's README](tools/scan/README.md#observed-file-access-optional)
 for what the attribute holds and how it is bounded.
 
-### AgentSight as the source (pending)
+### The probe behind `listen` and `files`
 
-`listen` and `files` are moving off listensnoop and filesnoop onto
-AgentSight's process probe (`--pidns-of <agent pid> --trace-net --heartbeat
-N`). This waits for an AgentSight release with
-[agentsight#237](https://github.com/eunomia-bpf/agentsight/pull/237) and a fix
-for [agentsight#238](https://github.com/eunomia-bpf/agentsight/issues/238)
-(processes in a PID namespace nested inside the agent's, such as a sandboxed
-tool call, are dropped). The pinned AgentSight cannot run it yet, so
-listensnoop and filesnoop stay the default and the image's scans are
-unchanged.
-
-To try it against such a build, set `RAIL_LISTEN_SOURCE=agentsight` or
-`RAIL_FILES_SOURCE=agentsight`; `RAIL_AGENTSIGHT_PROCESS` names how to run it
-(default `$AGENTSIGHT_PATH debug process --`). The deployment above is
-otherwise the same. With the container variable set, the supervisor runs
-AgentSight from the host PID namespace scoped to the agent's, and restarts it
-when the container's PID changes. Either way,
+Both run AgentSight's process probe (`agentsight debug process -- -m 0
+--pidns-of <agent pid> [--trace-net] --heartbeat N`) from the image's pinned
+release, the same binary `collect` uses.
 [`tools/listen/agentsight_adapter.py`](tools/listen/agentsight_adapter.py)
-writes AgentSight's events as the probes' lines, so the scan reads either source
-the same way. A missing or stopped AgentSight heartbeat makes the attribute
-PARTIAL, as for the probes. `agentsight_adapter.py --mode listen|files --input
-capture.jsonl` adapts a saved capture, for a side-by-side parity run.
+writes its events as listensnoop's and filesnoop's lines, and each start
+record names the probe, `"probe": "agentsight"`, which the bundle repeats in
+the attribute's method and notes. A missing or stopped heartbeat makes the
+attribute PARTIAL. `RAIL_AGENTSIGHT_PROCESS` overrides how it is run
+(default `$AGENTSIGHT_PATH debug process --`), and `agentsight_adapter.py
+--mode listen|files --input capture.jsonl` adapts a saved capture.
+
+One gap against listensnoop is accepted: AgentSight does not report a UDP
+socket that sends without binding first (listensnoop's `autobind`).
+`RAIL_LISTEN_SOURCE=listensnoop` with `LISTENSNOOP_PATH`, or
+`RAIL_FILES_SOURCE=filesnoop` with `FILESNOOP_PATH`, runs your own build of
+[ebpf-tls-tap](https://github.com/datrail/ebpf-tls-tap)'s probe instead,
+entered into the agent's PID namespace with `nsenter`; the image does not
+ship them.
 
 ## Configuration
 
@@ -338,9 +336,9 @@ The ones you are most likely to set:
 | `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. `scan --register` sends it the evidence bundle at `/v1/agents/register` (needs a Rail Center that accepts the evidence bundle there). |
 | `RAIL_AUTH_MODE` | collector `--webhook`, `forward`, `scan --register` | `none` | The credential to present: `none`, `bearer` or `gcp`. See above for `RAIL_AUTH_TOKEN`, `RAIL_AUTH_TOKEN_FILE` and `RAIL_AUTH_AUDIENCE`. |
 | `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
-| `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | listensnoop's JSON lines: where `listen` appends and `scan` reads. |
-| `RAIL_FILES_FILE` | `scan` (`--files-file`), `files` | none | filesnoop's JSON lines: where `files` appends and `scan` reads. |
-| `RAIL_LISTEN_SOURCE`, `RAIL_FILES_SOURCE` | `listen`, `files` | `listensnoop`, `filesnoop` | `agentsight` runs AgentSight's process probe instead; pending an AgentSight release, see [AgentSight as the source](#agentsight-as-the-source-pending). |
+| `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | The listener JSON lines (listensnoop's shape): where `listen` appends and `scan` reads. |
+| `RAIL_FILES_FILE` | `scan` (`--files-file`), `files` | none | The file-open JSON lines (filesnoop's shape): where `files` appends and `scan` reads. |
+| `RAIL_LISTEN_SOURCE`, `RAIL_FILES_SOURCE` | `listen`, `files` | `agentsight` | `listensnoop` / `filesnoop` runs your own probe from `LISTENSNOOP_PATH` / `FILESNOOP_PATH` instead; see [The probe behind `listen` and `files`](#the-probe-behind-listen-and-files). |
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `SSLSNIFF_PATH`, else `bin/agentsight` if it exists, else `/usr/local/bin/agentsight`; the image sets its own | The AgentSight probe binary. |

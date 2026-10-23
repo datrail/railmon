@@ -65,10 +65,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      # The image compiles the probes from the ebpf-tls-tap submodule (public).
       - uses: actions/checkout@v7
-        with:
-          submodules: recursive
 
       - uses: docker/setup-buildx-action@v4
 
