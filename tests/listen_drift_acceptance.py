@@ -22,7 +22,7 @@ The scan command is a prefix the scanner's own arguments are appended to, so
 CI runs it in the RailMon image and a developer runs the source directly:
 
   python3 tests/listen_drift_acceptance.py --raildash http://127.0.0.1:8000 \\
-      --token "$(cat raildash.db.token)" \\
+      --token="$(cat raildash.db.token)" \\
       --scan "python3 tools/scan/scan_agent_environment.py"
 
 With --listen-dir/--scan-listen-dir the event file is written on this side

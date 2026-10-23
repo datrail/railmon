@@ -28,7 +28,7 @@ listen_drift_acceptance.py does for listeners:
    on observed_file_access alone, with the path kept as it is.
 
   python3 tests/files_drift_acceptance.py --raildash http://127.0.0.1:8000 \\
-      --token "$(cat raildash.db.token)" \\
+      --token="$(cat raildash.db.token)" \\
       --scan "python3 tools/scan/scan_agent_environment.py"
 
 With --files-dir/--scan-files-dir the event file is written on this side

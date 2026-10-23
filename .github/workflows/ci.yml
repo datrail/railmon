@@ -241,7 +241,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/listen"
           python3 tests/listen_drift_acceptance.py \
             --raildash http://127.0.0.1:8000 --scan-raildash http://raildash:8000 \
-            --token "$token" \
+            --token="$token" \
             --listen-dir "$RUNNER_TEMP/listen" --scan-listen-dir /listen \
             --scan "docker run --rm --network railmon-raildash -e RAIL_RAILDASH_TOKEN -e RAIL_HOST_ID -v $RUNNER_TEMP/listen:/listen:ro railmon:ci scan" \
             || { docker logs raildash; exit 1; }
@@ -255,7 +255,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/files"
           python3 tests/files_drift_acceptance.py \
             --raildash http://127.0.0.1:8000 --scan-raildash http://raildash:8000 \
-            --token "$token" \
+            --token="$token" \
             --files-dir "$RUNNER_TEMP/files" --scan-files-dir /files \
             --scan "docker run --rm --network railmon-raildash -e RAIL_RAILDASH_TOKEN -e RAIL_HOST_ID -v $RUNNER_TEMP/files:/files:ro railmon:ci scan" \
             || { docker logs raildash; exit 1; }
@@ -266,5 +266,5 @@ jobs:
             -e RAILMON_BIN=/usr/local/bin/railmon-collector \
             -v "$PWD/tests:/tests:ro" \
             railmon:ci /tests/multi_agent_drift_acceptance.py \
-            --raildash http://raildash:8000 --token "$token" \
+            --raildash http://raildash:8000 --token="$token" \
             || { docker logs raildash; exit 1; }
