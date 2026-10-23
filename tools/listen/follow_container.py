@@ -381,6 +381,8 @@ def main() -> int:
     if not agentsight and not listensnoop:
         parser.error("--source probe needs --probe or LISTENSNOOP_PATH")
     adapter_module = load_adapter() if agentsight else None
+    if agentsight:
+        adapter_module.ensure_tracefs(log)
     mode = "files" if args.command == "files" else "listen"
     probe_name = "agentsight" if agentsight else os.path.basename(listensnoop)
     stop_probe = stop_agentsight if agentsight else stop_listensnoop

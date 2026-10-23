@@ -449,6 +449,29 @@ class WiringTest(unittest.TestCase):
         self.assertIn("[railmon files] attaching to agent (pid 4343)", stderr)
         self.assertEqual(supervisor.returncode, 0)
 
+    def test_tracefs_is_mounted_only_when_missing_and_a_refusal_is_logged(self):
+        # A privileged container has no tracefs, and the process probe's
+        # tracepoints need it (the image job's -ENOENT).
+        mounted, missing = self.dir / "mounted", self.dir / "missing"
+        (mounted / "events").mkdir(parents=True)
+        missing.mkdir()
+        mount = self.dir / "mount"
+        mount.write_text('#!/bin/sh\necho "$*" >> "$FAKE_ARGS"\nmkdir -p "$4/events"\n')
+        mount.chmod(0o755)
+        refuse = self.dir / "refuse"
+        refuse.write_text('#!/bin/sh\necho "permission denied" >&2\nexit 32\n')
+        refuse.chmod(0o755)
+        logged: list[str] = []
+        with mock.patch.dict(os.environ, {"FAKE_ARGS": str(self.args)}):
+            self.assertTrue(adapter.ensure_tracefs(logged.append, [str(missing), str(mounted)], str(mount)))
+            self.assertFalse(self.args.exists())  # one already has tracepoints
+            self.assertTrue(adapter.ensure_tracefs(logged.append, [str(missing)], str(mount)))
+            self.assertEqual(self.args.read_text(), f"-t tracefs tracefs {missing}\n")
+            other = self.dir / "other"
+            other.mkdir()
+            self.assertFalse(adapter.ensure_tracefs(logged.append, [str(other)], str(refuse)))
+        self.assertEqual(logged, [f"cannot mount tracefs at {other}: permission denied"])
+
     def test_one_failed_inspect_does_not_restart_the_probe(self):
         # A restart makes every attribute PARTIAL (drift in RailDash), so the
         # watcher stops AgentSight only on another PID, or after

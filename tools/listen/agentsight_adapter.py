@@ -395,6 +395,34 @@ def adapt_stream(stream, adapter: Adapter, idle: float = IDLE_SECONDS) -> Iterat
 # ── running the probe ─────────────────────────────────────────────────────
 
 
+# The two places libbpf reads a tracepoint's ID from. The process probe
+# attaches sched/sched_process_exec and the syscall tracepoints, so without
+# a mounted tracefs it fails to attach (-ENOENT). A privileged container
+# gets sysfs but not tracefs; `collect`'s TLS uprobes never needed it.
+TRACEFS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
+
+
+def ensure_tracefs(log=lambda message: print(message, file=sys.stderr, flush=True),
+                   roots: Iterable[str] = TRACEFS, mount: str = "mount") -> bool:
+    """Mount tracefs at the first of `roots` when none has tracepoints yet.
+    True when one has them. A refused mount (no CAP_SYS_ADMIN) is logged,
+    not raised: AgentSight then fails to attach, writes no start record, and
+    the scan says the probe never attached."""
+    roots = list(roots)
+    if any(os.path.isdir(os.path.join(root, "events")) for root in roots):
+        return True
+    try:
+        done = subprocess.run([mount, "-t", "tracefs", "tracefs", roots[0]],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"cannot mount tracefs at {roots[0]}: {exc}")
+        return False
+    if done.returncode != 0:
+        log(f"cannot mount tracefs at {roots[0]}: {done.stderr.strip() or done.returncode}")
+        return False
+    return os.path.isdir(os.path.join(roots[0], "events"))
+
+
 def probe_command(pid: int, heartbeat: int, mode: str, extra: Iterable[str] = ()) -> list[str]:
     """AgentSight's process probe scoped to `pid`'s PID namespace.
     RAIL_AGENTSIGHT_PROCESS overrides how it is run (default `$AGENTSIGHT_PATH
@@ -433,6 +461,7 @@ def main() -> int:
 
     extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
     command = probe_command(args.pidns_of or os.getpid(), args.heartbeat, args.mode, extra)
+    ensure_tracefs()
     child = subprocess.Popen(command, stdout=subprocess.PIPE)
 
     def stop(signo, _frame):
