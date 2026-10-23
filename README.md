@@ -296,6 +296,30 @@ private as the agent's own files. See
 [the scanner's README](tools/scan/README.md#observed-file-access-optional)
 for what the attribute holds and how it is bounded.
 
+### AgentSight as the source (pending)
+
+`listen` and `files` are moving off listensnoop and filesnoop onto
+AgentSight's process probe (`--pidns-of <agent pid> --trace-net --heartbeat
+N`). This waits for an AgentSight release with
+[agentsight#237](https://github.com/eunomia-bpf/agentsight/pull/237) and a fix
+for [agentsight#238](https://github.com/eunomia-bpf/agentsight/issues/238)
+(processes in a PID namespace nested inside the agent's, such as a sandboxed
+tool call, are dropped). The pinned AgentSight cannot run it yet, so
+listensnoop and filesnoop stay the default and the image's scans are
+unchanged.
+
+To try it against such a build, set `RAIL_LISTEN_SOURCE=agentsight` or
+`RAIL_FILES_SOURCE=agentsight`; `RAIL_AGENTSIGHT_PROCESS` names how to run it
+(default `$AGENTSIGHT_PATH debug process --`). The deployment above is
+otherwise the same. With the container variable set, the supervisor runs
+AgentSight from the host PID namespace scoped to the agent's, and restarts it
+when the container's PID changes. Either way,
+[`tools/listen/agentsight_adapter.py`](tools/listen/agentsight_adapter.py)
+writes AgentSight's events as the probes' lines, so the scan reads either source
+the same way. A missing or stopped AgentSight heartbeat makes the attribute
+PARTIAL, as for the probes. `agentsight_adapter.py --mode listen|files --input
+capture.jsonl` adapts a saved capture, for a side-by-side parity run.
+
 ## Configuration
 
 Every setting is an environment variable; RailMon loads no `.env` file
@@ -316,6 +340,7 @@ The ones you are most likely to set:
 | `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
 | `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | listensnoop's JSON lines: where `listen` appends and `scan` reads. |
 | `RAIL_FILES_FILE` | `scan` (`--files-file`), `files` | none | filesnoop's JSON lines: where `files` appends and `scan` reads. |
+| `RAIL_LISTEN_SOURCE`, `RAIL_FILES_SOURCE` | `listen`, `files` | `listensnoop`, `filesnoop` | `agentsight` runs AgentSight's process probe instead; pending an AgentSight release, see [AgentSight as the source](#agentsight-as-the-source-pending). |
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `SSLSNIFF_PATH`, else `bin/agentsight` if it exists, else `/usr/local/bin/agentsight`; the image sets its own | The AgentSight probe binary. |
