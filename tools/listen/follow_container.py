@@ -34,6 +34,14 @@ the same; only the feature file's raw event counts (`outside_namespace`,
 instead of every one. Past 16,384 paths of a class, where the attribute is
 already PARTIAL, which entries are listed may differ.
 
+With `--source agentsight` (DR-170, pending an AgentSight release; off by
+default) the probe is AgentSight's process probe instead, run from here with
+`--pidns-of` the container's PID rather than entered with nsenter, its events
+written in listensnoop's or filesnoop's shape by `agentsight_adapter.py`, so
+everything after (the snapshot, distinct opens, the scanner) is unchanged.
+It pins the namespace when it starts and does not die with the agent, so the
+supervisor watches the container's PID and restarts it when that changes.
+
 Needs: `--pid host`, eBPF privilege, and the Docker socket.
 """
 
@@ -41,12 +49,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 POLL_SECONDS = 1.0
@@ -158,6 +168,39 @@ def container_pid(docker: str, container: str) -> int:
         return 0
 
 
+def load_adapter():
+    """agentsight_adapter.py beside this file, loaded by path: tests load
+    this file the same way, without tools/listen on sys.path."""
+    spec = importlib.util.spec_from_file_location(
+        "agentsight_adapter", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "agentsight_adapter.py"))
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def stop_agentsight(child: subprocess.Popen) -> None:
+    """AgentSight runs here, not under nsenter: signal it, and it stops the
+    probe it started."""
+    try:
+        child.send_signal(signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def watch_container(docker: str, container: str, pid: int, child: subprocess.Popen,
+                    stop) -> None:
+    """Stop `child` once `container` is no longer running as `pid`.
+    AgentSight's --pidns-of pins the namespace it started in, and outlives
+    an agent restart that listensnoop, inside the namespace, dies with."""
+    while child.poll() is None:
+        time.sleep(POLL_SECONDS)
+        if child.poll() is None and container_pid(docker, container) != pid:
+            stop(child)
+            return
+
+
 def stop_listensnoop(child: subprocess.Popen) -> None:
     """Signal listensnoop, not nsenter: nsenter forks for -p, and a signalled
     nsenter dies leaving its child running as an orphan. Right after Popen
@@ -251,7 +294,7 @@ def log(message: str) -> None:
     print(f"[railmon {COMMAND}] {message}", file=sys.stderr, flush=True)
 
 
-def copy_with_snapshot(stream, sink, pid: int, probe_name: str) -> None:
+def copy_with_snapshot(stream, sink, pid: int, probe_name: str, on_snapshot=None) -> None:
     """Copy the probe's lines to `sink`, and after its start record append
     the sockets that were already listening. Taken after the probe attached,
     so nothing opened in between is missed, and a socket both report is
@@ -273,6 +316,8 @@ def copy_with_snapshot(stream, sink, pid: int, probe_name: str) -> None:
         except OSError as exc:  # the agent exited meanwhile
             log(f"cannot read the sockets already listening: {exc}")
             continue
+        if on_snapshot is not None:
+            on_snapshot(records)
         sink.write(b"".join(json.dumps(r, separators=(",", ":")).encode() + b"\n" for r in records))
         sink.flush()
         log(f"{probe_name} attached; {len(records)} socket(s) were already listening")
@@ -290,6 +335,12 @@ def main() -> int:
                         "has open to accept traffic (listensnoop only)")
     parser.add_argument("--distinct-opens", action="store_true",
                         help="append each distinct file open record once (filesnoop only)")
+    parser.add_argument("--source", choices=("probe", "agentsight"), default="probe",
+                        help="probe: --probe under nsenter (default); agentsight: AgentSight's "
+                        "process probe with --pidns-of, adapted to the probe's lines (DR-170, "
+                        "pending an AgentSight release)")
+    parser.add_argument("--heartbeat", type=int, default=60,
+                        help="AgentSight's --heartbeat (--source agentsight only)")
     parser.add_argument("container", help="agent container name or id")
     parser.add_argument("listensnoop_args", nargs=argparse.REMAINDER,
                         help="arguments passed to the probe")
@@ -299,7 +350,11 @@ def main() -> int:
     nsenter = os.environ.get("RAIL_NSENTER", "nsenter")
     listensnoop = args.probe or os.environ.get("LISTENSNOOP_PATH", "/usr/local/bin/listensnoop")
     COMMAND = args.command
-    probe_name = os.path.basename(listensnoop)
+    agentsight = args.source == "agentsight"
+    adapter_module = load_adapter() if agentsight else None
+    mode = "files" if args.command == "files" else "listen"
+    probe_name = "agentsight" if agentsight else os.path.basename(listensnoop)
+    stop_probe = stop_agentsight if agentsight else stop_listensnoop
     output = args.output if args.output is not None else os.environ.get("RAIL_LISTEN_FILE")
     sink = open(output, "ab", buffering=0) if output else sys.stdout.buffer
     seen = seen_opens(output) if args.distinct_opens else set()
@@ -311,7 +366,7 @@ def main() -> int:
         nonlocal stopping
         stopping = True
         if child and child.poll() is None:
-            stop_listensnoop(child)
+            stop_probe(child)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -329,22 +384,40 @@ def main() -> int:
         if stopping:  # a signal that landed during docker inspect
             break
         log(f"attaching to {args.container} (pid {pid})")
-        # -p only: listensnoop then lives in the agent's PID namespace (its
-        # PIDs are the agent's) but keeps this container's mounts and BPF
-        # privilege. nsenter forks for -p, so its child is the one inside.
-        child = subprocess.Popen([nsenter, "-t", str(pid), "-p", "--", listensnoop,
-                                  *args.listensnoop_args],
-                                 stdout=subprocess.PIPE if args.snapshot_listeners or args.distinct_opens
+        if agentsight:
+            # From here, in the host PID namespace: --pidns-of scopes it to
+            # the agent's, which nsenter would otherwise do.
+            command = adapter_module.probe_command(pid, args.heartbeat, mode, args.listensnoop_args)
+        else:
+            # -p only: listensnoop then lives in the agent's PID namespace (its
+            # PIDs are the agent's) but keeps this container's mounts and BPF
+            # privilege. nsenter forks for -p, so its child is the one inside.
+            command = [nsenter, "-t", str(pid), "-p", "--", listensnoop, *args.listensnoop_args]
+        child = subprocess.Popen(command,
+                                 stdout=subprocess.PIPE
+                                 if agentsight or args.snapshot_listeners or args.distinct_opens
                                  else sink)
         # A signal that landed before `child` was set found nothing to stop.
         # (Not a blocked mask around Popen: the child would inherit it, and
         # listensnoop would never see the SIGTERM meant for it.)
         if stopping:
-            stop_listensnoop(child)
+            stop_probe(child)
+        stream = child.stdout
+        on_snapshot = None
+        if agentsight:
+            threading.Thread(target=watch_container, daemon=True,
+                             args=(docker, args.container, pid, child, stop_probe)).start()
+            adapter = adapter_module.Adapter(mode)
+            on_snapshot = adapter.note_listeners
+            stream = adapter_module.adapt_stream(child.stdout, adapter)
         if args.snapshot_listeners:
-            copy_with_snapshot(child.stdout, sink, pid, probe_name)
+            copy_with_snapshot(stream, sink, pid, probe_name, on_snapshot)
         elif args.distinct_opens:
-            copy_distinct(child.stdout, sink, seen)
+            copy_distinct(stream, sink, seen)
+        elif agentsight:
+            for line in stream:
+                sink.write(line)
+                sink.flush()
         code = child.wait()
         child = None
         if not stopping:

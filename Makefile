@@ -40,6 +40,7 @@ test-python:
 		tools/scan/compose_evidence_bundle_v2.py \
 		tools/scan/egress_containment.py \
 		tools/listen/follow_container.py \
+		tools/listen/agentsight_adapter.py \
 		tools/collect/follow_container_tls.py \
 		tools/skills/skill_scanner.py \
 		tools/forward/forward.py \

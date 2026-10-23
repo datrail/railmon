@@ -68,8 +68,32 @@ case "$command_name" in
         # on at each attach (DR-182). Without it, the probe runs in this
         # container's own namespace (e.g. `--pid container:<agent>`) and
         # stops with it.
+        #
+        # RAIL_LISTEN_SOURCE=agentsight (DR-170; off by default, pending an
+        # AgentSight release with agentsight#237 and a fix for #238) runs
+        # AgentSight's process probe instead, --pidns-of the agent, written
+        # in listensnoop's lines by tools/listen/agentsight_adapter.py.
         listensnoop="${LISTENSNOOP_PATH:-/usr/local/bin/listensnoop}"
         heartbeat="${RAIL_LISTEN_HEARTBEAT:-60}"
+        case "${RAIL_LISTEN_SOURCE:-listensnoop}" in
+            listensnoop) ;;
+            agentsight)
+                if [ -n "${RAIL_LISTEN_CONTAINER:-}" ]; then
+                    exec python3 "$root/tools/listen/follow_container.py" --source agentsight \
+                        --heartbeat "$heartbeat" --snapshot-listeners "$RAIL_LISTEN_CONTAINER" "$@"
+                fi
+                if [ -n "${RAIL_LISTEN_FILE:-}" ]; then
+                    exec python3 "$root/tools/listen/agentsight_adapter.py" --mode listen \
+                        --heartbeat "$heartbeat" "$@" >> "$RAIL_LISTEN_FILE"
+                fi
+                exec python3 "$root/tools/listen/agentsight_adapter.py" --mode listen \
+                    --heartbeat "$heartbeat" "$@"
+                ;;
+            *)
+                echo "railmon listen: RAIL_LISTEN_SOURCE must be listensnoop or agentsight" >&2
+                exit 64
+                ;;
+        esac
         if [ -n "${RAIL_LISTEN_CONTAINER:-}" ]; then
             exec python3 "$root/tools/listen/follow_container.py" --snapshot-listeners \
                 "$RAIL_LISTEN_CONTAINER" -n -H "$heartbeat" "$@"
@@ -87,8 +111,30 @@ case "$command_name" in
         # (RAIL_FILES_HEARTBEAT), and with RAIL_FILES_CONTAINER the same
         # supervisor, following that container's PID namespace; it appends
         # each distinct open once (DR-185), so an always-on file stays bounded.
+        # RAIL_FILES_SOURCE=agentsight is `listen`'s AgentSight source for
+        # files (DR-170; off by default, pending the same release).
         filesnoop="${FILESNOOP_PATH:-/usr/local/bin/filesnoop}"
         heartbeat="${RAIL_FILES_HEARTBEAT:-60}"
+        case "${RAIL_FILES_SOURCE:-filesnoop}" in
+            filesnoop) ;;
+            agentsight)
+                if [ -n "${RAIL_FILES_CONTAINER:-}" ]; then
+                    exec python3 "$root/tools/listen/follow_container.py" --source agentsight \
+                        --command files --output "${RAIL_FILES_FILE:-}" --distinct-opens \
+                        --heartbeat "$heartbeat" "$RAIL_FILES_CONTAINER" "$@"
+                fi
+                if [ -n "${RAIL_FILES_FILE:-}" ]; then
+                    exec python3 "$root/tools/listen/agentsight_adapter.py" --mode files \
+                        --heartbeat "$heartbeat" "$@" >> "$RAIL_FILES_FILE"
+                fi
+                exec python3 "$root/tools/listen/agentsight_adapter.py" --mode files \
+                    --heartbeat "$heartbeat" "$@"
+                ;;
+            *)
+                echo "railmon files: RAIL_FILES_SOURCE must be filesnoop or agentsight" >&2
+                exit 64
+                ;;
+        esac
         if [ -n "${RAIL_FILES_CONTAINER:-}" ]; then
             exec python3 "$root/tools/listen/follow_container.py" \
                 --command files --probe "$filesnoop" --output "${RAIL_FILES_FILE:-}" --distinct-opens \

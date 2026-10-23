@@ -1,0 +1,13 @@
+{"kind":"start","time":"2026-10-08T10:00:00Z","every":2,"peers":true}
+{"timestamp_ns":10200000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"127.0.0.1","port":18170,"ephemeral":false}
+{"timestamp_ns":10220000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"0.0.0.0","port":41589,"ephemeral":true}
+{"timestamp_ns":10230000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"0.0.0.0","port":38743,"ephemeral":true}
+{"timestamp_ns":10250000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv6","addr":"::","port":38835,"ephemeral":true}
+{"timestamp_ns":10270000000,"kind":"listen","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv6","addr":"::1","port":18171,"ephemeral":false}
+{"kind":"alive","time":"2026-10-08T10:00:02Z","every":2,"peers":true}
+{"timestamp_ns":11000000000,"kind":"bind","pid":284731,"host_pid":284731,"comm":"udp-srv","protocol":"udp","family":"ipv4","addr":"127.0.0.1","port":18172,"ephemeral":false}
+{"timestamp_ns":11100000000,"kind":"peer","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"127.0.0.1","port":18170,"ephemeral":false,"peer":"127.0.0.1"}
+{"timestamp_ns":11200000000,"kind":"peer","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv6","addr":"::1","port":18171,"ephemeral":false,"peer":"::1"}
+{"timestamp_ns":11300000000,"kind":"peer","pid":284729,"host_pid":284729,"comm":"python3","protocol":"tcp","family":"ipv6","addr":"::","port":38835,"ephemeral":true,"peer":"127.0.0.1"}
+{"kind":"lost","count":3}
+{"kind":"alive","time":"2026-10-08T10:00:04Z","every":2,"peers":true}
