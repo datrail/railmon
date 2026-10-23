@@ -1,7 +1,8 @@
-# Three stages: build the collector, build the eBPF probes (listensnoop and
-# filesnoop), then ship a runtime that carries only those binaries and
-# AgentSight. The builder image is ~1.5GB of Rust toolchain and none
+# Two stages: build the collector, then ship a runtime that carries only that
+# binary and AgentSight. The builder image is ~1.5GB of Rust toolchain and none
 # of it needs to reach a host that is already running an agent under eBPF.
+# Every eBPF probe the image runs is AgentSight's: TLS/HTTP capture for
+# `collect`, and its process probe behind `listen` and `files` (DR-170).
 FROM rust:1-slim-bookworm AS build
 
 WORKDIR /src
@@ -18,26 +19,6 @@ COPY src/ ./src/
 # cargo skips a rebuild when only mtime changed, so touch the real entrypoint to
 # force it — otherwise the stub above is what gets shipped.
 RUN touch src/main.rs && cargo build --release --locked
-
-# The eBPF probes from ebpf-tls-tap: listensnoop (DR-124/DR-125), behind
-# `railmon listen`, reporting each socket an agent opens to accept inbound
-# traffic; and filesnoop (DR-152), behind `railmon files`, reporting each
-# regular file it opens to read, write or run (DR-154).
-# Built from the ebpf-tls-tap submodule, which pins the probes together with
-# their libbpf, bpftool and kernel headers, on the same base as the runtime below so
-# the libelf and glibc they link against are the ones they run with. The build
-# fails, not skips, when the submodule was not checked out: an image without
-# a probe would answer `listen` or `files` with "not found".
-FROM python:3.13-slim AS probes
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      clang llvm gcc libc6-dev libelf-dev zlib1g-dev libssl-dev make pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-COPY ebpf-tls-tap/ ./
-RUN test -f libbpf/src/Makefile || { \
-      echo "ebpf-tls-tap submodule is empty: git submodule update --init --recursive" >&2; \
-      exit 1; } \
-    && make -C bpf listensnoop filesnoop
 
 # python:3.13-slim, not debian-slim, and the version is the point. RailScan's
 # image was 3.13 and its CI pinned 3.13; folding the scanner in on top of
@@ -68,8 +49,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # release view <tag> --repo eunomia-bpf/agentsight --json assets`, or
 # sha256sum of the download).
 # `make fetch-agentsight` reads them from here, so the local binary and the
-# image's stay the same release. DR-170 bumps this when the release carrying
-# the listener and file capture it moves onto is cut.
+# image's stay the same release. A bump changes what the pack observes (the
+# listener and file-open evidence come from this release too, DR-170), so it
+# goes with a rule_pack_version bump unless the release leaves that alone.
 #
 # Both architectures, from the same release (DR-208): upstream publishes
 # `agentsight` (x86-64) and `agentsight-aarch64`, and each is checked against
@@ -88,9 +70,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # daemon and containerd for a client we invoke read-only against a mounted
 # socket. Pinned, because "latest" in an image build is a version nobody chose.
 # Callers still have to mount /var/run/docker.sock — necessary, not sufficient.
-ARG AGENTSIGHT_VERSION=v1.0.34
-ARG AGENTSIGHT_SHA256=02f8b04c0b463b3c21b12027ef3deaccccaffd265e0249dee0156ad352e3e12d
-ARG AGENTSIGHT_SHA256_ARM64=a333075ff5b89e998d4c4c11352d90e2b9740d5cb1eebb535703c7648e947f0a
+ARG AGENTSIGHT_VERSION=v1.0.35
+ARG AGENTSIGHT_SHA256=6b7c7760bf1fddd1308587e873025b4b001de62216010499938effa946cc2d9e
+ARG AGENTSIGHT_SHA256_ARM64=0d32e5f53301b9102836646c02df1fbc4f59e87a940aa417b67938db382b008f
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG TARGETARCH
 RUN case "${TARGETARCH:-$(uname -m)}" in \
@@ -115,11 +97,10 @@ RUN case "${TARGETARCH:-$(uname -m)}" in \
 # The collector keeps a distinct name so the entrypoint can dispatch to it
 # without recursing into itself.
 COPY --from=build /src/target/release/railmon /usr/local/bin/railmon-collector
-COPY --from=probes /src/bpf/listensnoop /usr/local/bin/listensnoop
-COPY --from=probes /src/bpf/filesnoop /usr/local/bin/filesnoop
-# The supervisor behind `railmon listen` and `railmon files` enters the
-# agent's PID namespace with nsenter (util-linux, in the base image); fail
-# here rather than at first use.
+# With RAIL_LISTEN_SOURCE=listensnoop or RAIL_FILES_SOURCE=filesnoop, the
+# supervisor behind `railmon listen` and `railmon files` runs an operator's
+# own probe binary inside the agent's PID namespace with nsenter
+# (util-linux, in the base image); fail here rather than at first use.
 RUN command -v nsenter
 
 # tools/ carries symlinks from the RailScan-era paths

@@ -1680,18 +1680,36 @@ def _probe_beat(event: dict[str, Any], kind: str) -> tuple[datetime, int] | None
     return seen, interval
 
 
+# The probes a start record may name as its `probe` (DR-170): AgentSight's
+# process probe, as `railmon listen`/`files` run it through
+# tools/listen/agentsight_adapter.py, or ebpf-tls-tap's listensnoop or
+# filesnoop. Anything else, or none, is the file's default probe: a file
+# from before DR-170 names none, and its lines are listensnoop's/filesnoop's.
+PROBE_NAMES = ("agentsight", "listensnoop", "filesnoop")
+
+
 class _ProbeHealth:
     """Whether a probe's event file can be trusted, from its start and alive
     records: no start record, a restart, or a stale heartbeat (see
-    `summarize_listeners`). Shared by listensnoop's and filesnoop's files."""
+    `summarize_listeners`), and which probe wrote it: the newest start
+    record's `probe`, else `default`. Shared by the listener and file-open
+    files, whichever probe wrote them."""
 
-    def __init__(self) -> None:
+    def __init__(self, default: str) -> None:
         self.starts = 0
         self.every = 0
         self.last_alive: datetime | None = None
+        self.last_start: datetime | None = None
+        self.probe = default
 
-    def beat(self, kind: str, seen: datetime, interval: int) -> None:
-        self.starts += kind == "start"
+    def beat(self, kind: str, seen: datetime, interval: int, event: dict[str, Any]) -> None:
+        if kind == "start":
+            self.starts += 1
+            if self.last_start is None or seen >= self.last_start:
+                self.last_start = seen
+                named = event.get("probe")
+                if named in PROBE_NAMES:
+                    self.probe = named
         if self.last_alive is None or seen > self.last_alive:
             self.last_alive, self.every = seen, interval
 
@@ -1749,13 +1767,14 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
     an empty list from a probe that predates them is never read as "nobody
     connected". Peer events are kept whatever the start record says.
 
-    Produce the file with listensnoop (ebpf-tls-tap) run in the agent's PID
-    namespace; see the README's "Observed listeners".
+    Produce the file with `railmon listen` (AgentSight's process probe in
+    listensnoop's lines, DR-170), or listensnoop (ebpf-tls-tap) run in the
+    agent's PID namespace; see the README's "Observed listeners".
     """
     listeners: set[tuple[str, str, Any, str]] = set()
     peers: set[tuple[str, str, Any, str, Any]] = set()
     lost = unlisted = peers_unlisted = malformed = outside = 0
-    health = _ProbeHealth()
+    health = _ProbeHealth("listensnoop")
     last_start: datetime | None = None
     peers_reported = False
     for line in lines:
@@ -1783,7 +1802,7 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
             seen, interval = beat
             if kind == "start" and (last_start is None or seen >= last_start):
                 last_start, peers_reported = seen, event.get("peers") is True
-            health.beat(kind, seen, interval)
+            health.beat(kind, seen, interval, event)
             continue
         port, protocol, addr = event.get("port"), event.get("protocol"), event.get("addr")
         comm, ephemeral = event.get("comm"), event.get("ephemeral")
@@ -1822,7 +1841,7 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
             continue
         listeners.add(key)
     return {
-        "source": "listensnoop",
+        "source": health.probe,
         "listeners": [
             {"protocol": protocol, "addr": addr, "port": port, "process": process}
             for protocol, addr, port, process in sorted(listeners, key=lambda k: (k[0], k[1], str(k[2]), k[3]))
@@ -2084,8 +2103,9 @@ def summarize_file_access(
       though every listed templated entry still counts at least 1;
     - `lost` and the start/alive records mean what they do for listensnoop.
 
-    Produce the file with filesnoop run in the agent's PID namespace (`-n`);
-    the image's `railmon files` does that.
+    Produce the file with the image's `railmon files` (AgentSight's process
+    probe in filesnoop's lines, DR-170), or filesnoop run in the agent's PID
+    namespace (`-n`).
     """
     files: dict[tuple[str, bool], list[bool]] = {}
     lost = unlisted = unnamed = malformed = outside = 0
@@ -2101,7 +2121,7 @@ def summarize_file_access(
     # the bundle's note can say a write was lost, not just "more files".
     unlisted_write_exec = unnamed_write_exec = 0
     tracked_reads = tracked_write_exec = 0
-    health = _ProbeHealth()
+    health = _ProbeHealth("filesnoop")
     for line in lines:
         line = line.strip()
         if not line:
@@ -2124,7 +2144,7 @@ def summarize_file_access(
             if beat is None:
                 malformed += 1
                 continue
-            health.beat(kind, beat[0], beat[1])
+            health.beat(kind, beat[0], beat[1], event)
             continue
         path, layer = event.get("path"), event.get("layer", False)
         access = [event.get(name) for name in ("read", "write", "exec")]
@@ -2196,7 +2216,7 @@ def summarize_file_access(
     unlisted_write_exec += sum(1 for _, (_, write, run) in ranked if write or run) \
         - sum(1 for entry in kept if entry["write"] or entry["exec"])
     return {
-        "source": "filesnoop",
+        "source": health.probe,
         "files": kept,
         "lost": lost,
         "unlisted": unlisted,
@@ -3593,13 +3613,13 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--listen-file",
-        help="listensnoop JSON lines (from ebpf-tls-tap, run in the agent's PID namespace) to "
+        help="`railmon listen` JSON lines (AgentSight's process probe in listensnoop's lines, scoped to the agent's PID namespace) to "
         "summarise into the observed listening sockets. Protocol, address, port and process "
         "name only. Defaults to RAIL_LISTEN_FILE.",
     )
     parser.add_argument(
         "--files-file",
-        help="filesnoop JSON lines (from ebpf-tls-tap, run in the agent's PID namespace) to "
+        help="`railmon files` JSON lines (AgentSight's process probe in filesnoop's lines, scoped to the agent's PID namespace) to "
         "summarise into the observed file access. Path and read/write/exec only; no file "
         "content. Defaults to RAIL_FILES_FILE.",
     )

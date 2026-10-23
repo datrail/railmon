@@ -55,28 +55,27 @@ case "$command_name" in
         exec python3 "$root/tools/forward/forward.py" "$@"
         ;;
     listen)
-        # listensnoop: one JSON line per socket the agent opens to accept
-        # inbound traffic, appended to RAIL_LISTEN_FILE for `scan
-        # --listen-file` (DR-143), or to stdout when that is unset. Needs eBPF
-        # privilege. -n keeps other namespaces' sockets out of the file; -H
-        # lets the scan see a probe that stopped (RAIL_LISTEN_HEARTBEAT).
+        # One JSON line per socket the agent opens to accept inbound traffic
+        # (listensnoop's lines), appended to RAIL_LISTEN_FILE for `scan
+        # --listen-file` (DR-143), or to stdout when that is unset. Needs
+        # eBPF privilege. The probe is AgentSight's process probe (DR-170),
+        # --pidns-of the agent so other namespaces' sockets stay out of the
+        # file, its events written in listensnoop's lines by
+        # tools/listen/agentsight_adapter.py; --heartbeat lets the scan see a
+        # probe that stopped (RAIL_LISTEN_HEARTBEAT).
         #
         # With RAIL_LISTEN_CONTAINER (and --pid host plus the Docker
         # socket), a supervisor outside the agent's reach keeps the probe
         # attached to that container's PID namespace across agent restarts
         # and kills, and records the sockets the agent was already listening
-        # on at each attach (DR-182). Without it, the probe runs in this
-        # container's own namespace (e.g. `--pid container:<agent>`) and
-        # stops with it.
+        # on at each attach (DR-182). Without it, the probe follows this
+        # container's own namespace (e.g. `--pid container:<agent>`).
         #
-        # RAIL_LISTEN_SOURCE=agentsight (DR-170; off by default, pending an
-        # AgentSight release with agentsight#237 and a fix for #238) runs
-        # AgentSight's process probe instead, --pidns-of the agent, written
-        # in listensnoop's lines by tools/listen/agentsight_adapter.py.
-        listensnoop="${LISTENSNOOP_PATH:-/usr/local/bin/listensnoop}"
+        # RAIL_LISTEN_SOURCE=listensnoop runs an operator's own listensnoop
+        # (ebpf-tls-tap) instead, from LISTENSNOOP_PATH: the image no longer
+        # ships it.
         heartbeat="${RAIL_LISTEN_HEARTBEAT:-60}"
-        case "${RAIL_LISTEN_SOURCE:-listensnoop}" in
-            listensnoop) ;;
+        case "${RAIL_LISTEN_SOURCE:-agentsight}" in
             agentsight)
                 if [ -n "${RAIL_LISTEN_CONTAINER:-}" ]; then
                     exec python3 "$root/tools/listen/follow_container.py" --source agentsight \
@@ -89,14 +88,21 @@ case "$command_name" in
                 exec python3 "$root/tools/listen/agentsight_adapter.py" --mode listen \
                     --heartbeat "$heartbeat" "$@"
                 ;;
+            listensnoop)
+                listensnoop="${LISTENSNOOP_PATH:-}"
+                if [ -z "$listensnoop" ]; then
+                    echo "railmon listen: RAIL_LISTEN_SOURCE=listensnoop needs LISTENSNOOP_PATH (the image does not ship it)" >&2
+                    exit 64
+                fi
+                ;;
             *)
-                echo "railmon listen: RAIL_LISTEN_SOURCE must be listensnoop or agentsight" >&2
+                echo "railmon listen: RAIL_LISTEN_SOURCE must be agentsight or listensnoop" >&2
                 exit 64
                 ;;
         esac
         if [ -n "${RAIL_LISTEN_CONTAINER:-}" ]; then
-            exec python3 "$root/tools/listen/follow_container.py" --snapshot-listeners \
-                "$RAIL_LISTEN_CONTAINER" -n -H "$heartbeat" "$@"
+            exec python3 "$root/tools/listen/follow_container.py" --source probe --probe "$listensnoop" \
+                --snapshot-listeners "$RAIL_LISTEN_CONTAINER" -n -H "$heartbeat" "$@"
         fi
         if [ -n "${RAIL_LISTEN_FILE:-}" ]; then
             exec "$listensnoop" -n -H "$heartbeat" "$@" >> "$RAIL_LISTEN_FILE"
@@ -104,19 +110,18 @@ case "$command_name" in
         exec "$listensnoop" -n -H "$heartbeat" "$@"
         ;;
     files)
-        # filesnoop (DR-152): one JSON line the first time a process opens a
-        # regular file for a kind of access (read, write, exec), appended to
-        # RAIL_FILES_FILE for `scan --files-file` (DR-154), or to stdout when
-        # that is unset. The same shape as `listen`: eBPF privilege, -n, -H
-        # (RAIL_FILES_HEARTBEAT), and with RAIL_FILES_CONTAINER the same
-        # supervisor, following that container's PID namespace; it appends
-        # each distinct open once (DR-185), so an always-on file stays bounded.
-        # RAIL_FILES_SOURCE=agentsight is `listen`'s AgentSight source for
-        # files (DR-170; off by default, pending the same release).
-        filesnoop="${FILESNOOP_PATH:-/usr/local/bin/filesnoop}"
+        # One JSON line the first time a process opens a regular file for a
+        # kind of access (read, write, exec), in filesnoop's lines (DR-152),
+        # appended to RAIL_FILES_FILE for `scan --files-file` (DR-154), or to
+        # stdout when that is unset. The same shape as `listen`: the same
+        # AgentSight probe and adapter, eBPF privilege, RAIL_FILES_HEARTBEAT,
+        # and with RAIL_FILES_CONTAINER the same supervisor, following that
+        # container's PID namespace; it appends each distinct open once
+        # (DR-185), so an always-on file stays bounded.
+        # RAIL_FILES_SOURCE=filesnoop runs an operator's own filesnoop from
+        # FILESNOOP_PATH instead.
         heartbeat="${RAIL_FILES_HEARTBEAT:-60}"
-        case "${RAIL_FILES_SOURCE:-filesnoop}" in
-            filesnoop) ;;
+        case "${RAIL_FILES_SOURCE:-agentsight}" in
             agentsight)
                 if [ -n "${RAIL_FILES_CONTAINER:-}" ]; then
                     exec python3 "$root/tools/listen/follow_container.py" --source agentsight \
@@ -130,13 +135,20 @@ case "$command_name" in
                 exec python3 "$root/tools/listen/agentsight_adapter.py" --mode files \
                     --heartbeat "$heartbeat" "$@"
                 ;;
+            filesnoop)
+                filesnoop="${FILESNOOP_PATH:-}"
+                if [ -z "$filesnoop" ]; then
+                    echo "railmon files: RAIL_FILES_SOURCE=filesnoop needs FILESNOOP_PATH (the image does not ship it)" >&2
+                    exit 64
+                fi
+                ;;
             *)
-                echo "railmon files: RAIL_FILES_SOURCE must be filesnoop or agentsight" >&2
+                echo "railmon files: RAIL_FILES_SOURCE must be agentsight or filesnoop" >&2
                 exit 64
                 ;;
         esac
         if [ -n "${RAIL_FILES_CONTAINER:-}" ]; then
-            exec python3 "$root/tools/listen/follow_container.py" \
+            exec python3 "$root/tools/listen/follow_container.py" --source probe \
                 --command files --probe "$filesnoop" --output "${RAIL_FILES_FILE:-}" --distinct-opens \
                 "$RAIL_FILES_CONTAINER" -n -H "$heartbeat" "$@"
         fi
@@ -160,8 +172,8 @@ Commands:
   scan       inspect and optionally register an agent
   skills     inventory OpenClaw/NemoClaw SKILL.md files
   forward    send captured interactions on to Rail Center
-  listen     report sockets the agent opens to accept traffic (listensnoop)
-  files      report files the agent opens to read, write or run (filesnoop)
+  listen     report sockets the agent opens to accept traffic (AgentSight)
+  files      report files the agent opens to read, write or run (AgentSight)
   demo       self-scan + a local offline capture, for a clean-checkout first run
 
 Called with no command, or with a flag first, RailMon runs the collector —

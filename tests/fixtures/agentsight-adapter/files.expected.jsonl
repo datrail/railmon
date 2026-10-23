@@ -1,4 +1,4 @@
-{"kind":"start","time":"2026-10-08T10:00:00Z","every":2}
+{"kind":"start","time":"2026-10-08T10:00:00Z","every":2,"probe":"agentsight"}
 {"timestamp_ns":10110000000,"kind":"open","pid":284729,"host_pid":284729,"comm":"python3","path":"/usr/bin/python3.13","read":true,"write":false,"exec":true,"creat":false,"trunc":false,"append":false,"dev":"259:1","ino":1001}
 {"timestamp_ns":10120000000,"kind":"open","pid":284729,"host_pid":284729,"comm":"python3","path":"/etc/hostname","read":true,"write":false,"exec":false,"creat":false,"trunc":false,"append":false,"dev":"259:1","ino":1002}
 {"timestamp_ns":10130000000,"kind":"open","pid":284729,"host_pid":284729,"comm":"python3","path":"/work/out.txt","read":false,"write":true,"exec":false,"creat":true,"trunc":true,"append":false,"dev":"8:1","ino":2001}

@@ -40,10 +40,7 @@ jobs:
     # 11-19, run by run (actions/runner-images#14748). Move on purpose (DR-133).
     runs-on: ubuntu-26.04
     steps:
-      # As in the release: the image cannot build without ebpf-tls-tap.
       - uses: actions/checkout@v7
-        with:
-          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,8 +67,6 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: recursive
 
       - uses: docker/setup-buildx-action@v4
 
@@ -168,16 +163,18 @@ jobs:
 
       # DR-143: the probe the image ships, deployed the way the README says.
       # An agent container opens a port. `railmon listen`, a privileged
-      # supervisor in the host PID namespace, runs listensnoop inside the
-      # agent's and appends to a volume the agent does not mount, and
+      # supervisor in the host PID namespace, runs AgentSight's process probe
+      # scoped to the agent's (DR-170) and appends to a volume the agent does
+      # not mount, and
       # `railmon scan` reads it into the bundle. Then the agent kills the
       # probe (the bundle must go PARTIAL) and restarts (the probe must
       # follow). The privilege is the listen container's alone.
       - name: listen and scan from the built image
         run: python3 tests/listen_image_acceptance.py --image railmon:ci
 
-      # DR-154: the same deployment for filesnoop. An agent container writes
-      # a file; `railmon files` runs filesnoop inside its PID namespace, and
+      # DR-154: the same deployment for file opens. An agent container writes
+      # a file; `railmon files` runs the same probe scoped to its PID
+      # namespace, and
       # `railmon scan` folds the write into observed_file_access. Then the
       # probe is killed and the bundle must go PARTIAL.
       - name: files and scan from the built image
@@ -240,7 +237,7 @@ jobs:
           echo "{\"result\": \"PASS\", \"interval_deliveries\": $((duplicates + 1)), \"interval_asps\": $asps}"
           # DR-125: a listening socket that appears after the baseline was
           # locked is drift, and an unchanged window is not. Real scanner in
-          # the image, real RailDash, listensnoop lines in a mounted file.
+          # the image, real RailDash, `railmon listen` lines in a mounted file.
           mkdir -p "$RUNNER_TEMP/listen"
           python3 tests/listen_drift_acceptance.py \
             --raildash http://127.0.0.1:8000 --scan-raildash http://raildash:8000 \
@@ -254,7 +251,7 @@ jobs:
           # randomly named temp files stays aligned, and a new fixed name in
           # /tmp is drift. DR-201: a second Python run's bytecode-cache temp
           # names (<module>.pyc.<id>) fold into <dir>/__pycache__/*.pyc and
-          # stay aligned. filesnoop lines in a mounted file.
+          # stay aligned. `railmon files` lines in a mounted file.
           mkdir -p "$RUNNER_TEMP/files"
           python3 tests/files_drift_acceptance.py \
             --raildash http://127.0.0.1:8000 --scan-raildash http://raildash:8000 \

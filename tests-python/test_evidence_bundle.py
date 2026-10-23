@@ -1097,8 +1097,20 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # adds egress_containment and egress_proxy_declared (DR-207); pack
         # 12 reads user from Config.User, records an MCP server's tool allow
         # list, stops counting a GPG fingerprint or a token budget as a
-        # credential (DR-218), and refuses NaN/Infinity in a config (DR-221).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 12)
+        # credential (DR-218), and refuses NaN/Infinity in a config (DR-221);
+        # pack 13 moves the listener and file-open probe onto AgentSight and
+        # names it in the method and notes, with AgentSight v1.0.35 (DR-170).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 13)
+
+    def test_the_method_and_notes_name_the_probe_that_wrote_the_file(self):
+        # DR-170: `railmon listen` writes "probe": "agentsight" in its start
+        # records; a file without it is listensnoop's.
+        theirs = self.attribute(self.listening([self.LISTENER], source="agentsight", restarted=True, starts=2))
+        self.assertTrue(theirs["method"].startswith("AgentSight's process probe events:"), theirs["method"])
+        self.assertIn("AgentSight's process probe restarted", theirs["note"])
+        ours = self.attribute(self.listening([self.LISTENER]))
+        self.assertTrue(ours["method"].startswith("listensnoop events:"), ours["method"])
+        self.assertIn("railmon listen", self.attribute(None)["note"])
 
     def test_without_an_event_file_the_pack_says_it_did_not_look(self):
         field = self.attribute(None)

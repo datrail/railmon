@@ -2153,7 +2153,7 @@ class FollowContainerProbeTest(unittest.TestCase):
                    "RAIL_LISTEN_FILE": str(listen)}
             supervisor = subprocess.Popen(
                 [sys.executable, str(ROOT / "tools/listen/follow_container.py"), "--command", "files",
-                 "--probe", str(probe),
+                 "--source", "probe", "--probe", str(probe),
                  "--output", str(files), "agent", "-n", "-H", "5"],
                 env=env, stderr=subprocess.PIPE, text=True)
             try:
@@ -2232,6 +2232,15 @@ class AlreadyListeningTest(unittest.TestCase):
              "addr": "0.0.0.0", "port": 5353, **common},
         ])
 
+    def test_with_host_pids_each_record_carries_the_hosts(self):
+        # AgentSight's events carry host PIDs (DR-170), so its file's
+        # snapshot records do too: one file never mixes the two.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fake_proc(Path(tmp))
+            records = follow_container.listening_sockets(100, proc=tmp, host_pids=True)
+        self.assertEqual([(r["pid"], r["comm"], r["port"]) for r in records],
+                         [(101, "worker", 9303), (100, "agent", 8443), (101, "worker", 5353)])
+
     def test_a_comm_that_is_not_utf8_keeps_its_sockets(self):
         # The agent names its own processes; listensnoop escapes each byte
         # as \u00XX, so a byte decodes to the same one character here.
@@ -2263,7 +2272,7 @@ class AlreadyListeningTest(unittest.TestCase):
         with mock.patch.object(follow_container, "listening_sockets", return_value=found) as read, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             follow_container.copy_with_snapshot(io.BytesIO(start + event + start), sink, 4242, "listensnoop")
-        read.assert_called_once_with(4242)
+        read.assert_called_once_with(4242, host_pids=False)
         self.assertEqual(sink.getvalue(), start + b'{"kind":"listen","port":9303}\n' + event + start)
         self.assertIn("1 socket(s) were already listening", err.getvalue())
 
@@ -2341,7 +2350,7 @@ class DistinctOpensTest(unittest.TestCase):
             env = {**os.environ, "RAIL_DOCKER": str(fake_docker), "RAIL_NSENTER": str(fake_nsenter)}
             supervisor = subprocess.Popen(
                 [sys.executable, str(ROOT / "tools/listen/follow_container.py"), "--command", "files",
-                 "--probe", str(probe), "--output", str(files), "--distinct-opens", "agent", "-n"],
+                 "--source", "probe", "--probe", str(probe), "--output", str(files), "--distinct-opens", "agent", "-n"],
                 env=env, stderr=subprocess.PIPE, text=True)
             try:
                 deadline = time.monotonic() + 20

@@ -5,7 +5,7 @@ is locked is drift (DR-125, DR-145).
 Drives the real scanner and a real RailDash end to end. RailDash compares a
 new ASP against the active alignment when it arrives, so:
 
-1. scan with a listensnoop file holding one listener; lock that ASP as the
+1. scan with a `railmon listen` file holding one listener; lock that ASP as the
    baseline and make it active;
 2. scan the same file again: ALIGNED. The listener value has no counts or
    PIDs, so an unchanged window must not churn;
@@ -106,9 +106,10 @@ def main() -> int:
     # A real probe's file opens with its start record (DR-143); without one
     # the scanner reports that the probe may never have attached. No -H here
     # ("every": 0), so no heartbeat is expected. "peers": this probe reports
-    # who connects in (DR-144).
+    # who connects in (DR-144). "probe": AgentSight's, as `railmon listen`
+    # runs it since DR-170, which the bundle names.
     start = json.dumps({"kind": "start", "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "every": 0, "peers": True})
+                        "every": 0, "peers": True, "probe": "agentsight"})
     listen_file.write_text(start + "\n" + event(40000, "agent") + "\n"
                            + event(40000, "agent", peer="127.0.0.1") + "\n", encoding="utf-8")
 
@@ -118,6 +119,7 @@ def main() -> int:
     checks["the bundle carries the listener"] = (
         listeners["status"] == "ANSWERED"
         and listeners["value"] == [{"protocol": "tcp", "addr": "0.0.0.0", "port": 40000, "process": "agent"}]
+        and listeners["method"].startswith("AgentSight's process probe events:")
     )
     version = api(args.raildash, f"/api/asps/{baseline}/lock", args.token, {"version": f"listen-{time.time_ns()}"})
     api(args.raildash, f"/api/alignments/{version['alignment_version_id']}/switch", args.token, {})

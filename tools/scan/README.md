@@ -323,6 +323,18 @@ exclusion before it: each changes what the bundle says for an unchanged
 agent, so RailDash shows a baseline locked under pack 11 as
 `CONTRACT_MISMATCH`, not as drift, until a pack-12 ASP is locked.
 
+Rule pack 13 (DR-170) moves `observed_listeners`, `observed_ingress_peers`
+and `observed_file_access` onto AgentSight's process probe, and the image's
+AgentSight from v1.0.34 to v1.0.35, whose TLS capture feeds
+`observed_destinations`. The three attributes' method and notes now name the
+probe that observed them, and a missing file's note names the `railmon`
+command that writes it, so a pack-12 baseline is `CONTRACT_MISMATCH` until a
+pack-13 ASP is locked. The values are the same for the same activity: the
+listener, peer and file lists matched listensnoop's and filesnoop's on one
+workload, sandboxed and thread-forked children included. AgentSight does
+not report a UDP socket that sends without binding (listensnoop's
+`autobind`), which is accepted.
+
 ## RailDash delivery
 
 A user should never have to run a CLI command to get an evidence bundle into
@@ -414,21 +426,27 @@ persisted and handed to a scorer.
 The other direction of reach: a socket the agent opened to *accept* traffic is
 a service nobody declared, the shape a covert channel takes.
 `--listen-file` (or `RAIL_LISTEN_FILE`) reads the JSON lines that
-[`listensnoop`](https://github.com/datrail/ebpf-tls-tap#listening-sockets)
-appends. The RailMon image ships it as `railmon listen`; the
+`railmon listen` appends: AgentSight's process probe, scoped to the agent's
+PID namespace with `--pidns-of`, its events written by
+`tools/listen/agentsight_adapter.py` in the lines of
+[`listensnoop`](https://github.com/datrail/ebpf-tls-tap#listening-sockets),
+whose own files the scanner reads too. The
 [top-level README](../../README.md#listening-sockets) has the two-container
-deployment. Run it in the agent's PID namespace, so that only this sandbox's
-sockets carry a PID. Without the image, build it from ebpf-tls-tap
-(`make build-bpf`) and enter the namespace yourself:
+deployment. Without the image, run the adapter with AgentSight on `PATH`
+(`make fetch-agentsight`):
 
 ```bash
 agent=$(docker inspect -f '{{.State.Pid}}' my-agent)
-sudo nsenter -t "$agent" -p -- ./bpf/listensnoop >> listen.jsonl &
+sudo AGENTSIGHT_PATH=bin/agentsight python3 tools/listen/agentsight_adapter.py \
+    --mode listen --pidns-of "$agent" >> listen.jsonl &
 python3 .../scan_agent_environment.py --listen-file listen.jsonl
 ```
 
-The scanner re-reads the whole file on every scan, so the list covers
-everything since listensnoop started. It becomes the `observed_listeners`
+Each `start` record names its probe (`"probe": "agentsight"`), and the
+attribute's method and notes name it after it ("AgentSight's process probe
+events: …"); a file with no name is listensnoop's. The scanner re-reads the
+whole file on every scan, so the list covers everything since the probe
+started. It becomes the `observed_listeners`
 attribute, and it is built so that it only changes when the agent starts
 listening somewhere new:
 
@@ -437,8 +455,9 @@ listening somewhere new:
   `listen()` on an unbound socket, an autobind) is `ephemeral`, not a number
   that differs on every run. A port the caller asked for stays a number in
   any range, so a covert listener on one is a new entry;
-- an event with `pid` 0 came from outside listensnoop's PID namespace. It is
-  counted (`outside_namespace`) but not listed;
+- an event with `pid` 0 came from outside the probe's PID namespace. It is
+  counted (`outside_namespace`) but not listed. AgentSight's events carry the
+  host's PID, listensnoop's the namespace's; neither reaches the bundle;
 - a record with `"snapshot": true` is a socket that was already listening
   when `railmon listen` attached, read from the agent's socket table. It is
   listed like the probe's own records, so a socket both report is usually
@@ -472,7 +491,7 @@ RailDash's comparison against the locked baseline: a new entry is a change to
 - ABSENT when nothing listened;
 - PARTIAL when the list may be missing a listener. A gap never reads as
   "none". There are two reasons:
-  - `NO_SOURCE_ACCESS` covers three cases: listensnoop restarted (a second
+  - `NO_SOURCE_ACCESS` covers three cases: the probe restarted (a second
     `start` record), its heartbeat is more than three intervals old, or it
     never attached (no `start` record);
   - `SIZE_CAP_EXCEEDED`: it reported lost events, or more than 256 distinct
@@ -486,8 +505,8 @@ in CI.
 
 ### Ingress peers
 
-The same file carries listensnoop's `peer` events (from ebpf-tls-tap versions
-that report them): each remote address a process accepted a TCP connection from, once per
+The same file carries the probe's `peer` events (AgentSight's accepted
+connections, or a listensnoop recent enough to report them): each remote address a process accepted a TCP connection from, once per
 listener. They become the `observed_ingress_peers` attribute, the "Ingress
 request" dimension of the first ASP requirements, whose threshold is an
 approved list of addresses or "internal only":
@@ -522,12 +541,13 @@ ASP is locked. The drift acceptance test covers it too.
 
 What the sandbox actually read, wrote and ran, as the kernel saw it.
 `--files-file` (or `RAIL_FILES_FILE`) reads the JSON lines that
-[`filesnoop`](https://github.com/datrail/ebpf-tls-tap#file-opens) appends:
-one line the first time a process opens a regular file for a kind of access.
-The RailMon image ships it as `railmon files`; the
+`railmon files` appends: one line the first time a process opens a regular
+file for a kind of access, from the same AgentSight probe as `railmon
+listen`, written in the lines of
+[`filesnoop`](https://github.com/datrail/ebpf-tls-tap#file-opens). The
 [top-level README](../../README.md#opened-files) has the deployment, which is
-the listener one. Without the image, build it from ebpf-tls-tap and run it
-in the agent's PID namespace with `-n`, as for listensnoop above.
+the listener one. Without the image, run the adapter with `--mode files`, as
+for listeners above.
 
 It becomes the `observed_file_access` attribute, at tier `observed` and
 authored by nobody. It is evidence of what happened, kept apart from what a
@@ -549,7 +569,7 @@ the listeners, it only changes when a file is opened in a new way:
 - there are no PIDs, counts or process names. A thread's name is chosen by
   the agent (Python names its threads `Thread-8 (reader)`), so it would
   churn;
-- an event with `pid` 0 came from outside filesnoop's PID namespace. It is
+- an event with `pid` 0 came from outside the probe's PID namespace. It is
   counted (`outside_namespace`) but not listed;
 - the list is capped at 512 entries and at 256 KiB as rendered (a path of
   non-ASCII characters is written as `\uXXXX` escapes, so the agent could
@@ -578,7 +598,7 @@ The attribute is:
 - ANSWERED with the list;
 - ABSENT when no regular file was opened;
 - PARTIAL when the list may be missing a file:
-  - `NO_SOURCE_ACCESS`: filesnoop restarted, its heartbeat is stale, or it
+  - `NO_SOURCE_ACCESS`: the probe restarted, its heartbeat is stale, or it
     never attached, exactly as for `observed_listeners`;
   - `SIZE_CAP_EXCEEDED`: it reported lost events, the list hit its cap, or
     a path was unnamed;
@@ -703,12 +723,12 @@ states: at most 256 KiB of compact JSON. The v2 schema has no per-attribute
 shapes, so `verify_bundle_v2` holds the sandbox-scoped value to the same def
 in code.
 
-Not covered, because filesnoop does not see it: files already open when it
+Not covered, because the probe does not see it: files already open when it
 attached, reads and writes through a descriptor opened earlier or passed in,
 `truncate(2)`, `rename` and `unlink`, directories and devices. The events are
 per PID namespace, so in a multi-agent bundle the attribute is
 sandbox-scoped. Keep the file where the agent cannot write, as for
-listensnoop's, and remember that paths can be sensitive.
+the listeners', and remember that paths can be sensitive.
 
 The attribute is new in rule pack 4. RailDash shows a baseline locked under
 pack 3 as `CONTRACT_MISMATCH`, not as drift, until a pack-4 ASP is locked.
