@@ -22,6 +22,9 @@ echo "railmon demo: 1/3 self-scan -> $out_dir/features.json"
 # The demo shows the inventory only. Without --no-evidence-bundle the scan
 # also builds an evidence bundle, which needs RAIL_HOST_ID and otherwise
 # fails the scan (and, under set -e, the demo).
+# The demo agent declares its own MCP server (DR-237; demo_server.py's
+# MCP_SERVER_NAME and MCP_URL), as datrail-project's demo-agent does.
+AGENT_MCP_NAME=demo AGENT_MCP_URL=https://127.0.0.1:8443/mcp \
 python3 "$root/tools/scan/scan_agent_environment.py" \
     --mode self --no-evidence-bundle --output "$out_dir/features.json" >/dev/null
 # store_json (scan_agent_environment.py) opens with O_TRUNC, so re-running
