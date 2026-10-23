@@ -16,6 +16,7 @@ import getpass
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -343,6 +344,15 @@ def _refuse_non_json_constant(name: str) -> Any:
     raise json.JSONDecodeError(f"{name} is not a JSON number", name, 0)
 
 
+def _finite_json_float(text: str) -> float:
+    # A number too large for a float (`1e999`) parses to inf, which
+    # json.dumps writes back as the literal Infinity (DR-221).
+    value = float(text)
+    if not math.isfinite(value):
+        raise json.JSONDecodeError(f"{text} is not a finite JSON number", text, 0)
+    return value
+
+
 def strict_json_loads(text: str | bytes) -> Any:
     """`json.loads` without the three literals Python accepts and JSON does not.
 
@@ -352,7 +362,7 @@ def strict_json_loads(text: str | bytes) -> Any:
     as a JSONDecodeError, every caller's existing parse-failure path handles
     it: the file did not parse, as it does not for the agent.
     """
-    return json.loads(text, parse_constant=_refuse_non_json_constant)
+    return json.loads(text, parse_constant=_refuse_non_json_constant, parse_float=_finite_json_float)
 
 
 def load_json_file(path: Path) -> Any | None:

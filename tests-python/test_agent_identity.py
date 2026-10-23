@@ -696,7 +696,8 @@ class StrictJsonTest(unittest.TestCase):
     does not parse, as it does not for the agent's own JSON reader, rather
     than carrying a float no strict reader accepts into the bundle."""
 
-    LITERALS = ("NaN", "Infinity", "-Infinity")
+    # 1e999 overflows a float to inf, which json.dumps writes as Infinity.
+    LITERALS = ("NaN", "Infinity", "-Infinity", "1e999")
 
     def test_a_config_file_holding_one_does_not_parse(self):
         import tempfile

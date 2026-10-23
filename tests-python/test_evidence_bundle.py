@@ -667,7 +667,9 @@ class BundlePermissionsTest(unittest.TestCase):
         # file did not parse - it is PARSE_FAILED, not carried verbatim.
         import tempfile
 
-        for literal in ("NaN", "Infinity", "-Infinity"):
+        # 1e999 is a JSON number, but too large for a float: Python reads it as
+        # inf, which json.dumps writes back as Infinity.
+        for literal in ("NaN", "Infinity", "-Infinity", "1e999", "-1e999"):
             with self.subTest(literal=literal), tempfile.TemporaryDirectory() as tmp:
                 config = Path(tmp) / "settings.json"
                 config.write_text('{"permissions": {"allow": ["Bash"], "deny": [%s]}}' % literal, encoding="utf-8")
@@ -1661,7 +1663,7 @@ class ScannerWiringTest(unittest.TestCase):
         def refuse(name):
             raise ValueError(f"{name} is not JSON")
 
-        config = '{"permissions": {"allow": ["Bash"], "maxTurns": NaN, "deny": [Infinity, -Infinity]}}'
+        config = '{"permissions": {"allow": ["Bash"], "maxTurns": NaN, "deny": [Infinity, -Infinity, 1e999]}}'
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "settings.json").write_text(config, encoding="utf-8")
             proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1", "--sandbox-name", "s-1",
