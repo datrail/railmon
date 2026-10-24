@@ -20,9 +20,12 @@ import subprocess
 PREFIX = "openshell:"
 SANDBOX_LABEL = "openshell.ai/sandbox-name"
 ROLE_LABEL = "openshell.ai/isolation-role=sandbox"
-# A name OpenShell accepts is a DNS-style label; anything else can't match a
-# label value we could safely pass to `docker ps --filter`.
+# What a sandbox name may be here: letters, digits, `.`, `_` and `-`, so it
+# is one `docker ps --filter label=…` value and can't add a filter or a flag.
 SANDBOX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+# The multi-agent key rule (compose_evidence_bundle_v2.KEY, RailDash's
+# _V2_AGENT_KEY): a sandbox name is the default agent key only if it is one.
+AGENT_KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 def sandbox_name(ref: str | None) -> str | None:
@@ -30,6 +33,23 @@ def sandbox_name(ref: str | None) -> str | None:
     if ref and ref.startswith(PREFIX):
         return ref[len(PREFIX):]
     return None
+
+
+def invalid(ref: str | None) -> str | None:
+    """Why `ref` can never resolve, or None. A supervisor given such a ref
+    exits instead of waiting for a container that can't exist."""
+    name = sandbox_name(ref)
+    if name is not None and not SANDBOX_NAME.fullmatch(name):
+        return f"{ref!r} does not name an OpenShell sandbox"
+    return None
+
+
+def default_agent_key(ref: str | None) -> str | None:
+    """The sandbox's name as the agent key, which stays the same across a
+    recreate while its container's name doesn't; None for a container name,
+    or a sandbox name that isn't a valid key (then pass --agent-key)."""
+    name = sandbox_name(ref)
+    return name if name is not None and AGENT_KEY.fullmatch(name) else None
 
 
 def resolve(ref: str, docker: str = "docker", timeout: float = 10.0) -> tuple[str | None, str | None]:
@@ -44,8 +64,9 @@ def resolve(ref: str, docker: str = "docker", timeout: float = 10.0) -> tuple[st
     name = sandbox_name(ref)
     if name is None:
         return ref, None
-    if not SANDBOX_NAME.fullmatch(name):
-        return None, f"{ref!r} does not name an OpenShell sandbox"
+    problem = invalid(ref)
+    if problem:
+        return None, problem
     try:
         out = subprocess.run(
             [docker, "ps", "--format", "{{.Names}}",
@@ -58,5 +79,6 @@ def resolve(ref: str, docker: str = "docker", timeout: float = 10.0) -> tuple[st
         return None, f"cannot ask Docker for OpenShell sandbox {name}'s container: {out.stderr.strip()}"
     names = sorted(line.strip() for line in out.stdout.splitlines() if line.strip())
     if len(names) > 1:
-        return None, f"OpenShell sandbox {name} has {len(names)} running containers ({', '.join(names)})"
+        return None, (f"OpenShell sandbox {name} has {len(names)} running containers "
+                      f"({', '.join(names)}); none is watched until exactly one runs")
     return (names[0], None) if names else (None, None)

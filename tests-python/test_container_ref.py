@@ -124,7 +124,8 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(self.resolve("openshell:my-agent"), (None, None))
         self.docker.running({"openshell-b": 2, "openshell-a": 1})
         self.assertEqual(self.resolve("openshell:my-agent"), (
-            None, "OpenShell sandbox my-agent has 2 running containers (openshell-a, openshell-b)"))
+            None, "OpenShell sandbox my-agent has 2 running containers (openshell-a, openshell-b); "
+                  "none is watched until exactly one runs"))
 
     def test_a_name_openshell_would_not_give_never_reaches_docker(self):
         for ref in ("openshell:", "openshell:a,label=x", "openshell:-a", "openshell:a b"):
@@ -150,7 +151,7 @@ class ResolveTest(unittest.TestCase):
             self.assertEqual(follow.container_pid(str(self.docker.path), "openshell:my-agent",
                                                   logged.append), 2)
         self.assertEqual(logged, ["OpenShell sandbox my-agent has 2 running containers "
-                                  "(openshell-a, openshell-b); not attaching until exactly one runs"])
+                                  "(openshell-a, openshell-b); none is watched until exactly one runs"])
 
 
 class SupervisorTest(unittest.TestCase):
@@ -198,6 +199,14 @@ class SupervisorTest(unittest.TestCase):
         self.assertIn("attaching to openshell:my-agent (pid 4343)", stderr)
         self.assertEqual(supervisor.returncode, 0)
 
+    def test_a_reference_that_can_never_resolve_exits_at_once(self):
+        for script in (SUPERVISOR, ROOT / "tools/collect/follow_container_tls.py"):
+            run = subprocess.run([sys.executable, str(script), "openshell:my agent"],
+                                 env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(run.returncode, 2, script)
+            self.assertIn("'openshell:my agent' does not name an OpenShell sandbox", run.stderr)
+        self.assertFalse(self.docker.args.exists())
+
 
 class ScanTest(unittest.TestCase):
     def setUp(self):
@@ -232,10 +241,20 @@ class ScanTest(unittest.TestCase):
         by_sandbox, sandbox_bundle = self.scan("--container", "openshell:my-agent", name="sandbox")
         self.assertEqual(by_sandbox.returncode, 0, by_sandbox.stderr)
         by_name, name_bundle = self.scan("--container", "openshell-7f3a", "--agent-key", "my-agent",
-                                         name="name")
+                                         "--sandbox-name", "my-agent", name="name")
         self.assertEqual(by_name.returncode, 0, by_name.stderr)
-        self.assertEqual(self.stable(sandbox_bundle), self.stable(name_bundle))
-        self.assertEqual(self.stable(sandbox_bundle)["attributes"]["agent_instance"]["value"]["container"],
+        sandbox, name = self.stable(sandbox_bundle), self.stable(name_bundle)
+        # The sandbox's name, which a recreate keeps, not the container's.
+        identity = sandbox["attributes"]["container_identity"]
+        self.assertEqual(identity["value"], {"host_id": "h1", "sandbox_name": "my-agent"})
+        self.assertEqual(sandbox["sandbox_name"], "my-agent")
+        # Apart from saying where that name came from, the same bundle.
+        self.assertEqual(identity["method"], "host_id: flag; sandbox_name: openshell_sandbox")
+        self.assertEqual(name["attributes"]["container_identity"]["method"],
+                         "host_id: flag; sandbox_name: flag")
+        identity["method"] = name["attributes"]["container_identity"]["method"]
+        self.assertEqual(sandbox, name)
+        self.assertEqual(sandbox["attributes"]["agent_instance"]["value"]["container"],
                          {"host_pid": 4242, "id": "id-openshell-7f3a"})
 
     def test_no_running_sandbox_container_fails_that_scan(self):
@@ -260,6 +279,13 @@ class AgentKeyTest(unittest.TestCase):
         self.assertEqual(self.key(container="openshell:my-agent", agent_key="other"), "other")
         self.assertIsNone(self.key(container="my-agent"))
         self.assertIsNone(self.key(mode="self", container="openshell:my-agent"))
+        # Not a valid agent key: no default, rather than one every delivery refuses.
+        self.assertIsNone(self.key(container="openshell:My-Agent"))
+        self.assertIsNone(self.key(container="openshell:" + "a" * 65))
+
+    def test_the_key_rule_is_the_multi_agent_one(self):
+        composer = _load("compose_evidence_bundle_v2", "tools/scan/compose_evidence_bundle_v2.py")
+        self.assertEqual(container_ref.AGENT_KEY.pattern, composer.KEY.pattern)
 
 
 if __name__ == "__main__":

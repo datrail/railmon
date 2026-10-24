@@ -107,8 +107,10 @@ running container labelled `openshell.ai/sandbox-name=<sandbox>` and
 `openshell.ai/isolation-role=sandbox` again on every attach and every scan.
 While none runs, the supervisors wait and a scan fails, and the next interval
 tries again. Several running containers are logged as an error, and none of
-them is watched. A scan's agent key defaults to the sandbox name, and its
-bundle is the one a scan of that container's name gives.
+them is attached to; `collect` keeps an attach it already has. A scan's
+agent key and `sandbox_name` default to the sandbox's name, which a recreate
+keeps (a sandbox name that isn't a valid agent key gets no default key). The
+bundle is otherwise the one a scan of that container's name gives.
 
 Its log names the process and file it chose. A collector that keeps exiting
 right after it starts ends the supervisor with the collector's status. It

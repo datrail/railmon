@@ -185,7 +185,7 @@ def container_pid(docker: str, container: str, log=None) -> int:
     if log is not None and _reported.get(container) != problem:
         _reported[container] = problem
         if problem:
-            log(f"{problem}; not attaching until exactly one runs")
+            log(problem)
     if resolved is None:
         return 0
     try:
@@ -406,6 +406,10 @@ def main() -> int:
     nsenter = os.environ.get("RAIL_NSENTER", "nsenter")
     listensnoop = args.probe or os.environ.get("LISTENSNOOP_PATH", "")
     COMMAND = args.command
+    problem = container_ref.invalid(args.container)
+    if problem:
+        log(problem)
+        return 2
     agentsight = args.source == "agentsight"
     if not agentsight and not listensnoop:
         parser.error("--source probe needs --probe or LISTENSNOOP_PATH")

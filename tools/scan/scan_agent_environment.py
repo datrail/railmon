@@ -1222,6 +1222,11 @@ def detect_sandbox_name(context: dict[str, Any], explicit: str | None = None) ->
     label = first_nonempty(container_labels(context).get(SANDBOX_NAME_LABEL))
     if label:
         return label[:SANDBOX_NAME_MAX], "label"
+    # `--container openshell:<sandbox>` (DR-247): the sandbox's name, which a
+    # recreate keeps, where its container's generated name changes.
+    sandbox = first_nonempty(context.get("openshell_sandbox"))
+    if sandbox:
+        return sandbox[:SANDBOX_NAME_MAX], "openshell_sandbox"
     name = first_nonempty(context.get("container_name"))
     if name:
         return name[:SANDBOX_NAME_MAX], "container_name"
@@ -2366,6 +2371,9 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         if not args.container:
             raise ScannerError("--container is required with --mode docker")
         context = collect_docker_context(resolve_container(args.container))
+        sandbox = _container_ref().sandbox_name(args.container)
+        if sandbox:
+            context["openshell_sandbox"] = sandbox
     else:
         context = collect_self_context()
     identity = collect_identity(args, context)
@@ -2714,7 +2722,7 @@ def configured_agent_key(args: argparse.Namespace) -> str | None:
     """--agent-key, else RAIL_AGENT_KEY, else for `--container
     openshell:<sandbox>` the sandbox's name, which stays the same across a
     recreate while its container's name doesn't (DR-247)."""
-    sandbox = (_container_ref().sandbox_name(getattr(args, "container", None))
+    sandbox = (_container_ref().default_agent_key(getattr(args, "container", None))
                if getattr(args, "mode", None) == "docker" else None)
     return first_nonempty(args.agent_key, os.environ.get("RAIL_AGENT_KEY"), sandbox)
 
