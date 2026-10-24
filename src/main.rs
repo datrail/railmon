@@ -9,6 +9,7 @@
 
 mod auth;
 mod heartbeat;
+mod http1_close;
 mod http1_decode;
 mod http1_guard;
 mod identity;

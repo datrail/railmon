@@ -8,6 +8,7 @@
 //! attributing the result, plus two byte-level stages in front of the HTTP/1
 //! parser (`http1_guard`, `http1_decode`).
 
+use crate::http1_close::{ClosedReplyEnder, MarkEndedAtClose};
 use crate::http1_decode::CompressedReplyDecoder;
 use crate::http1_guard::{Http1FramingGuard, RestoreDiverted};
 use agentsight_capture::analyzers::{
@@ -441,6 +442,7 @@ pub async fn event_stream(
     // raw data on, every event carries the original HTTP text, and
     // AuthHeaderRemover scrubs only the parsed header map — so credentials
     // would survive into the record written to disk and posted onward.
+    let ended = crate::http1_close::Ended::default();
     let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
         // First, and required, not optional: sslsniff timestamps are
         // `bpf_ktime_get_ns()`, nanoseconds since *boot*, and this is the
@@ -456,12 +458,17 @@ pub async fn event_stream(
         // on the same thread, then hands them back unchanged (#70). Only for
         // a capture whose records name no TLS connection.
         Box::new(Http1FramingGuard::new()),
+        // Supplies the last chunk of a chunked reply whose connection closed
+        // between chunks, so it is recorded rather than lost (#70). Before
+        // the decoder, so a compressed one is decoded whole.
+        Box::new(ClosedReplyEnder::new(ended.clone())),
         // Decodes a gzip/deflate/br/zstd HTTP/1 reply on its bytes, because
         // the parser's text conversion destroys a compressed body before
         // HTTPDecompressor can read it (#93). HTTPDecompressor stays for
         // HTTP/2 replies.
         Box::new(CompressedReplyDecoder::new()),
         Box::new(HTTPParser::new().disable_raw_data()),
+        Box::new(MarkEndedAtClose::new(ended)),
         Box::new(RestoreDiverted),
         Box::new(HTTPDecompressor::new()),
         // No SSEProcessor, deliberately. It is a filter_map: for a streaming

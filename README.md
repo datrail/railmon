@@ -52,7 +52,12 @@ id, so two connections busy on one thread, as a Node agent runs them, each get
 their own reply. An exchange AgentSight ends without a reply (its connection
 closed or went idle, or the capture lost bytes) is written at once as an
 interaction with `"incomplete": true` and no response, and so is a WebSocket
-message the agent sent. One still unanswered after `--pending-timeout`
+message the agent sent. An agent that closes the connection once it has a
+streamed reply's last event, before the chunk that ends the reply arrives
+(OpenClaw does, after a turn's final answer), still gets its reply: when the
+close falls between two chunks, the reply is recorded as captured and marked
+`"ended_at_close": true`. A close inside a chunk leaves the reply cut, so it
+is written as incomplete. One still unanswered after `--pending-timeout`
 seconds (600, ten minutes, by default) is written the same way, and the
 collector logs how many it wrote and how many responses matched no request.
 When the probe loses records (its ring buffer was full, or a truncated record
