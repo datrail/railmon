@@ -282,6 +282,7 @@ class AgentKeyTest(unittest.TestCase):
         # Not a valid agent key: no default, rather than one every delivery refuses.
         self.assertIsNone(self.key(container="openshell:My-Agent"))
         self.assertIsNone(self.key(container="openshell:" + "a" * 65))
+        self.assertIsNone(self.key(container="openshell:default"))
 
     def test_the_key_rule_is_the_multi_agent_one(self):
         composer = _load("compose_evidence_bundle_v2", "tools/scan/compose_evidence_bundle_v2.py")

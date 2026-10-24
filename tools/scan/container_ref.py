@@ -49,7 +49,8 @@ def default_agent_key(ref: str | None) -> str | None:
     recreate while its container's name doesn't; None for a container name,
     or a sandbox name that isn't a valid key (then pass --agent-key)."""
     name = sandbox_name(ref)
-    return name if name is not None and AGENT_KEY.fullmatch(name) else None
+    # `default` is the reserved unkeyed key, so it is no default either.
+    return name if name is not None and name != "default" and AGENT_KEY.fullmatch(name) else None
 
 
 def resolve(ref: str, docker: str = "docker", timeout: float = 10.0) -> tuple[str | None, str | None]:
