@@ -168,11 +168,53 @@ const EXTRA_CREDENTIAL_HEADERS: [&str; 3] = ["api-key", "x-goog-api-key", "proxy
 /// had in flight come through as incomplete; later ones on the same
 /// connection don't come through at all, and this is the only line that says
 /// so. While the buffer stays full nearly every record shows a higher count,
-/// so the line is written at most once per [`CAPTURE_LOSS_LOG_EVERY`], with
-/// the records lost since the last one.
+/// so after a line the next waits [`CAPTURE_LOSS_LOG_EVERY`] and carries
+/// every record lost since; what is still unreported when the capture ends is
+/// written then.
 struct CaptureLossLog;
 
 const CAPTURE_LOSS_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+struct CaptureLoss {
+    seen: u64,
+    reported: u64,
+    last: Option<std::time::Instant>,
+}
+
+impl CaptureLoss {
+    fn observe(&mut self, failures: u64) {
+        self.seen = self.seen.max(failures);
+        if self
+            .last
+            .is_none_or(|at| at.elapsed() >= CAPTURE_LOSS_LOG_EVERY)
+        {
+            self.report();
+        }
+    }
+
+    fn report(&mut self) {
+        if self.seen <= self.reported {
+            return;
+        }
+        log::warn!(
+            "the TLS probe lost {} record(s) (ring buffer full, {} so far); AgentSight stops \
+             pairing each connection it had open at the time until it closes or goes idle, so \
+             its later requests are not captured",
+            self.seen - self.reported,
+            self.seen
+        );
+        self.reported = self.seen;
+        self.last = Some(std::time::Instant::now());
+    }
+}
+
+impl Drop for CaptureLoss {
+    /// The capture ended (the stream holding this was dropped).
+    fn drop(&mut self) {
+        self.report();
+    }
+}
 
 #[async_trait::async_trait]
 impl Analyzer for CaptureLossLog {
@@ -180,25 +222,14 @@ impl Analyzer for CaptureLossLog {
         &mut self,
         stream: EventStream,
     ) -> std::result::Result<EventStream, Box<dyn std::error::Error + Send + Sync>> {
-        let (mut seen, mut reported) = (0u64, 0u64);
-        let mut last: Option<std::time::Instant> = None;
+        let mut loss = CaptureLoss::default();
         Ok(Box::pin(stream.map(move |event| {
-            if let Some(now) = event
+            if let Some(failures) = event
                 .data
                 .get("ringbuf_reserve_failures")
                 .and_then(Value::as_u64)
             {
-                seen = seen.max(now);
-                if seen > reported && last.is_none_or(|at| at.elapsed() >= CAPTURE_LOSS_LOG_EVERY) {
-                    log::warn!(
-                        "the TLS probe lost {} record(s) (ring buffer full, {seen} so far); \
-                         AgentSight stops pairing each connection it had open then until it \
-                         closes or goes idle, so its later requests are not captured",
-                        seen - reported
-                    );
-                    reported = seen;
-                    last = Some(std::time::Instant::now());
-                }
+                loss.observe(failures);
             }
             event
         })))
@@ -1432,6 +1463,25 @@ mod tests {
             .expect("a paired");
         assert_eq!(a["request"]["path"], "/a");
         assert_eq!(p.outstanding(), 0);
+    }
+
+    #[test]
+    fn capture_loss_is_reported_at_once_then_batched_and_at_the_end() {
+        let mut loss = CaptureLoss::default();
+        loss.observe(0);
+        assert_eq!(loss.reported, 0, "nothing lost, nothing written");
+        assert!(loss.last.is_none());
+        loss.observe(3);
+        assert_eq!(loss.reported, 3, "the first loss is written at once");
+        loss.observe(5);
+        loss.observe(4);
+        assert_eq!(
+            (loss.seen, loss.reported),
+            (5, 3),
+            "batched within the minute"
+        );
+        loss.report();
+        assert_eq!(loss.reported, 5, "and written by the end of the capture");
     }
 
     #[test]
