@@ -38,6 +38,16 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// A followed reply that has not moved for this long is let go, as
+/// [`Http1FramingGuard`](crate::http1_guard) lets its keys go: its
+/// connection may never report a close (a killed agent, a missed event).
+const IDLE_RELEASE: Duration = Duration::from_secs(120);
+
+/// The record field AgentSight's parser reads a capture loss from: a change
+/// in it, on any record, ends every connection it is following.
+const LOSS_COUNTER: &str = "ringbuf_reserve_failures";
 
 /// The terminating chunk passed on for a reply its connection closed on.
 const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
@@ -53,6 +63,8 @@ struct Reply {
     head_end: usize,
     /// The reply's last read, which the terminating chunk is cut from.
     last: Event,
+    /// When it last moved, on this process's clock.
+    moved: Instant,
 }
 
 #[derive(Default)]
@@ -84,6 +96,13 @@ impl ClosedReplyEnder {
             if !at_chunk_boundary(&reply) {
                 return vec![event];
             }
+            // The probe lost records since the reply's last read: the parser
+            // ends this connection on the close's counter anyway, and a read
+            // carrying the older counter would look like one more loss to it,
+            // ending every other connection it follows.
+            if reply.last.data.get(LOSS_COUNTER) != event.data.get(LOSS_COUNTER) {
+                return vec![event];
+            }
             let mut last = reply.last;
             if let Some(obj) = last.data.as_object_mut() {
                 let text: String = LAST_CHUNK.iter().map(|&b| char::from(b)).collect();
@@ -94,7 +113,7 @@ impl ClosedReplyEnder {
                     obj.insert("len".into(), json!(LAST_CHUNK.len()));
                 }
             }
-            last.timestamp = event.timestamp.max(last.timestamp);
+            // Dated with the reply's last read: when it really ended.
             self.ended.lock().expect("ended set").insert(key);
             log::debug!(
                 "pid {}: a chunked reply's connection closed between chunks; its last chunk is \
@@ -121,18 +140,30 @@ impl ClosedReplyEnder {
             self.replies.remove(&key);
             return vec![event];
         }
+        let now = Instant::now();
+        self.replies
+            .retain(|_, reply| now.duration_since(reply.moved) < IDLE_RELEASE);
         if looks_like_http1_start(&bytes) {
             self.replies.remove(&key);
             if let Some(head_end) = chunked_reply_head(&bytes) {
-                if self.replies.len() >= MAX_STREAMS {
-                    return vec![event];
-                }
                 let reply = Reply {
                     buf: bytes,
                     head_end,
                     last: event.clone(),
+                    moved: now,
                 };
                 if !ended(&reply) {
+                    if self.replies.len() >= MAX_STREAMS {
+                        // The longest-quiet reply goes, not the new one.
+                        if let Some(oldest) = self
+                            .replies
+                            .iter()
+                            .min_by_key(|(_, r)| r.moved)
+                            .map(|(k, _)| *k)
+                        {
+                            self.replies.remove(&oldest);
+                        }
+                    }
                     self.replies.insert(key, reply);
                 }
             }
@@ -141,6 +172,7 @@ impl ClosedReplyEnder {
         if let Some(reply) = self.replies.get_mut(&key) {
             reply.buf.extend_from_slice(&bytes);
             reply.last = event.clone();
+            reply.moved = now;
             if reply.buf.len() > MAX_BODY_BYTES || ended(reply) {
                 self.replies.remove(&key);
             }
@@ -156,10 +188,14 @@ fn chunked_reply_head(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let end = text.find("\r\n\r\n")? + 4;
+    // `chunked` last, as framing requires (`gzip, chunked` too).
     let chunked = text[..end].split("\r\n").any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
             name.trim().eq_ignore_ascii_case("transfer-encoding")
-                && value.trim().eq_ignore_ascii_case("chunked")
+                && value
+                    .rsplit(',')
+                    .next()
+                    .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"))
         })
     });
     chunked.then_some(end)
@@ -193,7 +229,10 @@ impl Analyzer for ClosedReplyEnder {
 }
 
 /// After the parser: the response [`ClosedReplyEnder`] supplied the last
-/// chunk of says so, `ended_at_close: true`.
+/// chunk of says so, `ended_at_close: true`. The parser emits it while
+/// handling the supplied read, before the close that follows; if it emits
+/// none (it had stopped following the connection), that close clears the
+/// entry, so a later connection reusing the handle is never marked.
 #[derive(Default)]
 pub struct MarkEndedAtClose {
     ended: Ended,
@@ -205,12 +244,21 @@ impl MarkEndedAtClose {
     }
 
     fn observe(&mut self, mut event: Event) -> Event {
-        if event.data.get("message_type").and_then(Value::as_str) != Some("response") {
-            return event;
-        }
         let Some(connection) = connection_key(&event) else {
             return event;
         };
+        if event.source == "ssl"
+            && event.data.get("connection_closed").and_then(Value::as_bool) == Some(true)
+        {
+            self.ended
+                .lock()
+                .expect("ended set")
+                .remove(&(event.pid, connection));
+            return event;
+        }
+        if event.data.get("message_type").and_then(Value::as_str) != Some("response") {
+            return event;
+        }
         if self
             .ended
             .lock()
@@ -342,7 +390,6 @@ mod tests {
             text.contains("READY") && text.contains("message_stop"),
             "{text}"
         );
-        // Nothing ended the exchange without a reply.
         // Nothing ended the exchange without a reply (a terminal record
         // names its exchange; the CLOSE itself only gains a reason).
         assert!(!out
@@ -390,6 +437,55 @@ mod tests {
             panic!("{out:?}")
         };
         assert!(response.data.get("ended_at_close").is_none());
+    }
+
+    /// A loss between the reply's last read and its close: the parser ends
+    /// the connection on the close's counter, and a supplied read with the
+    /// older counter would read to it as one more loss, ending every other
+    /// connection. Nothing is supplied.
+    #[test]
+    fn a_capture_loss_before_the_close_supplies_nothing() {
+        let mut events = exchange(Some("0xa"), HEAD, &body());
+        for event in &mut events {
+            event.data[LOSS_COUNTER] = json!(0);
+        }
+        let mut closing = close(90, Some("0xa"));
+        closing.data[LOSS_COUNTER] = json!(1);
+        events.push(closing);
+        let ended = Ended::default();
+        let mut ender = ClosedReplyEnder::new(ended.clone());
+        let out: Vec<Event> = events
+            .clone()
+            .into_iter()
+            .flat_map(|e| ender.observe(e))
+            .collect();
+        assert_eq!(out.len(), events.len());
+        assert!(ended.lock().unwrap().is_empty());
+    }
+
+    /// The parser emitted no reply for the supplied chunk: the close clears
+    /// the entry, so the next connection on a reused handle isn't marked.
+    #[test]
+    fn a_close_clears_an_entry_the_parser_never_answered() {
+        let ended = Ended::default();
+        let key = (7, connection_key(&close(1, Some("0xa"))).unwrap());
+        ended.lock().unwrap().insert(key);
+        let mut marker = MarkEndedAtClose::new(ended.clone());
+        marker.observe(close(90, Some("0xa")));
+        assert!(ended.lock().unwrap().is_empty());
+        let mut later = ssl(100, "READ/RECV", b"", Some("0xa"));
+        later.source = "http_parser".into();
+        later.data["message_type"] = json!("response");
+        assert!(marker.observe(later).data.get("ended_at_close").is_none());
+    }
+
+    #[test]
+    fn a_coding_list_ending_in_chunked_is_followed() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        assert_eq!(chunked_reply_head(head), Some(head.len()));
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n";
+        assert_eq!(chunked_reply_head(head), None);
+        assert_eq!(chunked_reply_head(HEAD), Some(HEAD.len()));
     }
 
     #[tokio::test]
