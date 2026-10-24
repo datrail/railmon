@@ -1,4 +1,4 @@
-"""DR-249: `railmon openshell`, over OpenShell 0.1.3's own output.
+"""DR-249: `railmon openshell`, over OpenShell 0.1.3 and 0.1.5 output.
 
 The fixtures in tests/fixtures/openshell-0.1.3 were recorded on a CI host by
 datrail-project's *Record OpenShell fixtures* workflow. A stand-in `openshell`
