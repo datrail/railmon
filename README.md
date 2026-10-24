@@ -60,7 +60,7 @@ broke a message's framing), AgentSight stops pairing each connection it names
 that was affected, until the connection closes or goes idle, rather than
 guess where the lost bytes belonged. Its requests in flight are written as
 incomplete, later ones on it are not captured, and the collector logs a
-warning when it happens.
+warning: at once, then at most once a minute while losses go on.
 
 A capture that names no connection (a rustls agent such as Codex, or an
 older probe) is paired by thread instead: a request with the next response

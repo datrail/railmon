@@ -169,8 +169,8 @@ const EXTRA_CREDENTIAL_HEADERS: [&str; 3] = ["api-key", "x-goog-api-key", "proxy
 /// connection don't come through at all, and this is the only line that says
 /// so. While the buffer stays full nearly every record shows a higher count,
 /// so after a line the next waits [`CAPTURE_LOSS_LOG_EVERY`] and carries
-/// every record lost since; what is still unreported when the capture ends is
-/// written then.
+/// every record lost since. It is written on the first record after that
+/// minute; with no traffic after it, at the end of the capture.
 struct CaptureLossLog;
 
 const CAPTURE_LOSS_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
