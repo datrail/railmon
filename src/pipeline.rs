@@ -160,6 +160,46 @@ pub type ProbeStatus = tokio::sync::oneshot::Receiver<Option<std::process::ExitS
 /// cover: Azure OpenAI, Gemini, and forward proxies.
 const EXTRA_CREDENTIAL_HEADERS: [&str; 3] = ["api-key", "x-goog-api-key", "proxy-authorization"];
 
+/// Says when the probe lost records: its ring buffer was full, so whole TLS
+/// reads and writes never reached us. The counter is the probe's own, for
+/// every connection at once, so AgentSight's parser (1.0.35 on) stops pairing
+/// every connection open at that moment until it closes, rather than guess
+/// where the lost bytes belonged. Requests it had in flight come through as
+/// incomplete; later ones on the same connection don't come through at all,
+/// and this is the only line that says so.
+#[derive(Default)]
+struct CaptureLossLog {
+    failures: u64,
+}
+
+#[async_trait::async_trait]
+impl Analyzer for CaptureLossLog {
+    async fn process(
+        &mut self,
+        stream: EventStream,
+    ) -> std::result::Result<EventStream, Box<dyn std::error::Error + Send + Sync>> {
+        let mut seen = std::mem::take(&mut self.failures);
+        Ok(Box::pin(stream.map(move |event| {
+            if let Some(now) = event
+                .data
+                .get("ringbuf_reserve_failures")
+                .and_then(Value::as_u64)
+            {
+                if now > seen {
+                    log::warn!(
+                        "the TLS probe lost {} record(s) (ring buffer full, {now} so far); AgentSight \
+                         stops pairing the connections open now until each closes, so their later \
+                         requests are not captured",
+                        now - seen
+                    );
+                }
+                seen = seen.max(now);
+            }
+            event
+        })))
+    }
+}
+
 /// Redacts the credential headers upstream misses.
 ///
 /// An analyzer rather than a step in `message_body`, so it covers `--mode raw`
@@ -375,6 +415,7 @@ pub async fn event_stream(
         // and on boot nanoseconds it retires every connection after 0.6 ms of
         // its ten-minute idle limit, so no reply finds its request.
         Box::new(TimestampNormalizer::new()),
+        Box::new(CaptureLossLog::default()),
         // Keeps another connection's reads out of a chunked reply in flight
         // on the same thread, then hands them back unchanged (#70). Only for
         // a capture whose records name no TLS connection.
@@ -585,17 +626,19 @@ impl Pairer {
                 }
                 match exchange {
                     Some(id) => {
-                        if let Some(older) = self.exchanges.insert(id.to_string(), pending) {
-                            log::warn!(
-                                "pid {} tid {}: exchange {id} opened twice; the earlier request is dropped",
-                                older.pid,
-                                older.tid
-                            );
-                        }
+                        let older = self.exchanges.insert(id.to_string(), pending)?;
+                        log::warn!(
+                            "pid {} tid {}: exchange {id} opened twice; the earlier request is forwarded as incomplete",
+                            older.pid,
+                            older.tid
+                        );
+                        Some(incomplete(older))
                     }
-                    None => self.pending.entry(key).or_default().push_back(pending),
+                    None => {
+                        self.pending.entry(key).or_default().push_back(pending);
+                        None
+                    }
                 }
-                None
             }
             Some("response") => {
                 let pending = match exchange {
@@ -636,12 +679,25 @@ impl Pairer {
             // AgentSight ended this exchange without a reply.
             None if data.get("completion_reason").is_some() => {
                 let pending = self.exchanges.remove(exchange?)?;
-                log::debug!(
-                    "pid {} tid {}: exchange ended with no reply ({}); forwarded as incomplete",
-                    pending.pid,
-                    pending.tid,
-                    data["completion_reason"].as_str().unwrap_or("unknown")
-                );
+                let reason = data["completion_reason"].as_str().unwrap_or("unknown");
+                if matches!(reason, "capture_loss" | "truncated" | "protocol_error") {
+                    // AgentSight stops matching the whole connection after
+                    // these, until it closes (http-correlation.md, "Loss and
+                    // incomplete captures"): its later requests aren't paired
+                    // or forwarded either.
+                    log::warn!(
+                        "pid {} tid {}: AgentSight ended an exchange on {reason} and stops \
+                         pairing its connection until it closes; the request is forwarded as incomplete",
+                        pending.pid,
+                        pending.tid
+                    );
+                } else {
+                    log::debug!(
+                        "pid {} tid {}: exchange ended with no reply ({reason}); forwarded as incomplete",
+                        pending.pid,
+                        pending.tid
+                    );
+                }
                 Some(incomplete(pending))
             }
             _ => None,
@@ -1367,6 +1423,21 @@ mod tests {
             .expect("a paired");
         assert_eq!(a["request"]["path"], "/a");
         assert_eq!(p.outstanding(), 0);
+    }
+
+    #[test]
+    fn an_exchange_opened_twice_forwards_the_earlier_request() {
+        let mut p = Pairer::new();
+        assert!(p.accept(1, &exchange("request", "a"), 1000).is_none());
+        let mut again = exchange("request", "a");
+        again["path"] = json!("/again");
+        let older = p
+            .accept(1, &again, 1100)
+            .expect("the earlier one is forwarded");
+        assert_eq!(older["incomplete"], true);
+        assert_eq!(older["request"]["path"], "/a");
+        let paired = p.accept(1, &exchange("response", "a"), 1200).unwrap();
+        assert_eq!(paired["request"]["path"], "/again");
     }
 
     #[test]

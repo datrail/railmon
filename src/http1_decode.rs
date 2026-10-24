@@ -84,11 +84,14 @@ impl CompressedReplyDecoder {
         if event.source != "ssl" {
             return vec![event];
         }
-        if event.data.get("connection_closed").and_then(Value::as_bool) == Some(true) {
-            // The parser retires the connection on its close, so a reply
-            // still held here has to reach it first, as captured: once the
-            // connection is gone the reply could only open a new one with
-            // no request to answer.
+        if event.data.get("connection_closed").and_then(Value::as_bool) == Some(true)
+            && connection_key(&event).is_some()
+        {
+            // The parser retires a connection it can name on its close, so a
+            // reply still held here has to reach it first, as captured: once
+            // the connection is gone the reply could only open a new one with
+            // no request to answer. A close that names no connection retires
+            // nothing there, and keyed by thread it could belong to another.
             let mut out = Vec::new();
             for is_read in [true, false] {
                 if let Some(pending) = self.pending.remove(&stream_key(&event, is_read)) {
@@ -617,6 +620,26 @@ mod tests {
             "as captured"
         );
         assert_eq!(out[held].data["function"], "CLOSE");
+    }
+
+    /// A close that names no connection retires nothing in the parser, and
+    /// keyed by thread it could be another connection's.
+    #[test]
+    fn a_close_without_a_connection_releases_nothing() {
+        let framed = node_chunked(&gzip(SSE.as_bytes()));
+        let mut events = reads(GZIP_HEAD, &framed[..framed.len() / 2], 8, 1);
+        let mut close = ssl(50, "CLOSE", 1, b"null");
+        close.data["connection_closed"] = json!(true);
+        events.push(close);
+        events.extend(
+            reads(b"", &framed[framed.len() / 2..], 8, 60)
+                .into_iter()
+                .skip(1),
+        );
+        let out = run(events);
+        assert_eq!(out.len(), 2, "{}", snapshot(&out).join("\n"));
+        assert_eq!(out[0].data["function"], "CLOSE");
+        assert_eq!(split_message(&data_bytes(&out[1])).1, SSE.as_bytes());
     }
 
     #[test]
