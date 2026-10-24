@@ -163,14 +163,16 @@ const EXTRA_CREDENTIAL_HEADERS: [&str; 3] = ["api-key", "x-goog-api-key", "proxy
 /// Says when the probe lost records: its ring buffer was full, so whole TLS
 /// reads and writes never reached us. The counter is the probe's own, for
 /// every connection at once, so AgentSight's parser (1.0.35 on) stops pairing
-/// every connection open at that moment until it closes, rather than guess
-/// where the lost bytes belonged. Requests it had in flight come through as
-/// incomplete; later ones on the same connection don't come through at all,
-/// and this is the only line that says so.
-#[derive(Default)]
-struct CaptureLossLog {
-    failures: u64,
-}
+/// every connection it can name that is open at that moment, until it closes
+/// or goes idle, rather than guess where the lost bytes belonged. Requests it
+/// had in flight come through as incomplete; later ones on the same
+/// connection don't come through at all, and this is the only line that says
+/// so. While the buffer stays full nearly every record shows a higher count,
+/// so the line is written at most once per [`CAPTURE_LOSS_LOG_EVERY`], with
+/// the records lost since the last one.
+struct CaptureLossLog;
+
+const CAPTURE_LOSS_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[async_trait::async_trait]
 impl Analyzer for CaptureLossLog {
@@ -178,22 +180,25 @@ impl Analyzer for CaptureLossLog {
         &mut self,
         stream: EventStream,
     ) -> std::result::Result<EventStream, Box<dyn std::error::Error + Send + Sync>> {
-        let mut seen = std::mem::take(&mut self.failures);
+        let (mut seen, mut reported) = (0u64, 0u64);
+        let mut last: Option<std::time::Instant> = None;
         Ok(Box::pin(stream.map(move |event| {
             if let Some(now) = event
                 .data
                 .get("ringbuf_reserve_failures")
                 .and_then(Value::as_u64)
             {
-                if now > seen {
-                    log::warn!(
-                        "the TLS probe lost {} record(s) (ring buffer full, {now} so far); AgentSight \
-                         stops pairing the connections open now until each closes, so their later \
-                         requests are not captured",
-                        now - seen
-                    );
-                }
                 seen = seen.max(now);
+                if seen > reported && last.is_none_or(|at| at.elapsed() >= CAPTURE_LOSS_LOG_EVERY) {
+                    log::warn!(
+                        "the TLS probe lost {} record(s) (ring buffer full, {seen} so far); \
+                         AgentSight stops pairing each connection it had open then until it \
+                         closes or goes idle, so its later requests are not captured",
+                        seen - reported
+                    );
+                    reported = seen;
+                    last = Some(std::time::Instant::now());
+                }
             }
             event
         })))
@@ -415,7 +420,7 @@ pub async fn event_stream(
         // and on boot nanoseconds it retires every connection after 0.6 ms of
         // its ten-minute idle limit, so no reply finds its request.
         Box::new(TimestampNormalizer::new()),
-        Box::new(CaptureLossLog::default()),
+        Box::new(CaptureLossLog),
         // Keeps another connection's reads out of a chunked reply in flight
         // on the same thread, then hands them back unchanged (#70). Only for
         // a capture whose records name no TLS connection.
@@ -680,14 +685,18 @@ impl Pairer {
             None if data.get("completion_reason").is_some() => {
                 let pending = self.exchanges.remove(exchange?)?;
                 let reason = data["completion_reason"].as_str().unwrap_or("unknown");
-                if matches!(reason, "capture_loss" | "truncated" | "protocol_error") {
-                    // AgentSight stops matching the whole connection after
-                    // these, until it closes (http-correlation.md, "Loss and
-                    // incomplete captures"): its later requests aren't paired
-                    // or forwarded either.
+                // Version 2 is a connection AgentSight names. After these it
+                // stops matching that connection until it closes or goes idle
+                // (http-correlation.md, "Loss and incomplete captures"), so
+                // its later requests aren't paired or forwarded either. A
+                // ring-buffer loss (`capture_loss`) has its own line, from
+                // CaptureLossLog, rather than one per exchange in flight.
+                let named = data.get("correlation_version").and_then(Value::as_u64) == Some(2);
+                if named && matches!(reason, "truncated" | "protocol_error") {
                     log::warn!(
                         "pid {} tid {}: AgentSight ended an exchange on {reason} and stops \
-                         pairing its connection until it closes; the request is forwarded as incomplete",
+                         pairing its connection until it closes or goes idle; the request is \
+                         forwarded as incomplete",
                         pending.pid,
                         pending.tid
                     );

@@ -56,10 +56,11 @@ message the agent sent. One still unanswered after `--pending-timeout`
 seconds (600, ten minutes, by default) is written the same way, and the
 collector logs how many it wrote and how many responses matched no request.
 When the probe loses records (its ring buffer was full, or a truncated record
-broke a message's framing), AgentSight stops pairing the connections affected until each
-closes rather than guess where the lost bytes belonged. Their requests in
-flight are written as incomplete, later ones on them are not captured, and
-the collector logs a warning when it happens.
+broke a message's framing), AgentSight stops pairing each connection it names
+that was affected, until the connection closes or goes idle, rather than
+guess where the lost bytes belonged. Its requests in flight are written as
+incomplete, later ones on it are not captured, and the collector logs a
+warning when it happens.
 
 A capture that names no connection (a rustls agent such as Codex, or an
 older probe) is paired by thread instead: a request with the next response
