@@ -94,6 +94,30 @@ RUN case "${TARGETARCH:-$(uname -m)}" in \
     && install -m 0755 /tmp/docker/docker /usr/local/bin/docker \
     && rm -rf /tmp/docker.tgz /tmp/docker
 
+# The OpenShell CLI, for the opt-in `railmon openshell` collector only
+# (DR-249): it reads a sandbox's policy and log from OpenShell's gateway.
+# Pinned and checked as AgentSight is: the static musl build OpenShell
+# publishes per architecture, against the sha256 its release's
+# openshell-checksums-sha256.txt records. The version is the one
+# datrail-project's CI installs (tests/openshell/install.sh). It adds one
+# 26 MB static binary; nothing runs it unless the collector is started.
+# Bumping is one edit of the three ARGs, after the fixture workflow in
+# datrail-project has recorded the new release's output.
+ARG OPENSHELL_VERSION=0.1.3
+ARG OPENSHELL_SHA256=ed08ea7874c47f22d6e5dcc4b27d9ef1ef5d2060f83035b35ff725d5160830a3
+ARG OPENSHELL_SHA256_ARM64=07687dacefc52bc73b01943f5b58f7a5082c1ceaa228461b9a2a78023b8057c0
+RUN case "${TARGETARCH:-$(uname -m)}" in \
+      amd64|x86_64)  OS_ARCH=x86_64;  OS_SHA256="$OPENSHELL_SHA256" ;; \
+      arm64|aarch64) OS_ARCH=aarch64; OS_SHA256="$OPENSHELL_SHA256_ARM64" ;; \
+      *) echo "no OpenShell release for ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/openshell.tgz \
+      "https://github.com/NVIDIA/OpenShell/releases/download/v${OPENSHELL_VERSION}/openshell-${OS_ARCH}-unknown-linux-musl.tar.gz" \
+    && echo "${OS_SHA256}  /tmp/openshell.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/openshell.tgz -C /tmp openshell \
+    && install -m 0755 /tmp/openshell /usr/local/bin/openshell \
+    && rm -f /tmp/openshell.tgz /tmp/openshell
+
 # The collector keeps a distinct name so the entrypoint can dispatch to it
 # without recursing into itself.
 COPY --from=build /src/target/release/railmon /usr/local/bin/railmon-collector
