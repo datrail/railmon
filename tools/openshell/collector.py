@@ -45,7 +45,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 ALLOWED_COMMANDS = (("policy", "get"), ("logs",))
 SANDBOX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
 OPENSHELL_PREFIX = "openshell:"
-# The gateway keeps this many log lines a sandbox (OpenShell 0.1.3); a poll
+# The gateway keeps this many log lines a sandbox (OpenShell 0.1.3 and 0.1.5); a poll
 # that returns as many may have lost older ones.
 LOG_BUFFER_LINES = 2000
 # Each logs window reaches back this far before the last line seen, so a
@@ -214,7 +214,8 @@ def parse_log(text: str) -> tuple[list[float], list[dict[str, Any]]]:
                 continue
             url = urlsplit(http["url"])
             try:
-                port = url.port
+                # 0.1.3 writes `http://host:443/path`; 0.1.5 `https://host/path`.
+                port = url.port or {"https": 443, "http": 80}.get(url.scheme)
             except ValueError:
                 port = None
             denial.update(kind="http", method=http["method"], host=url.hostname, port=port,
