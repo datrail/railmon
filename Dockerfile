@@ -103,9 +103,9 @@ RUN case "${TARGETARCH:-$(uname -m)}" in \
 # 26 MB static binary; nothing runs it unless the collector is started.
 # Bumping is one edit of the three ARGs, after the fixture workflow in
 # datrail-project has recorded the new release's output.
-ARG OPENSHELL_VERSION=0.1.3
-ARG OPENSHELL_SHA256=ed08ea7874c47f22d6e5dcc4b27d9ef1ef5d2060f83035b35ff725d5160830a3
-ARG OPENSHELL_SHA256_ARM64=07687dacefc52bc73b01943f5b58f7a5082c1ceaa228461b9a2a78023b8057c0
+ARG OPENSHELL_VERSION=0.1.5
+ARG OPENSHELL_SHA256=ca1ad6e6fbb4a6cd407e95763391b8ecff02912e7d9c467e7ca22696fe80af69
+ARG OPENSHELL_SHA256_ARM64=30c949b4ac07a9c8245c1248eb82e4eb241615134fcabf3c9bf30dec7d00addf
 RUN case "${TARGETARCH:-$(uname -m)}" in \
       amd64|x86_64)  OS_ARCH=x86_64;  OS_SHA256="$OPENSHELL_SHA256" ;; \
       arm64|aarch64) OS_ARCH=aarch64; OS_SHA256="$OPENSHELL_SHA256_ARM64" ;; \

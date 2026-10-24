@@ -1,4 +1,4 @@
-"""DR-249: `railmon openshell`, over OpenShell 0.1.3's own output.
+"""DR-249: `railmon openshell`, over OpenShell 0.1.3 and 0.1.5 output.
 
 The fixtures in tests/fixtures/openshell-0.1.3 were recorded on a CI host by
 datrail-project's *Record OpenShell fixtures* workflow. A stand-in `openshell`
@@ -122,6 +122,15 @@ class ParseLogTest(unittest.TestCase):
         self.assertEqual([d["at"] for d in denials],
                          ["2026-10-24T19:09:47.502Z", "2026-10-24T19:09:47.507Z", "2026-10-24T19:09:47.509Z"])
         self.assertEqual(len({d["hash"] for d in denials}), 3)
+
+    def test_0_1_5_writes_the_l7_url_without_its_port(self):
+        """OpenShell 0.1.5's log (recorded by the same workflow) gives the
+        same three denials; its L7 line's URL is https://host/path, and the
+        port is the scheme's, so a denial groups as it did under 0.1.3."""
+        _, old = collector.parse_log(LOG)
+        _, new = collector.parse_log((ROOT / "tests/fixtures/openshell-0.1.5/logs-sandbox.txt").read_text())
+        keep = ("kind", "host", "port", "method", "path", "binary", "policy", "reason")
+        self.assertEqual([{k: d[k] for k in keep} for d in new], [{k: d[k] for k in keep} for d in old])
 
     def test_lines_that_dont_parse_are_skipped(self):
         stamps, denials = collector.parse_log("not a log line\n[x] [sandbox]\n\n")
