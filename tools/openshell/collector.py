@@ -9,7 +9,10 @@ exchange for freshness and the supervisor's denials. Each interval it:
 
 - runs `openshell policy get <sandbox> --full -o json`, the effective policy
   the supervisor has loaded, and posts it to RailDash when its revision or
-  hash changed, with only the fields RailDash reads (no credential field);
+  hash changed, and at least every `POLICY_REPOST_SECONDS` so RailDash can
+  tell a current policy from a stopped collector, with only the fields
+  RailDash reads (no credential field). One call answers what the design's
+  `policy list` then `policy get` would: the loaded revision and its policy;
 - runs `openshell logs <sandbox> --source sandbox -n 2000 --since <window>`
   and posts the `DENIED` `NET:OPEN` and `HTTP:<method>` lines it hasn't
   posted yet. The CLI has no resume cursor and the gateway keeps 2,000 lines
@@ -53,7 +56,15 @@ FIRST_WINDOW_SECONDS = 3600
 DEFAULT_INTERVAL = 60
 CLI_TIMEOUT = 30.0
 POST_TIMEOUT = 15.0
-MAX_DENIALS_PER_POST = 2000
+# Each denial's text fields are capped (about 7.5 KB at worst), so 250 stay
+# under RailDash's 2 MiB body limit.
+MAX_DENIALS_PER_POST = 250
+# Denials RailDash hasn't taken yet (it was down), kept to post again; past
+# this many the oldest go and the span is marked PARTIAL.
+MAX_PENDING_DENIALS = 10_000
+# An unchanged policy is posted again this often: under RailDash's two-hour
+# stale window, so a running collector's policy never reads as stale.
+POLICY_REPOST_SECONDS = 1800
 
 # `[1792867645.652] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED <rest>`
 LOG_LINE = re.compile(
@@ -108,8 +119,11 @@ def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
     policy = view.get("policy")
     if not isinstance(policy, dict):
         raise CollectorError("openshell policy get printed no policy")
+    network = policy.get("network_policies") or {}
+    if not isinstance(network, dict):
+        raise CollectorError("openshell policy get printed network_policies that aren't a mapping")
     rules = {}
-    for key, rule in (policy.get("network_policies") or {}).items():
+    for key, rule in network.items():
         if not isinstance(rule, dict):
             continue
         endpoints = []
@@ -211,43 +225,61 @@ class DenialCursor:
     the lines in the overlap, so a line read twice is posted once."""
 
     def __init__(self) -> None:
+        self.started: float | None = None
         self.last_seen: float | None = None
         self.recent: dict[str, float] = {}
 
     def window(self, now: float) -> int:
-        """`--since` in whole seconds: back to the last line seen, plus the
+        """`--since` in whole seconds: back to the last line seen (or this
+        collector's first poll, while the log has held none), plus the
         overlap; the first poll reads the last hour."""
-        if self.last_seen is None:
+        anchor = self.last_seen if self.last_seen is not None else self.started
+        if anchor is None:
             return FIRST_WINDOW_SECONDS
-        return max(1, math.ceil(now - self.last_seen + OVERLAP_SECONDS))
+        return max(1, math.ceil(now - anchor + OVERLAP_SECONDS))
 
     def batch(self, text: str | None, now: float) -> dict[str, Any]:
         """The post for one poll's output (None: the poll failed)."""
-        reasons = []
         gap_from = None if self.last_seen is None else _iso(self.last_seen)
         if text is None:
             return {"denials": [], "partial": {"from": gap_from, "to": _iso(now), "reasons": ["poll_failed"]}}
         stamps, denials = parse_log(text)
         oldest = min(stamps) if stamps else None
-        if self.last_seen is None:
+        reasons = []
+        if self.started is None:
+            # Whatever the log held before the hour read is unknown.
             reasons.append("first_poll")
-        elif oldest is None or oldest > self.last_seen:
+        elif self.last_seen is not None and (oldest is None or oldest > self.last_seen):
             # The window reaches back past the last line seen, so a log that
             # still held it would have returned it.
             reasons.append("gap")
-        if len(stamps) >= LOG_BUFFER_LINES:
+        if len(stamps) >= LOG_BUFFER_LINES and (self.last_seen is None or oldest > self.last_seen):
+            # The newest 2,000 lines start after where this poll had to
+            # begin: older ones in the window were cut.
             reasons.append("full_buffer")
+        self.started = now if self.started is None else self.started
         fresh = [d for d in denials if d["hash"] not in self.recent]
         if stamps:
             self.last_seen = max(stamps) if self.last_seen is None else max(self.last_seen, max(stamps))
-        floor = (self.last_seen or now) - OVERLAP_SECONDS
         for denial in fresh:
             self.recent[denial["hash"]] = datetime.fromisoformat(denial["at"].replace("Z", "+00:00")).timestamp()
-        self.recent = {h: ts for h, ts in self.recent.items() if ts >= floor - OVERLAP_SECONDS}
+        floor = (self.last_seen or now) - 2 * OVERLAP_SECONDS
+        self.recent = {h: ts for h, ts in self.recent.items() if ts >= floor}
         partial = None
         if reasons:
             partial = {"from": gap_from, "to": _iso(oldest if oldest is not None else now), "reasons": reasons}
         return {"denials": fresh, "partial": partial}
+
+
+def merge_partial(first: dict[str, Any] | None, second: dict[str, Any] | None) -> dict[str, Any] | None:
+    """One span covering both (a batch held back, then the next one)."""
+    if first is None or second is None:
+        return first or second
+    return {
+        "from": None if first["from"] is None or second["from"] is None else min(first["from"], second["from"]),
+        "to": max(first["to"], second["to"]),
+        "reasons": sorted(set(first["reasons"]) | set(second["reasons"])),
+    }
 
 
 # ------------------------------------------------------------------ post
@@ -309,7 +341,10 @@ class Collector:
                  clock: Callable[[], float] = time.time) -> None:
         self.sandbox, self.raildash_url, self.cli, self.log, self.clock = sandbox, raildash_url, cli, log, clock
         self.revision: tuple[Any, Any] | None = None
+        self.posted_at: float | None = None
         self.cursor = DenialCursor()
+        # What RailDash hasn't taken yet: posted again with the next batch.
+        self.pending: dict[str, Any] = {"denials": [], "partial": None}
         self._last_problem: dict[str, str | None] = {}
 
     def _say(self, what: str, problem: str | None) -> None:
@@ -324,10 +359,13 @@ class Collector:
             if not isinstance(view, dict):
                 raise CollectorError("openshell policy get printed no JSON object")
             revision = policy_revision(view)
-            if revision != self.revision:
+            now = self.clock()
+            if (revision != self.revision or self.posted_at is None
+                    or now - self.posted_at >= POLICY_REPOST_SECONDS):
                 post(self.raildash_url, self.sandbox, "policy", strip_policy(view))
-                self.log(f"railmon openshell: posted {self.sandbox}'s policy revision {revision[0]}")
-                self.revision = revision
+                if revision != self.revision:
+                    self.log(f"railmon openshell: posted {self.sandbox}'s policy revision {revision[0]}")
+                self.revision, self.posted_at = revision, now
             self._say("policy", None)
         except (CollectorError, ValueError) as exc:
             self._say("policy", str(exc))
@@ -343,19 +381,29 @@ class Collector:
             text = None
             self._say("logs", str(exc))
         batch = self.cursor.batch(text, now)
-        if not batch["denials"] and batch["partial"] is None:
+        # Anything RailDash didn't take last time goes first.
+        denials = self.pending["denials"] + batch["denials"]
+        partial = merge_partial(self.pending["partial"], batch["partial"])
+        if len(denials) > MAX_PENDING_DENIALS:
+            dropped = denials[: len(denials) - MAX_PENDING_DENIALS]
+            denials = denials[len(dropped):]
+            partial = merge_partial(partial, {"from": dropped[0]["at"], "to": denials[0]["at"], "reasons": ["gap"]})
+        self.pending = {"denials": [], "partial": None}
+        if not denials and partial is None:
             return
+        posted = 0
         try:
-            for start in range(0, max(1, len(batch["denials"])), MAX_DENIALS_PER_POST):
-                chunk = {"denials": batch["denials"][start:start + MAX_DENIALS_PER_POST],
-                         "partial": batch["partial"] if start == 0 else None}
+            for start in range(0, max(1, len(denials)), MAX_DENIALS_PER_POST):
+                chunk = {"denials": denials[start:start + MAX_DENIALS_PER_POST],
+                         "partial": partial if start == 0 else None}
                 post(self.raildash_url, self.sandbox, "denials", chunk)
+                posted = start + len(chunk["denials"])
+                partial = None
             self._say("denials post", None)
         except CollectorError as exc:
-            # Not posted: forget these lines so the next poll posts them, and
-            # mark that span incomplete if they've left the log by then.
-            for denial in batch["denials"]:
-                self.cursor.recent.pop(denial["hash"], None)
+            # Kept, not dropped: the cursor has moved past these lines, so
+            # the next poll won't read them again.
+            self.pending = {"denials": denials[posted:], "partial": partial}
             self._say("denials post", str(exc))
 
     def once(self) -> None:
@@ -384,14 +432,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--sandbox", help="the sandbox's name (or RAIL_OPENSHELL_SANDBOX, or AGENT_CONTAINER=openshell:<name>)")
     parser.add_argument("--raildash-url", default=os.environ.get("RAIL_RAILDASH_URL") or None,
                         help="RailDash's base URL (or RAIL_RAILDASH_URL)")
-    parser.add_argument("--interval", type=float,
-                        default=float(os.environ.get("RAIL_OPENSHELL_INTERVAL") or DEFAULT_INTERVAL),
+    parser.add_argument("--interval", type=float, default=None,
                         help=f"seconds between polls (or RAIL_OPENSHELL_INTERVAL; default {DEFAULT_INTERVAL})")
     parser.add_argument("--openshell", default=os.environ.get("OPENSHELL_CLI") or "openshell",
                         help="the OpenShell CLI to run (or OPENSHELL_CLI)")
     parser.add_argument("--once", action="store_true", help="poll once and exit")
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
+        if args.interval is None:
+            raw = os.environ.get("RAIL_OPENSHELL_INTERVAL") or str(DEFAULT_INTERVAL)
+            try:
+                args.interval = float(raw)
+            except ValueError:
+                raise CollectorError(f"RAIL_OPENSHELL_INTERVAL is not a number: {raw!r}") from None
         sandbox = sandbox_from(args.sandbox)
         if not args.raildash_url:
             raise CollectorError("name RailDash: --raildash-url or RAIL_RAILDASH_URL")

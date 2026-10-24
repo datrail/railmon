@@ -186,12 +186,27 @@ class DenialCursorTest(unittest.TestCase):
     def test_a_full_buffer_and_a_failed_poll_are_partial(self):
         cursor = collector.DenialCursor()
         cursor.batch(LOG, self.now)
-        line = LOG.splitlines()[0]
-        full = "\n".join([line] * (collector.LOG_BUFFER_LINES - 1) + LOG.splitlines()[-1:])
-        self.assertIn("full_buffer", cursor.batch(full, self.now + 1)["partial"]["reasons"])
-        failed = cursor.batch(None, self.now + 2)
+        lines = LOG.splitlines()
+        # A full buffer that still reaches the last line seen lost nothing.
+        reaching = "\n".join([lines[0]] * (collector.LOG_BUFFER_LINES - 1) + lines[-1:])
+        self.assertIsNone(cursor.batch(reaching, self.now + 1)["partial"])
+        # One that starts after it cut older lines.
+        later = lines[-1].replace("[1792", "[1793", 1)
+        cut = "\n".join([later] * collector.LOG_BUFFER_LINES)
+        partial = cursor.batch(cut, self.now + 10**8)["partial"]
+        self.assertEqual(partial["reasons"], ["gap", "full_buffer"])
+        self.assertLess(partial["from"], partial["to"])
+        failed = cursor.batch(None, self.now + 2 * 10**8)
         self.assertEqual(failed["denials"], [])
         self.assertEqual(failed["partial"]["reasons"], ["poll_failed"])
+
+    def test_an_idle_sandbox_is_partial_once(self):
+        cursor = collector.DenialCursor()
+        first = cursor.batch("", 1000.0)
+        self.assertEqual(first["partial"]["reasons"], ["first_poll"])
+        # The next windows reach back to the first poll, and say nothing new.
+        self.assertEqual(cursor.window(1060.0), 60 + collector.OVERLAP_SECONDS)
+        self.assertEqual(cursor.batch("", 1060.0), {"denials": [], "partial": None})
 
 
 class CollectorTest(OpenShellCliTest):
@@ -240,19 +255,46 @@ class CollectorTest(OpenShellCliTest):
         self.assertEqual(FakeRailDash.posts[-1][0], "/v1/openshell/sandboxes/fx-base/policy")
         self.assertEqual(FakeRailDash.posts[-1][2]["active_version"], 2)
 
-    def test_a_failed_logs_call_posts_a_partial_span_and_a_refused_post_is_retried(self):
+    def test_a_failed_logs_call_posts_a_partial_span(self):
         poller = self.make()
         with mock.patch.dict(os.environ, {"FAKE_FAIL": "logs"}):
             poller.once()
         self.assertEqual(FakeRailDash.posts[-1][2]["partial"]["reasons"], ["poll_failed"])
         self.assertTrue(any("logs: openshell logs fx-base exited 1" in m for m in self.messages))
+
+    def test_what_raildash_refused_is_posted_with_the_next_batch(self):
+        """RailDash down for a poll: the cursor moves past those lines, so
+        the collector keeps them, and the first poll's span, and posts them
+        when RailDash is back, an hour later included."""
+        stamps, _ = collector.parse_log(LOG)
+        clock = [max(stamps) + 5]
+        poller = collector.Collector("fx-base", self.url, str(self.cli), log=self.messages.append,
+                                     clock=lambda: clock[0])
         FakeRailDash.status = 503
         poller.poll_denials()
+        self.assertEqual(len(poller.pending["denials"]), 3)
         FakeRailDash.status = 201
+        clock[0] += 3600
+        self.log.write_text("")  # the log has moved on
         before = len(FakeRailDash.posts)
         poller.poll_denials()
-        # The lines RailDash refused are posted again on the next poll.
-        self.assertEqual(len(FakeRailDash.posts[before][2]["denials"]), 3)
+        sent = FakeRailDash.posts[before][2]
+        self.assertEqual(len(sent["denials"]), 3)
+        self.assertEqual(sent["partial"]["reasons"], ["first_poll", "gap"])
+        self.assertEqual(poller.pending, {"denials": [], "partial": None})
+        self.assertTrue(any("denials post: ok again" in m for m in self.messages))
+
+    def test_an_unchanged_policy_is_posted_again_before_raildash_calls_it_stale(self):
+        stamps, _ = collector.parse_log(LOG)
+        clock = [max(stamps)]
+        poller = collector.Collector("fx-base", self.url, str(self.cli), log=self.messages.append,
+                                     clock=lambda: clock[0])
+        poller.poll_policy()
+        poller.poll_policy()
+        clock[0] += collector.POLICY_REPOST_SECONDS
+        poller.poll_policy()
+        self.assertEqual([p for p, _, _ in FakeRailDash.posts].count("/v1/openshell/sandboxes/fx-base/policy"), 2)
+        self.assertLess(collector.POLICY_REPOST_SECONDS, 2 * 3600)
 
     def test_main_names_what_is_missing(self):
         with mock.patch.dict(os.environ, {"AGENT_CONTAINER": "", "RAIL_RAILDASH_URL": ""}, clear=False):
@@ -261,6 +303,8 @@ class CollectorTest(OpenShellCliTest):
                 self.assertEqual(collector.main(["--raildash-url", self.url]), 64)
                 self.assertEqual(collector.main(["--sandbox", "fx-base"]), 64)
                 self.assertEqual(collector.main(["--sandbox", "bad name", "--raildash-url", self.url]), 64)
+                with mock.patch.dict(os.environ, {"RAIL_OPENSHELL_INTERVAL": "soon"}):
+                    self.assertEqual(collector.main(["--sandbox", "fx-base", "--raildash-url", self.url]), 64)
         with mock.patch.dict(os.environ, {"AGENT_CONTAINER": "openshell:my-agent", "RAIL_OPENSHELL_SANDBOX": ""}):
             # Set but empty, as .env.example leaves it, is unset.
             self.assertEqual(collector.sandbox_from(None), "my-agent")
