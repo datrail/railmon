@@ -157,6 +157,11 @@ case "$command_name" in
         fi
         exec "$filesnoop" -n -H "$heartbeat" "$@"
         ;;
+    openshell)
+        # DR-249: the opt-in collector that posts an OpenShell sandbox's
+        # policy and the denials its supervisor logged to RailDash.
+        exec python3 "$root/tools/openshell/collector.py" "$@"
+        ;;
     demo)
         # BDL-F4's local quickstart: self-scan plus a real, offline, local
         # capture, from this one container. See tools/local-demo/README.md.
@@ -174,6 +179,7 @@ Commands:
   forward    send captured interactions on to Rail Center
   listen     report sockets the agent opens to accept traffic (AgentSight)
   files      report files the agent opens to read, write or run (AgentSight)
+  openshell  post an OpenShell sandbox's policy and denials to RailDash (opt-in)
   demo       self-scan + a local offline capture, for a clean-checkout first run
 
 Called with no command, or with a flag first, RailMon runs the collector —

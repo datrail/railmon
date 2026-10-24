@@ -345,6 +345,36 @@ socket that sends without binding first (listensnoop's `autobind`).
 entered into the agent's PID namespace with `nsenter`; the image does not
 ship them.
 
+### An OpenShell sandbox's policy and denials
+
+`railmon openshell` is opt-in. It reads what only OpenShell knows about a
+sandbox and posts it to RailDash (`RAIL_RAILDASH_URL`, with the token):
+
+- **The policy.** Each interval it runs `openshell policy get <sandbox>
+  --full -o json`, the effective policy the sandbox has loaded, with its
+  revision. It posts the policy when the revision or hash changes, and at
+  least every 30 minutes, so RailDash can tell a current policy from a
+  stopped collector. A post carries the revision, the source and each rule's
+  endpoints, binaries and allow rules (method and path or tool), and no
+  other field, so no credential a policy carries leaves the process.
+- **The denials.** Each interval it runs `openshell logs <sandbox> --source
+  sandbox -n 2000 --since <window>` and posts each `DENIED` `NET:OPEN` and
+  `HTTP:<method>` line once, deduplicated by the line's hash. The window
+  reaches 30 s back past the last line seen. The CLI has no resume cursor
+  and the gateway keeps 2,000 lines a sandbox, so a batch is marked PARTIAL
+  in four cases: the first poll, a poll that no longer reaches the last line
+  seen, a full buffer that starts after it, or a failed poll. A post
+  RailDash refuses is kept and sent with the next one.
+
+It runs only `openshell policy get` and `openshell logs`. Anything else is
+refused in code. It needs the OpenShell CLI's own configuration
+(`~/.config/openshell`). On a local gateway that configuration is a Platform
+Admin credential, so anyone who takes over this process holds the gateway.
+It needs no Docker socket, privilege or host PID namespace. RailDash shows
+the policy on the agent's Egress line and the denials as **Blocked by
+OpenShell**. Without the collector, the user imports the policy file into
+RailDash instead.
+
 ## Configuration
 
 Every setting is an environment variable; RailMon loads no `.env` file
@@ -355,9 +385,9 @@ The ones you are most likely to set:
 | --- | --- | --- | --- |
 | `RAIL_HOST_ID` | `scan` (`--host-id`), collector heartbeat | none | Names the host in the evidence bundle and the registration; the same value RailProxy and the other Rail components on the host use. No fallback is invented: unset, the bundle fails its contract and `scan` exits 2 unless `--no-evidence-bundle` is given and no RailDash URL is set. The collector's heartbeat `collector_id` is it (else the hostname), `:`, and the collector's PID. |
 | `RAIL_AGENT_KEY` | `scan` (`--agent-key`) | none | The agent's key in RailDash, sent as `?agent_key=` with the bundle. With `--register` a single scan also sends it to Rail Center as `?agent_key=`, since a v1 bundle names no key; there it must match `^[a-z0-9][a-z0-9._-]{0,63}$`. RailDash needs it when the bundle carries no deployment pair (`RAIL_DEPLOYMENT` plus `RAIL_NAMESPACE`, or a Compose project and service). |
-| `RAIL_RAILDASH_URL` | `scan` (`--raildash-url`) | none | Setting it is the request to deliver each evidence bundle to RailDash's `/v1/evidence-bundles`. |
-| `RAIL_RAILDASH_TOKEN` | `scan`, collector `--webhook` | none | RailDash's local write token (`X-RailDash-Token`): the `RAILDASH_TOKEN` RailDash runs with, or else the contents of its persisted `<db path>.token`. Stable across RailDash restarts, except that an in-memory RailDash database without `RAILDASH_TOKEN` gets a new one on every start; RailDash never prints it. The collector sends it on every webhook batch and heartbeat (see [Architecture](#architecture)). |
-| `RAIL_RAILDASH_TOKEN_FILE` | collector `--webhook` | none | A file holding that token instead, re-read on every batch and heartbeat. Not with `RAIL_RAILDASH_TOKEN`. |
+| `RAIL_RAILDASH_URL` | `scan`, `openshell` (`--raildash-url`) | none | RailDash's base URL. For `scan`, setting it is the request to deliver each evidence bundle to RailDash's `/v1/evidence-bundles`; `openshell` posts under `/v1/openshell/sandboxes/`. |
+| `RAIL_RAILDASH_TOKEN` | `scan`, collector `--webhook`, `openshell` | none | RailDash's local write token (`X-RailDash-Token`): the `RAILDASH_TOKEN` RailDash runs with, or else the contents of its persisted `<db path>.token`. Stable across RailDash restarts, except that an in-memory RailDash database without `RAILDASH_TOKEN` gets a new one on every start; RailDash never prints it. The collector sends it on every webhook batch and heartbeat (see [Architecture](#architecture)). |
+| `RAIL_RAILDASH_TOKEN_FILE` | collector `--webhook`, `openshell` | none | A file holding that token instead, re-read on every batch and heartbeat. Not with `RAIL_RAILDASH_TOKEN`. |
 | `RAIL_HEARTBEAT_INTERVAL` | collector `--webhook` | `60` | Seconds between heartbeats, for tests (0.1 to 3600; anything that is not a positive number means 60). RailDash treats a collector with no heartbeat for 3 minutes as stopped. |
 | `RAIL_SCAN_INTERVAL_IN_SECONDS` | `scan` (`--interval`) | unset: scan once and exit | Keeps `scan` running and scans again on this interval (3600 if the value is not a number). Set but empty counts as set, so it scans every 3600 seconds. |
 | `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. `scan --register` sends it the evidence bundle at `/v1/agents/register` (needs a Rail Center that accepts the evidence bundle there). |
@@ -370,6 +400,9 @@ The ones you are most likely to set:
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `SSLSNIFF_PATH`, else `bin/agentsight` if it exists, else `/usr/local/bin/agentsight`; the image sets its own | The AgentSight probe binary. |
 | `RAIL_COLLECT_CONTAINER` | `collect` | none | Capture one container's agent, or with `openshell:<sandbox>` an OpenShell sandbox's: see [Following a container](#following-a-container). |
+| `RAIL_OPENSHELL_SANDBOX` | `openshell` (`--sandbox`) | the name in `AGENT_CONTAINER=openshell:<sandbox>` | The OpenShell sandbox whose policy and denials `openshell` posts; see [An OpenShell sandbox's policy and denials](#an-openshell-sandboxs-policy-and-denials). |
+| `RAIL_OPENSHELL_INTERVAL` | `openshell` (`--interval`) | `60` | Seconds between polls (5 to 3600). |
+| `OPENSHELL_CLI` | `openshell` (`--openshell`) | `openshell`; the image carries a pinned one | The OpenShell CLI it runs. |
 
 A flag always wins over its variable. `scan` exits 2 when the evidence bundle
 it built fails its contract, when a delivery (`--register` or RailDash) fails,

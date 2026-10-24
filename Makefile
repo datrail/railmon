@@ -45,6 +45,7 @@ test-python:
 		tools/collect/follow_container_tls.py \
 		tools/skills/skill_scanner.py \
 		tools/forward/forward.py \
+		tools/openshell/collector.py \
 		tools/local-demo/demo_server.py \
 		tools/local-demo/demo_client.py \
 		tools/local-demo/demo_mcp_call.py
@@ -52,6 +53,7 @@ test-python:
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh scan --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh forward --help >/dev/null
+	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh openshell --help >/dev/null
 	# The deprecated RailScan-era names and paths still resolve.
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh agent-environment-scanner --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills-scanner --help >/dev/null

@@ -110,6 +110,17 @@ jobs:
           echo "$got"
           [ -n "$want" ] && [ "$got" = "agentsight $want" ]
 
+      # DR-249: the same for the OpenShell CLI `railmon openshell` runs, and
+      # the collector itself answers from the image's copy.
+      - name: Pinned OpenShell CLI inside the built image
+        run: |
+          want=$(sed -n 's/^ARG OPENSHELL_VERSION=//p' Dockerfile)
+          got=$(docker run --rm --entrypoint /usr/local/bin/openshell railmon:ci --version)
+          echo "$got"
+          [ -n "$want" ] && [ "$got" = "openshell $want" ]
+          docker run --rm railmon:ci openshell --help > /dev/null
+          docker image inspect railmon:ci --format 'image size: {{.Size}} bytes'
+
       # The RailScan-era command names and script paths are deprecated but
       # kept: the old paths are symlinks, which only a run in the image shows
       # survived COPY.
