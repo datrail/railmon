@@ -4,7 +4,8 @@
 `railmon collect` with RAIL_COLLECT_CONTAINER set runs this instead of the
 collector directly. It sits in the host PID namespace and, each round:
 
-1. asks Docker for the container's init PID;
+1. asks Docker for the container's init PID (for `openshell:<sandbox>`,
+   the sandbox's current workload container's, DR-247);
 2. finds the TLS library the agent uses, the way AgentSight's `docker://`
    reference does: the first process in the container's tree that maps a
    `libssl.so`, or whose executable has TLS built in (Node, Bun, and other
@@ -44,7 +45,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "listen"))
-from follow_container import container_pid  # noqa: E402
+from follow_container import container_pid, container_ref  # noqa: E402
 
 POLL_SECONDS = 2.0
 PROC = "/proc"
@@ -210,7 +211,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--collector", default=os.environ.get("RAIL_COLLECTOR", "/usr/local/bin/railmon"),
                         help="collector binary")
-    parser.add_argument("container", help="agent container name or id")
+    parser.add_argument("container", help="agent container name or id, or openshell:<sandbox>")
     parser.add_argument("collector_args", nargs=argparse.REMAINDER,
                         help="arguments passed to the collector, e.g. --mode http --webhook URL")
     args = parser.parse_args()
@@ -220,6 +221,10 @@ def main() -> int:
             log(f"{flag} chooses the processes itself; unset RAIL_COLLECT_CONTAINER to use it")
             return 2
 
+    problem = container_ref.invalid(args.container)
+    if problem:
+        log(problem)
+        return 2
     docker = os.environ.get("RAIL_DOCKER", "docker")
     cache: dict = {}
     child: subprocess.Popen | None = None
@@ -235,7 +240,7 @@ def main() -> int:
     waiting_for = None
     fast_exits = 0
     while not stopping:
-        init = container_pid(docker, args.container)
+        init = container_pid(docker, args.container, log)
         if not init:
             if waiting_for != "container":
                 log(f"waiting for container {args.container} to run")
@@ -274,7 +279,9 @@ def main() -> int:
                 agent_gone = not alive(init) or not alive(pid)
                 break
             now = container_pid(docker, args.container)
-            # 0 is Docker not answering, which is not a restart; a dead init is.
+            # 0 is Docker not answering, or for openshell:<sandbox> no single
+            # running container (a recreate's overlap), which is not a restart;
+            # a dead init is.
             if (now and now != init) or not alive(init):
                 reason = f"container {args.container} restarted"
             elif not alive(pid):

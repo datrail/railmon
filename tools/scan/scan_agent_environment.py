@@ -1222,6 +1222,11 @@ def detect_sandbox_name(context: dict[str, Any], explicit: str | None = None) ->
     label = first_nonempty(container_labels(context).get(SANDBOX_NAME_LABEL))
     if label:
         return label[:SANDBOX_NAME_MAX], "label"
+    # `--container openshell:<sandbox>` (DR-247): the sandbox's name, which a
+    # recreate keeps, where its container's generated name changes.
+    sandbox = first_nonempty(context.get("openshell_sandbox"))
+    if sandbox:
+        return sandbox[:SANDBOX_NAME_MAX], "openshell_sandbox"
     name = first_nonempty(context.get("container_name"))
     if name:
         return name[:SANDBOX_NAME_MAX], "container_name"
@@ -2365,7 +2370,10 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
     if args.mode == "docker":
         if not args.container:
             raise ScannerError("--container is required with --mode docker")
-        context = collect_docker_context(args.container)
+        context = collect_docker_context(resolve_container(args.container))
+        sandbox = _container_ref().sandbox_name(args.container)
+        if sandbox:
+            context["openshell_sandbox"] = sandbox
     else:
         context = collect_self_context()
     identity = collect_identity(args, context)
@@ -2678,8 +2686,45 @@ def configured_raildash_url(args: argparse.Namespace) -> str | None:
     return first_nonempty(args.raildash_url, os.environ.get("RAIL_RAILDASH_URL"))
 
 
+_CONTAINER_REF: Any = None
+
+
+def _container_ref() -> Any:
+    """container_ref.py beside this file, loaded by path once: it imports
+    nothing of ours, and the listen/files/collect supervisors load the same
+    file, so all four look a sandbox up the same way (DR-247)."""
+    global _CONTAINER_REF
+    if _CONTAINER_REF is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "container_ref", Path(__file__).resolve().parent / "container_ref.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CONTAINER_REF = module
+    return _CONTAINER_REF
+
+
+def resolve_container(ref: str) -> str:
+    """The container a scan inspects: `ref` itself, or for
+    `openshell:<sandbox>` the sandbox's workload container now, looked up on
+    every scan so an interval scan follows a recreated sandbox (DR-247). The
+    scan then runs exactly as it would on that container's name."""
+    container, problem = _container_ref().resolve(ref)
+    if container is None:
+        raise ScannerError(problem or f"no running container for OpenShell sandbox "
+                           f"{_container_ref().sandbox_name(ref)} yet")
+    return container
+
+
 def configured_agent_key(args: argparse.Namespace) -> str | None:
-    return first_nonempty(args.agent_key, os.environ.get("RAIL_AGENT_KEY"))
+    """--agent-key, else RAIL_AGENT_KEY, else for `--container
+    openshell:<sandbox>` the sandbox's name, which stays the same across a
+    recreate while its container's name doesn't (DR-247)."""
+    sandbox = (_container_ref().default_agent_key(getattr(args, "container", None))
+               if getattr(args, "mode", None) == "docker" else None)
+    return first_nonempty(args.agent_key, os.environ.get("RAIL_AGENT_KEY"), sandbox)
 
 
 def resolve_listen_file(args: argparse.Namespace) -> str | None:
@@ -3574,7 +3619,8 @@ def make_parser() -> argparse.ArgumentParser:
         description="Scan the local agent environment and emit a rail-center registration payload."
     )
     parser.add_argument("--mode", choices=["self", "docker"], default="self")
-    parser.add_argument("--container", help="Docker container name/id to scan when --mode docker is used")
+    parser.add_argument("--container", help="Docker container name/id to scan when --mode docker is used, "
+                        "or openshell:<sandbox> for an OpenShell sandbox's current container")
     parser.add_argument("--output", "-o", help="Write JSON payload to this file instead of stdout")
     parser.add_argument("--agent-type", default="personal", choices=["personal", "service"])
     parser.add_argument("--owner", help="Owner identity override")

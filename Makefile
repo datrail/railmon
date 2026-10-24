@@ -39,6 +39,7 @@ test-python:
 		tools/scan/evidence_bundle.py \
 		tools/scan/compose_evidence_bundle_v2.py \
 		tools/scan/egress_containment.py \
+		tools/scan/container_ref.py \
 		tools/listen/follow_container.py \
 		tools/listen/agentsight_adapter.py \
 		tools/collect/follow_container_tls.py \
