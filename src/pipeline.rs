@@ -366,8 +366,18 @@ pub async fn event_stream(
     // AuthHeaderRemover scrubs only the parsed header map — so credentials
     // would survive into the record written to disk and posted onward.
     let mut analyzers: Vec<Box<dyn Analyzer>> = vec![
+        // First, and required, not optional: sslsniff timestamps are
+        // `bpf_ktime_get_ns()`, nanoseconds since *boot*, and this is the
+        // only thing converting them to epoch milliseconds. Without it every
+        // interaction is dated 1970 and `interaction_id` hashes that. Before
+        // the parser, as AgentSight's own chain has it: since 1.0.35 the
+        // parser ages its connections on these timestamps in milliseconds,
+        // and on boot nanoseconds it retires every connection after 0.6 ms of
+        // its ten-minute idle limit, so no reply finds its request.
+        Box::new(TimestampNormalizer::new()),
         // Keeps another connection's reads out of a chunked reply in flight
-        // on the same thread, then hands them back unchanged (#70).
+        // on the same thread, then hands them back unchanged (#70). Only for
+        // a capture whose records name no TLS connection.
         Box::new(Http1FramingGuard::new()),
         // Decodes a gzip/deflate/br/zstd HTTP/1 reply on its bytes, because
         // the parser's text conversion destroys a compressed body before
@@ -385,23 +395,20 @@ pub async fn event_stream(
         // means capturing almost nothing. The Python chain did not use it
         // either; it treated an SSE response as a response.
         //
-        // What leaving it out costs, on agentsight 1.0.34. A chunked HTTP/1.1
+        // What leaving it out costs, on agentsight 1.0.35. A chunked HTTP/1.1
         // reply is held until its last chunk and emitted whole (the parser
         // test in http1_guard.rs relies on it), and HTTP/2 DATA frames are
         // reassembled per stream. But the response keeps the timestamp of its
         // first read, so `latency_ms` is time-to-first-byte rather than stream
-        // duration; a chunked reply past 1 MiB is dropped whole and its
-        // request ends incomplete; and a close-delimited reply (neither
-        // Content-Length nor chunked) is recorded from its first read only.
-        // (At DR-20, on 1.0.14, chunked replies were cut to their first read
-        // too: 81 of 532 bytes on an Anthropic-shaped stream.) The holding
-        // buffer is per (pid, tid), which is what Http1FramingGuard protects.
-        //
-        // TimestampNormalizer is required, not optional: sslsniff timestamps
-        // are `bpf_ktime_get_ns()`, nanoseconds since *boot*, and this is the
-        // only thing converting them to epoch milliseconds. Without it every
-        // interaction is dated 1970 and `interaction_id` hashes that.
-        Box::new(TimestampNormalizer::new()),
+        // duration; a chunked reply past 1 MiB is emitted cut, as
+        // `body_truncated`, and stops matching its connection; and a
+        // close-delimited reply (neither Content-Length nor chunked) is
+        // recorded at its connection's close, or from its first read when
+        // the capture names no connection. (At DR-20, on 1.0.14, chunked
+        // replies were cut to their first read too: 81 of 532 bytes on an
+        // Anthropic-shaped stream.) The holding buffer is per connection, or
+        // per (pid, tid) without one, which is what Http1FramingGuard
+        // protects.
         Box::new(AuthHeaderRemover::new()),
         Box::new(ExtraCredentialRedactor),
     ];
@@ -501,13 +508,26 @@ fn ssl_event_from_line(line: &str) -> Option<Event> {
 
 /// Pairs parsed HTTP messages into interactions.
 ///
-/// A FIFO per `(pid, tid)`, matching the Python: an agent can have several
-/// requests in flight on one thread, and responses come back in order, so the
-/// oldest outstanding request owns the next response. Keying on the pair rather
-/// than the pid alone is what keeps two concurrent threads from stealing each
-/// other's responses.
+/// By AgentSight's `http_exchange_id` when the parser gives one (1.0.35 on):
+/// it shares one id between a request and the reply it reassembled for it on
+/// the same connection (HTTP/1.1 per-connection FIFO, HTTP/2 stream), so two
+/// connections on one thread, as a Node agent runs them, can no longer swap
+/// replies (datrail/railmon#70). A reply whose exchange has no request here
+/// is counted as unmatched and never falls back to another request, which is
+/// AgentSight's own rule. A record that ends an exchange without a reply
+/// (`http_correlation`: the connection closed or timed out, the capture lost
+/// bytes or ended) forwards its request as incomplete at once rather than
+/// after `--pending-timeout`.
+///
+/// A message without an exchange id falls back to a FIFO per `(pid, tid)`,
+/// matching the Python: an agent can have several requests in flight on one
+/// thread, and responses come back in order, so the oldest outstanding
+/// request owns the next response. Keying on the pair rather than the pid
+/// alone is what keeps two concurrent threads from stealing each other's
+/// responses.
 #[derive(Default)]
 pub struct Pairer {
+    exchanges: HashMap<String, PendingRequest>,
     pending: HashMap<(u32, u64), VecDeque<PendingRequest>>,
     /// Responses that arrived with no request outstanding on their thread.
     /// Counted, not paired: there is nothing to pair them with.
@@ -521,6 +541,7 @@ struct PendingRequest {
     /// CLOCK_MONOTONIC plus a boot time read once, so it falls behind the
     /// wall clock by every second the host has been suspended.
     queued: std::time::Instant,
+    pid: u32,
     tid: u64,
     request: Value,
     size: usize,
@@ -540,26 +561,52 @@ impl Pairer {
     pub fn accept(&mut self, pid: u32, data: &Value, epoch_ms: u64) -> Option<Value> {
         let tid = data.get("tid").and_then(Value::as_u64).unwrap_or(0);
         let key = (pid, tid);
+        let exchange = data
+            .get("http_exchange_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
 
         match data.get("message_type").and_then(Value::as_str) {
             Some("request") => {
-                self.pending
-                    .entry(key)
-                    .or_default()
-                    .push_back(PendingRequest {
-                        epoch_ms,
-                        queued: std::time::Instant::now(),
-                        tid,
-                        request: message_body(data),
-                        size: body_len(data),
-                    });
+                let pending = PendingRequest {
+                    epoch_ms,
+                    queued: std::time::Instant::now(),
+                    pid,
+                    tid,
+                    request: message_body(data),
+                    size: body_len(data),
+                };
+                if data.get("protocol").and_then(Value::as_str) == Some("WebSocket") {
+                    // A WebSocket message the agent sent: nothing answers it,
+                    // so queued here it could only take the next reply on its
+                    // thread, or wait out the pending timeout. It goes on as
+                    // it would have then, with no response.
+                    return Some(incomplete(pending));
+                }
+                match exchange {
+                    Some(id) => {
+                        if let Some(older) = self.exchanges.insert(id.to_string(), pending) {
+                            log::warn!(
+                                "pid {} tid {}: exchange {id} opened twice; the earlier request is dropped",
+                                older.pid,
+                                older.tid
+                            );
+                        }
+                    }
+                    None => self.pending.entry(key).or_default().push_back(pending),
+                }
                 None
             }
             Some("response") => {
-                let Some(pending) = self.pending.get_mut(&key).and_then(VecDeque::pop_front) else {
+                let pending = match exchange {
+                    Some(id) => self.exchanges.remove(id),
+                    None => self.pending.get_mut(&key).and_then(VecDeque::pop_front),
+                };
+                let Some(pending) = pending else {
                     self.unmatched_responses += 1;
                     log::debug!(
-                        "pid {pid} tid {tid}: a response with no request outstanding on its thread"
+                        "pid {pid} tid {tid}: a response with no request outstanding for it ({})",
+                        exchange.unwrap_or("no exchange id")
                     );
                     return None;
                 };
@@ -586,6 +633,17 @@ impl Pairer {
                     "latency_ms": latency_ms,
                 }))
             }
+            // AgentSight ended this exchange without a reply.
+            None if data.get("completion_reason").is_some() => {
+                let pending = self.exchanges.remove(exchange?)?;
+                log::debug!(
+                    "pid {} tid {}: exchange ended with no reply ({}); forwarded as incomplete",
+                    pending.pid,
+                    pending.tid,
+                    data["completion_reason"].as_str().unwrap_or("unknown")
+                );
+                Some(incomplete(pending))
+            }
             _ => None,
         }
     }
@@ -593,7 +651,7 @@ impl Pairer {
     /// Requests still outstanding — a response never arrived, or the capture
     /// stopped mid-flight. Reported rather than dropped silently.
     pub fn outstanding(&self) -> usize {
-        self.pending.values().map(VecDeque::len).sum()
+        self.exchanges.len() + self.pending.values().map(VecDeque::len).sum::<usize>()
     }
 
     /// Drains every still-pending request into a synthetic, response-less
@@ -603,47 +661,50 @@ impl Pairer {
     /// happened; this is what design doc §4.4 means by "pending requests are
     /// flushed as incomplete" rather than silently dropped.
     pub fn flush_incomplete(&mut self) -> Vec<Value> {
-        self.pending
-            .drain()
-            .flat_map(|((pid, _tid), queue)| {
-                queue
-                    .into_iter()
-                    .map(move |pending| incomplete(pid, pending))
-            })
-            .collect()
+        let mut flushed: Vec<PendingRequest> = self.exchanges.drain().map(|(_, p)| p).collect();
+        flushed.extend(self.pending.drain().flat_map(|(_, queue)| queue));
+        flushed.sort_by_key(|pending| pending.epoch_ms);
+        flushed.into_iter().map(incomplete).collect()
     }
 
     /// Takes out every request that has waited longer than `max_age` for
     /// its response, as incomplete interactions (DR-186), oldest first.
     ///
     /// Without this a lost response holds its request for the life of the
-    /// tap, and nothing is ever forwarded or logged for it. It is lost more
-    /// often than it sounds: AgentSight's SSL events carry a pid and tid but
-    /// no connection, and its HTTP/1 parser keeps one buffer per thread and
-    /// direction. A Node agent does all its TLS on one thread. A non-HTTP
-    /// read at a chunk boundary is kept out of that buffer (Http1FramingGuard),
-    /// but a second HTTP connection, or a foreign read in the middle of a
-    /// chunk, still corrupts it and the reply never completes
-    /// (datrail/railmon#70).
+    /// tap, and nothing is ever forwarded or logged for it. AgentSight ends
+    /// most such exchanges itself when it knows the connection (above); what
+    /// is left is a capture without connection identity, where its HTTP/1
+    /// parser keeps one buffer per thread and direction. A Node agent does
+    /// all its TLS on one thread. A non-HTTP read at a chunk boundary is kept
+    /// out of that buffer (Http1FramingGuard), but a second HTTP connection,
+    /// or a foreign read in the middle of a chunk, still corrupts it and the
+    /// reply never completes (datrail/railmon#70).
     ///
-    /// A response that does arrive after its request expired finds the next
-    /// request on that thread or none at all; the bound has to sit well past
-    /// any real stream so that stays rare.
+    /// Without an exchange id, a response that does arrive after its request
+    /// expired finds the next request on that thread or none at all; the
+    /// bound has to sit well past any real stream so that stays rare.
     pub fn expire(&mut self, now: std::time::Instant, max_age: std::time::Duration) -> Vec<Value> {
+        let stale =
+            |pending: &PendingRequest| now.saturating_duration_since(pending.queued) > max_age;
         let mut expired = Vec::new();
-        for (&(pid, _tid), queue) in self.pending.iter_mut() {
+        let ids: Vec<String> = self
+            .exchanges
+            .iter()
+            .filter(|(_, pending)| stale(pending))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            expired.extend(self.exchanges.remove(&id));
+        }
+        for queue in self.pending.values_mut() {
             // FIFO per thread, so the stale ones are at the front.
-            while queue
-                .front()
-                .is_some_and(|pending| now.saturating_duration_since(pending.queued) > max_age)
-            {
-                let pending = queue.pop_front().expect("front was checked");
-                expired.push(incomplete(pid, pending));
+            while queue.front().is_some_and(stale) {
+                expired.push(queue.pop_front().expect("front was checked"));
             }
         }
         self.pending.retain(|_, queue| !queue.is_empty());
-        expired.sort_by_key(|value| value["timestamp_ns"].as_u64().unwrap_or(0));
-        expired
+        expired.sort_by_key(|pending| pending.epoch_ms);
+        expired.into_iter().map(incomplete).collect()
     }
 
     /// Responses so far that found no request to pair with.
@@ -652,11 +713,11 @@ impl Pairer {
     }
 }
 
-fn incomplete(pid: u32, pending: PendingRequest) -> Value {
+fn incomplete(pending: PendingRequest) -> Value {
     json!({
         "timestamp": ms_to_rfc3339(pending.epoch_ms),
         "timestamp_ns": pending.epoch_ms.saturating_mul(1_000_000),
-        "pid": pid,
+        "pid": pending.pid,
         "tid": pending.tid,
         "request": usable_request(pending.request),
         "response": Value::Null,
@@ -681,6 +742,12 @@ fn ms_to_rfc3339(epoch_ms: u64) -> Value {
 /// does anything carrying unredacted wire bytes — `AuthHeaderRemover` scrubs the
 /// parsed header map only, so a surviving `raw_data` would put the credentials
 /// straight back into the record.
+///
+/// AgentSight 1.0.35's correlation and capture provenance go too
+/// ([`CORRELATION_KEYS`]): they say how the message was matched, which the
+/// pairing has already used, not what the agent sent. `transport_handle` is a
+/// TLS object's address in the agent's memory, which AgentSight itself keeps
+/// out of its stored call records.
 fn message_body(data: &Value) -> Value {
     let mut out = data.clone();
     if let Some(obj) = out.as_object_mut() {
@@ -691,7 +758,10 @@ fn message_body(data: &Value) -> Value {
             "raw_data",
             "body_hex",
             "data_hex",
-        ] {
+        ]
+        .into_iter()
+        .chain(CORRELATION_KEYS)
+        {
             obj.remove(key);
         }
     }
@@ -699,6 +769,41 @@ fn message_body(data: &Value) -> Value {
     strip_nul(&mut out);
     out
 }
+
+/// What AgentSight 1.0.35's HTTP parser adds to every message besides the
+/// message itself: its connection and exchange correlation, and the capture
+/// provenance of the TLS records it was reassembled from.
+const CORRELATION_KEYS: [&str; 29] = [
+    "connection_id",
+    "connection_generation",
+    "stream_id",
+    "http_exchange_id",
+    "correlation_method",
+    "correlation_status",
+    "confidence",
+    "correlation_version",
+    "completion_reason",
+    "end_stream",
+    "transport_handle",
+    "process_start_ns",
+    "tls_library",
+    "capture_seq_start",
+    "capture_seq_end",
+    "capture_fragment_count",
+    "capture_original_len",
+    "capture_captured_len",
+    "capture_truncated",
+    "capture_bytes_lost",
+    "ringbuf_reserve_failures_start",
+    "ringbuf_reserve_failures_end",
+    "ringbuf_reserve_failures_delta",
+    "capture_tids",
+    "capture_tid_count",
+    "capture_tids_truncated",
+    "capture_identity_consistent",
+    "capture_metadata_complete",
+    "response_id",
+];
 
 /// A request is only usable to Rail Center if it carries both a method and a
 /// path; the schema types them as required strings. Returning null for the
@@ -1109,6 +1214,221 @@ mod tests {
             assert!(!text.contains(secret), "{secret} survived: {text}");
         }
         assert_eq!(out[0].data["headers"]["host"], "api.anthropic.com");
+    }
+
+    /// A probe that prints `records` and exits, for replaying a capture.
+    fn replay_probe(dir: &Path, records: &[Value]) -> String {
+        let lines: Vec<String> = records.iter().map(Value::to_string).collect();
+        let capture = dir.join("capture.jsonl");
+        std::fs::write(&capture, lines.join("\n") + "\n").expect("write capture");
+        let path = dir.join("agentsight");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nexec cat '{}'\n", capture.display()),
+        )
+        .expect("write probe");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod probe");
+        path.display().to_string()
+    }
+
+    fn two_connections_capture() -> Vec<Value> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/agentsight-v1.0.35/ssl.two-connections.jsonl");
+        std::fs::read_to_string(path)
+            .expect("fixture")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON record"))
+            .collect()
+    }
+
+    /// Every interaction the chain and the pairer make of `records`, and the
+    /// pairer after the stream ended.
+    async fn pair_replayed(records: &[Value]) -> (Vec<Value>, Pairer) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = replay_probe(dir.path(), records);
+        let (stream, _status) = event_stream(&probe, &CaptureFilters::default())
+            .await
+            .expect("start replay");
+        let events: Vec<Event> =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.collect())
+                .await
+                .expect("the stream ends with the capture");
+        let mut pairer = Pairer::new();
+        let paired = events
+            .iter()
+            .filter_map(|event| pairer.accept(event.pid, &event.data, event.timestamp))
+            .collect();
+        (paired, pairer)
+    }
+
+    /// The path a demo reply names in its own events, `{"path": "/fast", …}`.
+    fn answered_path(interaction: &Value) -> Option<String> {
+        let raw = interaction["response"]["body"]["raw"].as_str()?;
+        let start = raw.find("\"path\": \"")? + 9;
+        Some(raw[start..].split('"').next()?.to_string())
+    }
+
+    /// railmon#70's second case, on a real AgentSight v1.0.35 capture: two
+    /// TLS connections on one Node thread whose streamed replies interleave,
+    /// the later request's ending first. Paired per thread, `/slow` took
+    /// `/fast`'s reply.
+    #[tokio::test]
+    async fn two_connections_on_one_thread_each_pair_with_their_own_reply() {
+        let (paired, pairer) = pair_replayed(&two_connections_capture()).await;
+        let pairs: Vec<(Option<String>, Option<String>)> = paired
+            .iter()
+            .map(|i| {
+                (
+                    i["request"]["path"].as_str().map(str::to_string),
+                    answered_path(i),
+                )
+            })
+            .collect();
+        let want = |p: &str| (Some(p.to_string()), Some(p.to_string()));
+        assert_eq!(pairs, vec![want("/fast"), want("/slow")], "{paired:#?}");
+        assert!(paired.iter().all(|i| i.get("incomplete").is_none()));
+        assert_eq!(pairer.outstanding(), 0);
+        assert_eq!(pairer.unmatched_responses(), 0);
+        // The timestamps were made epoch milliseconds before the parser saw
+        // them: a 2026 date, and a latency of a stream, not of nanoseconds.
+        assert!(paired[0]["timestamp"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-"));
+        let latency = paired[1]["latency_ms"].as_f64().unwrap();
+        assert!((1_000.0..10_000.0).contains(&latency), "{latency}");
+        // How the parser matched them stays out of the message.
+        for message in [&paired[0]["request"], &paired[0]["response"]] {
+            for key in CORRELATION_KEYS {
+                assert!(message.get(key).is_none(), "{key} in {message}");
+            }
+        }
+    }
+
+    /// The same records without the fields that name their connection, as a
+    /// rustls agent or an older probe sends them, take the per-thread path,
+    /// and that path can't tell the two connections apart: `/fast`'s reply
+    /// opens while `/slow`'s is in flight on the same thread, so it answers
+    /// the older request, and `/fast` is forwarded incomplete. Every request
+    /// is still accounted for. This is the limit connection identity removes;
+    /// for a capture without it the limit stays.
+    #[tokio::test]
+    async fn without_connection_identity_the_same_capture_pairs_by_thread() {
+        let records: Vec<Value> = two_connections_capture()
+            .into_iter()
+            .map(|mut record| {
+                let data = record["data"].as_object_mut().unwrap();
+                for key in ["transport_handle", "process_start_ns", "tls_library"] {
+                    data.remove(key);
+                }
+                record
+            })
+            .collect();
+        let (paired, pairer) = pair_replayed(&records).await;
+        let pairs: Vec<(Option<&str>, Option<String>, bool)> = paired
+            .iter()
+            .map(|i| {
+                (
+                    i["request"]["path"].as_str(),
+                    answered_path(i),
+                    i.get("incomplete").is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some("/slow"), Some("/fast".to_string()), false),
+                (Some("/fast"), None, true),
+            ],
+            "{paired:#?}"
+        );
+        assert_eq!(pairer.outstanding(), 0);
+    }
+
+    fn exchange(message: &str, id: &str) -> Value {
+        json!({"message_type": message, "tid": 7, "http_exchange_id": id,
+               "method": "POST", "path": format!("/{id}"), "status_code": 200})
+    }
+
+    #[test]
+    fn replies_pair_by_exchange_id_in_any_order() {
+        let mut p = Pairer::new();
+        assert!(p.accept(1, &exchange("request", "a"), 1000).is_none());
+        assert!(p.accept(1, &exchange("request", "b"), 1100).is_none());
+        let b = p
+            .accept(1, &exchange("response", "b"), 1200)
+            .expect("b paired");
+        assert_eq!(b["request"]["path"], "/b");
+        assert_eq!(b["latency_ms"], 100.0);
+        let a = p
+            .accept(1, &exchange("response", "a"), 1300)
+            .expect("a paired");
+        assert_eq!(a["request"]["path"], "/a");
+        assert_eq!(p.outstanding(), 0);
+    }
+
+    #[test]
+    fn a_reply_to_an_unknown_exchange_takes_no_other_request() {
+        let mut p = Pairer::new();
+        p.accept(1, &req(7, 0), 1000);
+        p.accept(1, &exchange("request", "a"), 1000);
+        assert!(p
+            .accept(1, &exchange("response", "elsewhere"), 1100)
+            .is_none());
+        assert_eq!(p.unmatched_responses(), 1);
+        assert_eq!(p.outstanding(), 2);
+    }
+
+    #[test]
+    fn an_exchange_agentsight_ends_without_a_reply_is_forwarded_at_once() {
+        let mut p = Pairer::new();
+        p.accept(1, &exchange("request", "a"), 1000);
+        p.accept(1, &exchange("request", "b"), 1000);
+        let ended = json!({"http_exchange_id": "a", "correlation_status": "unlinked",
+                           "completion_reason": "closed"});
+        let out = p.accept(1, &ended, 1500).expect("forwarded");
+        assert_eq!(out["incomplete"], true);
+        assert_eq!(out["request"]["path"], "/a");
+        // Once only: the stream's end doesn't forward it a second time.
+        assert!(p.accept(1, &ended, 1600).is_none());
+        let flushed = p.flush_incomplete();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0]["request"]["path"], "/b");
+    }
+
+    #[test]
+    fn a_websocket_message_is_forwarded_and_takes_no_reply() {
+        let mut p = Pairer::new();
+        let mut frame = req(7, 0);
+        frame["protocol"] = json!("WebSocket");
+        frame["path"] = json!("/gateway");
+        let out = p.accept(1, &frame, 1000).expect("forwarded at once");
+        assert_eq!(out["incomplete"], true);
+        assert_eq!(out["request"]["path"], "/gateway");
+        p.accept(1, &req(7, 0), 1100);
+        let paired = p.accept(1, &resp(7, 0, 200), 1200).expect("paired");
+        assert_eq!(paired["request"]["path"], "/v1/messages");
+    }
+
+    #[test]
+    fn expiry_covers_exchanges_too() {
+        let mut p = Pairer::new();
+        p.accept(1, &exchange("request", "a"), 2000);
+        p.accept(1, &req(7, 0), 1000);
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let expired = p.expire(later, std::time::Duration::from_secs(1));
+        let paths: Vec<_> = expired
+            .iter()
+            .map(|i| i["request"]["path"].clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![json!("/v1/messages"), json!("/a")],
+            "oldest first"
+        );
+        assert_eq!(p.outstanding(), 0);
     }
 
     #[test]

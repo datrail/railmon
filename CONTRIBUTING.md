@@ -18,12 +18,13 @@ is **AgentSight's**, consumed as the `agentsight-capture` library. RailMon used
 to carry its own 786-line implementation of that; keeping a second copy in step
 with upstream was all cost.
 
-What is ours: **pairing** (a FIFO per `(pid, tid)`), **attribution** (reading
+What is ours: **pairing** (by AgentSight's `http_exchange_id`, or a FIFO per
+`(pid, tid)` for a capture that names no connection), **attribution** (reading
 the `x-rail` ticket), the **Rail Center schema**, and **delivery**, plus two
 byte-level stages in front of AgentSight's HTTP/1 parser: keeping another
-connection's reads out of a chunked reply (`src/http1_guard.rs`) and decoding
-a compressed reply before the parser turns its bytes into text
-(`src/http1_decode.rs`).
+connection's reads out of a chunked reply when the capture names no
+connection (`src/http1_guard.rs`) and decoding a compressed reply before the
+parser turns its bytes into text (`src/http1_decode.rs`).
 
 A parsing bug most likely belongs upstream. Say so in the issue and we will
 help route it.

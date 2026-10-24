@@ -1,7 +1,12 @@
 //! Keeps reads from another connection out of an HTTP/1.1 chunked message
 //! (datrail/railmon#70).
 //!
-//! AgentSight's SSL events carry a pid and tid but no connection, and its
+//! Only for a capture whose records name no TLS connection. Since 1.0.35
+//! AgentSight's parser keeps one buffer per connection when a record carries
+//! its `transport_handle`, `process_start_ns` and `tls_library` (OpenSSL,
+//! BoringSSL and GnuTLS agents), and this guard lets every such record
+//! through ([`connection_key`]). Without them (a rustls agent, an older
+//! probe) its SSL events carry a pid and tid but no connection, and its
 //! HTTP/1 parser keeps one buffer per `(pid, tid, direction)`. A Node agent
 //! does all its TLS on one thread, so a WebSocket frame read between two SSE
 //! chunks lands in the middle of the streamed reply's buffer, the chunked
@@ -84,6 +89,13 @@ impl Http1FramingGuard {
 
     /// True when the event should be hidden from the parser.
     fn observe(&mut self, event: &Event) -> bool {
+        // A record that names its TLS connection reaches that connection's own
+        // buffer in the parser, so another connection's read can't land in
+        // the middle of it. Hiding it would only take bytes away from the
+        // connection it does belong to.
+        if connection_key(event).is_some() {
+            return false;
+        }
         let Some(text) = event.data.get("data").and_then(Value::as_str) else {
             return false;
         };
@@ -233,6 +245,48 @@ impl Analyzer for RestoreDiverted {
             event
         })))
     }
+}
+
+/// The TLS connection a record belongs to, when AgentSight names one (1.0.35
+/// on): the `(pid, process_start_ns, tls_library, transport_handle)` its HTTP
+/// parser keys a connection on, accepted by the same rules, as one opaque
+/// number with the top bit set so it can never equal a thread id. `None` for
+/// a capture without that identity (a rustls agent such as Codex, or an older
+/// probe), which the parser still keys by `(pid, tid)`.
+pub(crate) fn connection_key(event: &Event) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let handle = match event.data.get("transport_handle")? {
+        Value::String(s) if !s.is_empty() => {
+            match s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .map(|hex| u64::from_str_radix(hex, 16))
+                .unwrap_or_else(|| s.parse())
+            {
+                Ok(n) => format!("0x{n:x}"),
+                Err(_) => s.clone(),
+            }
+        }
+        Value::Number(n) => format!("0x{:x}", n.as_u64()?),
+        _ => return None,
+    };
+    if handle == "0x0" {
+        return None;
+    }
+    let library = event
+        .data
+        .get("tls_library")
+        .and_then(Value::as_str)
+        .filter(|l| !l.is_empty() && *l != "unknown")?;
+    let start = event
+        .data
+        .get("process_start_ns")
+        .and_then(Value::as_u64)
+        .filter(|s| *s != 0)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (event.pid, start, library, handle).hash(&mut hasher);
+    Some(hasher.finish() | 1 << 63)
 }
 
 /// The parser's own decoding of an SSL payload.
@@ -509,6 +563,56 @@ mod tests {
         // Message complete: the thread is idle and nothing is diverted.
         assert!(!g.observe(&read(1, WS)));
         assert!(g.streams.is_empty());
+    }
+
+    fn on(mut event: Event, handle: Value) -> Event {
+        event.data["transport_handle"] = handle;
+        event.data["process_start_ns"] = json!(12345);
+        event.data["tls_library"] = json!("openssl");
+        event
+    }
+
+    /// The parser keeps such a read in its own connection's buffer, so there
+    /// is nothing to keep out, and hiding it would cost that connection bytes.
+    #[test]
+    fn a_read_that_names_its_connection_is_never_diverted() {
+        let mut g = Http1FramingGuard::new();
+        assert!(!g.observe(&on(read(1, HEAD), json!("0xa"))));
+        assert!(!g.observe(&on(read(1, &chunk(0)), json!("0xa"))));
+        assert!(!g.observe(&on(read(1, WS), json!("0xb"))));
+        assert!(g.streams.is_empty());
+    }
+
+    #[test]
+    fn connection_key_accepts_what_agentsights_parser_does() {
+        let key = |e: &Event| connection_key(e);
+        let a = key(&on(read(1, HEAD), json!("0xab"))).expect("named");
+        assert_eq!(
+            key(&on(read(2, HEAD), json!("0xAB"))),
+            Some(a),
+            "tid isn't part of it"
+        );
+        assert_eq!(
+            key(&on(read(1, HEAD), json!(0xab))),
+            Some(a),
+            "a number is the same handle"
+        );
+        assert_eq!(
+            key(&on(read(1, HEAD), json!("171"))),
+            Some(a),
+            "so is decimal text"
+        );
+        assert_ne!(key(&on(read(1, HEAD), json!("0xac"))), Some(a));
+        assert!(a >= 1 << 63, "never equal to a thread id");
+        assert_eq!(key(&read(1, HEAD)), None);
+        assert_eq!(key(&on(read(1, HEAD), json!("0x0"))), None);
+        assert_eq!(key(&on(read(1, HEAD), json!(""))), None);
+        let mut unknown = on(read(1, HEAD), json!("0xab"));
+        unknown.data["tls_library"] = json!("unknown");
+        assert_eq!(key(&unknown), None);
+        let mut unstarted = on(read(1, HEAD), json!("0xab"));
+        unstarted.data["process_start_ns"] = json!(0);
+        assert_eq!(key(&unstarted), None);
     }
 
     #[test]

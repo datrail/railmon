@@ -45,18 +45,25 @@ sudo ./target/release/railmon --agentsight bin/agentsight \
   --mode http --output capture.jsonl
 ```
 
-In `--mode http` a request is paired with the next response on its thread.
-One still unanswered after `--pending-timeout` seconds (600, ten minutes, by default) is
-written as an interaction with `"incomplete": true` and no response, and the
+In `--mode http` a request is paired with its own reply. AgentSight names
+each record's TLS connection (OpenSSL, BoringSSL and GnuTLS agents) and
+reassembles HTTP per connection, giving a request and its reply one exchange
+id, so two connections busy on one thread, as a Node agent runs them, each get
+their own reply. An exchange AgentSight ends without a reply (its connection
+closed or went idle, or the capture lost bytes) is written at once as an
+interaction with `"incomplete": true` and no response, and so is a WebSocket
+message the agent sent. One still unanswered after `--pending-timeout`
+seconds (600, ten minutes, by default) is written the same way, and the
 collector logs how many it wrote and how many responses matched no request.
-The probe reports threads, not connections, and a Node agent does all its
-TLS on one thread. A read from another connection (a WebSocket frame, say)
-that arrives between two chunks of a chunked reply is kept out of that reply,
-so the reply still comes through whole. Two HTTP connections busy on one thread
-can still lose a reply or pair it with the wrong response, as can a foreign
-read landing in the middle of a chunk or a reply that is not chunked
-([#70](https://github.com/datrail/railmon/issues/70); the fix is a connection key upstream,
-[eunomia-bpf/agentsight#208](https://github.com/eunomia-bpf/agentsight/issues/208)).
+
+A capture that names no connection (a rustls agent such as Codex, or an
+older probe) is paired by thread instead: a request with the next response
+on its thread. A read from another connection (a WebSocket frame, say) that
+arrives between two chunks of a chunked reply is kept out of that reply, so
+the reply still comes through whole. Two HTTP connections busy on one thread
+can still lose a reply or pair it with the wrong response there, as can a
+foreign read landing in the middle of a chunk or a reply that is not chunked
+([#70](https://github.com/datrail/railmon/issues/70)).
 
 A compressed HTTP/1 reply (`Content-Encoding` gzip, x-gzip, deflate, br or
 zstd, chunked or sized by `Content-Length`) is de-chunked and decoded before it

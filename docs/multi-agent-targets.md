@@ -139,9 +139,11 @@ Per row, the output carries `agent_ref` (host, sandbox, `agent_key`) and
 | `ambiguous` | reason `MULTIPLE_TARGETS` | captured on a process session more than one target claims; `agent_ref`, `agent_id` and `target_id` are null, and `raw.railmon_attribution_audit` lists the `candidate_targets` and the discovery reason. `process` is the claimed process |
 | `unknown` | reason `PROCESS_INCARNATION_UNPINNED` | the row carries no process start time to pin the incarnation; `agent_ref`, `agent_id` and `process` are null |
 
-Rows flushed because their target stopped mid-request, or because a request
-waited longer than `--pending-timeout` (600 s by default) for its response,
-carry `raw.incomplete: true`. Conflict and unattributed totals are not logged;
+Rows flushed because their target stopped mid-request, because AgentSight
+ended the exchange without a reply (its connection closed or went idle, or
+the capture lost bytes), because they are a WebSocket message the agent sent,
+or because a request waited longer than `--pending-timeout` (600 s by
+default) for its response, carry `raw.incomplete: true`. Conflict and unattributed totals are not logged;
 count them from the file, e.g.
 `jq -r .attribution.state interactions.jsonl | sort | uniq -c`.
 
@@ -164,7 +166,7 @@ count them from the file, e.g.
 | `no declared agent resolved to a capturable process` (fatal, exit 1) | nothing in the manifest resolved to a process whose tap started, not even an ambiguous one; run `--print-resolved-targets` |
 | `target '<k>' exited or its PID was reused; stopping its tap …` | expected on agent restart; pending requests are written as incomplete |
 | `target '<k>' tap ended (…); … will retry discovery` | the probe for that one agent stopped |
-| `N request(s) got no response within …s and were forwarded as incomplete` / `N response(s) matched no request` | the probe reports threads, not connections; a reply streamed while another HTTP connection on the agent's thread is active, or a foreign read landing mid-chunk, can lose it (typical of Node agents) ([#70](https://github.com/datrail/railmon/issues/70)) |
+| `N request(s) got no response within …s and were forwarded as incomplete` / `N response(s) matched no request` | a reply still streaming past the timeout, or one that began before the tap attached; for a capture that names no TLS connection (a rustls agent), also a reply streamed while another HTTP connection on the agent's thread is active, or a foreign read landing mid-chunk ([#70](https://github.com/datrail/railmon/issues/70)) |
 | `target '<k>' resolved again; tap restarted` | recovery, retried every 5 s under the same `agent_key` |
 | `every declared target is currently down; capture is idle …` | RailMon keeps running and retrying; it does not exit |
 | `capture analyzer panicked on captured traffic (…); stopping this tap` | an analyzer panicked on captured traffic (since agentsight-capture 1.0.34 a malformed HPACK block no longer does); only that tap stops and restarts |
