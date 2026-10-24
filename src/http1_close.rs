@@ -108,9 +108,12 @@ impl ClosedReplyEnder {
                 let text: String = LAST_CHUNK.iter().map(|&b| char::from(b)).collect();
                 obj.insert("data".into(), Value::String(text));
                 obj.remove("data_hex");
-                obj.remove("truncated");
-                if obj.contains_key("len") {
-                    obj.insert("len".into(), json!(LAST_CHUNK.len()));
+                // A whole record of its own, as a real read of it would be.
+                obj.insert("truncated".into(), json!(false));
+                for field in ["len", "buf_size"] {
+                    if obj.contains_key(field) {
+                        obj.insert(field.into(), json!(LAST_CHUNK.len()));
+                    }
                 }
             }
             // Dated with the reply's last read: when it really ended.
@@ -396,6 +399,34 @@ mod tests {
             .iter()
             .any(|e| e.data.get("message_type").is_none()
                 && e.data.get("http_exchange_id").is_some()));
+    }
+
+    /// As sslsniff writes them: every record, the close too, carries the
+    /// tracer's loss counter. Equal on all of them, the parser sees no loss,
+    /// and the reply is dated by its last read.
+    #[tokio::test]
+    async fn with_the_probes_loss_counter_the_reply_still_pairs() {
+        let mut events = exchange(Some("0xa"), HEAD, &body());
+        events.push(close(90, Some("0xa")));
+        for event in &mut events {
+            event.data[LOSS_COUNTER] = json!(3);
+            event.data["truncated"] = json!(false);
+            event.data["buf_size"] = event.data["len"].clone();
+        }
+        let last_read = events[events.len() - 2].timestamp;
+        let out = chain(events).await;
+        let [response] = of_type(&out, "response")[..] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(response.data["ended_at_close"], true);
+        assert!(!out.iter().any(
+            |e| e.data.get("completion_reason").and_then(Value::as_str) == Some("capture_loss")
+        ));
+        assert_eq!(response.data["capture_truncated"], false);
+        assert!(
+            response.timestamp <= last_read,
+            "dated by its reads, not the close"
+        );
     }
 
     #[tokio::test]
