@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-session"
-version = "0.5.17"
+version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c8903111fd238ae6d7c602f377c0c94bbe0c29332ca98353ad31fbf1abe105b"
+checksum = "08cf4d3133ed4d81f24a14d531ec3a81368647c888315c892f215d2f599b7930"
 dependencies = [
  "chrono",
  "dirs",
@@ -25,9 +25,9 @@ dependencies = [
 
 [[package]]
 name = "agentsight-analysis"
-version = "1.0.34"
+version = "1.0.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e71019cfe1d071a28f762d4a3cd0e2c8566546e3cf427eaf7f343cd6425e6d13"
+checksum = "98b7703a166ccb93bd7cc64f599e5ba680d31212680a7e2eb289805f04a1f830"
 dependencies = [
  "agent-session",
  "agentsight-capture-core",
@@ -59,18 +59,18 @@ dependencies = [
 
 [[package]]
 name = "agentsight-capture"
-version = "1.0.34"
+version = "1.0.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a99dba3c431a14411cbd5adc67c3ad91065058e088409fb910ec959d88b26fda"
+checksum = "befa404897a40ac7414a8b52acec7e55cbf3376da93c9fb6aead40d0a94afff7"
 dependencies = [
  "agentsight-analysis",
 ]
 
 [[package]]
 name = "agentsight-capture-core"
-version = "1.0.34"
+version = "1.0.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1db1e8c64cdbaa2ac197e7c76e22f5503442a5058fc6204791517c02f316682c"
+checksum = "b9d86a6a9c74935376a72ece76e5e7035ba23e6e0e44364095ca84395781eb39"
 dependencies = [
  "agent-session",
  "async-stream",
@@ -559,7 +559,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1450,7 +1450,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1654,7 +1654,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1944,7 +1944,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

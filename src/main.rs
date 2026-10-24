@@ -248,8 +248,9 @@ impl PairingReport {
             parts.push(format!("{new_unmatched} response(s) matched no request"));
         }
         log::warn!(
-            "{}. The probe reports threads, not connections, so a reply streamed while another \
-             HTTP connection on the same thread is active can be lost (datrail/railmon#70).",
+            "{}. A reply can be lost when the capture loses bytes, or, for an agent whose TLS \
+             records name no connection (rustls), when another HTTP connection on the same \
+             thread is active (datrail/railmon#70).",
             parts.join("; ")
         );
         self.unmatched_reported = unmatched;

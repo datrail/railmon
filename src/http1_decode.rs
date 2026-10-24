@@ -28,8 +28,8 @@
 //! and uncompressed replies are never touched.
 
 use crate::http1_guard::{
-    chunk_position, event_bytes, find, header_info, looks_like_http1_start, parse_size,
-    MAX_BODY_BYTES, MAX_STREAMS,
+    chunk_position, connection_key, event_bytes, find, header_info, looks_like_http1_start,
+    parse_size, MAX_BODY_BYTES, MAX_STREAMS,
 };
 use agentsight_capture::analyzers::Analyzer;
 use agentsight_capture::runners::EventStream;
@@ -40,6 +40,14 @@ use std::collections::HashMap;
 use std::io::Read;
 
 type Key = (u32, u64, bool);
+
+/// The parser's own buffer a read goes to: its TLS connection when the record
+/// names one, otherwise its thread.
+fn stream_key(event: &Event, is_read: bool) -> Key {
+    let stream = connection_key(event)
+        .unwrap_or_else(|| event.data.get("tid").and_then(Value::as_u64).unwrap_or(0));
+    (event.pid, stream, is_read)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Coding {
@@ -76,6 +84,23 @@ impl CompressedReplyDecoder {
         if event.source != "ssl" {
             return vec![event];
         }
+        if event.data.get("connection_closed").and_then(Value::as_bool) == Some(true)
+            && connection_key(&event).is_some()
+        {
+            // The parser retires a connection it can name on its close, so a
+            // reply still held here has to reach it first, as captured: once
+            // the connection is gone the reply could only open a new one with
+            // no request to answer. A close that names no connection retires
+            // nothing there, and keyed by thread it could belong to another.
+            let mut out = Vec::new();
+            for is_read in [true, false] {
+                if let Some(pending) = self.pending.remove(&stream_key(&event, is_read)) {
+                    out.extend(pending.events);
+                }
+            }
+            out.push(event);
+            return out;
+        }
         let Some(text) = event.data.get("data").and_then(Value::as_str) else {
             return vec![event];
         };
@@ -90,8 +115,7 @@ impl CompressedReplyDecoder {
         if !is_read && !is_write {
             return vec![event];
         }
-        let tid = event.data.get("tid").and_then(Value::as_u64).unwrap_or(0);
-        let key = (event.pid, tid, is_read);
+        let key = stream_key(&event, is_read);
         let bytes = event_bytes(&event, text);
         let truncated = event
             .data
@@ -170,7 +194,7 @@ impl CompressedReplyDecoder {
             }
             None => {
                 log::debug!(
-                    "pid {} tid {}: a {:?}-encoded reply could not be decoded within {} bytes; \
+                    "pid {} stream {:x}: a {:?}-encoded reply could not be decoded within {} bytes; \
                      passed on as captured",
                     key.0,
                     key.1,
@@ -542,6 +566,80 @@ mod tests {
             );
             assert_eq!(out[0].data["len"], json!(head.len() + SSE.len()));
         }
+    }
+
+    /// The fields AgentSight 1.0.35 names a record's TLS connection with.
+    fn on(mut event: Event, handle: &str) -> Event {
+        event.data["transport_handle"] = json!(handle);
+        event.data["process_start_ns"] = json!(12345);
+        event.data["tls_library"] = json!("openssl");
+        event
+    }
+
+    /// Two connections on one Node thread, each with a compressed streamed
+    /// reply, read interleaved: keyed by thread, the second reply's head
+    /// would release the first unchanged, still compressed.
+    #[test]
+    fn interleaved_replies_on_two_connections_are_each_decoded() {
+        let framed = node_chunked(&gzip(SSE.as_bytes()));
+        let a = reads(GZIP_HEAD, &framed, 16, 100);
+        let b = reads(GZIP_HEAD, &framed, 16, 500);
+        let mut events = Vec::new();
+        for i in 0..a.len().max(b.len()) {
+            events.extend(a.get(i).cloned().map(|e| on(e, "0xa")));
+            events.extend(b.get(i).cloned().map(|e| on(e, "0xb")));
+        }
+        let out = run(events);
+        assert_eq!(out.len(), 2, "{}", snapshot(&out).join("\n"));
+        for (event, handle) in out.iter().zip(["0xa", "0xb"]) {
+            assert_eq!(event.data["transport_handle"], handle);
+            assert_eq!(split_message(&data_bytes(event)).1, SSE.as_bytes());
+        }
+    }
+
+    /// The parser retires a connection on its close, so a reply still held
+    /// for it reaches the parser first.
+    #[test]
+    fn a_close_releases_its_connections_held_reply_first() {
+        let framed = node_chunked(&gzip(SSE.as_bytes()));
+        let mut events: Vec<Event> = reads(GZIP_HEAD, &framed[..framed.len() / 2], 8, 1)
+            .into_iter()
+            .map(|e| on(e, "0xa"))
+            .collect();
+        let held = events.len();
+        let other = on(ssl(90, "READ/RECV", 1, GZIP_HEAD), "0xb");
+        events.push(other);
+        let mut close = on(ssl(99, "CLOSE", 1, b"null"), "0xa");
+        close.data["connection_closed"] = json!(true);
+        events.push(close);
+        let out = run(events.clone());
+        assert_eq!(out.len(), held + 1, "0xb's reply stays held");
+        assert_eq!(
+            snapshot(&out[..held]),
+            snapshot(&events[..held]),
+            "as captured"
+        );
+        assert_eq!(out[held].data["function"], "CLOSE");
+    }
+
+    /// A close that names no connection retires nothing in the parser, and
+    /// keyed by thread it could be another connection's.
+    #[test]
+    fn a_close_without_a_connection_releases_nothing() {
+        let framed = node_chunked(&gzip(SSE.as_bytes()));
+        let mut events = reads(GZIP_HEAD, &framed[..framed.len() / 2], 8, 1);
+        let mut close = ssl(50, "CLOSE", 1, b"null");
+        close.data["connection_closed"] = json!(true);
+        events.push(close);
+        events.extend(
+            reads(b"", &framed[framed.len() / 2..], 8, 60)
+                .into_iter()
+                .skip(1),
+        );
+        let out = run(events);
+        assert_eq!(out.len(), 2, "{}", snapshot(&out).join("\n"));
+        assert_eq!(out[0].data["function"], "CLOSE");
+        assert_eq!(split_message(&data_bytes(&out[1])).1, SSE.as_bytes());
     }
 
     #[test]
