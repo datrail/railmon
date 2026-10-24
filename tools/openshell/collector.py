@@ -56,9 +56,10 @@ FIRST_WINDOW_SECONDS = 3600
 DEFAULT_INTERVAL = 60
 CLI_TIMEOUT = 30.0
 POST_TIMEOUT = 15.0
-# Each denial's text fields are capped (about 7.5 KB at worst), so 250 stay
-# under RailDash's 2 MiB body limit.
-MAX_DENIALS_PER_POST = 250
+# RailDash takes at most 2,000 denials and 2 MiB a post; a post is cut at
+# whichever of these comes first.
+MAX_DENIALS_PER_POST = 1000
+MAX_POST_BYTES = 1024 * 1024
 # Denials RailDash hasn't taken yet (it was down), kept to post again; past
 # this many the oldest go and the span is marked PARTIAL.
 MAX_PENDING_DENIALS = 10_000
@@ -87,7 +88,13 @@ WRAPPER_FIELDS = ("active_version", "current_policy_version", "version", "hash",
 
 
 class CollectorError(Exception):
-    """A setting or call that failed; the message says which."""
+    """A setting or call that failed; the message says which. `refused` is
+    True when RailDash answered that the post itself is wrong (a 4xx other
+    than auth or rate limiting), so sending it again can't help."""
+
+    def __init__(self, message: str, refused: bool = False) -> None:
+        super().__init__(message)
+        self.refused = refused
 
 
 # --------------------------------------------------------------- the CLI
@@ -197,8 +204,10 @@ def parse_log(text: str) -> tuple[list[float], list[dict[str, Any]]]:
             net = NET_OPEN.match(denied["rest"])
             if net is None:
                 continue
+            port = int(net["port"]) if net["port"] else None
             denial.update(kind="net", host=net["host"], binary=net["binary"],
-                          port=int(net["port"]) if net["port"] else None, **_brackets(net["tail"]))
+                          port=port if port is not None and 0 < port < 65536 else None,
+                          **_brackets(net["tail"]))
         else:
             http = HTTP_REQUEST.match(denied["rest"])
             if http is None:
@@ -240,7 +249,8 @@ class DenialCursor:
 
     def batch(self, text: str | None, now: float) -> dict[str, Any]:
         """The post for one poll's output (None: the poll failed)."""
-        gap_from = None if self.last_seen is None else _iso(self.last_seen)
+        anchor = self.last_seen if self.last_seen is not None else self.started
+        gap_from = None if anchor is None else _iso(anchor)
         if text is None:
             return {"denials": [], "partial": {"from": gap_from, "to": _iso(now), "reasons": ["poll_failed"]}}
         stamps, denials = parse_log(text)
@@ -312,12 +322,30 @@ def raildash_token() -> str:
     return value
 
 
+def encode(body: dict[str, Any]) -> bytes:
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def chunks(denials: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Posts of at most MAX_DENIALS_PER_POST denials and MAX_POST_BYTES."""
+    out: list[list[dict[str, Any]]] = [[]]
+    size = 0
+    for denial in denials:
+        length = len(encode(denial)) + 1
+        if out[-1] and (len(out[-1]) >= MAX_DENIALS_PER_POST or size + length > MAX_POST_BYTES):
+            out.append([])
+            size = 0
+        out[-1].append(denial)
+        size += length
+    return out
+
+
 def post(raildash_url: str, sandbox: str, what: str, body: dict[str, Any]) -> dict[str, Any]:
     parts = urlsplit(raildash_url)
     path = f"{parts.path.rstrip('/')}/v1/openshell/sandboxes/{quote(sandbox, safe='')}/{what}"
     request = Request(
         urlunsplit((parts.scheme, parts.netloc, path, "", "")),
-        data=json.dumps(body, separators=(",", ":")).encode(),
+        data=encode(body),
         headers={"Content-Type": "application/json", "Accept": "application/json",
                  "X-RailDash-Token": raildash_token()},
         method="POST",
@@ -327,7 +355,8 @@ def post(raildash_url: str, sandbox: str, what: str, body: dict[str, Any]) -> di
             return json.loads(response.read() or b"null")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
-        raise CollectorError(f"RailDash refused the {what} post: HTTP {exc.code}: {detail}") from exc
+        refused = 400 <= exc.code < 500 and exc.code not in (401, 403, 408, 429)
+        raise CollectorError(f"RailDash refused the {what} post: HTTP {exc.code}: {detail}", refused) from exc
     except (URLError, TimeoutError, OSError, ValueError) as exc:
         raise CollectorError(f"RailDash {what} post failed: {exc}") from exc
 
@@ -392,19 +421,30 @@ class Collector:
         if not denials and partial is None:
             return
         posted = 0
-        try:
-            for start in range(0, max(1, len(denials)), MAX_DENIALS_PER_POST):
-                chunk = {"denials": denials[start:start + MAX_DENIALS_PER_POST],
-                         "partial": partial if start == 0 else None}
-                post(self.raildash_url, self.sandbox, "denials", chunk)
-                posted = start + len(chunk["denials"])
-                partial = None
-            self._say("denials post", None)
-        except CollectorError as exc:
-            # Kept, not dropped: the cursor has moved past these lines, so
-            # the next poll won't read them again.
-            self.pending = {"denials": denials[posted:], "partial": partial}
-            self._say("denials post", str(exc))
+        for chunk in chunks(denials):
+            try:
+                post(self.raildash_url, self.sandbox, "denials", {"denials": chunk, "partial": partial})
+            except CollectorError as exc:
+                if exc.refused:
+                    # RailDash says this post is wrong: sending it again
+                    # would block every later one. Its span is marked.
+                    self.log(f"railmon openshell: RailDash refused {len(chunk)} denials, dropped: {exc}")
+                    if chunk:
+                        partial = merge_partial(partial, {"from": chunk[0]["at"], "to": chunk[-1]["at"],
+                                                          "reasons": ["gap"]})
+                    posted += len(chunk)
+                    continue
+                # Kept, not dropped: the cursor has moved past these lines,
+                # so the next poll won't read them again.
+                self.pending = {"denials": denials[posted:], "partial": partial}
+                self._say("denials post", str(exc))
+                return
+            posted += len(chunk)
+            partial = None
+        if partial is not None:
+            # The last chunk was refused: its span still has to arrive.
+            self.pending = {"denials": [], "partial": partial}
+        self._say("denials post", None)
 
     def once(self) -> None:
         self.poll_policy()

@@ -284,6 +284,33 @@ class CollectorTest(OpenShellCliTest):
         self.assertEqual(poller.pending, {"denials": [], "partial": None})
         self.assertTrue(any("denials post: ok again" in m for m in self.messages))
 
+    def test_a_post_raildash_refuses_is_dropped_with_its_span_marked(self):
+        poller = self.make()
+        FakeRailDash.status = 422
+        poller.poll_denials()
+        self.assertTrue(any("RailDash refused 3 denials, dropped" in m for m in self.messages))
+        # Not queued again; only its span waits, as a gap.
+        self.assertEqual(poller.pending["denials"], [])
+        self.assertEqual(poller.pending["partial"]["reasons"], ["first_poll", "gap"])
+        FakeRailDash.status = 201
+        before = len(FakeRailDash.posts)
+        poller.poll_denials()
+        self.assertEqual(FakeRailDash.posts[-1][2]["denials"], [])
+        self.assertEqual(FakeRailDash.posts[-1][2]["partial"]["reasons"], ["first_poll", "gap"])
+        self.assertEqual(len(FakeRailDash.posts), before + 1)
+
+    def test_posts_are_cut_by_count_and_by_size(self):
+        small = {"at": "2026-10-24T00:00:00.000Z", "hash": "a" * 32, "kind": "net", "path": "é" * 2048}
+        cut = collector.chunks([small] * 3000)
+        self.assertTrue(all(len(collector.encode({"denials": c, "partial": None})) < 2 * 1024 * 1024 for c in cut))
+        self.assertTrue(all(len(c) <= collector.MAX_DENIALS_PER_POST for c in cut))
+        self.assertEqual(sum(len(c) for c in cut), 3000)
+        self.assertEqual(collector.chunks([]), [[]])
+
+    def test_an_out_of_range_port_is_no_port(self):
+        line = "[1792867645.652] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /bin/x(1) -> example.org:99999 [reason:r]"
+        self.assertIsNone(collector.parse_log(line)[1][0]["port"])
+
     def test_an_unchanged_policy_is_posted_again_before_raildash_calls_it_stale(self):
         stamps, _ = collector.parse_log(LOG)
         clock = [max(stamps)]
