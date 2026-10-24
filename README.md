@@ -98,6 +98,18 @@ socket mounted, `--pid host`, `--privileged`) chooses the processes itself:
 - it attaches again when the container restarts or is recreated, so the PID
   never has to be looked up.
 
+**An agent in an OpenShell sandbox.** Every variable or flag that names the
+agent's container (`RAIL_COLLECT_CONTAINER`, `RAIL_LISTEN_CONTAINER`,
+`RAIL_FILES_CONTAINER`, `scan --container`) also takes `openshell:<sandbox>`.
+OpenShell names the sandbox's workload container after an id it generates,
+and the name changes when the sandbox is recreated. So RailMon finds the one
+running container labelled `openshell.ai/sandbox-name=<sandbox>` and
+`openshell.ai/isolation-role=sandbox` again on every attach and every scan.
+While none runs, the supervisors wait and a scan fails, and the next interval
+tries again. Several running containers are logged as an error, and none of
+them is watched. A scan's agent key defaults to the sandbox name, and its
+bundle is the one a scan of that container's name gives.
+
 Its log names the process and file it chose. A collector that keeps exiting
 right after it starts ends the supervisor with the collector's status. It
 refuses `--pid`, `--uid`, `--comm`, `--binary-path`, `--session` and
@@ -355,7 +367,7 @@ The ones you are most likely to set:
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `SSLSNIFF_PATH`, else `bin/agentsight` if it exists, else `/usr/local/bin/agentsight`; the image sets its own | The AgentSight probe binary. |
-| `RAIL_COLLECT_CONTAINER` | `collect` | none | Capture one container's agent: see [Following a container](#following-a-container). |
+| `RAIL_COLLECT_CONTAINER` | `collect` | none | Capture one container's agent, or with `openshell:<sandbox>` an OpenShell sandbox's: see [Following a container](#following-a-container). |
 
 A flag always wins over its variable. `scan` exits 2 when the evidence bundle
 it built fails its contract, when a delivery (`--register` or RailDash) fails,

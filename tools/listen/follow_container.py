@@ -3,7 +3,8 @@
 
 `railmon listen` with RAIL_LISTEN_CONTAINER set runs this. The supervisor
 itself sits in the host PID namespace, so the agent cannot see or signal it.
-Each round it asks Docker for the container's PID and runs AgentSight's
+Each round it asks Docker for the container's PID (for `openshell:<sandbox>`,
+first which container is that sandbox's now, DR-247) and runs AgentSight's
 process probe with `--pidns-of` that PID (DR-170), its events written in
 listensnoop's lines by `agentsight_adapter.py`, appending to the output.
 --pidns-of pins the namespace when the probe starts and does not die with
@@ -157,11 +158,39 @@ def listening_sockets(pid: int, proc: str = PROC, host_pids: bool = False) -> li
     return records
 
 
-def container_pid(docker: str, container: str) -> int:
-    """The container's init PID on the host, or 0 while it is not running."""
+def load_container_ref():
+    """tools/scan/container_ref.py, loaded by path as load_adapter is: the
+    scanner and the supervisors share one sandbox lookup (DR-247)."""
+    spec = importlib.util.spec_from_file_location(
+        "container_ref", os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                                      "scan", "container_ref.py"))
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+container_ref = load_container_ref()
+# The last problem logged for each reference, so a sandbox with two running
+# containers is logged once, not on every poll.
+_reported: dict[str, str | None] = {}
+
+
+def container_pid(docker: str, container: str, log=None) -> int:
+    """The container's init PID on the host, or 0 while it is not running.
+    `container` may be `openshell:<sandbox>`, looked up again on every call,
+    so a recreated sandbox's new container is the one found (DR-247). With
+    `log`, a lookup problem is logged once until it changes."""
+    resolved, problem = container_ref.resolve(container, docker)
+    if log is not None and _reported.get(container) != problem:
+        _reported[container] = problem
+        if problem:
+            log(f"{problem}; not attaching until exactly one runs")
+    if resolved is None:
+        return 0
     try:
         out = subprocess.run(
-            [docker, "inspect", "-f", "{{.State.Pid}}", container],
+            [docker, "inspect", "-f", "{{.State.Pid}}", resolved],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -368,7 +397,7 @@ def main() -> int:
                         "operator's own --probe under nsenter")
     parser.add_argument("--heartbeat", type=int, default=60,
                         help="AgentSight's --heartbeat (--source agentsight only)")
-    parser.add_argument("container", help="agent container name or id")
+    parser.add_argument("container", help="agent container name or id, or openshell:<sandbox>")
     parser.add_argument("listensnoop_args", nargs=argparse.REMAINDER,
                         help="arguments passed to the probe")
     args = parser.parse_args()
@@ -404,7 +433,7 @@ def main() -> int:
 
     waiting_logged = False
     while not stopping:
-        pid = container_pid(docker, args.container)
+        pid = container_pid(docker, args.container, log)
         if not pid:
             if not waiting_logged:
                 log(f"waiting for container {args.container} to run")

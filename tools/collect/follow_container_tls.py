@@ -4,7 +4,8 @@
 `railmon collect` with RAIL_COLLECT_CONTAINER set runs this instead of the
 collector directly. It sits in the host PID namespace and, each round:
 
-1. asks Docker for the container's init PID;
+1. asks Docker for the container's init PID (for `openshell:<sandbox>`,
+   the sandbox's current workload container's, DR-247);
 2. finds the TLS library the agent uses, the way AgentSight's `docker://`
    reference does: the first process in the container's tree that maps a
    `libssl.so`, or whose executable has TLS built in (Node, Bun, and other
@@ -210,7 +211,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--collector", default=os.environ.get("RAIL_COLLECTOR", "/usr/local/bin/railmon"),
                         help="collector binary")
-    parser.add_argument("container", help="agent container name or id")
+    parser.add_argument("container", help="agent container name or id, or openshell:<sandbox>")
     parser.add_argument("collector_args", nargs=argparse.REMAINDER,
                         help="arguments passed to the collector, e.g. --mode http --webhook URL")
     args = parser.parse_args()
@@ -235,7 +236,7 @@ def main() -> int:
     waiting_for = None
     fast_exits = 0
     while not stopping:
-        init = container_pid(docker, args.container)
+        init = container_pid(docker, args.container, log)
         if not init:
             if waiting_for != "container":
                 log(f"waiting for container {args.container} to run")
