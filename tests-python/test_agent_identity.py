@@ -2365,6 +2365,104 @@ class DistinctOpensTest(unittest.TestCase):
             self.assertEqual(supervisor.returncode, 0)
 
 
+class ClaimOutputTest(unittest.TestCase):
+    """A probe's output file is one agent's: after AGENT_CONTAINER changes,
+    the previous agent's listeners and files are not the new one's (DR-253)."""
+
+    def test_another_agent_moves_the_file_aside(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "listen.jsonl")
+            Path(out + ".container").write_text("datrail-demo-agent\n")
+            Path(out).write_text('{"kind":"start"}\n')
+            Path(out + ".previous").write_text("older\n")
+            moved = follow_container.claim_output(out, "my-agent")
+            self.assertIn("moved to", moved)
+            self.assertFalse(os.path.exists(out))
+            self.assertEqual(Path(out + ".previous").read_text(), '{"kind":"start"}\n')
+            self.assertEqual(Path(out + ".container").read_text(), "my-agent\n")
+            self.assertFalse(os.path.exists(out + ".container.tmp"))
+
+    def test_the_same_agent_keeps_its_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "listen.jsonl")
+            Path(out + ".container").write_text("openshell:my-agent\n")
+            Path(out).write_text('{"kind":"start"}\n')
+            self.assertIsNone(follow_container.claim_output(out, "openshell:my-agent"))
+            self.assertEqual(Path(out).read_text(), '{"kind":"start"}\n')
+            self.assertFalse(os.path.exists(out + ".previous"))
+
+    def test_a_file_from_before_the_marker_is_taken_as_this_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "files.jsonl")
+            Path(out).write_text('{"kind":"start"}\n')
+            self.assertIsNone(follow_container.claim_output(out, "datrail-demo-agent"))
+            self.assertEqual(Path(out).read_text(), '{"kind":"start"}\n')
+            self.assertEqual(Path(out + ".container").read_text(), "datrail-demo-agent\n")
+
+    def test_a_marker_without_a_file_only_changes_hands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "files.jsonl")
+            Path(out + ".container").write_text("datrail-demo-agent\n")
+            self.assertIsNone(follow_container.claim_output(out, "my-agent"))
+            self.assertFalse(os.path.exists(out + ".previous"))
+            self.assertEqual(Path(out + ".container").read_text(), "my-agent\n")
+
+    def test_the_scan_refuses_a_file_written_for_another_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "listen.jsonl"
+            out.write_text('{"kind":"start"}\n')
+            (Path(tmp) / "listen.jsonl.container").write_text("datrail-demo-agent\n")
+            with self.assertRaisesRegex(scanner.ScannerError, "written for datrail-demo-agent, not my-agent"):
+                scanner.check_probe_file_owner(out, "my-agent")
+            scanner.check_probe_file_owner(out, "datrail-demo-agent")
+            scanner.check_probe_file_owner(out, None)
+            # The same running container by another name: its id.
+            inspect = {"datrail-demo-agent": {"Id": "c0ffee"}, "c0ffee": {"Id": "c0ffee"}}
+            with mock.patch.object(scanner, "docker_inspect", side_effect=lambda ref: inspect[ref]), \
+                    mock.patch.object(scanner, "resolve_container", side_effect=lambda ref: ref):
+                scanner.check_probe_file_owner(out, "c0ffee")
+            (Path(tmp) / "listen.jsonl.container").unlink()
+            scanner.check_probe_file_owner(out, "my-agent")
+
+    def test_the_supervisor_starts_a_switched_agent_on_a_fresh_file(self):
+        import signal
+        import subprocess
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_docker = tmp_path / "docker"
+            fake_docker.write_text("#!/bin/sh\necho 4242\n")
+            fake_nsenter = tmp_path / "nsenter"
+            fake_nsenter.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n')
+            probe = tmp_path / "filesnoop"
+            probe.write_text('#!/bin/sh\necho \'{"kind":"start"}\'\nexec sleep 30\n')
+            for script in (fake_docker, fake_nsenter, probe):
+                script.chmod(0o755)
+            files = tmp_path / "files.jsonl"
+            demo = b'{"kind":"start"}\n{"kind":"open","path":"/opt/demo_client.py"}\n'
+            files.write_bytes(demo)
+            (tmp_path / "files.jsonl.container").write_text("datrail-demo-agent\n")
+            env = {**os.environ, "RAIL_DOCKER": str(fake_docker), "RAIL_NSENTER": str(fake_nsenter)}
+            supervisor = subprocess.Popen(
+                [sys.executable, str(ROOT / "tools/listen/follow_container.py"), "--command", "files",
+                 "--source", "probe", "--probe", str(probe), "--output", str(files), "my-agent", "-n"],
+                env=env, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 20
+                previous = tmp_path / "files.jsonl.previous"
+                while time.monotonic() < deadline and not (
+                        previous.exists() and files.exists() and files.read_bytes()):
+                    time.sleep(0.05)
+            finally:
+                supervisor.send_signal(signal.SIGTERM)
+                _, stderr = supervisor.communicate(timeout=20)
+            self.assertEqual(files.read_bytes(), b'{"kind":"start"}\n')
+            self.assertEqual((tmp_path / "files.jsonl.previous").read_bytes(), demo)
+            self.assertIn("written for datrail-demo-agent; moved to", stderr)
+            self.assertEqual(supervisor.returncode, 0)
+
+
 class RegistrationStatusTest(unittest.TestCase):
     """A scorer reading "registered" off an agent that never reached the control
     plane would be reading a lie, so the status reports the outcome."""

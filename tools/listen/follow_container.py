@@ -39,6 +39,11 @@ the same; only the feature file's raw event counts (`outside_namespace`,
 instead of every one. Past 16,384 paths of a class, where the attribute is
 already PARTIAL, which entries are listed may differ.
 
+The output file is one agent's (DR-253): `<output>.container` names the
+reference it was written for, and a supervisor started for another agent
+moves the old file to `<output>.previous` first (`claim_output`), so the
+scanner never reports the previous agent's listeners or files as this one's.
+
 With `--source probe` the probe is an operator's own listensnoop or
 filesnoop binary instead (`--probe`, else LISTENSNOOP_PATH): entered with
 nsenter into the agent's PID namespace, it dies with the agent, and
@@ -336,6 +341,37 @@ def copy_distinct(stream, sink, seen: set[bytes]) -> None:
         sink.flush()
 
 
+def claim_output(path: str, container: str) -> str | None:
+    """Make `path` this agent's before anything is appended to it (DR-253).
+
+    The output outlives the supervisor (a named volume in the Compose stack),
+    and its records don't name the container they came from, so after
+    AGENT_CONTAINER changes the scanner would report the previous agent's
+    listeners and files as the new one's. `<path>.container` holds the
+    reference the file was written for. Started for another one, the file
+    moves to `<path>.previous` (replacing an older one) and a fresh file
+    begins. A file with no marker predates it and is taken as this agent's,
+    so an upgrade with the same agent keeps its records. The same reference
+    (a restarted container, a recreated `openshell:` sandbox) keeps its file.
+    Returns what was done, for the log, or None."""
+    marker = path + ".container"
+    try:
+        with open(marker, encoding="utf-8") as stream:
+            owner = stream.read().strip()
+    except FileNotFoundError:
+        owner = None
+    if owner == container:
+        return None
+    moved = None
+    if owner is not None and os.path.exists(path):
+        os.replace(path, path + ".previous")
+        moved = f"{path} was written for {owner}; moved to {path}.previous for {container}"
+    with open(marker + ".tmp", "w", encoding="utf-8") as stream:
+        stream.write(container + "\n")
+    os.replace(marker + ".tmp", marker)
+    return moved
+
+
 def log(message: str) -> None:
     print(f"[railmon {COMMAND}] {message}", file=sys.stderr, flush=True)
 
@@ -420,6 +456,15 @@ def main() -> int:
     probe_name = "agentsight" if agentsight else os.path.basename(listensnoop)
     stop_probe = stop_agentsight if agentsight else stop_listensnoop
     output = args.output if args.output is not None else os.environ.get("RAIL_LISTEN_FILE")
+    if output:
+        try:
+            moved = claim_output(output, args.container)
+        except OSError as exc:
+            # A single-file bind mount, or a directory it can't write: append
+            # as before, with no marker, so the scan checks nothing.
+            moved = f"cannot mark {output} as {args.container}'s, appending to it: {exc}"
+        if moved:
+            log(moved)
     sink = open(output, "ab", buffering=0) if output else sys.stdout.buffer
     seen = seen_opens(output) if args.distinct_opens else set()
 
