@@ -235,7 +235,15 @@ container's PID namespace. The agent sees and can signal neither. When the
 container's PID changes (the agent restarted) the supervisor restarts the
 probe on the new namespace, and when the probe exits it attaches again.
 Start `listen` before the scan: it creates the file, and a scan fails while
-the file is missing.
+the file is missing. The file holds one agent's records:
+`listen.jsonl.container` names the agent it was written for, and when
+`listen` starts for another `RAIL_LISTEN_CONTAINER`, it moves the old file to
+`listen.jsonl.previous` and begins a fresh one, so the new agent's bundle never
+lists the previous agent's sockets (one generation is kept, so switching
+back starts that agent fresh too). `files` does the same with its file. A
+scan that runs before they have (the three start together) fails that
+interval rather than read the previous agent's file, and the next reads the
+fresh one.
 
 The probe runs with two options:
 - `--pidns-of` the agent, so only the agent's namespace is recorded,

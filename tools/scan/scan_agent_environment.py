@@ -2256,6 +2256,39 @@ def _bounded_lines(stream: Any, limit: int = MAX_LISTEN_LINE) -> Iterable[str]:
         yield line
 
 
+def same_container(first: str, second: str) -> bool:
+    """Whether two container references are one running container now."""
+    try:
+        ids = {docker_inspect(resolve_container(ref)).get("Id") for ref in (first, second)}
+    except ScannerError:
+        return False
+    return len(ids) == 1 and None not in ids
+
+
+def check_probe_file_owner(path: Path, container: str | None) -> None:
+    """Refuse a listen or files file written for another agent (DR-253).
+
+    `railmon listen` and `railmon files` name the agent their file is for in
+    `<file>.container`, and move the file aside when started for another
+    one. A scan that starts with them after AGENT_CONTAINER changed can run
+    before they have, so it fails that interval rather than report the
+    previous agent's records as this one's; the next interval reads the
+    fresh file. No marker (a probe from before it, or a file written by
+    hand) and no `--container` check nothing. Two references to one running
+    container (its name and its id) are the same agent."""
+    if not container:
+        return
+    try:
+        owner = path.with_name(path.name + ".container").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ScannerError(f"cannot read {path}.container: {exc}") from exc
+    if owner and owner != container and not same_container(owner, container):
+        raise ScannerError(f"{path} was written for {owner}, not {container}; "
+                           "its probe starts a fresh one when it attaches to the new agent")
+
+
 def load_listen_events(path: Path) -> dict[str, Any]:
     # Streamed, not read whole: listensnoop appends for as long as it runs.
     try:
@@ -2390,9 +2423,11 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         )
     listen_file = resolve_listen_file(args)
     if listen_file:
+        check_probe_file_owner(Path(listen_file).expanduser(), getattr(args, "container", None))
         identity["observed_listeners"] = load_listen_events(Path(listen_file).expanduser())
     files_file = resolve_files_file(args)
     if files_file:
+        check_probe_file_owner(Path(files_file).expanduser(), getattr(args, "container", None))
         identity["observed_file_access"] = load_file_events(Path(files_file).expanduser(), context["env"])
     return context, payload, identity
 
