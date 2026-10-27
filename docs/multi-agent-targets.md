@@ -50,7 +50,9 @@ What the collector checks beyond the schema, and what a violation looks like:
   agent's uid, and RailMon keeps the agent's processes: those descended from
   it, or in its session. A worker that starts a session of its own, as
   OpenClaw's CLI does every turn, is still the agent's. A process that
-  switches to another uid (a setuid helper such as `sudo`) is not.
+  switches its real uid (as `sudo` does) is not. Two agents also collide
+  when one's real uid is the other's uid, as for one started through a
+  setuid binary.
 - **Locators are re-read only while some target is down.** Every 5 s, while
   at least one declared target has no tap, RailMon re-resolves every locator.
   A running target whose locator now collides with another's is tapped as

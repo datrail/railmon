@@ -84,7 +84,14 @@ pub struct ProcessIncarnation {
     pub pid: u32,
     pub start_time_ticks: u64,
     pub session_id: u32,
+    /// `/proc/<pid>`'s owner: the effective uid.
     pub uid: u32,
+    /// The first of `/proc/<pid>/status`'s `Uid:` fields: the real uid, the
+    /// one AgentSight's `-u` compares in the kernel. A process started
+    /// through a setuid binary has it apart from `uid`, so collisions are
+    /// checked on both. Not printed with the resolved targets.
+    #[serde(skip)]
+    pub real_uid: u32,
 }
 
 /// Per-target discovery result. A manifest declares an agent whether or not
@@ -129,24 +136,6 @@ impl ProcessIncarnation {
             fs::metadata(format!("/proc/{}", self.pid)).is_ok_and(|meta| meta.uid() == self.uid);
         same_incarnation && same_uid
     }
-}
-
-/// The uid AgentSight's `-u` compares, in the kernel, with each event's:
-/// the process's real uid, the first of `/proc/<pid>/status`'s `Uid:`
-/// fields. `uid` above is `/proc/<pid>`'s owner, the effective uid, which a
-/// process started through a setuid binary has apart from its real one; its
-/// tap would hear nothing. A process that is already gone keeps `uid`: its
-/// tap is stopped by `is_live` anyway.
-pub fn real_uid(process: &ProcessIncarnation) -> Option<u32> {
-    let status = fs::read_to_string(format!("/proc/{}/status", process.pid)).ok();
-    let real = status.as_deref().and_then(|status| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix("Uid:"))
-            .and_then(|uids| uids.split_whitespace().next())
-            .and_then(|uid| uid.parse().ok())
-    });
-    Some(real.unwrap_or(process.uid))
 }
 
 /// The Rail Center `agent_id` each keyed target registered under, read from
@@ -429,7 +418,7 @@ impl TargetManifest {
 }
 
 /// Downgrades every `Available` outcome that shares a process incarnation,
-/// session, or uid with another `Available` outcome to `Ambiguous`, in
+/// session, or uid (effective or real, either way round) with another `Available` outcome to `Ambiguous`, in
 /// place. Pure and free of I/O so it can be exercised directly with
 /// synthetic `ProcessIncarnation`s, without needing a second real uid.
 fn mark_collisions(outcomes: &mut [DiscoveryOutcome]) {
@@ -447,6 +436,9 @@ fn mark_collisions(outcomes: &mut [DiscoveryOutcome]) {
                 .or_default()
                 .push(index);
             by_uid.entry(process.uid).or_default().push(index);
+            if process.real_uid != process.uid {
+                by_uid.entry(process.real_uid).or_default().push(index);
+            }
         }
     }
 
@@ -564,6 +556,9 @@ fn try_resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessInc
     let uid = fs::metadata(&proc_dir)
         .with_context(|| format!("target '{}' is not live", target.agent_key))?
         .uid();
+    let status = fs::read_to_string(proc_dir.join("status"))
+        .with_context(|| format!("target '{}' is not live", target.agent_key))?;
+    let real_uid = parse_real_uid(&status).context("malformed /proc status: no Uid line")?;
     validate_control_path(&locator_path, Some(uid))?;
     if uid == supervisor_uid {
         bail!(
@@ -589,7 +584,18 @@ fn try_resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessInc
         start_time_ticks,
         session_id,
         uid,
+        real_uid,
     })
+}
+
+fn parse_real_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn parse_proc_stat(expected_pid: u32, stat: &str) -> Result<(u32, u64)> {
@@ -1169,6 +1175,7 @@ mod tests {
             start_time_ticks,
             session_id,
             uid,
+            real_uid: uid,
         })
     }
 
@@ -1195,19 +1202,31 @@ mod tests {
     }
 
     #[test]
-    fn the_real_uid_is_read_from_status_and_a_gone_process_keeps_its_own() {
-        let me = ProcessIncarnation {
-            pid: std::process::id(),
-            start_time_ticks: 0,
-            session_id: 0,
-            uid: u32::MAX - 1,
-        };
-        assert_eq!(real_uid(&me), Some(unsafe { libc::getuid() }));
-        let gone = ProcessIncarnation {
-            pid: u32::MAX,
-            ..me
-        };
-        assert_eq!(real_uid(&gone), Some(u32::MAX - 1));
+    fn the_real_uid_is_the_first_of_status_uid_fields() {
+        let status = "Name:\tsudo\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_real_uid(status), Some(1000));
+        assert_eq!(parse_real_uid("Name:\tx\n"), None);
+    }
+
+    #[test]
+    fn mark_collisions_downgrades_one_agents_real_uid_that_is_anothers_effective_uid() {
+        // B was started through a setuid binary: its real uid is A's, so the
+        // kernel would hand both taps each other's records.
+        let a = available(10, 100, 10, 1000);
+        let mut b = available(20, 200, 20, 0);
+        if let DiscoveryOutcome::Available(process) = &mut b {
+            process.real_uid = 1000;
+        }
+        let mut outcomes = vec![a, b];
+        mark_collisions(&mut outcomes);
+        for outcome in &outcomes {
+            match outcome {
+                DiscoveryOutcome::Ambiguous { reason, .. } => {
+                    assert!(reason.contains("share a uid"))
+                }
+                other => panic!("expected ambiguous, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1324,6 +1343,7 @@ mod tests {
                     start_time_ticks: 100,
                     session_id: 42,
                     uid: 1000,
+                    real_uid: 1000,
                 },
                 colliding: vec![0],
             },
@@ -1406,6 +1426,7 @@ mod tests {
             start_time_ticks,
             session_id,
             uid,
+            real_uid: uid,
         };
         assert!(
             incarnation.is_live(),

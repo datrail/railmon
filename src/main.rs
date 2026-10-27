@@ -920,9 +920,14 @@ async fn reconcile_shared_taps(
         // A session's leader is the process whose PID is the session's id.
         // Colliding locators that resolved to processes of different uids
         // (defensive: see `SharedTap::incarnations`) leave the uid open.
-        let uids: Vec<Option<u32>> = plan.incarnations.iter().map(identity::real_uid).collect();
-        let uid = match uids.as_slice() {
-            [first, rest @ ..] if rest.iter().all(|uid| uid == first) => *first,
+        let uid = match plan.incarnations.as_slice() {
+            [first, rest @ ..]
+                if rest
+                    .iter()
+                    .all(|process| process.real_uid == first.real_uid) =>
+            {
+                Some(first.real_uid)
+            }
             _ => None,
         };
         match spawn_target_tap(
@@ -1130,7 +1135,7 @@ async fn run_multi_target(
                     agentsight,
                     binary_path,
                     process.pid,
-                    identity::real_uid(&process),
+                    Some(process.real_uid),
                     &label,
                 )
                 .await
@@ -1408,7 +1413,7 @@ async fn run_multi_target(
                             .capture_binary_path()
                             .or_else(|| args.binary_path.clone());
                         let label = format!("'{}'", target.agent_key);
-                        match spawn_target_tap(agentsight, binary_path, process.pid, identity::real_uid(&process), &label).await {
+                        match spawn_target_tap(agentsight, binary_path, process.pid, Some(process.real_uid), &label).await {
                             Ok(stream) => {
                                 log::info!("target '{}' resolved again; tap restarted", target.agent_key);
                                 stream_map.insert(TapSlot::Target(index), stream);
@@ -1502,6 +1507,7 @@ agents:
             start_time_ticks: u64::from(pid) * 10,
             session_id,
             uid,
+            real_uid: uid,
         }
     }
 
