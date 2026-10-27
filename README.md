@@ -95,11 +95,13 @@ socket mounted, `--pid host`, `--privileged`) chooses the processes itself:
   OpenSSL or BoringSSL, so `--comm node` finds no library to hook and
   captures nothing;
 - it runs the collector with `--binary-path` set to the kernel's link to that
-  file (`/proc/<pid>/map_files/…` or `/proc/<pid>/exe`) and `--session` set
-  to that process's session. The agent's processes in that session that use
-  that file are captured; other sessions, the host's and `docker exec`'s
-  included, are not. A child that starts its own session, or uses a
-  different TLS library than the one found first, is not captured;
+  file (`/proc/<pid>/map_files/…` or `/proc/<pid>/exe`) and `--process-tree`
+  set to the container's init. The container's processes that use that file
+  are captured, a child that starts a session of its own included (OpenClaw's
+  CLI runs each turn that way); the host's and `docker exec`'s processes are
+  not, unless one exits before the collector reads its first record, which
+  is then let through rather than lost. A process that uses a different TLS
+  library than the one found first is not captured;
 - it attaches again when the container restarts or is recreated, so the PID
   never has to be looked up.
 
@@ -119,9 +121,9 @@ bundle is otherwise the one a scan of that container's name gives.
 
 Its log names the process and file it chose. A collector that keeps exiting
 right after it starts ends the supervisor with the collector's status. It
-refuses `--pid`, `--uid`, `--comm`, `--binary-path`, `--session` and
-`--target-manifest`; leave `RAIL_COLLECT_CONTAINER` unset to pass those
-yourself.
+refuses `--pid`, `--uid`, `--comm`, `--binary-path`, `--session`,
+`--process-tree` and `--target-manifest`; leave `RAIL_COLLECT_CONTAINER`
+unset to pass those yourself.
 
 `railmon` with a command (`railmon collect`, `railmon scan`, …) is the
 container image's entrypoint, so those commands work only inside the

@@ -90,8 +90,8 @@ scanner skips an agent.
 ## Running it
 
 Keyed capture needs `--output-format runtime-interaction` and the default
-`--mode http`, and cannot be combined with `--pid`, `--uid`, `--comm` or
-`--session`:
+`--mode http`, and cannot be combined with `--pid`, `--uid`, `--comm`,
+`--session` or `--process-tree`:
 
 ```bash
 railmon collect \
@@ -189,7 +189,7 @@ Drop `--target-manifest` (and `--registration-state` /
 `legacy-http` rows; unset `--target-manifest` / `RAIL_TARGET_MANIFEST` for the
 scanner. Both return to their previous behaviour unchanged: collector rows
 carry no `agent_ref` or `attribution` and read `agent_id` from the ticket as
-before, and `--pid`/`--uid`/`--comm`/`--session` work again.
+before, and `--pid`/`--uid`/`--comm`/`--session`/`--process-tree` work again.
 
 The keyed files the scanner wrote (`….<agent_key>` next to the registration,
 feature and evidence-bundle outputs) are left on disk; delete them if the

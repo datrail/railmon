@@ -15,6 +15,7 @@ mod http1_guard;
 mod identity;
 mod interaction;
 mod pipeline;
+mod process_tree;
 mod sink;
 
 use anyhow::{Context, Result};
@@ -98,12 +99,21 @@ struct Args {
     comm: Option<String>,
 
     /// Capture only processes in this process session (host PID namespace).
-    /// A container's processes share its init's session unless one starts
-    /// its own, so this scopes capture to one container; `railmon collect`
-    /// with RAIL_COLLECT_CONTAINER sets it (DR-187). An event whose process
-    /// has already exited is let through, since its session can't be read.
+    /// An event whose process has already exited is let through, since its
+    /// session can't be read. A container's processes share its init's
+    /// session only until one starts its own, as OpenClaw's worker does on
+    /// every turn; to scope capture to a container, use --process-tree.
     #[arg(long)]
     session: Option<u32>,
+
+    /// Capture only this process (host PID namespace) and its descendants:
+    /// a container's init, to scope capture to the container's own
+    /// processes, including any that start a session of their own, but not
+    /// a `docker exec` process. `railmon collect` with RAIL_COLLECT_CONTAINER
+    /// sets it (DR-187). A record from a process that exited before it could
+    /// be placed is let through, as with --session.
+    #[arg(long, value_name = "PID")]
+    process_tree: Option<u32>,
 
     /// Path to the agentsight (or bare sslsniff) binary. Defaults to
     /// AGENTSIGHT_PATH, then SSLSNIFF_PATH, then ./bin/agentsight, then the
@@ -414,6 +424,7 @@ async fn main() -> Result<()> {
         uid: args.uid,
         comm: args.comm.clone(),
         process_session: args.session,
+        process_tree: args.process_tree,
     };
 
     log::info!("session {session_id}, agentsight at {}", agentsight);
@@ -730,6 +741,7 @@ async fn spawn_session_tap(
         uid: None,
         comm: None,
         process_session: Some(session_id),
+        process_tree: None,
     };
     let (stream, status) = pipeline::event_stream(agentsight, &filters)
         .await
@@ -1030,9 +1042,14 @@ async fn run_multi_target(
     if !matches!(args.output_format, OutputFormat::RuntimeInteraction) {
         anyhow::bail!("keyed capture requires --output-format runtime-interaction");
     }
-    if args.pid.is_some() || args.uid.is_some() || args.comm.is_some() || args.session.is_some() {
+    if args.pid.is_some()
+        || args.uid.is_some()
+        || args.comm.is_some()
+        || args.session.is_some()
+        || args.process_tree.is_some()
+    {
         anyhow::bail!(
-            "--pid, --uid, --comm and --session cannot be combined with --target-manifest"
+            "--pid, --uid, --comm, --session and --process-tree cannot be combined with --target-manifest"
         );
     }
 
