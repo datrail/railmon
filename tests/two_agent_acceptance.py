@@ -195,12 +195,17 @@ agents:
             # it will get: the same two rows, indexed under the same keys.
             stored = get_json(f"{raildash}/api/interactions")
             require(stored.get("total") == len(rows), f"RailDash stored {stored.get('total')} rows, not {len(rows)}")
+            # RailDash keeps the PID that made each call: planner's own or
+            # its worker's, and executor's.
+            stored_pids: dict[str, set[int]] = {name: set() for name in by_key}
             for item in stored["items"]:
                 name = item.get("agent_key")
                 require(name in by_key, f"RailDash row names agent {name!r}")
                 require(item.get("attribution_state") == "attributed", f"RailDash lost {name}'s attribution")
-                require(item.get("pid") == by_key[name]["attribution"]["process"]["pid"], f"RailDash crossed {name}'s PID")
+                stored_pids[name].add(item.get("pid"))
                 require(item.get("status_code") == 200, f"RailDash lost {name}'s response status")
+            expected_pids = {"planner": {agents[0].pid, worker}, "executor": {agents[1].pid}}
+            require(stored_pids == expected_pids, f"RailDash stored PIDs {stored_pids}, not {expected_pids}")
             filters = get_json(f"{raildash}/api/filters")
             require(
                 filters.get("agent_keys") == sorted(by_key),
