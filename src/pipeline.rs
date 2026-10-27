@@ -35,6 +35,10 @@ pub struct CaptureFilters {
     pub uid: Option<i32>,
     pub comm: Option<String>,
     pub process_session: Option<u32>,
+    /// Kept here, not handed to the probe, which has no such filter: only
+    /// records from this process and its descendants are read
+    /// (`process_tree`).
+    pub process_tree: Option<u32>,
 }
 
 /// Build the probe's command line.
@@ -412,9 +416,12 @@ pub async fn event_stream(
     // The child rides in the stream's state, so it lives exactly as long as the
     // capture and `kill_on_drop` stops it when the stream is dropped. When its
     // output ends we reap it and publish the exit status.
+    let tree = filters
+        .process_tree
+        .map(crate::process_tree::ProcessTree::new);
     let raw = stream::unfold(
-        (lines, child, Some(status_tx)),
-        |(mut lines, mut child, mut status_tx)| async move {
+        (lines, child, Some(status_tx), tree),
+        |(mut lines, mut child, mut status_tx, mut tree)| async move {
             loop {
                 let line = match lines.next_line().await {
                     Ok(Some(line)) => line,
@@ -429,7 +436,10 @@ pub async fn event_stream(
                     }
                 };
                 if let Some(event) = ssl_event_from_line(&line) {
-                    return Some((event, (lines, child, status_tx)));
+                    if tree.as_mut().is_some_and(|tree| !tree.admits(event.pid)) {
+                        continue;
+                    }
+                    return Some((event, (lines, child, status_tx, tree)));
                 }
             }
         },
@@ -1348,11 +1358,16 @@ mod tests {
     /// Every interaction the chain and the pairer make of `records`, and the
     /// pairer after the stream ended.
     async fn pair_replayed(records: &[Value]) -> (Vec<Value>, Pairer) {
+        pair_replayed_with(records, &CaptureFilters::default()).await
+    }
+
+    async fn pair_replayed_with(
+        records: &[Value],
+        filters: &CaptureFilters,
+    ) -> (Vec<Value>, Pairer) {
         let dir = tempfile::tempdir().expect("tempdir");
         let probe = replay_probe(dir.path(), records);
-        let (stream, _status) = event_stream(&probe, &CaptureFilters::default())
-            .await
-            .expect("start replay");
+        let (stream, _status) = event_stream(&probe, filters).await.expect("start replay");
         let events: Vec<Event> =
             tokio::time::timeout(std::time::Duration::from_secs(10), stream.collect())
                 .await
@@ -1363,6 +1378,51 @@ mod tests {
             .filter_map(|event| pairer.accept(event.pid, &event.data, event.timestamp))
             .collect();
         (paired, pairer)
+    }
+
+    /// The capture as if made by `pid`.
+    fn as_from(records: &[Value], pid: u32) -> Vec<Value> {
+        records
+            .iter()
+            .map(|record| {
+                let mut record = record.clone();
+                record["pid"] = json!(pid);
+                record["data"]["pid"] = json!(pid);
+                record
+            })
+            .collect()
+    }
+
+    /// `--process-tree`: a record from a descendant of the root is read,
+    /// whatever its session (the child here starts one of its own, as
+    /// OpenClaw's worker does), and one from outside the tree is not.
+    #[tokio::test]
+    async fn a_process_tree_keeps_its_descendants_records_only() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep");
+        child.arg("30");
+        // SAFETY: setsid is async-signal-safe, as pre_exec requires.
+        unsafe {
+            child.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = child.spawn().expect("spawn a worker");
+        let filters = CaptureFilters {
+            process_tree: Some(std::process::id()),
+            ..Default::default()
+        };
+        let (inside, _) =
+            pair_replayed_with(&as_from(&two_connections_capture(), child.id()), &filters).await;
+        let (outside, _) =
+            pair_replayed_with(&as_from(&two_connections_capture(), 1), &filters).await;
+        child.kill().expect("kill the worker");
+        child.wait().expect("reap the worker");
+        assert_eq!(inside.len(), 2, "{inside:#?}");
+        assert!(outside.is_empty(), "{outside:#?}");
     }
 
     /// The path a demo reply names in its own events, `{"path": "/fast", …}`.

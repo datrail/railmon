@@ -14,9 +14,12 @@ collector directly. It sits in the host PID namespace and, each round:
    program linked against libssl names `SSL_write` without containing it;
 3. runs the collector with `--binary-path` naming that file through the
    kernel's own link to it (`/proc/<pid>/map_files/<range>` or
-   `/proc/<pid>/exe`) and `--session` set to that process's session. Every
-   process in that session that uses that file is captured; others, the
-   host's and `docker exec` sessions included (the scanner's), are not;
+   `/proc/<pid>/exe`) and `--process-tree` set to the container's init.
+   Every process descending from it that uses that file is captured, a
+   worker that starts a session of its own included (OpenClaw's, on every
+   turn, datrail/railmon#70); others, the host's and `docker exec`
+   processes (the scanner's) included, are not, unless one exits before
+   the collector reads its first record (see src/process_tree.rs);
 4. stops the collector (which flushes what it holds) and starts again when
    the container is recreated or restarted, or when the agent's process is
    replaced by one using a different TLS library file.
@@ -143,16 +146,6 @@ def children(pid: int, proc: str = PROC) -> list[int]:
     return found
 
 
-def session_of(pid: int, proc: str = PROC) -> int | None:
-    """Field 6 of /proc/<pid>/stat, after the parenthesised comm."""
-    try:
-        with open(f"{proc}/{pid}/stat") as f:
-            stat = f.read()
-        return int(stat[stat.rindex(")") + 2:].split()[3])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 def comm_of(pid: int, proc: str = PROC) -> str:
     try:
         with open(f"{proc}/{pid}/comm") as f:
@@ -216,7 +209,8 @@ def main() -> int:
                         help="arguments passed to the collector, e.g. --mode http --webhook URL")
     args = parser.parse_args()
     passthrough = [a for a in args.collector_args if a != "--"]
-    for flag in ("--pid", "--uid", "--comm", "--binary-path", "--session", "--target-manifest"):
+    for flag in ("--pid", "--uid", "--comm", "--binary-path", "--session", "--process-tree",
+                 "--target-manifest"):
         if any(a == flag or a.startswith(flag + "=") for a in passthrough):
             log(f"{flag} chooses the processes itself; unset RAIL_COLLECT_CONTAINER to use it")
             return 2
@@ -248,8 +242,7 @@ def main() -> int:
             time.sleep(POLL_SECONDS)
             continue
         target = find_tls_target(init, cache)
-        session = session_of(target[0]) if target else None
-        if not target or session is None:
+        if not target:
             if waiting_for != "tls":
                 log(f"no process in container {args.container} loads libssl or has TLS built in yet; "
                     f"nothing to capture until one does (checking every {POLL_SECONDS:.0f}s)")
@@ -262,11 +255,11 @@ def main() -> int:
         pid, path, how = target
         identity = file_identity(path)
         log(f"attaching to {args.container}: pid {pid} ({comm_of(pid)}) {how}; "
-            f"--binary-path {path} --session {session}")
+            f"--binary-path {path} --process-tree {init}")
         started = time.monotonic()
         agent_gone = False
         child = subprocess.Popen([args.collector, *passthrough, "--binary-path", path,
-                                  "--session", str(session)])
+                                  "--process-tree", str(init)])
         reason = None
         while not stopping and reason is None:
             time.sleep(POLL_SECONDS)
@@ -287,9 +280,9 @@ def main() -> int:
             elif not alive(pid):
                 replaced = find_tls_target(init, cache)
                 if replaced is None:
-                    pass  # keep the attach; the agent may start again in this session
-                elif file_identity(replaced[1]) != identity or session_of(replaced[0]) != session:
-                    reason = f"pid {pid} was replaced by one using another TLS library or session"
+                    pass  # keep the attach; the agent may start again in this container
+                elif file_identity(replaced[1]) != identity:
+                    reason = f"pid {pid} was replaced by one using another TLS library"
                 else:
                     pid = replaced[0]
         code = stop(child)

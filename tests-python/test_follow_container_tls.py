@@ -97,7 +97,6 @@ class ResolverTest(unittest.TestCase):
         self.assertEqual(pid, 41)
         self.assertTrue(path.startswith(f"{self.fake.proc}/41/map_files/"))
         self.assertIn("libssl.so.3", how)
-        self.assertEqual(tls.session_of(41, proc=self.fake.proc), 40)
 
     def test_a_needle_across_a_read_boundary_is_found(self):
         self.fake.file("/bin/agent", b"\0" * (tls.CHUNK - 4) + b"SSL_write")
@@ -138,16 +137,12 @@ class ResolverTest(unittest.TestCase):
         self.fake.process(11, "/bin/sh")
         self.assertIsNone(tls.find_tls_target(10, {}, proc=self.fake.proc))
 
-    def test_the_session_is_read_after_a_comm_with_spaces_and_parens(self):
-        self.fake.file("/bin/x")
-        self.fake.process(10, "/bin/x", comm="a) (b", session=4242)
-        self.assertEqual(tls.session_of(10, proc=self.fake.proc), 4242)
-
     def test_a_flag_that_picks_processes_itself_is_refused(self):
-        out = subprocess.run([sys.executable, str(SCRIPT), "agent", "--mode", "http", "--comm", "node"],
-                             capture_output=True, text=True, timeout=30)
-        self.assertEqual(out.returncode, 2)
-        self.assertIn("--comm", out.stderr)
+        for flag in ("--comm", "--process-tree"):
+            out = subprocess.run([sys.executable, str(SCRIPT), "agent", "--mode", "http", flag, "7"],
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(out.returncode, 2)
+            self.assertIn(flag, out.stderr)
 
 
 @unittest.skipUnless(Path("/proc/self/maps").exists() and os.geteuid() == 0,
@@ -202,7 +197,7 @@ class FollowTest(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"collector started fewer than {n} times")
 
-    def test_attaches_to_the_containers_libssl_and_session_and_follows_a_restart(self):
+    def test_attaches_to_the_containers_libssl_and_tree_and_follows_a_restart(self):
         first = self.start_agent()
         if tls.mapped_libssl(first) is None:
             self.skipTest("this python's ssl module does not map a libssl.so")
@@ -216,14 +211,15 @@ class FollowTest(unittest.TestCase):
             path = call[call.index("--binary-path") + 1]
             self.assertTrue(path.startswith(f"/proc/{first}/map_files/"), path)
             self.assertIn("libssl.so", os.readlink(path))
-            self.assertEqual(call[call.index("--session") + 1], str(first))
+            self.assertEqual(call[call.index("--process-tree") + 1], str(first))
+            self.assertNotIn("--session", call)
 
             gone = self.agents.pop(0)
             gone.kill()
             gone.wait()
             second = self.start_agent()
             call = self.wait_for_calls(2)[1].split()
-            self.assertEqual(call[call.index("--session") + 1], str(second))
+            self.assertEqual(call[call.index("--process-tree") + 1], str(second))
         finally:
             sup.send_signal(signal.SIGTERM)
             _, err = sup.communicate(timeout=30)
