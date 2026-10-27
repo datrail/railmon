@@ -36,8 +36,8 @@ pub struct CaptureFilters {
     pub comm: Option<String>,
     pub process_session: Option<u32>,
     /// Kept here, not handed to the probe, which has no such filter: only
-    /// records from this process and its descendants are read
-    /// (`process_tree`).
+    /// records from this process, its descendants and the processes in its
+    /// session are read (`process_tree`).
     pub process_tree: Option<u32>,
 }
 

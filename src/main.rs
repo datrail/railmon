@@ -106,10 +106,10 @@ struct Args {
     #[arg(long)]
     session: Option<u32>,
 
-    /// Capture only this process (host PID namespace) and its descendants:
-    /// a container's init, to scope capture to the container's own
-    /// processes, including any that start a session of their own, but not
-    /// a `docker exec` process. `railmon collect` with RAIL_COLLECT_CONTAINER
+    /// Capture only this process (host PID namespace), its descendants and
+    /// the processes in its session: a container's init, to scope capture to
+    /// the container's own processes, including any that start a session of
+    /// their own, but not a `docker exec` process. `railmon collect` with RAIL_COLLECT_CONTAINER
     /// sets it (DR-187). A record from a process that exited before it could
     /// be placed is let through, as with --session.
     #[arg(long, value_name = "PID")]
@@ -645,8 +645,8 @@ struct SharedPlan {
 }
 
 /// Groups every `Ambiguous` outcome by the process session its locator
-/// resolved to: one shared tap per session, since two session-scoped taps
-/// on one session would capture every event twice.
+/// resolved to: one shared tap per session, rooted at its leader, since two
+/// taps on one leader would capture every event twice.
 fn plan_shared_taps(
     manifest: &identity::TargetManifest,
     outcomes: &[identity::DiscoveryOutcome],
@@ -920,10 +920,9 @@ async fn reconcile_shared_taps(
         // A session's leader is the process whose PID is the session's id.
         // Colliding locators that resolved to processes of different uids
         // (defensive: see `SharedTap::incarnations`) leave the uid open.
-        let uid = match plan.incarnations.as_slice() {
-            [first, rest @ ..] if rest.iter().all(|process| process.uid == first.uid) => {
-                Some(first.uid)
-            }
+        let uids: Vec<Option<u32>> = plan.incarnations.iter().map(identity::real_uid).collect();
+        let uid = match uids.as_slice() {
+            [first, rest @ ..] if rest.iter().all(|uid| uid == first) => *first,
             _ => None,
         };
         match spawn_target_tap(
@@ -1131,7 +1130,7 @@ async fn run_multi_target(
                     agentsight,
                     binary_path,
                     process.pid,
-                    Some(process.uid),
+                    identity::real_uid(&process),
                     &label,
                 )
                 .await
@@ -1193,7 +1192,7 @@ async fn run_multi_target(
                             // The pinned incarnation is gone (exited, or its
                             // PID/session was reused by an unrelated
                             // process) but this stream is still bound to that
-                            // session filter, so its events are no longer
+                            // PID's uid and tree, so its events are no longer
                             // trustworthy. Never re-read /proc to relabel a
                             // queued event (design doc §4.4/§5) — stop
                             // trusting this stream instead of trying to.
@@ -1210,7 +1209,7 @@ async fn run_multi_target(
                             log_target_availability_transition(&targets, &shared, &mut all_targets_down);
                             continue;
                         }
-                        // The tap was bound to the target's process session.
+                        // The tap was bound to the target's uid and tree.
                         // Stamp the already pinned root incarnation now,
                         // before the interaction enters the sink's
                         // asynchronous webhook queue.
@@ -1409,7 +1408,7 @@ async fn run_multi_target(
                             .capture_binary_path()
                             .or_else(|| args.binary_path.clone());
                         let label = format!("'{}'", target.agent_key);
-                        match spawn_target_tap(agentsight, binary_path, process.pid, Some(process.uid), &label).await {
+                        match spawn_target_tap(agentsight, binary_path, process.pid, identity::real_uid(&process), &label).await {
                             Ok(stream) => {
                                 log::info!("target '{}' resolved again; tap restarted", target.agent_key);
                                 stream_map.insert(TapSlot::Target(index), stream);

@@ -131,6 +131,24 @@ impl ProcessIncarnation {
     }
 }
 
+/// The uid AgentSight's `-u` compares, in the kernel, with each event's:
+/// the process's real uid, the first of `/proc/<pid>/status`'s `Uid:`
+/// fields. `uid` above is `/proc/<pid>`'s owner, the effective uid, which a
+/// process started through a setuid binary has apart from its real one; its
+/// tap would hear nothing. A process that is already gone keeps `uid`: its
+/// tap is stopped by `is_live` anyway.
+pub fn real_uid(process: &ProcessIncarnation) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{}/status", process.pid)).ok();
+    let real = status.as_deref().and_then(|status| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|uids| uids.split_whitespace().next())
+            .and_then(|uid| uid.parse().ok())
+    });
+    Some(real.unwrap_or(process.uid))
+}
+
 /// The Rail Center `agent_id` each keyed target registered under, read from
 /// the scanner's own keyed registration state. It is what lets an unsigned
 /// `x-rail` ticket's claimed `agent_id` be resolved to an `agent_key` (design
@@ -1174,6 +1192,22 @@ mod tests {
                 other => panic!("expected Ambiguous, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn the_real_uid_is_read_from_status_and_a_gone_process_keeps_its_own() {
+        let me = ProcessIncarnation {
+            pid: std::process::id(),
+            start_time_ticks: 0,
+            session_id: 0,
+            uid: u32::MAX - 1,
+        };
+        assert_eq!(real_uid(&me), Some(unsafe { libc::getuid() }));
+        let gone = ProcessIncarnation {
+            pid: u32::MAX,
+            ..me
+        };
+        assert_eq!(real_uid(&gone), Some(u32::MAX - 1));
     }
 
     #[test]
