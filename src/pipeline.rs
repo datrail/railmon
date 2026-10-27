@@ -395,8 +395,15 @@ pub async fn event_stream(
     let cmd = build_command(agentsight_path, filters);
     log::info!("starting: {}", cmd.join(" "));
 
-    let mut child = Command::new(&cmd[0])
-        .args(&cmd[1..])
+    let mut command = Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    // The probe has no flag for a process tree: RailMon keeps it itself
+    // (below). Naming the root in the probe's environment tells whoever reads
+    // it (`ps e`, the acceptance scripts' stub probes) which tree a tap is for.
+    if let Some(root) = filters.process_tree {
+        command.env("RAILMON_TAP_ROOT", root.to_string());
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         // Otherwise the probe outlives us with its eBPF programs still

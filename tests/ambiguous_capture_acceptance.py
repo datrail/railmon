@@ -49,8 +49,8 @@ STUB = """#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as log:
-    log.write(json.dumps({"args": args, "pid": os.getpid()}) + "\\n")
-pid = int(args[args.index("--session") + 1])
+    log.write(json.dumps({"args": args, "pid": os.getpid(), "root": os.environ["RAILMON_TAP_ROOT"]}) + "\\n")
+pid = int(os.environ["RAILMON_TAP_ROOT"])
 base = {"source": "ssl", "pid": pid, "comm": "python",
         "data": {"pid": pid, "tid": pid, "timestamp_ns": time.monotonic_ns(), "function": "SSL_write"}}
 request = json.loads(json.dumps(base))
@@ -101,7 +101,7 @@ def require_one_tap_per_session(taps_log: pathlib.Path, phase: int) -> None:
     deadline = time.monotonic() + 3
     while True:
         live = [
-            int(tap["args"][tap["args"].index("--session") + 1])
+            int(tap["root"])
             for tap in taps(taps_log)
             if running(tap["pid"])
         ]
@@ -246,7 +246,7 @@ agents:
         railmon.send_signal(signal.SIGINT)
         require(railmon.wait(timeout=5) == 0, "RailMon did not stop cleanly")
         rows = read_rows(output)
-        sessions = [int(tap["args"][tap["args"].index("--session") + 1]) for tap in taps(taps_log)]
+        sessions = [int(tap["root"]) for tap in taps(taps_log)]
         require(set(sessions[5:]) == {agent.pid}, f"phase 7 tapped {sessions[5:]}")
         expected = [agent.pid, agent.pid, other.pid, agent.pid, agent.pid]
         require(sessions[:5] == expected, f"taps opened on {sessions}, expected {expected} first")

@@ -10,6 +10,11 @@
 //! container's init, even when reparented to it, while a `docker exec`
 //! process is a child of the runtime's shim, outside the container's tree.
 //!
+//! A process whose parent left the tree but which stays in the root's own
+//! session is in too: when the root leads a session (a keyed target always
+//! does), an orphan reparented outside the tree is still the target's, as it
+//! was under `--session`.
+//!
 //! A process is placed once, from `/proc` in the host PID namespace, while
 //! it runs, and remembered by its start time, so a PID the kernel reuses is
 //! placed again. A record from a process that exited before it was ever
@@ -53,7 +58,7 @@ impl ProcessTree {
         if pid == self.root {
             return true;
         }
-        let Some((parent, start)) = self.stat(pid) else {
+        let Some((parent, session, start)) = self.stat(pid) else {
             return self.placed.get(&pid).is_none_or(|&(_, inside)| inside);
         };
         if let Some(&(known, inside)) = self.placed.get(&pid) {
@@ -61,7 +66,7 @@ impl ProcessTree {
                 return inside;
             }
         }
-        let inside = self.descends(parent);
+        let inside = session == self.root || self.descends(parent);
         if self.placed.len() >= MAX_REMEMBERED {
             let proc = self.proc.clone();
             self.placed
@@ -83,25 +88,29 @@ impl ProcessTree {
                 return false;
             }
             match self.stat(pid) {
-                Some((parent, _)) => pid = parent,
+                Some((parent, _, _)) => pid = parent,
                 None => return false,
             }
         }
         false
     }
 
-    /// (parent pid, start time) from `/proc/<pid>/stat`, read after the
-    /// parenthesised comm. The comm is the process's to set: it can hold
+    /// (parent pid, session, start time) from `/proc/<pid>/stat`, read after
+    /// the parenthesised comm. The comm is the process's to set: it can hold
     /// spaces, parentheses and bytes that aren't UTF-8, so only the ASCII
     /// fields after it are decoded.
-    fn stat(&self, pid: u32) -> Option<(u32, u64)> {
+    fn stat(&self, pid: u32) -> Option<(u32, u32, u64)> {
         let bytes = std::fs::read(self.proc.join(pid.to_string()).join("stat")).ok()?;
         let after = bytes.iter().rposition(|&b| b == b')')? + 2;
         let text = std::str::from_utf8(bytes.get(after..)?).ok()?;
         let fields: Vec<&str> = text.split_whitespace().collect();
-        // Field 4 is the parent and field 22 the start time; the slice starts
-        // at field 3, the state.
-        Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+        // Field 4 is the parent, field 6 the session and field 22 the start
+        // time; the slice starts at field 3, the state.
+        Some((
+            fields.get(1)?.parse().ok()?,
+            fields.get(3)?.parse().ok()?,
+            fields.get(19)?.parse().ok()?,
+        ))
     }
 }
 
@@ -111,10 +120,19 @@ mod tests {
     use std::path::Path;
 
     fn process(proc: &Path, pid: u32, parent: u32, start: u64, comm: &str) {
+        in_session(proc, pid, parent, 0, start, comm);
+    }
+
+    fn in_session(proc: &Path, pid: u32, parent: u32, session: u32, start: u64, comm: &str) {
         let dir = proc.join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let mut fields = vec!["S".to_string(), parent.to_string()];
-        fields.extend((5..22).map(|n| n.to_string()));
+        let mut fields = vec![
+            "S".to_string(),
+            parent.to_string(),
+            "5".into(),
+            session.to_string(),
+        ];
+        fields.extend((7..22).map(|n| n.to_string()));
         fields.push(start.to_string());
         fields.push("0".into());
         std::fs::write(
@@ -165,6 +183,22 @@ mod tests {
         process(dir.path(), 102, 100, 30, "openclaw");
         let mut tree = ProcessTree::with_proc(100, dir.path());
         assert!(tree.admits(102));
+    }
+
+    #[test]
+    fn an_orphan_reparented_out_of_the_tree_stays_in_by_the_roots_session() {
+        let dir = tempfile::tempdir().unwrap();
+        container(dir.path());
+        // A keyed target 101 leads session 101; its daemon 104 was orphaned
+        // to the host's init but kept the session, while 105 left both.
+        in_session(dir.path(), 101, 100, 101, 20, "agent");
+        in_session(dir.path(), 104, 1, 101, 70, "daemon");
+        in_session(dir.path(), 105, 1, 105, 80, "daemon");
+        let mut tree = ProcessTree::with_proc(101, dir.path());
+        assert!(tree.admits(102), "a worker in a session of its own");
+        assert!(tree.admits(104), "an orphan still in the target's session");
+        assert!(!tree.admits(105), "an orphan that left the session too");
+        assert!(!tree.admits(100), "the target's own parent");
     }
 
     #[test]

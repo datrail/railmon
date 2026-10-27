@@ -725,23 +725,35 @@ type TargetStream = Pin<Box<dyn Stream<Item = TargetStreamItem> + Send>>;
 /// rule out a busy-loop; a flat interval already does that.
 const TARGET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Spawns one tap scoped to a pinned incarnation's process session, and
-/// wraps its event/exit streams into one `TargetStreamItem` stream keyed
-/// later by `TapSlot` in a `StreamMap`. Used both at startup and to restart
-/// a tap that previously stopped; `label` only names it in errors.
-async fn spawn_session_tap(
+/// Spawns one tap scoped to a pinned incarnation, and wraps its event/exit
+/// streams into one `TargetStreamItem` stream keyed later by `TapSlot` in a
+/// `StreamMap`. Used both at startup and to restart a tap that previously
+/// stopped; `label` only names it in errors.
+///
+/// The probe drops every other uid in the kernel, before RailMon sees the
+/// event, and each agent runs as a uid of its own; RailMon then keeps the
+/// `leader`'s process tree and session (`process_tree`). A process session
+/// alone loses a worker that starts a session of its own, as OpenClaw's CLI
+/// does every turn (railmon#70), and AgentSight's `--session` lets through,
+/// into every target's tap, a record from a process that exited before it
+/// was looked up. The uid keeps such a record to its own agent.
+async fn spawn_target_tap(
     agentsight: &str,
     binary_path: Option<String>,
-    session_id: u32,
+    leader: u32,
+    uid: Option<u32>,
     label: &str,
 ) -> Result<TargetStream> {
     let filters = CaptureFilters {
         binary_path,
         pid: None,
-        uid: None,
+        // The probe reads the flag with atoi into a uid_t, so a uid past
+        // i32::MAX round-trips through its wrapped value. Only (uid_t)-1,
+        // which no process has, would turn the filter off.
+        uid: uid.map(|uid| uid as i32),
         comm: None,
-        process_session: Some(session_id),
-        process_tree: None,
+        process_session: None,
+        process_tree: Some(leader),
     };
     let (stream, status) = pipeline::event_stream(agentsight, &filters)
         .await
@@ -905,10 +917,20 @@ async fn reconcile_shared_taps(
             "targets {} sharing session {process_session}",
             plan.candidates.join(", ")
         );
-        match spawn_session_tap(
+        // A session's leader is the process whose PID is the session's id.
+        // Colliding locators that resolved to processes of different uids
+        // (defensive: see `SharedTap::incarnations`) leave the uid open.
+        let uid = match plan.incarnations.as_slice() {
+            [first, rest @ ..] if rest.iter().all(|process| process.uid == first.uid) => {
+                Some(first.uid)
+            }
+            _ => None,
+        };
+        match spawn_target_tap(
             agentsight,
             plan.binary_path.clone(),
             process_session,
+            uid,
             &label,
         )
         .await
@@ -1105,20 +1127,25 @@ async fn run_multi_target(
                 // aborting every other target that resolved and started
                 // cleanly.
                 let label = format!("'{}'", target.agent_key);
-                let stream =
-                    match spawn_session_tap(agentsight, binary_path, process.session_id, &label)
-                        .await
-                    {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            log::warn!(
-                                "target '{}' resolved but its tap failed to start: {error:#}",
-                                target.agent_key
-                            );
-                            targets.push(None);
-                            continue;
-                        }
-                    };
+                let stream = match spawn_target_tap(
+                    agentsight,
+                    binary_path,
+                    process.pid,
+                    Some(process.uid),
+                    &label,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        log::warn!(
+                            "target '{}' resolved but its tap failed to start: {error:#}",
+                            target.agent_key
+                        );
+                        targets.push(None);
+                        continue;
+                    }
+                };
                 stream_map.insert(TapSlot::Target(index), stream);
                 targets.push(Some(TargetRuntime {
                     agent_ref: manifest.agent_ref(target),
@@ -1382,7 +1409,7 @@ async fn run_multi_target(
                             .capture_binary_path()
                             .or_else(|| args.binary_path.clone());
                         let label = format!("'{}'", target.agent_key);
-                        match spawn_session_tap(agentsight, binary_path, process.session_id, &label).await {
+                        match spawn_target_tap(agentsight, binary_path, process.pid, Some(process.uid), &label).await {
                             Ok(stream) => {
                                 log::info!("target '{}' resolved again; tap restarted", target.agent_key);
                                 stream_map.insert(TapSlot::Target(index), stream);

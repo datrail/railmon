@@ -76,9 +76,10 @@ def main() -> None:
 import json, os, sys, time
 args = sys.argv
 require = lambda c, m: c or (_ for _ in ()).throw(RuntimeError(m))
-require("--session" in args, "RailMon did not use AgentSight session filtering")
-sid = int(args[args.index("--session") + 1])
+require("-u" in args, "RailMon did not have AgentSight keep only the target's uid")
+sid = int(os.environ["RAILMON_TAP_ROOT"])
 require(os.getsid(sid) == sid, "target is not its own process session")
+require(os.stat(f"/proc/{{sid}}").st_uid == int(args[args.index("-u") + 1]), "the tap's uid is not the target's")
 headers = {{"host": "example.test"}}
 token = json.load(open("{root}/tickets.json")).get(str(sid))
 if token:

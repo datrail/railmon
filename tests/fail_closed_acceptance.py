@@ -82,9 +82,13 @@ STUB = """#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as log:
-    log.write(json.dumps(args) + "\\n")
-flag = next(f for f in ("--session", "--pid", "-p") if f in args)
-pid = int(args[args.index(flag) + 1])
+    root = os.environ.get("RAILMON_TAP_ROOT")
+    log.write(json.dumps(args + ([f"RAILMON_TAP_ROOT={root}"] if root else [])) + "\\n")
+if root:
+    pid = int(root)
+else:
+    flag = next(f for f in ("--pid", "-p") if f in args)
+    pid = int(args[args.index(flag) + 1])
 headers = {"host": "example.test"}
 if os.environ.get("STUB_X_RAIL"):
     headers["x-rail"] = os.environ["STUB_X_RAIL"]
@@ -242,7 +246,9 @@ agents:
             f"ambiguous audit {row['raw'].get('railmon_attribution_audit')}",
         )
         taps = [json.loads(line) for line in (root / "keyed-taps.jsonl").read_text().splitlines()]
-        tapped = sorted(int(args[args.index("--session") + 1]) for args in taps)
+        tapped = sorted(
+            int(arg.removeprefix("RAILMON_TAP_ROOT=")) for args in taps for arg in args if arg.startswith("RAILMON_TAP_ROOT=")
+        )
         require(tapped == sorted([reviewer.pid, shared.pid]), f"taps opened on {tapped}, not once per process")
 
         # Evidence: one v2 collection keeps every key; only the reviewer has any.
@@ -314,7 +320,8 @@ agents:
             require(field not in legacy, f"legacy row gained keyed field {field}")
         taps = [json.loads(line) for line in (root / "legacy-taps.jsonl").read_text().splitlines()]
         require(
-            len(taps) == 1 and taps[0][taps[0].index("-p") + 1] == str(reviewer.pid) and "--session" not in taps[0],
+            len(taps) == 1 and taps[0][taps[0].index("-p") + 1] == str(reviewer.pid) and "--session" not in taps[0]
+            and not any(arg.startswith("RAILMON_TAP_ROOT=") for arg in taps[0]),
             f"legacy tap arguments changed: {taps}",
         )
 
