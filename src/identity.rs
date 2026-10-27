@@ -560,7 +560,9 @@ fn try_resolve_target(target: &Target, supervisor_uid: u32) -> Result<ProcessInc
         .with_context(|| format!("target '{}' is not live", target.agent_key))?;
     let real_uid = parse_real_uid(&status).context("malformed /proc status: no Uid line")?;
     validate_control_path(&locator_path, Some(uid))?;
-    if uid == supervisor_uid {
+    // The real uid too: it is what the tap's -u keeps, and the supervisor's
+    // would hand that tap RailMon's and the probe's own records.
+    if uid == supervisor_uid || real_uid == supervisor_uid {
         bail!(
             "locator {} names a process owned by the supervisor",
             locator_path.display()
