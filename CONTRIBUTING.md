@@ -81,6 +81,10 @@ actual schema — not against what the code currently does.
   [DCO](https://developercertificate.org/)), no CLA.
 - CI runs `make test` and builds the image (amd64 on a pull request; both
   architectures on a release tag). Both jobs must pass.
+- A maintainer reviews the pull request's head commit and records the result
+  as the `rail-review` status on that commit. It is a required check: a pull
+  request merges only once it passes, and every new push needs a new review.
+  When yours is ready, mark it ready for review or ask on the pull request.
 
 ## Reporting a vulnerability
 
