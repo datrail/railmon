@@ -46,7 +46,13 @@ What the collector checks beyond the schema, and what a violation looks like:
   ambiguous — a shared uid or session is not an attribution boundary. Neither
   gets a tap of its own or evidence; each process session they resolved to is
   tapped once instead, and its rows are `ambiguous` with no agent. Two agents
-  may run the same binary; each gets its own tap filtered by its session.
+  may run the same binary; each gets its own tap. The probe keeps only the
+  agent's uid, and RailMon keeps the agent's processes: those descended from
+  it, or in its session. A worker that starts a session of its own, as
+  OpenClaw's CLI does every turn, is still the agent's. A process that
+  switches its real uid (as `sudo` does) is not. Two agents also collide
+  when one's real uid is the other's uid, as for one started through a
+  setuid binary.
 - **Locators are re-read only while some target is down.** Every 5 s, while
   at least one declared target has no tap, RailMon re-resolves every locator.
   A running target whose locator now collides with another's is tapped as

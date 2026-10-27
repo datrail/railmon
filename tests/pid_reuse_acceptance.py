@@ -90,7 +90,7 @@ def main() -> None:
         old_start = start_time_ticks(old.pid)
 
         # Attempt 0 emits one interaction, then waits for `fire` and emits a
-        # second one — the traffic its session filter would still deliver
+        # second one — the traffic its uid filter would still deliver
         # after the reuse — noting first that it was still up to do so. Later attempts emit one
         # interaction and stay up. Each attempt is its own process, hence the
         # counter file.
@@ -100,8 +100,8 @@ def main() -> None:
 import json, os, pathlib, sys, time
 args = sys.argv
 require = lambda c, m: c or (_ for _ in ()).throw(RuntimeError(m))
-require("--session" in args, "RailMon did not use AgentSight session filtering")
-sid = int(args[args.index("--session") + 1])
+require("-u" in args, "RailMon did not have AgentSight keep only the target's uid")
+sid = int(os.environ["RAILMON_TAP_ROOT"])
 counter = pathlib.Path("{root}/attempts")
 attempt = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(attempt + 1))

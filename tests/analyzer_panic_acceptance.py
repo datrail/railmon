@@ -57,7 +57,7 @@ def main() -> None:
             f"""#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 args = sys.argv
-sid = int(args[args.index("--session") + 1])
+sid = int(os.environ["RAILMON_TAP_ROOT"])
 counter = pathlib.Path("{root}/attempts-%d" % sid)
 counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))
 base = {{"source":"ssl","pid":sid,"comm":"python","data":{{"pid":sid,"tid":sid,"timestamp_ns":time.monotonic_ns(),"function":"SSL_write"}}}}
