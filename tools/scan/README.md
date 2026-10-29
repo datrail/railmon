@@ -341,13 +341,16 @@ workload, sandboxed and thread-forked children included. AgentSight does
 not report a UDP socket that sends without binding (listensnoop's
 `autobind`), which is accepted.
 
-Rule pack 14 changes what two attributes say for an unchanged agent, so a
+Rule pack 14 changes what three attributes say for an unchanged agent, so a
 pack-13 baseline is `CONTRACT_MISMATCH` until a pack-14 ASP is locked:
 `observed_file_access` lists a large group of written or run files sharing a
 directory and an extension as `<dir>/*.<ext>` when they would not fit the
 cap (DR-262), and an OpenShell
 provider placeholder (`openshell:resolve:env:KEY`) is a `reference` in
-`credential_inventory`, not a plaintext secret (DR-194).
+`credential_inventory`, not a plaintext secret (DR-194). And `skills_inventory`
+(DR-264) names each MCP skill's `server`, keeps a probed tool's `inputSchema`
+and `annotations`, and marks a server whose tools couldn't be listed
+`mcp_server`, not `mcp_config`.
 
 ## RailDash delivery
 
@@ -1068,11 +1071,15 @@ The scanner looks for MCP config in:
 ~/.mcp.json
 ```
 
-Each `mcpServers` entry becomes registration `SkillInput`s with
-`source_type: "mcp_config"`: a server with a `url` is asked for its tools and
-becomes one skill per tool it declares (or one skill marked unreachable, or
-declaring no tools); a `command` server becomes one skill. Pass custom paths
-with:
+Each `mcpServers` entry becomes registration `SkillInput`s, each naming its
+`server`. A server with a `url` is asked for its tools and becomes one skill
+per tool it declares, `source_type: "mcp_config"`, keeping the tool's
+`inputSchema` (redacted, up to 8 KiB) and `annotations` (MCP's four boolean
+hints and its title). A server whose tools can't be listed (unreachable,
+declaring none, or a `command` server) becomes one skill with
+`source_type: "mcp_server"`: a server, not a tool. `source_type` is one of
+`mcp_config`, `mcp_server` and `skills_config`; a skills file's entry is
+always `skills_config`, whatever the file says. Pass custom paths with:
 
 ```bash
 python3 tools/scan/scan_agent_environment.py \
@@ -1085,8 +1092,9 @@ discovered — no flag
 needed. If both `AGENT_MCP_NAME` and `AGENT_MCP_URL` are set, that server is
 added to the inventory and skills list the same way a `.mcp.json` entry would
 be, merged with any file-derived servers (a server with the same name and
-URL is listed once; skills with the same name are merged, their endpoints
-combined and the longer description kept). Only this one name/URL pair is read; there is no env-var equivalent of
+URL is listed once; one server's skills with the same name are merged, their
+endpoints combined and the longer description kept; two servers' same-named
+tools stay two skills). Only this one name/URL pair is read; there is no env-var equivalent of
 a multi-server `mcpServers` block.
 
 Merge external skills from the skills scanner:

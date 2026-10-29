@@ -94,8 +94,10 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 14 lists a large group of written or run files sharing a directory
 # and an extension as <dir>/*.<ext> when they would not fit the cap (DR-262), and classifies OpenShell's
 # provider placeholders (openshell:resolve:env:KEY) as references, not
-# plaintext secrets (DR-194 I1): either changes what an unchanged agent's
-# observed_file_access or credential_inventory says.
+# plaintext secrets (DR-194 I1), and skills_inventory names each MCP
+# skill's server, keeps a probed tool's inputSchema and annotations, and
+# marks a server it couldn't list mcp_server (DR-264): each changes what an
+# unchanged agent's bundle says.
 RULE_PACK_VERSION = 14
 
 # The value shape of observed_file_access (DR-154), published in the v1

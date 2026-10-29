@@ -934,6 +934,8 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
                     "description": description or f"tool declared by {name} ({source_label})",
                     "destination_endpoints": endpoints,
                     "source_type": "mcp_config",
+                    "server": name,
+                    **tool_schema_fields(tool),
                 }
             )
         return result or [unreachable_mcp_skill(name, source_label, endpoints, "reachable, declares no tools")]
@@ -947,7 +949,8 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
             "name": name,
             "description": f"MCP server configured via {source_label}: {reached}",
             "destination_endpoints": endpoints,
-            "source_type": "mcp_config",
+            "source_type": "mcp_server",
+            "server": name,
         }
     ]
 
@@ -957,7 +960,8 @@ def unreachable_mcp_skill(name: str, source_label: str, endpoints: list[str], re
         "name": name,
         "description": f"MCP server configured via {source_label}: {reason}",
         "destination_endpoints": endpoints,
-        "source_type": "mcp_config",
+        "source_type": "mcp_server",
+        "server": name,
     }
 
 
@@ -1077,7 +1081,8 @@ def collect_strings(value: Any) -> list[str]:
 
 
 def collect_skills(mcp_configs: list[Path], env: dict[str, str] | None = None) -> list[dict[str, Any]]:
-    """Every mcp_config skill across every config path, same-name collisions merged.
+    """Every MCP skill across every config path, collisions of one server's
+    same-named tool merged (two servers' stay apart: `server`, DR-264).
 
     Used to dedupe on name alone and drop the second match outright — safe
     while `name` was an operator-chosen server nickname, but this now reads
@@ -1094,6 +1099,74 @@ def collect_skills(mcp_configs: list[Path], env: dict[str, str] | None = None) -
             skills.extend(read_mcp_config(path))
     skills.extend(read_mcp_config_from_env(env or {}))
     return merge_skill_lists(skills)
+
+
+# A skill's source_type, a closed set (DR-264, Eason 2026-10-29): a tool an
+# MCP server declared (mcp_config), a configured MCP server RailMon could not
+# list tools for, being unreachable, declaring none, or run as a command
+# (mcp_server: a server, not a tool), and a skills file's entry
+# (skills_config). Anything else, a skills file's own spelling included, is
+# skills_config.
+SKILL_SOURCE_TYPES = frozenset({"mcp_config", "mcp_server", "skills_config"})
+# An MCP tool's inputSchema as kept, compact JSON with sorted keys: a larger
+# one is left out rather than letting one server's tools crowd the bundle.
+SKILL_SCHEMA_BYTES = 8192
+SKILL_SCHEMA_DEPTH = 16
+# The behaviour hints MCP's ToolAnnotations defines, kept when boolean.
+MCP_ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+
+
+def _redacted_json(value: Any, depth: int = 0) -> Any:
+    """`value` with every string, keys included, through `redact_text`, or
+    None past SKILL_SCHEMA_DEPTH or for a value JSON has no form for: a
+    schema's descriptions are operator text, like the tool's own."""
+    if depth > SKILL_SCHEMA_DEPTH:
+        return None
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, list):
+        items = [_redacted_json(item, depth + 1) for item in value]
+        return None if any(item is None and raw is not None for item, raw in zip(items, value)) else items
+    if isinstance(value, dict):
+        kept: dict[str, Any] = {}
+        for key, item in value.items():
+            redacted = _redacted_json(item, depth + 1)
+            if redacted is None and item is not None:
+                return None
+            kept[redact_text(str(key))] = redacted
+        return kept
+    return None
+
+
+def tool_schema_fields(tool: dict[str, Any]) -> dict[str, Any]:
+    """`inputSchema` and `annotations` from one tools/list entry, as a probed
+    skill keeps them (DR-264): the schema redacted and within
+    SKILL_SCHEMA_BYTES, the annotations' boolean hints and title. What the
+    classifier needs to tell an upload (an argument named data, a binary
+    format) or a destructive call from a read-looking name."""
+    fields: dict[str, Any] = {}
+    schema = tool.get("inputSchema")
+    if isinstance(schema, dict):
+        redacted = _redacted_json(schema)
+        if isinstance(redacted, dict) and len(
+            json.dumps(redacted, separators=(",", ":"), sort_keys=True)
+        ) <= SKILL_SCHEMA_BYTES:
+            fields["inputSchema"] = redacted
+    annotations = tool.get("annotations")
+    if isinstance(annotations, dict):
+        kept: dict[str, Any] = {
+            hint: annotations[hint] for hint in MCP_ANNOTATION_HINTS if isinstance(annotations.get(hint), bool)
+        }
+        title = annotations.get("title")
+        if isinstance(title, str) and first_nonempty(redact_text(title)):
+            kept["title"] = first_nonempty(redact_text(title))[:255]
+        if kept:
+            fields["annotations"] = kept
+    return fields
 
 
 def normalize_skill(value: Any, source_hint: str) -> dict[str, Any]:
@@ -1122,13 +1195,26 @@ def normalize_skill(value: Any, source_hint: str) -> dict[str, Any]:
     else:
         raise ScannerError(f"invalid skill {name!r} in {source_hint}: destination_endpoints must be a list")
 
-    source_type = first_nonempty(str(value.get("source_type") or "")) or "skills_config"
-    return {
+    source_type = first_nonempty(str(value.get("source_type") or ""))
+    if source_type not in SKILL_SOURCE_TYPES:
+        source_type = "skills_config"
+    skill = {
         "name": name,
         "description": description,
         "destination_endpoints": dedupe(endpoints),
         "source_type": source_type,
     }
+    if source_type != "skills_config":
+        # Which server it came from (DR-264): two servers' same-named tools
+        # stay two skills. A probed tool's schema and annotations, which
+        # tool_schema_fields made, are put through it again here, so this
+        # stays the one place a skill's shape is decided.
+        server = first_nonempty(redact_text(str(value.get("server") or "")))
+        if server:
+            skill["server"] = server
+        if source_type == "mcp_config":
+            skill.update(tool_schema_fields(value))
+    return skill
 
 
 def read_skills_file(path: Path) -> list[dict[str, Any]]:
@@ -1141,7 +1227,12 @@ def read_skills_file(path: Path) -> list[dict[str, Any]]:
         raw_skills = data
     else:
         raise ScannerError(f"skills file must be a SkillInput list or payload object with skills: {path}")
-    return [normalize_skill(skill, str(path)) for skill in raw_skills]
+    # A skills file's entry is skills_config whatever it says (DR-264): it
+    # cannot pass for an MCP server's tool.
+    return [
+        normalize_skill({**skill, "source_type": "skills_config"} if isinstance(skill, dict) else skill, str(path))
+        for skill in raw_skills
+    ]
 
 
 def collect_skills_from_files(paths: list[Path]) -> list[dict[str, Any]]:
@@ -1152,11 +1243,11 @@ def collect_skills_from_files(paths: list[Path]) -> list[dict[str, Any]]:
 
 
 def merge_skill_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
     for group in groups:
         for raw_skill in group:
             skill = normalize_skill(raw_skill, "generated skills")
-            key = (skill["source_type"], skill["name"])
+            key = (skill["source_type"], skill.get("server", ""), skill["name"])
             if key not in merged:
                 merged[key] = skill
                 continue
