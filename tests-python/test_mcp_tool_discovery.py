@@ -284,6 +284,22 @@ class SkillShapeForRailCenterTest(unittest.TestCase):
         self.assertEqual(skill["inputSchema"]["properties"]["size"]["maximum"], 1048576)
         self.assertEqual(skill["annotations"], {"title": "Upload", "readOnlyHint": False, "destructiveHint": True})
 
+    def test_all_schemas_together_stay_within_their_budget(self):
+        # One server's many tools must not push the bundle past 1 MiB.
+        import json
+
+        schema = {"type": "object", "properties": {f"p{i}": {"type": "string", "description": "x" * 40}
+                                                   for i in range(60)}}
+        tools = [{"name": f"t{i:03d}", "description": "d", "source_type": "mcp_config", "entry": "tool",
+                  "server": "big", "inputSchema": schema} for i in range(200)]
+        skills = scanner.merge_skill_lists(tools)
+        kept = [s for s in skills if "inputSchema" in s]
+        self.assertTrue(0 < len(kept) < 200)
+        self.assertEqual([s["name"] for s in kept], [f"t{i:03d}" for i in range(len(kept))])
+        rendered = sum(len(json.dumps(s["inputSchema"], indent=2)) for s in kept)
+        self.assertLessEqual(rendered, scanner.SKILL_SCHEMAS_BYTES)
+        self.assertEqual(len(skills), 200)  # the skills stay, only schemas go
+
     def test_an_oversized_or_malformed_schema_is_left_out(self):
         big = {"type": "object", "description": "x" * (scanner.SKILL_SCHEMA_BYTES + 1)}
         deep: dict = {"type": "object"}

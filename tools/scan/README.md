@@ -1074,7 +1074,8 @@ The scanner looks for MCP config in:
 Each `mcpServers` entry becomes registration `SkillInput`s with
 `source_type: "mcp_config"`, each naming its `server`. A server with a `url`
 is asked for its tools and becomes one skill per tool it declares,
-`entry: "tool"`, keeping the tool's `inputSchema` (redacted, up to 8 KiB) and
+`entry: "tool"`, keeping the tool's `inputSchema` (redacted, up to 8 KiB each and
+256 KiB for all of them as rendered) and
 `annotations` (MCP's four boolean hints and its title). A server whose tools
 can't be listed (unreachable, declaring none, or a `command` server) becomes
 one skill with `entry: "server"`: a server, not a tool. `source_type` is

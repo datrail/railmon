@@ -1117,6 +1117,14 @@ MCP_ENTRIES = frozenset({"tool", "server"})
 # An MCP tool's inputSchema as kept, compact JSON with sorted keys: a larger
 # one is left out rather than letting one server's tools crowd the bundle.
 SKILL_SCHEMA_BYTES = 8192
+# And all of them together, as the bundle renders them (pretty-printed, at
+# the depth skills_inventory's value puts them: SKILL_SCHEMA_INDENT more
+# spaces on each line), so one server with many tools can't push the bundle
+# past RailDash's and Rail Center's 1 MiB bound and have every delivery
+# refused. Past it, a skill's schema is left out, in merge_skill_lists'
+# order, as an oversized one is.
+SKILL_SCHEMAS_BYTES = 256 * 1024
+SKILL_SCHEMA_INDENT = 12
 SKILL_SCHEMA_DEPTH = 16
 # The behaviour hints MCP's ToolAnnotations defines, kept when boolean.
 MCP_ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
@@ -1265,7 +1273,19 @@ def merge_skill_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
             if len(skill["description"]) > len(merged[key]["description"]):
                 merged[key]["description"] = skill["description"]
-    return [merged[key] for key in sorted(merged)]
+    skills = [merged[key] for key in sorted(merged)]
+    used = 0
+    for skill in skills:
+        schema = skill.get("inputSchema")
+        if schema is None:
+            continue
+        rendered = json.dumps(schema, indent=2)
+        size = len(rendered) + SKILL_SCHEMA_INDENT * (rendered.count("\n") + 1)
+        if used + size > SKILL_SCHEMAS_BYTES:
+            del skill["inputSchema"]
+            continue
+        used += size
+    return skills
 
 
 def default_mcp_paths(env: dict[str, str]) -> list[Path]:
