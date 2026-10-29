@@ -1897,12 +1897,22 @@ FILE_ACCESS_TRACKED = 16384
 # kept by path they filled the cap and an ordinary write sorted after them
 # (the agent's own notes under /home/node/work, or /tmp/exfil.tar) was the
 # one left out. When the written and run entries alone do not fit, the
-# directory holding the most of them is listed once, as <dir>/*, with read,
-# write and exec the union of its files, and then the next, until they fit:
-# every place the agent wrote stays in the list, at the price of the names in
-# a crowded directory. Only a directory holding at least FILE_DIR_FOLD_MIN of
-# them, and never /, so a handful of writes is never folded.
+# largest group of them sharing a directory and an extension is listed once,
+# as <dir>/*.<ext>, with read, write and exec the union of its files, and
+# then the next, until they fit. The kind survives, so RailDash judges the
+# entry as it would each file in it: a pattern that matches <dir>/*.js
+# matches every <dir>/<name>.js, and the kind is .js. Only a group of at
+# least FILE_DIR_FOLD_MIN files, never in /, never one without an extension
+# (whose <dir>/* would read as a temp-name template such as /tmp/*), and never
+# onto a path already in the list, such as the bytecode-cache template
+# <dir>/__pycache__/*.pyc: a flood can then only fold files like itself, and
+# a lone write of another kind (/tmp/exfil.tar beside 600 .dat files) stays
+# by name. What does not fold is still dropped past the cap, and the note
+# says so as before.
 FILE_DIR_FOLD_MIN = 32
+# The extension a fold keeps: the name's last suffix, as RailDash's file kind
+# reads it, when it is 1 to 8 letters and digits after a non-empty stem.
+_FOLD_EXTENSION = re.compile(r"[^/]+(?P<extension>\.[A-Za-z0-9]{1,8})")
 # A longer path is counted, not listed: it would let one entry dominate the
 # bundle. PATH_MAX is 4096, so an agent can make one; that is a gap (PARTIAL),
 # never a silent omission.
@@ -2122,6 +2132,11 @@ def summarize_file_access(
       after the /proc fold, and the bytecode-cache fold before the temp
       patterns. Past FILE_ACCESS_TRACKED folds it is a lower bound,
       though every listed templated entry still counts at least 1;
+    - when the written and run entries alone would not fit, the largest
+      groups of them sharing a directory and an extension are folded into
+      one <dir>/*.<ext> entry each (`_fold_crowded_written_dirs`, DR-262)
+      before the cap picks, and `dir_folded` says whether a listed entry is
+      one; what still does not fit is dropped and counted as above;
     - `lost` and the start/alive records mean what they do for listensnoop.
 
     Produce the file with the image's `railmon files` (AgentSight's process
@@ -2250,7 +2265,7 @@ def summarize_file_access(
         # counts, so the note is never lost once the count stopped growing.
         "collapsed": sum(max(folded_into.get(key, 0), 1) for key in
                          ((entry["path"], entry["layer"]) for entry in kept) if key in templated),
-        # Whether a listed entry is a crowded directory's <dir>/* (DR-262).
+        # Whether a listed entry is a fold's <dir>/*.<ext> (DR-262).
         "dir_folded": any((entry["path"], entry["layer"]) in dir_folded for entry in kept),
         "malformed": malformed,
         "outside_namespace": outside,
@@ -2267,36 +2282,37 @@ def _file_entry_size(path: str, access: list[bool], layer: bool) -> int:
 def _fold_crowded_written_dirs(
     files: dict[tuple[str, bool], list[bool]], templated: set[tuple[str, bool]]
 ) -> set[tuple[str, bool]]:
-    """Fold, in place, the directories crowded with written or run entries
-    into one <dir>/* entry each (see FILE_DIR_FOLD_MIN), the most crowded
-    first (then by directory and layer, so the same set always folds the
-    same way), until those entries fit FILE_ACCESS_CAP and FILE_ACCESS_BYTES.
-    A read-only entry in a folded directory stays as it is. Returns the keys
-    of the <dir>/* entries made."""
+    """Fold, in place, the groups of written or run entries sharing a
+    directory, an extension and a layer into one <dir>/*.<ext> entry each
+    (see FILE_DIR_FOLD_MIN), the largest first (then by directory, extension
+    and layer, so the same set always folds the same way), until those
+    entries fit FILE_ACCESS_CAP and FILE_ACCESS_BYTES. A read-only entry
+    stays as it is. Returns the keys of the entries made."""
     written = {key: access for key, access in files.items() if access[1] or access[2]}
     count = len(written)
     size = sum(_file_entry_size(path, access, layer) for (path, layer), access in written.items())
-    groups: dict[tuple[str, bool], list[tuple[str, bool]]] = {}
+    groups: dict[tuple[str, str, bool], list[tuple[str, bool]]] = {}
     for key in written:
-        directory = key[0].rpartition("/")[0]
-        if directory:  # never /
-            groups.setdefault((directory, key[1]), []).append(key)
-    # A fold changes no other directory's group: <dir>/* is in its own.
+        directory, _, name = key[0].rpartition("/")
+        match = _FOLD_EXTENSION.fullmatch(name)
+        if directory and match:  # never /, never without an extension
+            groups.setdefault((directory, match["extension"], key[1]), []).append(key)
+    # A fold changes no other group: <dir>/*.<ext> is in none, as its stem
+    # is `*`, and no fold lands on a path already listed.
     crowded = sorted((item for item in groups.items() if len(item[1]) >= FILE_DIR_FOLD_MIN),
                      key=lambda item: (-len(item[1]), item[0]))
     made: set[tuple[str, bool]] = set()
-    for (directory, layer), keys in crowded:
+    for (directory, extension, layer), keys in crowded:
         if count <= FILE_ACCESS_CAP and size <= FILE_ACCESS_BYTES:
             break
-        folded_key = (f"{directory}/*", layer)
-        before = files.get(folded_key)
-        union = list(before or [False, False, False])
+        folded_key = (f"{directory}/*{extension}", layer)
+        if folded_key in files:
+            continue
+        union = [False, False, False]
         for key in keys:
             union = [old or new for old, new in zip(union, files.pop(key))]
             templated.discard(key)
             size -= _file_entry_size(key[0], written[key], layer)
-        # A written <dir>/* already there (a temp template such as /tmp/*)
-        # is one of keys, so it is counted once either way.
         count -= len(keys) - 1
         files[folded_key] = union
         size += _file_entry_size(folded_key[0], union, layer)

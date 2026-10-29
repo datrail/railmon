@@ -91,8 +91,8 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # observed_file_access onto AgentSight's process probe and the image's
 # AgentSight from v1.0.34 to v1.0.35 (DR-170): their method and notes name
 # the probe that observed them, so a pack-12 baseline is not comparable.
-# Pack 14 lists a directory crowded with written or run files as <dir>/*
-# when they would not fit the cap (DR-262), and classifies OpenShell's
+# Pack 14 lists a large group of written or run files sharing a directory
+# and an extension as <dir>/*.<ext> when they would not fit the cap (DR-262), and classifies OpenShell's
 # provider placeholders (openshell:resolve:env:KEY) as references, not
 # plaintext secrets (DR-194 I1): either changes what an unchanged agent's
 # observed_file_access or credential_inventory says.
@@ -1217,8 +1217,9 @@ def build_evidence_bundle(
         ) + (
             # DR-262: after the temp-name words, so RailDash's reading of the
             # gap before ": files may be missing" is unchanged.
-            "; a directory holding more written or run files than the list has room "
-            "for is listed once, as <dir>/*, with the union of their access"
+            "; where more files were written or run than the list has room for, those "
+            "sharing a directory and an extension are listed once, as <dir>/*.<ext>, "
+            "with the union of their access"
             if file_access.get("dir_folded") else ""
         )
         if file_gaps:

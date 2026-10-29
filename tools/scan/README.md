@@ -343,8 +343,9 @@ not report a UDP socket that sends without binding (listensnoop's
 
 Rule pack 14 changes what two attributes say for an unchanged agent, so a
 pack-13 baseline is `CONTRACT_MISMATCH` until a pack-14 ASP is locked:
-`observed_file_access` lists a directory crowded with written or run files
-as `<dir>/*` when they would not fit the cap (DR-262), and an OpenShell
+`observed_file_access` lists a large group of written or run files sharing a
+directory and an extension as `<dir>/*.<ext>` when they would not fit the
+cap (DR-262), and an OpenShell
 provider placeholder (`openshell:resolve:env:KEY`) is a `reference` in
 `credential_inventory`, not a plaintext secret (DR-194).
 
@@ -601,14 +602,18 @@ the listeners, it only changes when a file is opened in a new way:
   `__pycache__` directory, are folded, so a name that differs on every
   run is not a new path on every scan (see
   [Randomly named temp files](#randomly-named-temp-files) below);
-- when the written and run files alone would not fit, a directory holding
-  at least 32 of them (never `/`) is listed once, as `<dir>/*`, with read,
-  write and exec the union of its files: the most crowded first, until they
-  fit. OpenClaw's gateway copies its ~490 control-UI assets into
+- when the written and run files alone would not fit, the largest group of
+  at least 32 of them sharing a directory and an extension (never in `/`,
+  never without an extension) is listed once, as `<dir>/*.<ext>`, with read,
+  write and exec the union of its files, and then the next, until they fit.
+  OpenClaw's gateway copies its ~490 control-UI assets into
   `~/.openclaw/cache` each time it starts on a fresh home, and listed by name
-  they would push every later write (the agent's own files, `/tmp`) off the
-  list. Every place the agent wrote stays listed, at the price of the names
-  in a crowded directory, and the note says so;
+  they pushed every later write (the agent's own files, `/tmp`) off the
+  list. The kind survives the fold, so a guardrail judges `<dir>/*.js` as it
+  would each `.js` file in it, and a lone write of another kind stays by
+  name. A fold never lands on a path already listed (a temp-name template
+  such as `/tmp/*`, or `__pycache__/*.pyc`). The note says when a fold
+  happened; what still does not fit is dropped as above;
 - the PARTIAL note names the kind of gap, never a count. A written or run
   file that was left out or unnamed has its own words in the note, so a
   baseline already PARTIAL for too many reads still drifts when a write goes

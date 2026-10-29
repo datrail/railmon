@@ -1100,7 +1100,7 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # credential (DR-218), and refuses NaN/Infinity in a config (DR-221);
         # pack 13 moves the listener and file-open probe onto AgentSight and
         # names it in the method and notes, with AgentSight v1.0.35 (DR-170);
-        # pack 14 folds a crowded written directory to <dir>/* (DR-262) and
+        # pack 14 folds a crowded written group to <dir>/*.<ext> (DR-262) and
         # reads OpenShell's provider placeholder as a reference (DR-194).
         self.assertEqual(self.bundle(None)["rule_pack_version"], 14)
 
@@ -1378,17 +1378,17 @@ class ObservedFileAccessBundleTest(unittest.TestCase):
         # DR-262. After the gap and the temp-name words: RailDash reads a
         # reads-only cap from the text before ": files may be missing"
         # (raildash asp.only_reads_left_out), which must stay as it was.
-        crowded = {"path": "/home/node/.openclaw/cache/x/assets/*", "read": False, "write": True,
+        crowded = {"path": "/home/node/.openclaw/cache/x/assets/*.js", "read": False, "write": True,
                    "exec": False, "layer": False}
         answered = self.attribute(self.files([self.WROTE, crowded], dir_folded=True))
         self.assertEqual(answered["status"], "ANSWERED")
-        self.assertIn("is listed once, as <dir>/*", answered["note"])
+        self.assertIn("are listed once, as <dir>/*.<ext>", answered["note"])
         reads_cut = self.attribute(self.files([self.WROTE, crowded], unlisted=9, dir_folded=True))
         self.assertTrue(reads_cut["note"].startswith(
             "more distinct files than the cap (reads are left out first): files may be missing from this list; "
         ), reads_cut["note"])
         self.assertTrue(reads_cut["note"].endswith("with the union of their access"))
-        self.assertNotIn("<dir>/*", self.attribute(self.files([self.WROTE], unlisted=9))["note"])
+        self.assertNotIn("<dir>/*.<ext>", self.attribute(self.files([self.WROTE], unlisted=9))["note"])
 
     def test_a_newly_written_path_changes_this_value_and_nothing_else_moves(self):
         before = self.bundle(self.files([self.READ]))["attributes"]

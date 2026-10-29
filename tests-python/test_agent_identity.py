@@ -2000,62 +2000,87 @@ class EphemeralFileAccessTest(unittest.TestCase):
         self.assertEqual(result["files"], [self.entry("/tmp/tmp*", read=False, write=True)])
         self.assertEqual((result["unlisted"], result["collapsed"]), (0, len(names)))
 
-    def test_a_crowded_written_directory_is_one_entry_so_a_later_write_stays(self):
+    def test_a_crowded_written_group_is_one_entry_so_a_later_write_stays(self):
         # DR-262: OpenClaw's gateway copies ~490 control-UI assets into its
         # cache on start (a staging directory, then its content hash). Listed
         # by name they filled the cap and the agent's own write sorted after
         # them was the one left out.
         cap = scanner.FILE_ACCESS_CAP
         staging = "/home/node/.openclaw/cache/control-ui-assets/.staging-14-aef01cf0/assets"
-        assets = [self.event(path=f"{staging}/chunk-{i:03d}.js", read=False, write=True) for i in range(489)]
+        assets = [self.event(path=f"{staging}/chunk-{i:03d}.js", read=False, write=True) for i in range(450)]
+        assets += [self.event(path=f"{staging}/style-{i:02d}.css", read=False, write=True) for i in range(39)]
         reads = [self.event(path=f"/usr/local/lib/openclaw/assets/chunk-{i:03d}.js") for i in range(489)]
         state = [self.event(path=f"/home/node/.openclaw/state/s{i}.json", read=False, write=True) for i in range(30)]
         note = self.event(path="/home/node/work/notes/turn.txt", read=False, write=True)
         result = self.summary(*assets, *reads, *state, note)
-        self.assertIn(self.entry(f"{staging}/*", read=False, write=True), result["files"])
+        self.assertIn(self.entry(f"{staging}/*.js", read=False, write=True), result["files"])
         self.assertIn(self.entry("/home/node/work/notes/turn.txt", read=False, write=True), result["files"])
-        self.assertEqual(sum(1 for e in result["files"] if e["path"].startswith(staging + "/")), 1)
+        # One fold was enough: the 39 .css files and the 30 state files stay
+        # by name, and the reads still go first.
+        self.assertEqual(sum(1 for e in result["files"] if e["path"].endswith(".css")), 39)
+        self.assertEqual(sum(1 for e in result["files"] if "/state/" in e["path"]), 30)
         self.assertEqual(len(result["files"]), cap)
         self.assertTrue(result["dir_folded"])
         self.assertEqual(result["unlisted_write_exec"], 0)
-        # The 30 state files (under FILE_DIR_FOLD_MIN) stay by name, and the
-        # reads still go first.
-        self.assertEqual(sum(1 for e in result["files"] if "/state/" in e["path"]), 30)
-        self.assertEqual(result["unlisted"], 489 + 30 + 1 + 1 - cap)
+        self.assertEqual(result["unlisted"], 1 + 39 + 30 + 1 + 489 - cap)
         # The same set, any order, is the same value.
         self.assertEqual(self.summary(note, *reversed(state), *reads, *reversed(assets))["files"],
                          result["files"])
 
-    def test_a_directory_is_folded_only_when_the_writes_would_not_fit(self):
-        writes = [self.event(path=f"/data/out/{i:03d}", read=False, write=True) for i in range(100)]
+    def test_a_flood_cannot_fold_a_lone_write_of_another_kind_or_onto_a_listed_path(self):
+        # A Python agent's tempfile probe makes /tmp/* (a temp-name template)
+        # that a baseline may allow. 600 extensionless names and the probe
+        # must not become that same /tmp/*, hiding /tmp/exfil.tar beside
+        # them, nor may 600 .dat files hide it in /tmp/*.dat.
+        probe = self.event(path="/tmp/abcd1234", read=False, write=True)
+        bare = [self.event(path=f"/tmp/file-name-{i}", read=False, write=True) for i in range(600)]
+        exfil = self.event(path="/tmp/exfil.tar", read=False, write=True)
+        result = self.summary(probe, *bare, exfil)
+        self.assertFalse(result["dir_folded"])
+        self.assertGreater(result["unlisted_write_exec"], 0)  # PARTIAL, a write lost: surfaced
+        dat = [self.event(path=f"/tmp/file-name-{i}.dat", read=False, write=True) for i in range(600)]
+        result = self.summary(probe, *dat, exfil)
+        paths = [e["path"] for e in result["files"]]
+        self.assertEqual(paths, ["/tmp/*", "/tmp/*.dat", "/tmp/exfil.tar"])
+        self.assertEqual(result["unlisted_write_exec"], 0)
+        # And never onto a path already listed: real .pyc writes beside the
+        # bytecode-cache template stay apart from it.
+        cache = "/app/__pycache__"
+        pyc = [self.event(path=f"{cache}/m{i}.cpython-313.pyc", read=False, write=True) for i in range(40)]
+        with mock.patch.object(scanner, "FILE_ACCESS_CAP", 20):
+            result = self.summary(self.event(path=f"{cache}/m0.cpython-313.pyc.1234", read=False, write=True), *pyc)
+        self.assertFalse(result["dir_folded"])
+        self.assertIn(self.entry(f"{cache}/*.pyc", read=False, write=True), result["files"])
+
+    def test_a_group_is_folded_only_when_the_writes_would_not_fit(self):
+        writes = [self.event(path=f"/data/out/{i:03d}.json", read=False, write=True) for i in range(100)]
         result = self.summary(*writes)
         self.assertEqual(len(result["files"]), 100)
         self.assertFalse(result["dir_folded"])
-        # Over the cap: the most crowded directory goes first, and only as
-        # many as it takes; a handful in one directory, or in /, never.
+        # Over the cap: the largest group goes first, and only as many as it
+        # takes; a handful in one directory, or in /, never.
         with mock.patch.object(scanner, "FILE_ACCESS_CAP", 60):
             result = self.summary(*writes[:50],
-                                  *(self.event(path=f"/data/big/{i:03d}", read=False, exec=True) for i in range(40)),
-                                  *(self.event(path=f"/r{i}", read=False, write=True) for i in range(5)),
-                                  self.event(path="/data/big/lib.so"))
+                                  *(self.event(path=f"/data/big/{i:03d}.so", read=False, exec=True) for i in range(40)),
+                                  *(self.event(path=f"/r{i}.txt", read=False, write=True) for i in range(5)),
+                                  self.event(path="/data/out/lib.json"))
         paths = [e["path"] for e in result["files"]]
-        self.assertIn("/data/out/*", paths)
-        self.assertEqual(sum(p.startswith("/data/big/") for p in paths), 41)
+        self.assertIn(self.entry("/data/out/*.json", read=False, write=True), result["files"])
+        self.assertEqual(sum(p.startswith("/data/big/") for p in paths), 40)
         self.assertEqual(sum(p.startswith("/r") for p in paths), 5)
-        self.assertIn(self.entry("/data/out/*", read=False, write=True), result["files"])
-        # A read-only file in the folded directory's neighbour is kept apart.
-        self.assertIn(self.entry("/data/big/lib.so"), result["files"])
+        # A read-only file in a folded group stays by name.
+        self.assertIn(self.entry("/data/out/lib.json"), result["files"])
         self.assertEqual((result["unlisted"], result["unlisted_write_exec"]), (0, 0))
         with mock.patch.object(scanner, "FILE_ACCESS_CAP", 3):
-            result = self.summary(*(self.event(path=f"/r{i}", read=False, write=True) for i in range(5)))
+            result = self.summary(*(self.event(path=f"/r{i}.txt", read=False, write=True) for i in range(40)))
         self.assertFalse(result["dir_folded"])
-        self.assertEqual(result["unlisted_write_exec"], 2)
+        self.assertEqual(result["unlisted_write_exec"], 37)
 
     def test_folding_unions_the_access_of_the_files_folded(self):
         with mock.patch.object(scanner, "FILE_ACCESS_CAP", 1):
-            result = self.summary(*(self.event(path=f"/d/{i:02d}", write=True) for i in range(31)),
-                                  self.event(path="/d/run", read=False, exec=True))
-        self.assertEqual(result["files"], [self.entry("/d/*", read=True, write=True, exec=True)])
+            result = self.summary(*(self.event(path=f"/d/{i:02d}.bin", write=True) for i in range(31)),
+                                  self.event(path="/d/run.bin", read=False, exec=True))
+        self.assertEqual(result["files"], [self.entry("/d/*.bin", read=True, write=True, exec=True)])
 
     def test_the_scanned_tmpdir_is_a_temp_dir_and_a_bad_one_is_ignored(self):
         dirs = scanner.file_temp_dirs({"TMPDIR": "/scratch/tmp/", "HOME": "/home/a"})
