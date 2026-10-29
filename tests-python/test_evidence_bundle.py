@@ -1101,7 +1101,8 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # pack 13 moves the listener and file-open probe onto AgentSight and
         # names it in the method and notes, with AgentSight v1.0.35 (DR-170);
         # pack 14 folds a crowded written group to <dir>/*.<ext> (DR-262) and
-        # reads OpenShell's provider placeholder as a reference (DR-194).
+        # reads OpenShell's provider placeholder as a reference (DR-194), and
+        # skills carry their server, schema and annotations (DR-264).
         self.assertEqual(self.bundle(None)["rule_pack_version"], 14)
 
     def test_the_method_and_notes_name_the_probe_that_wrote_the_file(self):
