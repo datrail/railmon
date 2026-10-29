@@ -223,32 +223,43 @@ class SkillShapeForRailCenterTest(unittest.TestCase):
     tool from a server, one server from another, and an upload or a
     destructive call from a read-looking name."""
 
-    def test_a_server_that_could_not_be_listed_is_an_mcp_server_not_a_tool(self):
+    def test_a_server_that_could_not_be_listed_is_a_server_entry_not_a_tool(self):
+        # source_type stays mcp_config: Rail Center stores it in a Postgres
+        # enum (skills_config, mcp_config, api_config), and a new value would
+        # fail the registration. `entry` says server or tool.
         unreachable = scanner.mcp_server_skills("fetch", {"url": "http://127.0.0.1:1/mcp"}, Path("a.json"))
         stdio = scanner.mcp_server_skills("local", {"command": "mcp-server"}, Path("a.json"))
         with FakeMcpServer([]) as server:
             empty = scanner.mcp_server_skills("quiet", {"url": server.url}, Path("a.json"))
         for skills, name in ((unreachable, "fetch"), (stdio, "local"), (empty, "quiet")):
-            self.assertEqual([(s["source_type"], s["server"]) for s in skills], [("mcp_server", name)])
-            self.assertEqual(scanner.merge_skill_lists(skills)[0]["source_type"], "mcp_server")
+            for skill in (*skills, *scanner.merge_skill_lists(skills)):
+                self.assertEqual((skill["source_type"], skill["entry"], skill["server"]),
+                                 ("mcp_config", "server", name))
         with FakeMcpServer([{"name": "t", "description": "d"}]) as server:
-            tool = scanner.mcp_server_skills("alpha", {"url": server.url}, Path("a.json"))
-        self.assertEqual([(s["source_type"], s["server"]) for s in tool], [("mcp_config", "alpha")])
+            tool = scanner.merge_skill_lists(scanner.mcp_server_skills("alpha", {"url": server.url}, Path("a.json")))
+        self.assertEqual([(s["source_type"], s["entry"], s["server"]) for s in tool], [("mcp_config", "tool", "alpha")])
+        # A server and a tool of one name on one server are two entries.
+        both = scanner.merge_skill_lists([*stdio, {**stdio[0], "entry": "tool"}])
+        self.assertEqual(sorted(s["entry"] for s in both), ["server", "tool"])
 
     def test_source_type_is_a_closed_set_and_a_skills_file_cannot_pick_one(self):
         import json
         import tempfile
 
-        for given, kept in (("mcp_config", "mcp_config"), ("mcp_server", "mcp_server"),
-                            ("skills_config", "skills_config"), ("MCP_CONFIG", "skills_config"),
-                            ("tool", "skills_config"), ("", "skills_config")):
+        for given, kept in (("mcp_config", "mcp_config"), ("skills_config", "skills_config"),
+                            ("mcp_server", "skills_config"), ("api_config", "skills_config"),
+                            ("MCP_CONFIG", "skills_config"), ("", "skills_config")):
             skill = scanner.normalize_skill({"name": "n", "description": "d", "source_type": given}, "t")
             self.assertEqual(skill["source_type"], kept, given)
+        odd = scanner.normalize_skill({"name": "n", "description": "d", "source_type": "mcp_config",
+                                       "entry": "prompt", "inputSchema": {"type": "object"}}, "t")
+        self.assertNotIn("entry", odd)
+        self.assertNotIn("inputSchema", odd)  # only a tool keeps a schema
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "skills.json"
             path.write_text(json.dumps({"skills": [
                 {"name": "fetch", "description": "d", "source_type": "mcp_config", "server": "x",
-                 "inputSchema": {"type": "object"}}]}), encoding="utf-8")
+                 "entry": "tool", "inputSchema": {"type": "object"}}]}), encoding="utf-8")
             skills = scanner.read_skills_file(path)
         self.assertEqual(skills, [{"name": "fetch", "description": "d", "destination_endpoints": [],
                                    "source_type": "skills_config"}])

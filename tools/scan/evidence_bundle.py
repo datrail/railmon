@@ -91,13 +91,14 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # observed_file_access onto AgentSight's process probe and the image's
 # AgentSight from v1.0.34 to v1.0.35 (DR-170): their method and notes name
 # the probe that observed them, so a pack-12 baseline is not comparable.
-# Pack 14 lists a large group of written or run files sharing a directory
-# and an extension as <dir>/*.<ext> when they would not fit the cap (DR-262), and classifies OpenShell's
-# provider placeholders (openshell:resolve:env:KEY) as references, not
-# plaintext secrets (DR-194 I1), and skills_inventory names each MCP
-# skill's server, keeps a probed tool's inputSchema and annotations, and
-# marks a server it couldn't list mcp_server (DR-264): each changes what an
-# unchanged agent's bundle says.
+# Pack 14 changes what an unchanged agent's bundle says in three places:
+# observed_file_access lists a large group of written or run files sharing
+# a directory and an extension as <dir>/*.<ext> when they would not fit the
+# cap (DR-262); credential_inventory classifies OpenShell's provider
+# placeholders (openshell:resolve:env:KEY) as references, not plaintext
+# secrets (DR-194 I1); and skills_inventory names each MCP skill's server,
+# marks it a tool or a server it couldn't list, and keeps a probed tool's
+# inputSchema and annotations (DR-264).
 RULE_PACK_VERSION = 14
 
 # The value shape of observed_file_access (DR-154), published in the v1

@@ -934,6 +934,7 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
                     "description": description or f"tool declared by {name} ({source_label})",
                     "destination_endpoints": endpoints,
                     "source_type": "mcp_config",
+                    "entry": "tool",
                     "server": name,
                     **tool_schema_fields(tool),
                 }
@@ -949,7 +950,8 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
             "name": name,
             "description": f"MCP server configured via {source_label}: {reached}",
             "destination_endpoints": endpoints,
-            "source_type": "mcp_server",
+            "source_type": "mcp_config",
+            "entry": "server",
             "server": name,
         }
     ]
@@ -960,7 +962,8 @@ def unreachable_mcp_skill(name: str, source_label: str, endpoints: list[str], re
         "name": name,
         "description": f"MCP server configured via {source_label}: {reason}",
         "destination_endpoints": endpoints,
-        "source_type": "mcp_server",
+        "source_type": "mcp_config",
+        "entry": "server",
         "server": name,
     }
 
@@ -1101,13 +1104,16 @@ def collect_skills(mcp_configs: list[Path], env: dict[str, str] | None = None) -
     return merge_skill_lists(skills)
 
 
-# A skill's source_type, a closed set (DR-264, Eason 2026-10-29): a tool an
-# MCP server declared (mcp_config), a configured MCP server RailMon could not
-# list tools for, being unreachable, declaring none, or run as a command
-# (mcp_server: a server, not a tool), and a skills file's entry
-# (skills_config). Anything else, a skills file's own spelling included, is
-# skills_config.
-SKILL_SOURCE_TYPES = frozenset({"mcp_config", "mcp_server", "skills_config"})
+# A skill's source_type, a closed set (DR-264, Eason 2026-10-29): an MCP
+# config's entry (mcp_config) or a skills file's (skills_config). Anything
+# else, a skills file's own spelling included, is skills_config. Rail
+# Center stores it in a Postgres enum (skill_source_type: skills_config,
+# mcp_config, api_config), so a new value would fail the registration; an
+# MCP entry says instead, in `entry`, whether it is a tool the server
+# declared or a configured server RailMon could not list tools for (being
+# unreachable, declaring none, or run as a command): a server, not a tool.
+SKILL_SOURCE_TYPES = frozenset({"mcp_config", "skills_config"})
+MCP_ENTRIES = frozenset({"tool", "server"})
 # An MCP tool's inputSchema as kept, compact JSON with sorted keys: a larger
 # one is left out rather than letting one server's tools crowd the bundle.
 SKILL_SCHEMA_BYTES = 8192
@@ -1204,15 +1210,18 @@ def normalize_skill(value: Any, source_hint: str) -> dict[str, Any]:
         "destination_endpoints": dedupe(endpoints),
         "source_type": source_type,
     }
-    if source_type != "skills_config":
-        # Which server it came from (DR-264): two servers' same-named tools
-        # stay two skills. A probed tool's schema and annotations, which
-        # tool_schema_fields made, are put through it again here, so this
-        # stays the one place a skill's shape is decided.
+    if source_type == "mcp_config":
+        # Tool or server, and which server it came from (DR-264): two
+        # servers' same-named tools stay two skills. A probed tool's schema
+        # and annotations, which tool_schema_fields made, are put through it
+        # again here, so this stays the one place a skill's shape is decided.
+        entry = value.get("entry")
+        if entry in MCP_ENTRIES:
+            skill["entry"] = entry
         server = first_nonempty(redact_text(str(value.get("server") or "")))
         if server:
             skill["server"] = server
-        if source_type == "mcp_config":
+        if entry == "tool":
             skill.update(tool_schema_fields(value))
     return skill
 
@@ -1243,11 +1252,11 @@ def collect_skills_from_files(paths: list[Path]) -> list[dict[str, Any]]:
 
 
 def merge_skill_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for group in groups:
         for raw_skill in group:
             skill = normalize_skill(raw_skill, "generated skills")
-            key = (skill["source_type"], skill.get("server", ""), skill["name"])
+            key = (skill["source_type"], skill.get("server", ""), skill.get("entry", ""), skill["name"])
             if key not in merged:
                 merged[key] = skill
                 continue

@@ -349,8 +349,8 @@ cap (DR-262), and an OpenShell
 provider placeholder (`openshell:resolve:env:KEY`) is a `reference` in
 `credential_inventory`, not a plaintext secret (DR-194). And `skills_inventory`
 (DR-264) names each MCP skill's `server`, keeps a probed tool's `inputSchema`
-and `annotations`, and marks a server whose tools couldn't be listed
-`mcp_server`, not `mcp_config`.
+and `annotations`, and says in `entry` whether it is a tool or a server
+whose tools couldn't be listed.
 
 ## RailDash delivery
 
@@ -1071,15 +1071,15 @@ The scanner looks for MCP config in:
 ~/.mcp.json
 ```
 
-Each `mcpServers` entry becomes registration `SkillInput`s, each naming its
-`server`. A server with a `url` is asked for its tools and becomes one skill
-per tool it declares, `source_type: "mcp_config"`, keeping the tool's
-`inputSchema` (redacted, up to 8 KiB) and `annotations` (MCP's four boolean
-hints and its title). A server whose tools can't be listed (unreachable,
-declaring none, or a `command` server) becomes one skill with
-`source_type: "mcp_server"`: a server, not a tool. `source_type` is one of
-`mcp_config`, `mcp_server` and `skills_config`; a skills file's entry is
-always `skills_config`, whatever the file says. Pass custom paths with:
+Each `mcpServers` entry becomes registration `SkillInput`s with
+`source_type: "mcp_config"`, each naming its `server`. A server with a `url`
+is asked for its tools and becomes one skill per tool it declares,
+`entry: "tool"`, keeping the tool's `inputSchema` (redacted, up to 8 KiB) and
+`annotations` (MCP's four boolean hints and its title). A server whose tools
+can't be listed (unreachable, declaring none, or a `command` server) becomes
+one skill with `entry: "server"`: a server, not a tool. `source_type` is
+`mcp_config` or `skills_config` (Rail Center stores it in an enum); a skills
+file's entry is always `skills_config`, whatever the file says. Pass custom paths with:
 
 ```bash
 python3 tools/scan/scan_agent_environment.py \
