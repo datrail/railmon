@@ -420,7 +420,7 @@
           "maxLength": 300
         },
         "allow_list": {
-          "$comment": "DR-266. Null unless railmon openshell's copy of the sandbox's loaded OpenShell policy was current for this sandbox: then one entry per allowed endpoint and port, as `openshell policy get` returned it. Sorted by host, then port.",
+          "$comment": "DR-266. Null unless railmon openshell's copy of the sandbox's loaded OpenShell policy was current for this sandbox: then one entry per allowed endpoint and port, as `openshell policy get` returned it (host null for an endpoint named only by allowed_ips). Sorted by host, then port; at most 131072 bytes as compact JSON, checked in code.",
           "type": [
             "array",
             "null"
@@ -430,6 +430,7 @@
             "type": "object",
             "required": [
               "host",
+              "allowed_ips",
               "port",
               "protocol",
               "enforcement",
@@ -440,9 +441,21 @@
             "additionalProperties": false,
             "properties": {
               "host": {
-                "type": "string",
+                "type": [
+                  "string",
+                  "null"
+                ],
                 "minLength": 1,
                 "maxLength": 253
+              },
+              "allowed_ips": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
               },
               "port": {
                 "type": [

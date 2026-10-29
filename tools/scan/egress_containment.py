@@ -53,6 +53,11 @@ MAX_ALLOW_RULES = 32
 MAX_ALLOW_BINARIES = 32
 MAX_ALLOW_TEXT = 256
 MAX_ALLOW_PATH = 1024
+MAX_ALLOW_IPS = 32
+MAX_ALLOW_IP = 64
+# All entries together, as compact JSON: past it, entries are left out and
+# counted, so a large policy can't push the bundle past its 1 MiB bound.
+MAX_ALLOW_BYTES = 128 * 1024
 ALLOW_RULE_FIELDS = ("method", "path", "command", "operation_type", "tool")
 # The policy file's own bound; a larger one isn't read.
 MAX_POLICY_FILE = 1024 * 1024
@@ -202,48 +207,75 @@ def _text(value: Any, limit: int = MAX_ALLOW_TEXT) -> str | None:
     return value if isinstance(value, str) and 0 < len(value) <= limit and value.isprintable() else None
 
 
-def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int]:
+def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
     """The allow-list of one `openshell policy get` view, as the collector
-    stripped it, and how many entries the bound left out: one entry per
-    endpoint and port, `{host, port, protocol, enforcement, access, rules,
-    binaries}`, sorted, a port the endpoint names none of being null.
-    Anything not in the shape OpenShell writes is skipped, not guessed."""
+    stripped it: one entry per endpoint and port, `{host, allowed_ips, port,
+    protocol, enforcement, access, rules, binaries}`, sorted, a port the
+    endpoint names none of being null and a host-less endpoint (allowed_ips
+    only) having a null host. Also how many entries the bounds left out,
+    and whether anything was cut inside the list: an endpoint not in the
+    shape OpenShell writes, an allow rule with a field too long to keep
+    (dropped whole, never kept narrower in what it names and so broader in
+    what it allows), or rules, binaries or addresses past their cap."""
     policy = view.get("policy") if isinstance(view, dict) else None
     network = policy.get("network_policies") if isinstance(policy, dict) else None
     entries: dict[str, dict[str, Any]] = {}
+    cut = False
     for rule in (network.values() if isinstance(network, dict) else ()):
         if not isinstance(rule, dict):
             continue
-        binaries = sorted({
-            path for path in (
-                _text(binary.get("path") if isinstance(binary, dict) else binary, MAX_ALLOW_PATH)
-                for binary in _list(rule.get("binaries"))
-            ) if path
-        })[:MAX_ALLOW_BINARIES]
+        paths = [_text(binary.get("path") if isinstance(binary, dict) else binary, MAX_ALLOW_PATH)
+                 for binary in _list(rule.get("binaries"))]
+        binaries = sorted({path for path in paths if path})
+        cut = cut or None in paths or len(binaries) > MAX_ALLOW_BINARIES
+        binaries = binaries[:MAX_ALLOW_BINARIES]
         for endpoint in _list(rule.get("endpoints")):
-            if not isinstance(endpoint, dict) or (host := _text(endpoint.get("host"), 253)) is None:
+            host = _text(endpoint.get("host"), 253) if isinstance(endpoint, dict) else None
+            ips_in = _list(endpoint.get("allowed_ips")) if isinstance(endpoint, dict) else []
+            read = [_text(item, MAX_ALLOW_IP) for item in ips_in]
+            ips = sorted({ip for ip in read if ip})
+            if host is None and not ips:
+                cut = True
                 continue
-            ports: list[int | None] = []
+            cut = cut or None in read or len(ips) > MAX_ALLOW_IPS
+            ips = ips[:MAX_ALLOW_IPS]
+            ports: list[int] = []
             for port in [endpoint.get("port"), *_list(endpoint.get("ports"))]:
                 if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
                     ports.append(port)
+                elif port is not None:
+                    cut = True
             rules: list[dict[str, str]] = []
             for allow_rule in _list(endpoint.get("rules")):
                 allow = allow_rule.get("allow") if isinstance(allow_rule, dict) else None
-                if isinstance(allow, dict):
-                    kept = {field: text for field in ALLOW_RULE_FIELDS
-                            if (text := _text(allow.get(field), MAX_ALLOW_PATH)) is not None}
-                    if kept:
-                        rules.append(kept)
-            rules = sorted(rules, key=lambda item: sorted(item.items()))[:MAX_ALLOW_RULES]
+                if not isinstance(allow, dict):
+                    continue
+                kept = {field: _text(allow.get(field), MAX_ALLOW_PATH) for field in ALLOW_RULE_FIELDS
+                        if field in allow}
+                if not kept or None in kept.values():
+                    cut = True
+                    continue
+                rules.append(kept)  # type: ignore[arg-type]
+            rules = sorted(rules, key=lambda item: sorted(item.items()))
+            cut = cut or len(rules) > MAX_ALLOW_RULES
+            rules = rules[:MAX_ALLOW_RULES]
             for port in sorted(set(ports)) or [None]:
-                entry = {"host": host, "port": port, "protocol": _text(endpoint.get("protocol")),
+                entry = {"host": host, "allowed_ips": ips, "port": port,
+                         "protocol": _text(endpoint.get("protocol")),
                          "enforcement": _text(endpoint.get("enforcement")), "access": _text(endpoint.get("access")),
                          "rules": rules, "binaries": binaries}
                 entries[json.dumps(entry, sort_keys=True)] = entry
-    ordered = sorted(entries.values(), key=lambda entry: (entry["host"], entry["port"] or 0,
+    ordered = sorted(entries.values(), key=lambda entry: (entry["host"] or "", entry["port"] or 0,
                                                          json.dumps(entry, sort_keys=True)))
-    return ordered[:MAX_ALLOW_ENTRIES], max(0, len(ordered) - MAX_ALLOW_ENTRIES)
+    kept_entries: list[dict[str, Any]] = []
+    used = 0
+    for entry in ordered:
+        size = len(json.dumps(entry, separators=(",", ":")))
+        if len(kept_entries) >= MAX_ALLOW_ENTRIES or used + size > MAX_ALLOW_BYTES:
+            break
+        kept_entries.append(entry)
+        used += size
+    return kept_entries, len(ordered) - len(kept_entries), cut
 
 
 def read_policy_file(path: str | None) -> dict[str, Any] | None:
@@ -258,7 +290,7 @@ def read_policy_file(path: str | None) -> dict[str, Any] | None:
         if len(raw) > MAX_POLICY_FILE:
             return None
         body = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(body, dict) or body.get("kind") != "openshell_policy":
         return None
@@ -288,14 +320,14 @@ def allow_list_for(sandbox: str | None, body: dict[str, Any] | None, now: float)
     age = _policy_age(body, now)
     if age is None or age > POLICY_STALE_INTERVALS * every + 60 or age < -60:
         return None, ["allow-list not read: railmon openshell's copy of the policy is not current"]
-    entries, left_out = allow_list_entries(body.get("view"))
-    view = body.get("view") if isinstance(body.get("view"), dict) else {}
-    revision = view.get("active_version", view.get("current_policy_version"))
-    reasons = [f"allow-list: OpenShell's loaded policy"
-               + (f" revision {revision}" if isinstance(revision, int) and not isinstance(revision, bool) else "")
-               + ", read by railmon openshell"]
+    entries, left_out, cut = allow_list_entries(body.get("view"))
+    # No revision number: OpenShell numbers every `policy set`, the same
+    # content included, and the entries already say what changed.
+    reasons = ["allow-list: OpenShell's loaded policy, read by railmon openshell"]
     if left_out:
         reasons.append(f"{left_out} more allow-list entries not listed")
+    if cut:
+        reasons.append("some endpoints, allow rules, binaries or addresses could not be listed")
     return entries, reasons
 
 

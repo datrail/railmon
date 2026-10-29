@@ -794,10 +794,13 @@ itself. `allow_list` is `null` unless `railmon openshell` runs (README, "An
 OpenShell sandbox's policy and denials") and writes what `openshell policy
 get` returned to `RAIL_OPENSHELL_POLICY_FILE`, which `railmon scan` reads too
 (DR-266). Then, for an `allow_list_enforced` container, it is one entry per
-endpoint and port the sandbox's loaded policy allows, `{host, port,
-protocol, enforcement, access, rules, binaries}`, sorted by host and port (at
-most 256, each with up to 32 allow rules and binaries; a reason says how
-many more there were), and a reason names the policy revision. The copy is
+endpoint and port the sandbox's loaded policy allows, `{host, allowed_ips,
+port, protocol, enforcement, access, rules, binaries}` (`host` null for an
+endpoint named only by `allowed_ips`), sorted by host and port. It holds at
+most 256 entries and 128 KiB, each with up to 32 allow rules, binaries and
+addresses; a reason says how many entries were left out, and another when
+anything inside the list couldn't be kept (an allow rule with a field too
+long to keep is dropped whole, never kept as a broader rule). The copy is
 used only for the sandbox it names (`openshell.ai/sandbox-name`) and only
 while it is current (within three of the collector's intervals, plus a
 minute); otherwise the list stays `null` and a reason says why. The scanner

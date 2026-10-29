@@ -12,6 +12,7 @@ import copy
 import importlib.util
 import sys
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -444,16 +445,21 @@ class AllowListTest(unittest.TestCase):
     def test_a_current_copy_for_this_sandbox_is_the_allow_list(self):
         status, value = self.classify_with(OPENSHELL, self.body())
         self.assertEqual((status, value["level"]), ("ANSWERED", "allow_list_enforced"))
+        # A new revision of the same content says the same.
+        again = self.body()
+        again["view"] = {**again["view"], "active_version": 7}
+        self.assertEqual(self.classify_with(OPENSHELL, again), (status, value))
         self.assertEqual([(e["host"], e["port"]) for e in value["allow_list"]], [
             ("*.example.com", 443), ("*.example.com", 8443), ("api.github.com", 443),
             ("raw.githubusercontent.com", 443), ("uploads.github.com", 443)])
         uploads = value["allow_list"][-1]
         self.assertEqual(uploads, {
-            "host": "uploads.github.com", "port": 443, "protocol": "rest", "enforcement": "enforce",
+            "host": "uploads.github.com", "allowed_ips": [], "port": 443, "protocol": "rest", "enforcement": "enforce",
             "access": None, "rules": [{"method": "GET", "path": "/repos/**"},
                                       {"method": "POST", "path": "/repos/*/*/releases/*/assets"}],
             "binaries": ["/usr/local/bin/python3.13"]})
-        self.assertIn("allow-list: OpenShell's loaded policy revision 1, read by railmon openshell", value["reasons"])
+        self.assertIn("allow-list: OpenShell's loaded policy, read by railmon openshell", value["reasons"])
+        self.assertFalse(any("could not be listed" in reason for reason in value["reasons"]))
 
     def test_the_same_policy_reads_the_same_on_every_scan(self):
         first = self.classify_with(OPENSHELL, self.body(age=10))
@@ -487,18 +493,24 @@ class AllowListTest(unittest.TestCase):
                       "endpoints": [{"host": f"h{i:03d}.example", "ports": [443, 8443],
                                      "rules": [{"allow": {"method": "GET", "path": f"/p{k}"}} for k in range(40)]}]}
             for i in range(200)}}}
-        entries, left_out = egress.allow_list_entries(view)
-        self.assertEqual((len(entries), left_out), (256, 144))
+        entries, left_out, cut = egress.allow_list_entries(view)
+        self.assertEqual(len(entries) + left_out, 400)
+        self.assertTrue(cut)  # 40 rules and binaries, cut to 32
         self.assertTrue(all(len(e["rules"]) == 32 and len(e["binaries"]) == 32 for e in entries))
+        self.assertLessEqual(len(json.dumps(entries, separators=(",", ":"))), egress.MAX_ALLOW_BYTES)
         status, value = self.classify_with(OPENSHELL, {**self.body(), "view": view})
-        self.assertIn("144 more allow-list entries not listed", value["reasons"])
+        self.assertIn(f"{left_out} more allow-list entries not listed", value["reasons"])
+        self.assertIn("some endpoints, allow rules, binaries or addresses could not be listed", value["reasons"])
+        small = {"policy": {"network_policies": {f"r{i}": {"endpoints": [{"host": f"h{i:03d}.x", "port": 443}]}
+                                                 for i in range(300)}}}
+        self.assertEqual(egress.allow_list_entries(small)[:2][1], 300 - 256)
         # The bundle's contract (the published schema) holds at the bounds.
         docker = Docker([OPENSHELL])
         inputs = egress.collect_inputs(OPENSHELL, docker.container, docker.network)
         inputs.update(openshell_policy={**self.body(), "view": view}, now=self.NOW)
         attrs = BundleTest("test_an_openshell_sandbox_is_answered_observed").build(
             {"mode": "docker", "docker_inspect": OPENSHELL, "env": {}, "egress_inputs": inputs})
-        self.assertEqual(len(attrs["egress_containment"]["value"]["allow_list"]), 256)
+        self.assertEqual(attrs["egress_containment"]["value"]["allow_list"], entries)
 
     def test_shapes_openshell_does_not_write_are_skipped(self):
         view = {"policy": {"network_policies": {
@@ -506,10 +518,30 @@ class AllowListTest(unittest.TestCase):
                                 {"host": "x" * 254}, {"host": "p.example", "port": 70000, "ports": "443"},
                                 "junk"], "binaries": "nope"},
             "b": "junk"}}}
-        entries, _ = egress.allow_list_entries(view)
+        entries, _, cut = egress.allow_list_entries(view)
         self.assertEqual([(e["host"], e["port"], e["binaries"]) for e in entries],
                          [("ok.example", None, []), ("p.example", None, [])])
-        self.assertEqual(egress.allow_list_entries(None), ([], 0))
+        self.assertTrue(cut)
+        self.assertEqual(egress.allow_list_entries(None), ([], 0, False))
+
+    def test_an_endpoint_named_by_addresses_alone_is_kept(self):
+        # OpenShell allows an endpoint with allowed_ips and no host.
+        view = {"policy": {"network_policies": {"lan": {"endpoints": [
+            {"allowed_ips": ["10.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16"], "port": 443},
+            {"host": "x.example", "allowed_ips": ["203.0.113.7"], "port": 443}]}}}}
+        entries, _, cut = egress.allow_list_entries(view)
+        self.assertFalse(cut)
+        self.assertEqual([(e["host"], e["allowed_ips"]) for e in entries],
+                         [(None, ["10.0.0.0/8", "192.168.0.0/16"]), ("x.example", ["203.0.113.7"])])
+
+    def test_a_rule_that_cannot_be_kept_whole_is_dropped_not_widened(self):
+        view = {"policy": {"network_policies": {"r": {"endpoints": [{"host": "x.example", "port": 443, "rules": [
+            {"allow": {"method": "GET", "path": "/" + "a" * 2000}},
+            {"allow": {"method": "POST", "path": "/ok"}},
+            {"allow": {"method": None}}]}]}}}}
+        entries, _, cut = egress.allow_list_entries(view)
+        self.assertEqual(entries[0]["rules"], [{"method": "POST", "path": "/ok"}])
+        self.assertTrue(cut)
 
     def test_the_file_is_read_only_when_it_is_the_collectors(self):
         import json
@@ -526,6 +558,8 @@ class AllowListTest(unittest.TestCase):
             path.write_text(json.dumps(self.body()))
             self.assertEqual(egress.read_policy_file(str(path))["sandbox"], "my-agent")
             path.write_text(" " * (egress.MAX_POLICY_FILE + 1))
+            self.assertIsNone(egress.read_policy_file(str(path)))
+            path.write_text("[" * 200000)
             self.assertIsNone(egress.read_policy_file(str(path)))
 
 

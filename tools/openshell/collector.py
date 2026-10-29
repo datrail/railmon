@@ -41,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
@@ -177,16 +178,20 @@ def write_policy_file(path: str, sandbox: str, interval: float, view: dict[str, 
     body = {"kind": "openshell_policy", "sandbox": sandbox, "read_at": _iso(now),
             "every": interval, "view": view}
     directory = os.path.dirname(os.path.abspath(path))
-    temp = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    temp = None
     try:
-        with open(temp, "w", encoding="utf-8") as handle:
-            json.dump(body, handle, separators=(",", ":"), sort_keys=True)
+        # A fresh name of its own (O_EXCL), never one planted beforehand.
+        handle, temp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(body, out, separators=(",", ":"), sort_keys=True)
         os.chmod(temp, 0o644)
         os.replace(temp, path)
     except OSError as exc:
-        with contextlib.suppress(OSError):
-            os.unlink(temp)
-        raise CollectorError(f"could not write {path}: {exc}") from exc
+        if temp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+        # Without the temp file's random name, so the same failure is said once.
+        raise CollectorError(f"could not write {path}: {exc.strerror or exc}") from exc
 
 
 # --------------------------------------------------------------- denials

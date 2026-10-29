@@ -360,7 +360,7 @@ class CollectorTest(OpenShellCliTest):
             sys.path.pop(0)
         entries, reasons = egress.allow_list_for("fx-base", egress.read_policy_file(str(path)), clock[0])
         self.assertIn(("api.github.com", 443), [(e["host"], e["port"]) for e in entries])
-        self.assertEqual(reasons, ["allow-list: OpenShell's loaded policy revision 1, read by railmon openshell"])
+        self.assertEqual(reasons, ["allow-list: OpenShell's loaded policy, read by railmon openshell"])
 
     def test_a_policy_file_that_cannot_be_written_is_said_once(self):
         poller = collector.Collector("fx-base", self.url, str(self.cli), log=self.messages.append,
