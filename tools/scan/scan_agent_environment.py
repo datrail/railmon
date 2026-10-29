@@ -124,6 +124,10 @@ SECRET_REFERENCE_PREFIXES = (
     "arn:aws:secretsmanager:",
     "azurekeyvault://",
     "${",
+    # OpenShell's provider placeholder (openshell:resolve:env:KEY): the
+    # sandbox's supervisor swaps in the real value on the way out, so the
+    # agent never holds it (DR-194 §4.6; Daniel, 2026-10-28).
+    "openshell:",
 )
 
 # Credentials in the shapes their vendors actually issue. Length alone cannot
@@ -1887,6 +1891,18 @@ FILE_ENTRY_OVERHEAD = 128
 # this many, so a flood of reads cannot use up the room a write needs.
 # filesnoop's own dedup LRU is 65,536 entries.
 FILE_ACCESS_TRACKED = 16384
+# A directory the agent (or its runtime) fills with more written or run files
+# than the list has room for (DR-262). OpenClaw's gateway copies its ~490
+# control-UI assets into ~/.openclaw/cache on start, every one a write, so
+# kept by path they filled the cap and an ordinary write sorted after them
+# (the agent's own notes under /home/node/work, or /tmp/exfil.tar) was the
+# one left out. When the written and run entries alone do not fit, the
+# directory holding the most of them is listed once, as <dir>/*, with read,
+# write and exec the union of its files, and then the next, until they fit:
+# every place the agent wrote stays in the list, at the price of the names in
+# a crowded directory. Only a directory holding at least FILE_DIR_FOLD_MIN of
+# them, and never /, so a handful of writes is never folded.
+FILE_DIR_FOLD_MIN = 32
 # A longer path is counted, not listed: it would let one entry dominate the
 # bundle. PATH_MAX is 4096, so an agent can make one; that is a gap (PARTIAL),
 # never a silent omission.
@@ -2201,6 +2217,7 @@ def summarize_file_access(
             if folded not in collapsed:
                 collapsed.add(folded)
                 folded_into[key] = folded_into.get(key, 0) + 1
+    dir_folded = _fold_crowded_written_dirs(files, templated)
     # Writes and execs first, then by path: the same set always yields the
     # same value, and a new read can only displace another read. Within the
     # byte budget, an entry too large to fit is skipped, not the rest.
@@ -2233,10 +2250,58 @@ def summarize_file_access(
         # counts, so the note is never lost once the count stopped growing.
         "collapsed": sum(max(folded_into.get(key, 0), 1) for key in
                          ((entry["path"], entry["layer"]) for entry in kept) if key in templated),
+        # Whether a listed entry is a crowded directory's <dir>/* (DR-262).
+        "dir_folded": any((entry["path"], entry["layer"]) in dir_folded for entry in kept),
         "malformed": malformed,
         "outside_namespace": outside,
         **health.summary(now),
     }
+
+
+def _file_entry_size(path: str, access: list[bool], layer: bool) -> int:
+    """An entry's size as summarize_file_access measures it for the byte budget."""
+    entry = {"path": path, "read": access[0], "write": access[1], "exec": access[2], "layer": layer}
+    return len(json.dumps(entry, separators=(",", ":"))) + FILE_ENTRY_OVERHEAD
+
+
+def _fold_crowded_written_dirs(
+    files: dict[tuple[str, bool], list[bool]], templated: set[tuple[str, bool]]
+) -> set[tuple[str, bool]]:
+    """Fold, in place, the directories crowded with written or run entries
+    into one <dir>/* entry each (see FILE_DIR_FOLD_MIN), the most crowded
+    first (then by directory and layer, so the same set always folds the
+    same way), until those entries fit FILE_ACCESS_CAP and FILE_ACCESS_BYTES.
+    A read-only entry in a folded directory stays as it is. Returns the keys
+    of the <dir>/* entries made."""
+    written = {key: access for key, access in files.items() if access[1] or access[2]}
+    count = len(written)
+    size = sum(_file_entry_size(path, access, layer) for (path, layer), access in written.items())
+    groups: dict[tuple[str, bool], list[tuple[str, bool]]] = {}
+    for key in written:
+        directory = key[0].rpartition("/")[0]
+        if directory:  # never /
+            groups.setdefault((directory, key[1]), []).append(key)
+    # A fold changes no other directory's group: <dir>/* is in its own.
+    crowded = sorted((item for item in groups.items() if len(item[1]) >= FILE_DIR_FOLD_MIN),
+                     key=lambda item: (-len(item[1]), item[0]))
+    made: set[tuple[str, bool]] = set()
+    for (directory, layer), keys in crowded:
+        if count <= FILE_ACCESS_CAP and size <= FILE_ACCESS_BYTES:
+            break
+        folded_key = (f"{directory}/*", layer)
+        before = files.get(folded_key)
+        union = list(before or [False, False, False])
+        for key in keys:
+            union = [old or new for old, new in zip(union, files.pop(key))]
+            templated.discard(key)
+            size -= _file_entry_size(key[0], written[key], layer)
+        # A written <dir>/* already there (a temp template such as /tmp/*)
+        # is one of keys, so it is counted once either way.
+        count -= len(keys) - 1
+        files[folded_key] = union
+        size += _file_entry_size(folded_key[0], union, layer)
+        made.add(folded_key)
+    return made
 
 
 def _bounded_lines(stream: Any, limit: int = MAX_LISTEN_LINE) -> Iterable[str]:

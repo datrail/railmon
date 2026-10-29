@@ -2000,6 +2000,63 @@ class EphemeralFileAccessTest(unittest.TestCase):
         self.assertEqual(result["files"], [self.entry("/tmp/tmp*", read=False, write=True)])
         self.assertEqual((result["unlisted"], result["collapsed"]), (0, len(names)))
 
+    def test_a_crowded_written_directory_is_one_entry_so_a_later_write_stays(self):
+        # DR-262: OpenClaw's gateway copies ~490 control-UI assets into its
+        # cache on start (a staging directory, then its content hash). Listed
+        # by name they filled the cap and the agent's own write sorted after
+        # them was the one left out.
+        cap = scanner.FILE_ACCESS_CAP
+        staging = "/home/node/.openclaw/cache/control-ui-assets/.staging-14-aef01cf0/assets"
+        assets = [self.event(path=f"{staging}/chunk-{i:03d}.js", read=False, write=True) for i in range(489)]
+        reads = [self.event(path=f"/usr/local/lib/openclaw/assets/chunk-{i:03d}.js") for i in range(489)]
+        state = [self.event(path=f"/home/node/.openclaw/state/s{i}.json", read=False, write=True) for i in range(30)]
+        note = self.event(path="/home/node/work/notes/turn.txt", read=False, write=True)
+        result = self.summary(*assets, *reads, *state, note)
+        self.assertIn(self.entry(f"{staging}/*", read=False, write=True), result["files"])
+        self.assertIn(self.entry("/home/node/work/notes/turn.txt", read=False, write=True), result["files"])
+        self.assertEqual(sum(1 for e in result["files"] if e["path"].startswith(staging + "/")), 1)
+        self.assertEqual(len(result["files"]), cap)
+        self.assertTrue(result["dir_folded"])
+        self.assertEqual(result["unlisted_write_exec"], 0)
+        # The 30 state files (under FILE_DIR_FOLD_MIN) stay by name, and the
+        # reads still go first.
+        self.assertEqual(sum(1 for e in result["files"] if "/state/" in e["path"]), 30)
+        self.assertEqual(result["unlisted"], 489 + 30 + 1 + 1 - cap)
+        # The same set, any order, is the same value.
+        self.assertEqual(self.summary(note, *reversed(state), *reads, *reversed(assets))["files"],
+                         result["files"])
+
+    def test_a_directory_is_folded_only_when_the_writes_would_not_fit(self):
+        writes = [self.event(path=f"/data/out/{i:03d}", read=False, write=True) for i in range(100)]
+        result = self.summary(*writes)
+        self.assertEqual(len(result["files"]), 100)
+        self.assertFalse(result["dir_folded"])
+        # Over the cap: the most crowded directory goes first, and only as
+        # many as it takes; a handful in one directory, or in /, never.
+        with mock.patch.object(scanner, "FILE_ACCESS_CAP", 60):
+            result = self.summary(*writes[:50],
+                                  *(self.event(path=f"/data/big/{i:03d}", read=False, exec=True) for i in range(40)),
+                                  *(self.event(path=f"/r{i}", read=False, write=True) for i in range(5)),
+                                  self.event(path="/data/big/lib.so"))
+        paths = [e["path"] for e in result["files"]]
+        self.assertIn("/data/out/*", paths)
+        self.assertEqual(sum(p.startswith("/data/big/") for p in paths), 41)
+        self.assertEqual(sum(p.startswith("/r") for p in paths), 5)
+        self.assertIn(self.entry("/data/out/*", read=False, write=True), result["files"])
+        # A read-only file in the folded directory's neighbour is kept apart.
+        self.assertIn(self.entry("/data/big/lib.so"), result["files"])
+        self.assertEqual((result["unlisted"], result["unlisted_write_exec"]), (0, 0))
+        with mock.patch.object(scanner, "FILE_ACCESS_CAP", 3):
+            result = self.summary(*(self.event(path=f"/r{i}", read=False, write=True) for i in range(5)))
+        self.assertFalse(result["dir_folded"])
+        self.assertEqual(result["unlisted_write_exec"], 2)
+
+    def test_folding_unions_the_access_of_the_files_folded(self):
+        with mock.patch.object(scanner, "FILE_ACCESS_CAP", 1):
+            result = self.summary(*(self.event(path=f"/d/{i:02d}", write=True) for i in range(31)),
+                                  self.event(path="/d/run", read=False, exec=True))
+        self.assertEqual(result["files"], [self.entry("/d/*", read=True, write=True, exec=True)])
+
     def test_the_scanned_tmpdir_is_a_temp_dir_and_a_bad_one_is_ignored(self):
         dirs = scanner.file_temp_dirs({"TMPDIR": "/scratch/tmp/", "HOME": "/home/a"})
         self.assertEqual(dirs, (*scanner.FILE_TEMP_DIRS, "/scratch/tmp"))
@@ -2605,6 +2662,16 @@ class SecretClassFilesystemTest(unittest.TestCase):
             raise AssertionError("the local checker must not be consulted here")
 
         self.assertEqual(scanner.classify_secret_class("sk-plaintext", refuses), "plaintext")
+
+    def test_an_openshell_provider_placeholder_is_a_reference(self):
+        # DR-194 §4.6 (Daniel, 2026-10-28): OpenShell's supervisor swaps the
+        # placeholder for the real value on the way out; the agent holds none.
+        self.assertEqual(scanner.classify_secret_class("openshell:resolve:env:ANTHROPIC_API_KEY"), "reference")
+        by_key = {secret["key"]: secret for secret in scanner.collect_secret_hygiene(
+            {"ANTHROPIC_API_KEY": "openshell:resolve:env:ANTHROPIC_API_KEY",
+             "OPENAI_API_KEY": "sk-proj-" + "a1B2" * 12})}
+        self.assertEqual(by_key["ANTHROPIC_API_KEY"]["secret_class"], "reference")
+        self.assertEqual(by_key["OPENAI_API_KEY"]["secret_class"], "plaintext")
 
 
 class RegistrationPayloadAgentKeyTest(unittest.TestCase):
