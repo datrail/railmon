@@ -332,6 +332,45 @@ class CollectorTest(OpenShellCliTest):
         self.assertEqual([p for p, _, _ in FakeRailDash.posts].count("/v1/openshell/sandboxes/fx-base/policy"), 2)
         self.assertLess(collector.POLICY_REPOST_SECONDS, 2 * 3600)
 
+    def test_each_policy_read_is_written_for_the_scan_even_when_raildash_refuses(self):
+        # DR-266: railmon scan carries the allow-list from this file, read from
+        # OpenShell itself; RailDash being down mustn't make it look stale.
+        stamps, _ = collector.parse_log(LOG)
+        clock = [max(stamps)]
+        path = Path(self.tmp.name) / "for-scan.json"
+        poller = collector.Collector("fx-base", self.url, str(self.cli), log=self.messages.append,
+                                     clock=lambda: clock[0], policy_file=str(path), interval=30)
+        FakeRailDash.status = 503
+        poller.poll_policy()
+        first = json.loads(path.read_text())
+        self.assertEqual((first["kind"], first["sandbox"], first["every"]), ("openshell_policy", "fx-base", 30))
+        self.assertEqual(first["view"], collector.strip_policy(json.loads(POLICY)))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        clock[0] += 30
+        poller.poll_policy()  # unchanged revision: not posted, still written
+        self.assertGreater(json.loads(path.read_text())["read_at"], first["read_at"])
+        self.assertEqual(list(Path(self.tmp.name).glob(".for-scan.json.*")), [])
+        # What the scan makes of it.
+        sys.path.insert(0, str(ROOT / "tools" / "scan"))
+        try:
+            spec = importlib.util.spec_from_file_location("egress_for_collector", ROOT / "tools/scan/egress_containment.py")
+            egress = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(egress)
+        finally:
+            sys.path.pop(0)
+        entries, reasons = egress.allow_list_for("fx-base", egress.read_policy_file(str(path)), clock[0])
+        self.assertIn(("api.github.com", 443), [(e["host"], e["port"]) for e in entries])
+        self.assertEqual(reasons, ["allow-list: OpenShell's loaded policy revision 1, read by railmon openshell"])
+
+    def test_a_policy_file_that_cannot_be_written_is_said_once(self):
+        poller = collector.Collector("fx-base", self.url, str(self.cli), log=self.messages.append,
+                                     policy_file=str(Path(self.tmp.name) / "missing-dir" / "policy.json"))
+        poller.poll_policy()
+        poller.poll_policy()
+        said = [m for m in self.messages if "policy file" in m]
+        self.assertEqual(len(said), 1, said)
+        self.assertEqual(FakeRailDash.posts[0][0], "/v1/openshell/sandboxes/fx-base/policy")
+
     def test_main_names_what_is_missing(self):
         with mock.patch.dict(os.environ, {"AGENT_CONTAINER": "", "RAIL_RAILDASH_URL": ""}, clear=False):
             os.environ.pop("RAIL_OPENSHELL_SANDBOX", None)

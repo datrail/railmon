@@ -341,13 +341,15 @@ workload, sandboxed and thread-forked children included. AgentSight does
 not report a UDP socket that sends without binding (listensnoop's
 `autobind`), which is accepted.
 
-Rule pack 14 changes what three attributes say for an unchanged agent, so a
+Rule pack 14 changes what four attributes say for an unchanged agent, so a
 pack-13 baseline is `CONTRACT_MISMATCH` until a pack-14 ASP is locked:
 `observed_file_access` lists a large group of written or run files sharing a
 directory and an extension as `<dir>/*.<ext>` when they would not fit the
 cap (DR-262), and an OpenShell
 provider placeholder (`openshell:resolve:env:KEY`) is a `reference` in
-`credential_inventory`, not a plaintext secret (DR-194). And `skills_inventory`
+`credential_inventory`, not a plaintext secret (DR-194); `egress_containment`
+carries an OpenShell sandbox's allow-list when `railmon openshell` read it
+(DR-266). And `skills_inventory`
 (DR-264) names each MCP skill's `server`, keeps a probed tool's `inputSchema`
 and `annotations`, and says in `entry` whether it is a tool or a server
 whose tools couldn't be listed.
@@ -788,8 +790,19 @@ applies:
 The value carries the observations behind the level (`network_mode`, each
 network's `internal` flag and gateway peers, whether the OpenShell labels are
 there, `privileged`, the matched socket mounts), so a consumer can judge them
-itself. `allow_list` is always `null`: OpenShell keeps its allow-list in its
-own gateway, so RailMon can say one is enforced but not what is on it. In
+itself. `allow_list` is `null` unless `railmon openshell` runs (README, "An
+OpenShell sandbox's policy and denials") and writes what `openshell policy
+get` returned to `RAIL_OPENSHELL_POLICY_FILE`, which `railmon scan` reads too
+(DR-266). Then, for an `allow_list_enforced` container, it is one entry per
+endpoint and port the sandbox's loaded policy allows, `{host, port,
+protocol, enforcement, access, rules, binaries}`, sorted by host and port (at
+most 256, each with up to 32 allow rules and binaries; a reason says how
+many more there were), and a reason names the policy revision. The copy is
+used only for the sandbox it names (`openshell.ai/sandbox-name`) and only
+while it is current (within three of the collector's intervals, plus a
+minute); otherwise the list stays `null` and a reason says why. The scanner
+itself never holds an OpenShell credential, and without the collector the
+attribute says exactly what it did before. In
 `container:<id>` mode the namespace's owner decides the network, and a
 downgrade on either container counts. If a network can't be inspected, it is
 never assumed internal. The attribute is `PARTIAL` (level `open`) only when

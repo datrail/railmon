@@ -11,7 +11,9 @@ calls Docker, and it runs in the scan that already inspected the target.
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime
 from typing import Any, Callable
 
 # The schema's bounds (`$defs.egress_containment_value`). A bundle past one
@@ -39,6 +41,24 @@ OPENSHELL_LABELS = {
     "openshell.ai/isolation-backend": "openshell-sandbox",
     "openshell.ai/isolation-role": "sandbox",
 }
+
+# The sandbox a container is the workload of (OpenShell's Docker driver).
+OPENSHELL_SANDBOX_LABEL = "openshell.ai/sandbox-name"
+
+# The allow-list (DR-266): what `railmon openshell` read from `openshell
+# policy get` and wrote to RAIL_OPENSHELL_POLICY_FILE. Bounds as the schema's
+# `$defs.egress_containment_value.allow_list`.
+MAX_ALLOW_ENTRIES = 256
+MAX_ALLOW_RULES = 32
+MAX_ALLOW_BINARIES = 32
+MAX_ALLOW_TEXT = 256
+MAX_ALLOW_PATH = 1024
+ALLOW_RULE_FIELDS = ("method", "path", "command", "operation_type", "tool")
+# The policy file's own bound; a larger one isn't read.
+MAX_POLICY_FILE = 1024 * 1024
+# A copy older than this many of the collector's intervals (plus a minute)
+# is a stopped collector's, not the sandbox's policy now.
+POLICY_STALE_INTERVALS = 3
 
 SOCKET_NAMES = ("docker.sock", "podman.sock", "containerd.sock", "crio.sock")
 KNOWN_SOCKET_PATHS = (
@@ -174,6 +194,111 @@ def collect_inputs(
     return {"owner": owner, "owner_wanted": mode.startswith("container:"), "networks": networks}
 
 
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _text(value: Any, limit: int = MAX_ALLOW_TEXT) -> str | None:
+    return value if isinstance(value, str) and 0 < len(value) <= limit and value.isprintable() else None
+
+
+def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int]:
+    """The allow-list of one `openshell policy get` view, as the collector
+    stripped it, and how many entries the bound left out: one entry per
+    endpoint and port, `{host, port, protocol, enforcement, access, rules,
+    binaries}`, sorted, a port the endpoint names none of being null.
+    Anything not in the shape OpenShell writes is skipped, not guessed."""
+    policy = view.get("policy") if isinstance(view, dict) else None
+    network = policy.get("network_policies") if isinstance(policy, dict) else None
+    entries: dict[str, dict[str, Any]] = {}
+    for rule in (network.values() if isinstance(network, dict) else ()):
+        if not isinstance(rule, dict):
+            continue
+        binaries = sorted({
+            path for path in (
+                _text(binary.get("path") if isinstance(binary, dict) else binary, MAX_ALLOW_PATH)
+                for binary in _list(rule.get("binaries"))
+            ) if path
+        })[:MAX_ALLOW_BINARIES]
+        for endpoint in _list(rule.get("endpoints")):
+            if not isinstance(endpoint, dict) or (host := _text(endpoint.get("host"), 253)) is None:
+                continue
+            ports: list[int | None] = []
+            for port in [endpoint.get("port"), *_list(endpoint.get("ports"))]:
+                if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+                    ports.append(port)
+            rules: list[dict[str, str]] = []
+            for allow_rule in _list(endpoint.get("rules")):
+                allow = allow_rule.get("allow") if isinstance(allow_rule, dict) else None
+                if isinstance(allow, dict):
+                    kept = {field: text for field in ALLOW_RULE_FIELDS
+                            if (text := _text(allow.get(field), MAX_ALLOW_PATH)) is not None}
+                    if kept:
+                        rules.append(kept)
+            rules = sorted(rules, key=lambda item: sorted(item.items()))[:MAX_ALLOW_RULES]
+            for port in sorted(set(ports)) or [None]:
+                entry = {"host": host, "port": port, "protocol": _text(endpoint.get("protocol")),
+                         "enforcement": _text(endpoint.get("enforcement")), "access": _text(endpoint.get("access")),
+                         "rules": rules, "binaries": binaries}
+                entries[json.dumps(entry, sort_keys=True)] = entry
+    ordered = sorted(entries.values(), key=lambda entry: (entry["host"], entry["port"] or 0,
+                                                         json.dumps(entry, sort_keys=True)))
+    return ordered[:MAX_ALLOW_ENTRIES], max(0, len(ordered) - MAX_ALLOW_ENTRIES)
+
+
+def read_policy_file(path: str | None) -> dict[str, Any] | None:
+    """RAIL_OPENSHELL_POLICY_FILE as `railmon openshell` wrote it, or None
+    when there is no file, it is too large or isn't one of those. Never
+    raises: without a copy the allow-list just stays unread."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_POLICY_FILE + 1)
+        if len(raw) > MAX_POLICY_FILE:
+            return None
+        body = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(body, dict) or body.get("kind") != "openshell_policy":
+        return None
+    return body
+
+
+def _policy_age(body: dict[str, Any], now: float) -> float | None:
+    try:
+        read_at = datetime.fromisoformat(str(body.get("read_at")).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+    return now - read_at
+
+
+def allow_list_for(sandbox: str | None, body: dict[str, Any] | None, now: float) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """(allow_list, reasons) for an OpenShell sandbox's container: the list
+    from the collector's copy when it is for this sandbox and fresh, else
+    None and a reason why. No copy at all adds no reason, so a stack
+    without the collector says what it said before DR-266. A reason carries
+    no time, so it doesn't change from one scan to the next."""
+    if body is None:
+        return None, []
+    if not sandbox or body.get("sandbox") != sandbox:
+        return None, ["allow-list not read: railmon openshell follows another sandbox"]
+    every = body.get("every")
+    every = float(every) if isinstance(every, (int, float)) and not isinstance(every, bool) and 5 <= every <= 3600 else 60.0
+    age = _policy_age(body, now)
+    if age is None or age > POLICY_STALE_INTERVALS * every + 60 or age < -60:
+        return None, ["allow-list not read: railmon openshell's copy of the policy is not current"]
+    entries, left_out = allow_list_entries(body.get("view"))
+    view = body.get("view") if isinstance(body.get("view"), dict) else {}
+    revision = view.get("active_version", view.get("current_policy_version"))
+    reasons = [f"allow-list: OpenShell's loaded policy"
+               + (f" revision {revision}" if isinstance(revision, int) and not isinstance(revision, bool) else "")
+               + ", read by railmon openshell"]
+    if left_out:
+        reasons.append(f"{left_out} more allow-list entries not listed")
+    return entries, reasons
+
+
 def _joined(prefix: str, names: list[str]) -> str:
     text = prefix + ", ".join(names)
     return text if len(text) <= MAX_REASON else text[: MAX_REASON - 1] + "…"
@@ -220,6 +345,7 @@ def classify(
     attached = [n["name"] for n in networks]
     status = "ANSWERED"
     enforcer = None
+    allow_list: list[dict[str, Any]] | None = None
 
     if reasons:
         level = "open"
@@ -229,6 +355,9 @@ def classify(
         if openshell:
             level, enforcer = "allow_list_enforced", "openshell"
             reasons = ["openshell sandbox labels", "NetworkMode none, no attached network"]
+            allow_list, allow_reasons = allow_list_for(
+                labels.get(OPENSHELL_SANDBOX_LABEL), inputs.get("openshell_policy"), float(inputs.get("now") or 0))
+            reasons += allow_reasons
         else:
             level, reasons = "no_network", ["NetworkMode none, no attached network"]
     elif not attached:
@@ -269,7 +398,7 @@ def classify(
             "runtime_socket_mounts": _capped(sockets),
         },
         "via": f"container:{_container_name(owner)}" if owner is not None else None,
-        "allow_list": None,
+        "allow_list": allow_list,
         "reasons": [reason[:MAX_REASON] for reason in reasons][:16],
     }
     return status, value

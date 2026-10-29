@@ -560,11 +560,17 @@ def collect_egress_containment(inspect: dict[str, Any]) -> dict[str, Any]:
     each internal network's other containers (DR-207)."""
     import evidence_bundle  # lazy: breaks the import cycle
 
-    return evidence_bundle._sibling("egress_containment").collect_inputs(
+    egress = evidence_bundle._sibling("egress_containment")
+    inputs = egress.collect_inputs(
         inspect,
         lambda ref: _docker_inspect_json(["docker", "container", "inspect", ref]),
         lambda ref: _docker_inspect_json(["docker", "network", "inspect", ref]),
     )
+    # DR-266: the sandbox's allow-list, as `railmon openshell` last read it
+    # from OpenShell (its RAIL_OPENSHELL_POLICY_FILE); none without one.
+    inputs["openshell_policy"] = egress.read_policy_file(os.environ.get("RAIL_OPENSHELL_POLICY_FILE"))
+    inputs["now"] = time.time()
+    return inputs
 
 
 def collect_docker_context(container: str) -> dict[str, Any]:

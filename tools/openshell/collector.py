@@ -20,6 +20,12 @@ exchange for freshness and the supervisor's denials. Each interval it:
   denial since the last one: the first poll, a poll that no longer reaches
   the last line seen, a full buffer, or a failed poll.
 
+With `RAIL_OPENSHELL_POLICY_FILE` set, each policy it reads is also written
+there (`write_policy_file`), for `railmon scan` to carry the sandbox's
+allow-list to Rail Center as agent data read from OpenShell itself, not
+from RailDash's record (DR-266; Daniel, 2026-10-28). The scanner never
+holds an OpenShell credential.
+
 It runs only the CLI subcommands in `ALLOWED_COMMANDS`, enforced in
 `run_openshell`. It holds no Docker socket and listens on nothing.
 """
@@ -27,6 +33,7 @@ It runs only the CLI subcommands in `ALLOWED_COMMANDS`, enforced in
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -160,6 +167,26 @@ def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
 def policy_revision(view: dict[str, Any]) -> tuple[Any, Any]:
     """What says the loaded policy changed: its version and its hash."""
     return (view.get("active_version", view.get("current_policy_version")), view.get("hash"))
+
+
+def write_policy_file(path: str, sandbox: str, interval: float, view: dict[str, Any], now: float) -> None:
+    """`view` (`strip_policy`'s) as `railmon scan` reads it (DR-266): which
+    sandbox, when it was read and how often it is, so the scan can tell a
+    current copy from a stopped collector's. Written beside itself and
+    renamed, so the scan never reads half a file."""
+    body = {"kind": "openshell_policy", "sandbox": sandbox, "read_at": _iso(now),
+            "every": interval, "view": view}
+    directory = os.path.dirname(os.path.abspath(path))
+    temp = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, separators=(",", ":"), sort_keys=True)
+        os.chmod(temp, 0o644)
+        os.replace(temp, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise CollectorError(f"could not write {path}: {exc}") from exc
 
 
 # --------------------------------------------------------------- denials
@@ -368,8 +395,10 @@ def post(raildash_url: str, sandbox: str, what: str, body: dict[str, Any]) -> di
 class Collector:
     def __init__(self, sandbox: str, raildash_url: str, cli: str = "openshell",
                  log: Callable[[str], None] = lambda message: print(message, file=sys.stderr, flush=True),
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 policy_file: str | None = None, interval: float = DEFAULT_INTERVAL) -> None:
         self.sandbox, self.raildash_url, self.cli, self.log, self.clock = sandbox, raildash_url, cli, log, clock
+        self.policy_file, self.interval = policy_file, interval
         self.revision: tuple[Any, Any] | None = None
         self.posted_at: float | None = None
         self.cursor = DenialCursor()
@@ -390,9 +419,18 @@ class Collector:
                 raise CollectorError("openshell policy get printed no JSON object")
             revision = policy_revision(view)
             now = self.clock()
+            stripped = strip_policy(view)
+            if self.policy_file:
+                # Every poll, so its time says the collector is still running;
+                # before the post, so RailDash being down doesn't stop it.
+                try:
+                    write_policy_file(self.policy_file, self.sandbox, self.interval, stripped, now)
+                    self._say("policy file", None)
+                except CollectorError as exc:
+                    self._say("policy file", str(exc))
             if (revision != self.revision or self.posted_at is None
                     or now - self.posted_at >= POLICY_REPOST_SECONDS):
-                post(self.raildash_url, self.sandbox, "policy", strip_policy(view))
+                post(self.raildash_url, self.sandbox, "policy", stripped)
                 if revision != self.revision:
                     self.log(f"railmon openshell: posted {self.sandbox}'s policy revision {revision[0]}")
                 self.revision, self.posted_at = revision, now
@@ -495,7 +533,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     except CollectorError as exc:
         print(f"railmon openshell: {exc}", file=sys.stderr)
         return 64
-    collector = Collector(sandbox, args.raildash_url, args.openshell)
+    collector = Collector(sandbox, args.raildash_url, args.openshell,
+                          policy_file=os.environ.get("RAIL_OPENSHELL_POLICY_FILE") or None,
+                          interval=args.interval)
     collector.log(f"railmon openshell: following sandbox {sandbox} every {args.interval:g}s")
     while True:
         collector.once()
