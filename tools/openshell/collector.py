@@ -133,8 +133,9 @@ def strip_policy(view: dict[str, Any], count_unread: bool = False) -> dict[str, 
     """`policy get --full -o json` with only what RailDash reads. With
     `count_unread` (the copy `railmon scan` reads, DR-266), each endpoint
     also says how many of its rules weren't an allow rule this can read
-    (`unread_rules`), so the scan never lists it as less restricted than
-    the policy."""
+    (`unread_rules`), and each rule how many binaries (`unread_binaries`),
+    so the scan never lists one as other than the policy without saying
+    so."""
     policy = view.get("policy")
     if not isinstance(policy, dict):
         raise CollectorError("openshell policy get printed no policy")
@@ -151,7 +152,9 @@ def strip_policy(view: dict[str, Any], count_unread: bool = False) -> dict[str, 
                 continue
             kept = {field: endpoint[field] for field in ENDPOINT_FIELDS if field in endpoint}
             raw_rules = endpoint.get("rules")
-            rule_items = raw_rules if isinstance(raw_rules, list) else []
+            # The post reads rules as it always has; only the scan's copy
+            # turns a rules value that isn't a list into a count.
+            rule_items = (raw_rules if isinstance(raw_rules, list) else []) if count_unread else raw_rules or []
             kept["rules"] = [
                 {"allow": {field: rule_["allow"][field] for field in RULE_FIELDS if field in rule_["allow"]}}
                 for rule_ in rule_items
@@ -169,6 +172,10 @@ def strip_policy(view: dict[str, Any], count_unread: bool = False) -> dict[str, 
             if (isinstance(binary, dict) and isinstance(binary.get("path"), str)) or isinstance(binary, str)
         ]
         rules[key] = {"name": rule.get("name") or key, "endpoints": endpoints, "binaries": binaries}
+        if count_unread:
+            raw_binaries = rule.get("binaries")
+            rules[key]["unread_binaries"] = (
+                (len(raw_binaries) - len(binaries)) if isinstance(raw_binaries, list) else int(raw_binaries is not None))
     out = {field: view[field] for field in WRAPPER_FIELDS if field in view}
     out["policy"] = {"version": policy.get("version", 1), "network_policies": rules}
     return out

@@ -383,6 +383,12 @@ class CollectorTest(OpenShellCliTest):
             {"allow": {"method": "GET", "path": "/a"}}, {"deny": {}}]}]}}}}
         entries, _, cut = egress.allow_list_entries(collector.strip_policy(mixed, count_unread=True))
         self.assertEqual(([e["rules"] for e in entries], cut), ([[{"method": "GET", "path": "/a"}]], True))
+        odd = {"policy": {"network_policies": {"r": {"binaries": [{"path": "/a"}, {"path": None}],
+                                                     "endpoints": [{"host": "x.example", "port": 443}]}}}}
+        entries, _, cut = egress.allow_list_entries(collector.strip_policy(odd, count_unread=True))
+        self.assertEqual(([e["binaries"] for e in entries], cut), ([["/a"]], True))
+        # The RailDash post carries neither count.
+        self.assertNotIn("unread_", json.dumps(collector.strip_policy(odd)))
         for fixture in ("policy-full.json", "provider-github.policy-full.json"):
             raw = json.loads((FIXTURES / fixture).read_text())
             self.assertFalse(egress.allow_list_entries(collector.strip_policy(raw, count_unread=True))[2], fixture)

@@ -228,7 +228,9 @@ def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
         paths = [_text(binary.get("path") if isinstance(binary, dict) else binary, MAX_ALLOW_PATH)
                  for binary in _list(rule.get("binaries"))]
         binaries = sorted({path for path in paths if path})
-        cut = cut or None in paths or len(binaries) > MAX_ALLOW_BINARIES
+        unread_binaries = rule.get("unread_binaries")
+        cut = (cut or None in paths or len(binaries) > MAX_ALLOW_BINARIES
+               or (isinstance(unread_binaries, int) and not isinstance(unread_binaries, bool) and unread_binaries > 0))
         binaries = binaries[:MAX_ALLOW_BINARIES]
         for endpoint in _list(rule.get("endpoints")):
             if not isinstance(endpoint, dict):

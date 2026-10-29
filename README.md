@@ -393,9 +393,9 @@ RailDash instead.
 With `RAIL_OPENSHELL_POLICY_FILE` set, each policy it reads, every interval,
 is also written to that file, for `railmon scan` (with the same variable) to
 carry the sandbox's allow-list in `egress_containment` to Rail Center as
-agent data read from OpenShell itself (DR-266). The file holds the same
-fields as the post, the sandbox's name and when it was read; the scanner
-uses it only while it is current.
+agent data read from OpenShell itself (DR-266). The file holds the post's
+fields, how many rules and binaries it couldn't read, the sandbox's name and
+when it was read; the scanner uses it only while it is current.
 
 ## Configuration
 
