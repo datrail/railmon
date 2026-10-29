@@ -275,11 +275,15 @@ def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
                     cut = True
                     continue
                 rules.append(kept)  # type: ignore[arg-type]
-            if _list(endpoint.get("rules")) and not rules:
-                # Every allow rule dropped: listed with none, it would read
-                # as no L7 restriction at all.
+            unread = endpoint.get("unread_rules")
+            unread = unread if isinstance(unread, int) and not isinstance(unread, bool) and unread > 0 else 0
+            if (_list(endpoint.get("rules")) or unread) and not rules:
+                # Every allow rule dropped (here, or by the collector, which
+                # counts what it couldn't read): listed with none, it would
+                # read as no L7 restriction at all.
                 cut = True
                 continue
+            cut = cut or bool(unread)
             rules = sorted(rules, key=lambda item: sorted(item.items()))
             cut = cut or len(rules) > MAX_ALLOW_RULES
             rules = rules[:MAX_ALLOW_RULES]

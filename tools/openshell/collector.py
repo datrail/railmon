@@ -129,8 +129,12 @@ def run_openshell(cli: str, args: list[str], timeout: float = CLI_TIMEOUT) -> st
 # ---------------------------------------------------------------- policy
 
 
-def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
-    """`policy get --full -o json` with only what RailDash reads."""
+def strip_policy(view: dict[str, Any], count_unread: bool = False) -> dict[str, Any]:
+    """`policy get --full -o json` with only what RailDash reads. With
+    `count_unread` (the copy `railmon scan` reads, DR-266), each endpoint
+    also says how many of its rules weren't an allow rule this can read
+    (`unread_rules`), so the scan never lists it as less restricted than
+    the policy."""
     policy = view.get("policy")
     if not isinstance(policy, dict):
         raise CollectorError("openshell policy get printed no policy")
@@ -146,11 +150,16 @@ def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(endpoint, dict):
                 continue
             kept = {field: endpoint[field] for field in ENDPOINT_FIELDS if field in endpoint}
+            raw_rules = endpoint.get("rules")
+            rule_items = raw_rules if isinstance(raw_rules, list) else []
             kept["rules"] = [
                 {"allow": {field: rule_["allow"][field] for field in RULE_FIELDS if field in rule_["allow"]}}
-                for rule_ in endpoint.get("rules") or []
+                for rule_ in rule_items
                 if isinstance(rule_, dict) and isinstance(rule_.get("allow"), dict)
             ]
+            if count_unread:
+                kept["unread_rules"] = (len(rule_items) - len(kept["rules"])
+                                        + (raw_rules is not None and not isinstance(raw_rules, list)))
             # Only how many: a deny rule's matchers aren't shown.
             kept["deny_rules"] = [{} for _ in endpoint.get("deny_rules") or []]
             endpoints.append(kept)
@@ -429,7 +438,8 @@ class Collector:
                 # Every poll, so its time says the collector is still running;
                 # before the post, so RailDash being down doesn't stop it.
                 try:
-                    write_policy_file(self.policy_file, self.sandbox, self.interval, stripped, now)
+                    write_policy_file(self.policy_file, self.sandbox, self.interval,
+                                      strip_policy(view, count_unread=True), now)
                     self._say("policy file", None)
                 except CollectorError as exc:
                     self._say("policy file", str(exc))
