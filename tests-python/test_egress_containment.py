@@ -12,6 +12,7 @@ import copy
 import importlib.util
 import sys
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -408,6 +409,175 @@ class V2Test(unittest.TestCase):
         }
         problems = evidence_bundle._semantic_problems_v2(bundle)
         self.assertTrue(any("egress_containment" in p for p in problems), problems)
+
+
+
+class AllowListTest(unittest.TestCase):
+    """DR-266: the sandbox's allow-list, read from OpenShell by `railmon
+    openshell` (Daniel, 2026-10-28), never from RailDash's record."""
+
+    NOW = 1_800_000_000.0
+
+    def view(self):
+        import json
+
+        sys.path.insert(0, str(ROOT / "tools" / "openshell"))
+        try:
+            import collector
+        finally:
+            sys.path.pop(0)
+        raw = json.loads((ROOT / "tests" / "fixtures" / "openshell-0.1.3" / "policy-full.json").read_text())
+        return collector.strip_policy(raw)
+
+    def body(self, sandbox="my-agent", age=30.0, every=60):
+        from datetime import datetime, timezone
+
+        read_at = datetime.fromtimestamp(self.NOW - age, timezone.utc).isoformat().replace("+00:00", "Z")
+        return {"kind": "openshell_policy", "sandbox": sandbox, "read_at": read_at, "every": every,
+                "view": self.view()}
+
+    def classify_with(self, target, body):
+        docker = Docker([target])
+        inputs = egress.collect_inputs(target, docker.container, docker.network)
+        inputs.update(openshell_policy=body, now=self.NOW)
+        return egress.classify(target, inputs)
+
+    def test_a_current_copy_for_this_sandbox_is_the_allow_list(self):
+        status, value = self.classify_with(OPENSHELL, self.body())
+        self.assertEqual((status, value["level"]), ("ANSWERED", "allow_list_enforced"))
+        # A new revision of the same content says the same.
+        again = self.body()
+        again["view"] = {**again["view"], "active_version": 7}
+        self.assertEqual(self.classify_with(OPENSHELL, again), (status, value))
+        self.assertEqual([(e["host"], e["port"]) for e in value["allow_list"]], [
+            ("*.example.com", 443), ("*.example.com", 8443), ("api.github.com", 443),
+            ("raw.githubusercontent.com", 443), ("uploads.github.com", 443)])
+        uploads = value["allow_list"][-1]
+        self.assertEqual(uploads, {
+            "host": "uploads.github.com", "allowed_ips": [], "port": 443, "path": None, "protocol": "rest",
+            "enforcement": "enforce", "access": None,
+            "rules": [{"method": "GET", "path": "/repos/**"}, {"method": "POST", "path": "/repos/*/*/releases/*/assets"}],
+            "deny_rules": 0, "binaries": ["/usr/local/bin/python3.13"]})
+        self.assertIn("allow-list: OpenShell's loaded policy, read by railmon openshell", value["reasons"])
+        self.assertFalse(any("could not be listed" in reason for reason in value["reasons"]))
+
+    def test_the_same_policy_reads_the_same_on_every_scan(self):
+        first = self.classify_with(OPENSHELL, self.body(age=10))
+        later = self.classify_with(OPENSHELL, self.body(age=100))
+        self.assertEqual(first, later)
+
+    def test_no_copy_says_what_it_said_before(self):
+        before = classify(OPENSHELL, Docker([OPENSHELL]))
+        self.assertEqual(self.classify_with(OPENSHELL, None), before)
+        self.assertIsNone(before[1]["allow_list"])
+
+    def test_a_stale_copy_or_another_sandbox_is_not_read(self):
+        for body, words in ((self.body(age=60 * 3 + 61), "is not current"),
+                            (self.body(age=-120), "is not current"),
+                            ({**self.body(), "read_at": "yesterday"}, "is not current"),
+                            (self.body(sandbox="other"), "follows another sandbox")):
+            status, value = self.classify_with(OPENSHELL, body)
+            self.assertIsNone(value["allow_list"])
+            self.assertTrue(any(words in reason for reason in value["reasons"]), value["reasons"])
+        unnamed = container("none", ("none",), {k: v for k, v in OPENSHELL_LABELS.items()
+                                                 if k != "openshell.ai/sandbox-name"})
+        reasons = self.classify_with(unnamed, self.body())[1]["reasons"]
+        self.assertIn("allow-list not read: the container names no OpenShell sandbox", reasons)
+        # Fresh within three of its own intervals.
+        self.assertIsNotNone(self.classify_with(OPENSHELL, self.body(age=3 * 600, every=600))[1]["allow_list"])
+
+    def test_only_an_openshell_sandbox_reads_it(self):
+        agent = container("none", ("none",))
+        status, value = self.classify_with(agent, self.body())
+        self.assertEqual((value["level"], value["allow_list"]), ("no_network", None))
+
+    def test_the_list_is_bounded_and_what_it_left_out_is_said(self):
+        view = {"policy": {"network_policies": {
+            f"r{i}": {"binaries": [{"path": f"/bin/b{j}"} for j in range(40)],
+                      "endpoints": [{"host": f"h{i:03d}.example", "ports": [443, 8443],
+                                     "rules": [{"allow": {"method": "GET", "path": f"/p{k}"}} for k in range(40)]}]}
+            for i in range(200)}}}
+        entries, left_out, cut = egress.allow_list_entries(view)
+        self.assertEqual(len(entries) + left_out, 400)
+        self.assertTrue(cut)  # 40 rules and binaries, cut to 32
+        self.assertTrue(all(len(e["rules"]) == 32 and len(e["binaries"]) == 32 for e in entries))
+        self.assertLessEqual(len(json.dumps(entries, separators=(",", ":"))), egress.MAX_ALLOW_BYTES)
+        status, value = self.classify_with(OPENSHELL, {**self.body(), "view": view})
+        self.assertIn(f"{left_out} more allow-list entries not listed", value["reasons"])
+        self.assertIn("some endpoints, allow rules, binaries or addresses could not be listed", value["reasons"])
+        small = {"policy": {"network_policies": {f"r{i}": {"endpoints": [{"host": f"h{i:03d}.x", "port": 443}]}
+                                                 for i in range(300)}}}
+        self.assertEqual(egress.allow_list_entries(small)[:2][1], 300 - 256)
+        # The bundle's contract (the published schema) holds at the bounds.
+        docker = Docker([OPENSHELL])
+        inputs = egress.collect_inputs(OPENSHELL, docker.container, docker.network)
+        inputs.update(openshell_policy={**self.body(), "view": view}, now=self.NOW)
+        attrs = BundleTest("test_an_openshell_sandbox_is_answered_observed").build(
+            {"mode": "docker", "docker_inspect": OPENSHELL, "env": {}, "egress_inputs": inputs})
+        self.assertEqual(attrs["egress_containment"]["value"]["allow_list"], entries)
+
+    def test_shapes_openshell_does_not_write_are_skipped(self):
+        view = {"policy": {"network_policies": {
+            "a": {"endpoints": [{"host": "ok.example", "port": True}, {"host": ""}, {"port": 443},
+                                {"host": "x" * 254}, {"host": "p.example", "port": 70000, "ports": "443"},
+                                "junk"], "binaries": "nope"},
+            "b": "junk"}}}
+        entries, _, cut = egress.allow_list_entries(view)
+        # A bool port, an empty or too-long host, an out-of-range port: each
+        # endpoint dropped whole, never listed as allowing more.
+        self.assertEqual(entries, [])
+        self.assertTrue(cut)
+        for endpoint in ({"host": "x" * 254, "allowed_ips": ["10.0.0.1"], "port": 443},
+                         {"host": "x.example", "port": 443, "access": "r" * 300},
+                         {"host": "x.example", "port": 443, "path": "/" + "p" * 2000},
+                         {"host": "x.example", "allowed_ips": ["10.0.0.1", 7], "port": 443},
+                         {"host": "x.example", "ports": "443"},
+                         {"host": "x.example", "allowed_ips": "10.0.0.1", "port": 443},
+                         {"host": "x.example", "port": 443, "rules": [{"allow": {}}]}):
+            got = egress.allow_list_entries({"policy": {"network_policies": {"a": {"endpoints": [endpoint]}}}})
+            self.assertEqual(got, ([], 0, True), endpoint)
+        mcp = {"host": "mcp.example", "port": 443, "path": "/mcp", "deny_rules": [{}, {}]}
+        (entry,), _, cut = egress.allow_list_entries({"policy": {"network_policies": {"m": {"endpoints": [mcp]}}}})
+        self.assertEqual((entry["path"], entry["deny_rules"], cut), ("/mcp", 2, False))
+        self.assertEqual(egress.allow_list_entries(None), ([], 0, False))
+
+    def test_an_endpoint_named_by_addresses_alone_is_kept(self):
+        # OpenShell allows an endpoint with allowed_ips and no host.
+        view = {"policy": {"network_policies": {"lan": {"endpoints": [
+            {"allowed_ips": ["10.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16"], "port": 443},
+            {"host": "x.example", "allowed_ips": ["203.0.113.7"], "port": 443}]}}}}
+        entries, _, cut = egress.allow_list_entries(view)
+        self.assertFalse(cut)
+        self.assertEqual([(e["host"], e["allowed_ips"]) for e in entries],
+                         [(None, ["10.0.0.0/8", "192.168.0.0/16"]), ("x.example", ["203.0.113.7"])])
+
+    def test_a_rule_that_cannot_be_kept_whole_is_dropped_not_widened(self):
+        view = {"policy": {"network_policies": {"r": {"endpoints": [{"host": "x.example", "port": 443, "rules": [
+            {"allow": {"method": "GET", "path": "/" + "a" * 2000}},
+            {"allow": {"method": "POST", "path": "/ok"}},
+            {"allow": {"method": None}}]}]}}}}
+        entries, _, cut = egress.allow_list_entries(view)
+        self.assertEqual(entries[0]["rules"], [{"method": "POST", "path": "/ok"}])
+        self.assertTrue(cut)
+
+    def test_the_file_is_read_only_when_it_is_the_collectors(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.json"
+            self.assertIsNone(egress.read_policy_file(str(path)))
+            self.assertIsNone(egress.read_policy_file(None))
+            path.write_text("{not json")
+            self.assertIsNone(egress.read_policy_file(str(path)))
+            path.write_text(json.dumps({"kind": "other"}))
+            self.assertIsNone(egress.read_policy_file(str(path)))
+            path.write_text(json.dumps(self.body()))
+            self.assertEqual(egress.read_policy_file(str(path))["sandbox"], "my-agent")
+            path.write_text(" " * (egress.MAX_POLICY_FILE + 1))
+            self.assertIsNone(egress.read_policy_file(str(path)))
+            path.write_text("[" * 200000)
+            self.assertIsNone(egress.read_policy_file(str(path)))
 
 
 if __name__ == "__main__":

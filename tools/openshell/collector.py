@@ -20,6 +20,12 @@ exchange for freshness and the supervisor's denials. Each interval it:
   denial since the last one: the first poll, a poll that no longer reaches
   the last line seen, a full buffer, or a failed poll.
 
+With `RAIL_OPENSHELL_POLICY_FILE` set, each policy it reads is also written
+there (`write_policy_file`), for `railmon scan` to carry the sandbox's
+allow-list to Rail Center as agent data read from OpenShell itself, not
+from RailDash's record (DR-266; Daniel, 2026-10-28). The scanner never
+holds an OpenShell credential.
+
 It runs only the CLI subcommands in `ALLOWED_COMMANDS`, enforced in
 `run_openshell`. It holds no Docker socket and listens on nothing.
 """
@@ -27,6 +33,7 @@ It runs only the CLI subcommands in `ALLOWED_COMMANDS`, enforced in
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -34,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
@@ -121,8 +129,13 @@ def run_openshell(cli: str, args: list[str], timeout: float = CLI_TIMEOUT) -> st
 # ---------------------------------------------------------------- policy
 
 
-def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
-    """`policy get --full -o json` with only what RailDash reads."""
+def strip_policy(view: dict[str, Any], count_unread: bool = False) -> dict[str, Any]:
+    """`policy get --full -o json` with only what RailDash reads. With
+    `count_unread` (the copy `railmon scan` reads, DR-266), each endpoint
+    also says how many of its rules weren't an allow rule this can read
+    (`unread_rules`), and each rule how many binaries (`unread_binaries`),
+    so the scan never lists one as other than the policy without saying
+    so."""
     policy = view.get("policy")
     if not isinstance(policy, dict):
         raise CollectorError("openshell policy get printed no policy")
@@ -138,11 +151,18 @@ def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(endpoint, dict):
                 continue
             kept = {field: endpoint[field] for field in ENDPOINT_FIELDS if field in endpoint}
+            raw_rules = endpoint.get("rules")
+            # The post reads rules as it always has; only the scan's copy
+            # turns a rules value that isn't a list into a count.
+            rule_items = (raw_rules if isinstance(raw_rules, list) else []) if count_unread else raw_rules or []
             kept["rules"] = [
                 {"allow": {field: rule_["allow"][field] for field in RULE_FIELDS if field in rule_["allow"]}}
-                for rule_ in endpoint.get("rules") or []
+                for rule_ in rule_items
                 if isinstance(rule_, dict) and isinstance(rule_.get("allow"), dict)
             ]
+            if count_unread:
+                kept["unread_rules"] = (len(rule_items) - len(kept["rules"])
+                                        + (raw_rules is not None and not isinstance(raw_rules, list)))
             # Only how many: a deny rule's matchers aren't shown.
             kept["deny_rules"] = [{} for _ in endpoint.get("deny_rules") or []]
             endpoints.append(kept)
@@ -152,6 +172,10 @@ def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
             if (isinstance(binary, dict) and isinstance(binary.get("path"), str)) or isinstance(binary, str)
         ]
         rules[key] = {"name": rule.get("name") or key, "endpoints": endpoints, "binaries": binaries}
+        if count_unread:
+            raw_binaries = rule.get("binaries")
+            rules[key]["unread_binaries"] = (
+                (len(raw_binaries) - len(binaries)) if isinstance(raw_binaries, list) else int(raw_binaries is not None))
     out = {field: view[field] for field in WRAPPER_FIELDS if field in view}
     out["policy"] = {"version": policy.get("version", 1), "network_policies": rules}
     return out
@@ -160,6 +184,30 @@ def strip_policy(view: dict[str, Any]) -> dict[str, Any]:
 def policy_revision(view: dict[str, Any]) -> tuple[Any, Any]:
     """What says the loaded policy changed: its version and its hash."""
     return (view.get("active_version", view.get("current_policy_version")), view.get("hash"))
+
+
+def write_policy_file(path: str, sandbox: str, interval: float, view: dict[str, Any], now: float) -> None:
+    """`view` (`strip_policy`'s) as `railmon scan` reads it (DR-266): which
+    sandbox, when it was read and how often it is, so the scan can tell a
+    current copy from a stopped collector's. Written beside itself and
+    renamed, so the scan never reads half a file."""
+    body = {"kind": "openshell_policy", "sandbox": sandbox, "read_at": _iso(now),
+            "every": interval, "view": view}
+    directory = os.path.dirname(os.path.abspath(path))
+    temp = None
+    try:
+        # A fresh name of its own (O_EXCL), never one planted beforehand.
+        handle, temp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(body, out, separators=(",", ":"), sort_keys=True)
+        os.chmod(temp, 0o644)
+        os.replace(temp, path)
+    except OSError as exc:
+        if temp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+        # Without the temp file's random name, so the same failure is said once.
+        raise CollectorError(f"could not write {path}: {exc.strerror or exc}") from exc
 
 
 # --------------------------------------------------------------- denials
@@ -368,8 +416,10 @@ def post(raildash_url: str, sandbox: str, what: str, body: dict[str, Any]) -> di
 class Collector:
     def __init__(self, sandbox: str, raildash_url: str, cli: str = "openshell",
                  log: Callable[[str], None] = lambda message: print(message, file=sys.stderr, flush=True),
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 policy_file: str | None = None, interval: float = DEFAULT_INTERVAL) -> None:
         self.sandbox, self.raildash_url, self.cli, self.log, self.clock = sandbox, raildash_url, cli, log, clock
+        self.policy_file, self.interval = policy_file, interval
         self.revision: tuple[Any, Any] | None = None
         self.posted_at: float | None = None
         self.cursor = DenialCursor()
@@ -390,9 +440,19 @@ class Collector:
                 raise CollectorError("openshell policy get printed no JSON object")
             revision = policy_revision(view)
             now = self.clock()
+            stripped = strip_policy(view)
+            if self.policy_file:
+                # Every poll, so its time says the collector is still running;
+                # before the post, so RailDash being down doesn't stop it.
+                try:
+                    write_policy_file(self.policy_file, self.sandbox, self.interval,
+                                      strip_policy(view, count_unread=True), now)
+                    self._say("policy file", None)
+                except CollectorError as exc:
+                    self._say("policy file", str(exc))
             if (revision != self.revision or self.posted_at is None
                     or now - self.posted_at >= POLICY_REPOST_SECONDS):
-                post(self.raildash_url, self.sandbox, "policy", strip_policy(view))
+                post(self.raildash_url, self.sandbox, "policy", stripped)
                 if revision != self.revision:
                     self.log(f"railmon openshell: posted {self.sandbox}'s policy revision {revision[0]}")
                 self.revision, self.posted_at = revision, now
@@ -495,7 +555,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     except CollectorError as exc:
         print(f"railmon openshell: {exc}", file=sys.stderr)
         return 64
-    collector = Collector(sandbox, args.raildash_url, args.openshell)
+    collector = Collector(sandbox, args.raildash_url, args.openshell,
+                          policy_file=os.environ.get("RAIL_OPENSHELL_POLICY_FILE") or None,
+                          interval=args.interval)
     collector.log(f"railmon openshell: following sandbox {sandbox} every {args.interval:g}s")
     while True:
         collector.once()

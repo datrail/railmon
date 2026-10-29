@@ -390,6 +390,13 @@ the policy on the agent's Egress line and the denials as **Blocked by
 OpenShell**. Without the collector, the user imports the policy file into
 RailDash instead.
 
+With `RAIL_OPENSHELL_POLICY_FILE` set, each policy it reads, every interval,
+is also written to that file, for `railmon scan` (with the same variable) to
+carry the sandbox's allow-list in `egress_containment` to Rail Center as
+agent data read from OpenShell itself (DR-266). The file holds the post's
+fields, how many rules and binaries it couldn't read, the sandbox's name and
+when it was read; the scanner uses it only while it is current.
+
 ## Configuration
 
 Every setting is an environment variable; RailMon loads no `.env` file
@@ -417,6 +424,7 @@ The ones you are most likely to set:
 | `RAIL_COLLECT_CONTAINER` | `collect` | none | Capture one container's agent, or with `openshell:<sandbox>` an OpenShell sandbox's: see [Following a container](#following-a-container). |
 | `RAIL_OPENSHELL_SANDBOX` | `openshell` (`--sandbox`) | the name in `AGENT_CONTAINER=openshell:<sandbox>` | The OpenShell sandbox whose policy and denials `openshell` posts; see [An OpenShell sandbox's policy and denials](#an-openshell-sandboxs-policy-and-denials). |
 | `RAIL_OPENSHELL_INTERVAL` | `openshell` (`--interval`) | `60` | Seconds between polls (5 to 3600). |
+| `RAIL_OPENSHELL_POLICY_FILE` | `openshell`, `scan` | none | Where `openshell` writes each policy it reads and `scan` reads it, to carry an OpenShell sandbox's allow-list in `egress_containment` (DR-266). |
 | `OPENSHELL_CLI` | `openshell` (`--openshell`) | `openshell`; the image carries a pinned one | The OpenShell CLI it runs. |
 
 A flag always wins over its variable. `scan` exits 2 when the evidence bundle
