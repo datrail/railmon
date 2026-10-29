@@ -795,12 +795,16 @@ OpenShell sandbox's policy and denials") and writes what `openshell policy
 get` returned to `RAIL_OPENSHELL_POLICY_FILE`, which `railmon scan` reads too
 (DR-266). Then, for an `allow_list_enforced` container, it is one entry per
 endpoint and port the sandbox's loaded policy allows, `{host, allowed_ips,
-port, protocol, enforcement, access, rules, binaries}` (`host` null for an
-endpoint named only by `allowed_ips`), sorted by host and port. It holds at
-most 256 entries and 128 KiB, each with up to 32 allow rules, binaries and
-addresses; a reason says how many entries were left out, and another when
-anything inside the list couldn't be kept (an allow rule with a field too
-long to keep is dropped whole, never kept as a broader rule). The copy is
+port, path, protocol, enforcement, access, rules, deny_rules, binaries}`
+(`host` null for an endpoint named only by `allowed_ips`; `deny_rules` a
+count, since the collector keeps no deny matcher), sorted by host and port.
+It holds at most 256 entries and 128 KiB, each with up to 32 allow rules,
+binaries and addresses; a reason says how many entries were left out, and
+another when anything inside the list couldn't be kept. An endpoint or allow
+rule with a field that is there but can't be kept is dropped whole, not
+listed without it. An allow rule's query matchers aren't carried (the
+collector drops them, as they can hold a credential), so such a rule reads
+broader than it is. The copy is
 used only for the sandbox it names (`openshell.ai/sandbox-name`) and only
 while it is current (within three of the collector's intervals, plus a
 minute); otherwise the list stays `null` and a reason says why. The scanner

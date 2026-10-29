@@ -454,10 +454,10 @@ class AllowListTest(unittest.TestCase):
             ("raw.githubusercontent.com", 443), ("uploads.github.com", 443)])
         uploads = value["allow_list"][-1]
         self.assertEqual(uploads, {
-            "host": "uploads.github.com", "allowed_ips": [], "port": 443, "protocol": "rest", "enforcement": "enforce",
-            "access": None, "rules": [{"method": "GET", "path": "/repos/**"},
-                                      {"method": "POST", "path": "/repos/*/*/releases/*/assets"}],
-            "binaries": ["/usr/local/bin/python3.13"]})
+            "host": "uploads.github.com", "allowed_ips": [], "port": 443, "path": None, "protocol": "rest",
+            "enforcement": "enforce", "access": None,
+            "rules": [{"method": "GET", "path": "/repos/**"}, {"method": "POST", "path": "/repos/*/*/releases/*/assets"}],
+            "deny_rules": 0, "binaries": ["/usr/local/bin/python3.13"]})
         self.assertIn("allow-list: OpenShell's loaded policy, read by railmon openshell", value["reasons"])
         self.assertFalse(any("could not be listed" in reason for reason in value["reasons"]))
 
@@ -479,6 +479,10 @@ class AllowListTest(unittest.TestCase):
             status, value = self.classify_with(OPENSHELL, body)
             self.assertIsNone(value["allow_list"])
             self.assertTrue(any(words in reason for reason in value["reasons"]), value["reasons"])
+        unnamed = container("none", ("none",), {k: v for k, v in OPENSHELL_LABELS.items()
+                                                 if k != "openshell.ai/sandbox-name"})
+        reasons = self.classify_with(unnamed, self.body())[1]["reasons"]
+        self.assertIn("allow-list not read: the container names no OpenShell sandbox", reasons)
         # Fresh within three of its own intervals.
         self.assertIsNotNone(self.classify_with(OPENSHELL, self.body(age=3 * 600, every=600))[1]["allow_list"])
 
@@ -519,9 +523,19 @@ class AllowListTest(unittest.TestCase):
                                 "junk"], "binaries": "nope"},
             "b": "junk"}}}
         entries, _, cut = egress.allow_list_entries(view)
-        self.assertEqual([(e["host"], e["port"], e["binaries"]) for e in entries],
-                         [("ok.example", None, []), ("p.example", None, [])])
+        # A bool port, an empty or too-long host, an out-of-range port: each
+        # endpoint dropped whole, never listed as allowing more.
+        self.assertEqual(entries, [])
         self.assertTrue(cut)
+        for endpoint in ({"host": "x" * 254, "allowed_ips": ["10.0.0.1"], "port": 443},
+                         {"host": "x.example", "port": 443, "access": "r" * 300},
+                         {"host": "x.example", "port": 443, "path": "/" + "p" * 2000},
+                         {"host": "x.example", "allowed_ips": ["10.0.0.1", 7], "port": 443}):
+            got = egress.allow_list_entries({"policy": {"network_policies": {"a": {"endpoints": [endpoint]}}}})
+            self.assertEqual(got, ([], 0, True), endpoint)
+        mcp = {"host": "mcp.example", "port": 443, "path": "/mcp", "deny_rules": [{}, {}]}
+        (entry,), _, cut = egress.allow_list_entries({"policy": {"network_policies": {"m": {"endpoints": [mcp]}}}})
+        self.assertEqual((entry["path"], entry["deny_rules"], cut), ("/mcp", 2, False))
         self.assertEqual(egress.allow_list_entries(None), ([], 0, False))
 
     def test_an_endpoint_named_by_addresses_alone_is_kept(self):

@@ -432,10 +432,12 @@
               "host",
               "allowed_ips",
               "port",
+              "path",
               "protocol",
               "enforcement",
               "access",
               "rules",
+              "deny_rules",
               "binaries"
             ],
             "additionalProperties": false,
@@ -464,6 +466,14 @@
                 ],
                 "minimum": 1,
                 "maximum": 65535
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 1024
               },
               "protocol": {
                 "type": [
@@ -524,6 +534,10 @@
                     }
                   }
                 }
+              },
+              "deny_rules": {
+                "type": "integer",
+                "minimum": 0
               },
               "binaries": {
                 "type": "array",

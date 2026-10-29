@@ -210,13 +210,14 @@ def _text(value: Any, limit: int = MAX_ALLOW_TEXT) -> str | None:
 def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
     """The allow-list of one `openshell policy get` view, as the collector
     stripped it: one entry per endpoint and port, `{host, allowed_ips, port,
-    protocol, enforcement, access, rules, binaries}`, sorted, a port the
-    endpoint names none of being null and a host-less endpoint (allowed_ips
-    only) having a null host. Also how many entries the bounds left out,
-    and whether anything was cut inside the list: an endpoint not in the
-    shape OpenShell writes, an allow rule with a field too long to keep
-    (dropped whole, never kept narrower in what it names and so broader in
-    what it allows), or rules, binaries or addresses past their cap."""
+    path, protocol, enforcement, access, rules, deny_rules, binaries}`
+    (deny_rules a count: the collector keeps no deny matcher), sorted, a
+    port the endpoint names none of being null and a host-less endpoint
+    (allowed_ips only) having a null host. Also how many entries the bounds
+    left out, and whether anything was cut inside the list: an endpoint or
+    allow rule with a field that is there but can't be kept (dropped whole,
+    never kept without it and so broader than the policy), or rules,
+    binaries or addresses past their cap."""
     policy = view.get("policy") if isinstance(view, dict) else None
     network = policy.get("network_policies") if isinstance(policy, dict) else None
     entries: dict[str, dict[str, Any]] = {}
@@ -230,21 +231,35 @@ def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
         cut = cut or None in paths or len(binaries) > MAX_ALLOW_BINARIES
         binaries = binaries[:MAX_ALLOW_BINARIES]
         for endpoint in _list(rule.get("endpoints")):
-            host = _text(endpoint.get("host"), 253) if isinstance(endpoint, dict) else None
-            ips_in = _list(endpoint.get("allowed_ips")) if isinstance(endpoint, dict) else []
-            read = [_text(item, MAX_ALLOW_IP) for item in ips_in]
-            ips = sorted({ip for ip in read if ip})
-            if host is None and not ips:
+            if not isinstance(endpoint, dict):
                 cut = True
                 continue
-            cut = cut or None in read or len(ips) > MAX_ALLOW_IPS
+            # A field that narrows the endpoint and is there but can't be
+            # kept drops the endpoint whole: kept without it, the entry
+            # would allow more than the policy does.
+            narrowing = {field: _text(endpoint.get(field), limit)
+                         for field, limit in (("host", 253), ("path", MAX_ALLOW_PATH), ("protocol", MAX_ALLOW_TEXT),
+                                              ("enforcement", MAX_ALLOW_TEXT), ("access", MAX_ALLOW_TEXT))}
+            if any(value is None and endpoint.get(field) is not None for field, value in narrowing.items()):
+                cut = True
+                continue
+            host = narrowing["host"]
+            ips_in = _list(endpoint.get("allowed_ips"))
+            read = [_text(item, MAX_ALLOW_IP) for item in ips_in]
+            ips = sorted({ip for ip in read if ip})
+            if (host is None and not ips) or None in read:
+                cut = True
+                continue
+            cut = cut or len(ips) > MAX_ALLOW_IPS
             ips = ips[:MAX_ALLOW_IPS]
-            ports: list[int] = []
-            for port in [endpoint.get("port"), *_list(endpoint.get("ports"))]:
-                if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
-                    ports.append(port)
-                elif port is not None:
-                    cut = True
+            named = [port for port in [endpoint.get("port"), *_list(endpoint.get("ports"))] if port is not None]
+            ports = [port for port in named
+                     if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535]
+            if len(ports) < len(named):
+                cut = True
+                continue
+            deny = endpoint.get("deny_rules")
+            deny_rules = len(deny) if isinstance(deny, list) else 0
             rules: list[dict[str, str]] = []
             for allow_rule in _list(endpoint.get("rules")):
                 allow = allow_rule.get("allow") if isinstance(allow_rule, dict) else None
@@ -260,10 +275,10 @@ def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
             cut = cut or len(rules) > MAX_ALLOW_RULES
             rules = rules[:MAX_ALLOW_RULES]
             for port in sorted(set(ports)) or [None]:
-                entry = {"host": host, "allowed_ips": ips, "port": port,
-                         "protocol": _text(endpoint.get("protocol")),
-                         "enforcement": _text(endpoint.get("enforcement")), "access": _text(endpoint.get("access")),
-                         "rules": rules, "binaries": binaries}
+                entry = {"host": host, "allowed_ips": ips, "port": port, "path": narrowing["path"],
+                         "protocol": narrowing["protocol"], "enforcement": narrowing["enforcement"],
+                         "access": narrowing["access"], "rules": rules, "deny_rules": deny_rules,
+                         "binaries": binaries}
                 entries[json.dumps(entry, sort_keys=True)] = entry
     ordered = sorted(entries.values(), key=lambda entry: (entry["host"] or "", entry["port"] or 0,
                                                          json.dumps(entry, sort_keys=True)))
@@ -313,7 +328,9 @@ def allow_list_for(sandbox: str | None, body: dict[str, Any] | None, now: float)
     no time, so it doesn't change from one scan to the next."""
     if body is None:
         return None, []
-    if not sandbox or body.get("sandbox") != sandbox:
+    if not sandbox:
+        return None, ["allow-list not read: the container names no OpenShell sandbox"]
+    if body.get("sandbox") != sandbox:
         return None, ["allow-list not read: railmon openshell follows another sandbox"]
     every = body.get("every")
     every = float(every) if isinstance(every, (int, float)) and not isinstance(every, bool) and 5 <= every <= 3600 else 60.0
