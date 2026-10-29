@@ -243,6 +243,10 @@ def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
             if any(value is None and endpoint.get(field) is not None for field, value in narrowing.items()):
                 cut = True
                 continue
+            if any(endpoint.get(field) is not None and not isinstance(endpoint.get(field), list)
+                   for field in ("ports", "allowed_ips", "rules")):
+                cut = True
+                continue
             host = narrowing["host"]
             ips_in = _list(endpoint.get("allowed_ips"))
             read = [_text(item, MAX_ALLOW_IP) for item in ips_in]
@@ -271,6 +275,11 @@ def allow_list_entries(view: Any) -> tuple[list[dict[str, Any]], int, bool]:
                     cut = True
                     continue
                 rules.append(kept)  # type: ignore[arg-type]
+            if _list(endpoint.get("rules")) and not rules:
+                # Every allow rule dropped: listed with none, it would read
+                # as no L7 restriction at all.
+                cut = True
+                continue
             rules = sorted(rules, key=lambda item: sorted(item.items()))
             cut = cut or len(rules) > MAX_ALLOW_RULES
             rules = rules[:MAX_ALLOW_RULES]

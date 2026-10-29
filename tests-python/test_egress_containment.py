@@ -530,7 +530,10 @@ class AllowListTest(unittest.TestCase):
         for endpoint in ({"host": "x" * 254, "allowed_ips": ["10.0.0.1"], "port": 443},
                          {"host": "x.example", "port": 443, "access": "r" * 300},
                          {"host": "x.example", "port": 443, "path": "/" + "p" * 2000},
-                         {"host": "x.example", "allowed_ips": ["10.0.0.1", 7], "port": 443}):
+                         {"host": "x.example", "allowed_ips": ["10.0.0.1", 7], "port": 443},
+                         {"host": "x.example", "ports": "443"},
+                         {"host": "x.example", "allowed_ips": "10.0.0.1", "port": 443},
+                         {"host": "x.example", "port": 443, "rules": [{"allow": {}}]}):
             got = egress.allow_list_entries({"policy": {"network_policies": {"a": {"endpoints": [endpoint]}}}})
             self.assertEqual(got, ([], 0, True), endpoint)
         mcp = {"host": "mcp.example", "port": 443, "path": "/mcp", "deny_rules": [{}, {}]}
