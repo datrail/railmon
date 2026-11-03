@@ -224,7 +224,7 @@ jobs:
           flags=(--title "$TAG" --notes-file notes.md "--prerelease=$PRERELEASE" --verify-tag)
           if author=$(gh release view "$TAG" --json author --jq .author.login 2> /dev/null); then
             if [[ "$author" == "github-actions[bot]" ]]; then
-              # Rewrites this workflow's own Release; `--draft=false` since a tag deleted and pushed again leaves a draft.
+              # Rewrites a Release made with GITHUB_TOKEN; `--draft=false` since a tag deleted and pushed again leaves a draft.
               url=$(gh release edit "$TAG" --draft=false "${flags[@]}")
             else
               # Made by anyone else, a person or another app: left as it is.
