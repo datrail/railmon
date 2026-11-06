@@ -191,6 +191,12 @@ class OneValue(unittest.TestCase):
         other = [{"source": "//data/", "target": "/x", "mode": "read-only"}, "bare"]
         self.assertEqual(_read("mounts", one), _read("mounts", other))
 
+    def test_a_root_of_slashes_alone_is_the_root(self) -> None:
+        """Linux resolves `//` as `/`, so an MCP root of `//` is the filesystem root, while `/srv/`
+        is `/srv` and not the root."""
+        self.assertEqual(respelled("mcp_servers_declared", [{"root": "//"}]), [{"root": "/"}])
+        self.assertEqual(respelled("mcp_servers_declared", [{"root": "/srv/"}]), [{"root": "/srv"}])
+
     def test_a_name_spellings_does_not_know_is_kept_as_it_came(self) -> None:
         value = {"Anything": ["B", "a"]}
         self.assertIs(respelled("image_digest", value), value)

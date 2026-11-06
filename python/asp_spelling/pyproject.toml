@@ -3,7 +3,8 @@
 #   asp-spelling @ git+https://github.com/datrail/railmon@<commit>#subdirectory=python/asp_spelling
 # RailDash vendors asp_spelling.py byte-for-byte, as it does RailMon's schemas.
 [build-system]
-requires = ["setuptools>=69"]
+# 77 is the first that reads an SPDX `license` string.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]

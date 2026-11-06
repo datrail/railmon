@@ -91,8 +91,9 @@ def _user(value: object) -> object:
     A blank account is the runtime's default user, which is root: moby's `GetExecUser` reads an empty
     account, and an empty group, as none given. So an empty user and one naming only a group
     (`:1000`) run as root, and RailMon writes `root` itself where Docker's user is unset; and `0:`
-    is `0`, since a blank group leaves the user's own. A JSON number is the uid it names, which is how a Kubernetes pod spec reports `runAsUser`, and is written as the
-    string a Dockerfile's `USER` is. A group that is named is kept, so `0` and `0:0` stay two values:
+    is `0`, since a blank group leaves the user's own. A JSON number is the uid it names, which is
+    how a Kubernetes pod spec reports `runAsUser`, and is written as the string a Dockerfile's
+    `USER` is. A group that is named is kept, so `0` and `0:0` stay two values:
     only the second names its group.
 
     A user name is not folded to one case. Linux reads `ROOT` as an account of its own.
