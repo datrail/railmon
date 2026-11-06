@@ -464,6 +464,11 @@ make test
 `make test-rust` runs formatting, Clippy, and Rust tests. `make demo` is a
 separate privileged integration check and is not run by ordinary CI.
 
+[`python/asp_spelling`](python/asp_spelling/README.md) is the one spelling
+RailDash and Rail Center read ASP values in (`root` and `0` are one user). It
+is a standalone, standard-library-only package that `make test-python` tests;
+the RailMon image doesn't use it.
+
 ## Related projects
 
 - [RailDash](https://github.com/datrail/raildash) visualizes captures.
