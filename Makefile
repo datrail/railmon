@@ -48,7 +48,8 @@ test-python:
 		tools/openshell/collector.py \
 		tools/local-demo/demo_server.py \
 		tools/local-demo/demo_client.py \
-		tools/local-demo/demo_mcp_call.py
+		tools/local-demo/demo_mcp_call.py \
+		python/asp_spelling/asp_spelling.py
 	sh -n tools/local-demo/run_local_demo.sh
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh scan --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills --help >/dev/null
@@ -62,6 +63,9 @@ test-python:
 	python3 tools/skills-scanner/skill_scanner.py --help >/dev/null
 	python3 rail-collector/rail_collector.py --help >/dev/null
 	python3 -m unittest discover -s tests-python
+	# asp_spelling is its own package (Rail Center installs it, RailDash vendors it),
+	# so its tests run from its own directory.
+	python3 -m unittest discover -s python/asp_spelling/tests
 
 fmt:
 	cargo fmt

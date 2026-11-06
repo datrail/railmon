@@ -24,3 +24,7 @@ out/
 
 # tools/skills/run-*.sh write their inventory beside the vendored Compose file.
 tools/skills/examples/*/output/
+
+# A local `pip install python/asp_spelling` leaves these behind.
+python/asp_spelling/build/
+python/asp_spelling/*.egg-info/

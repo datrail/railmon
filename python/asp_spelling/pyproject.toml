@@ -1,0 +1,18 @@
+# One spelling for each ASP value, shared by RailDash and Rail Center.
+# Standard library only. Rail Center installs it pinned to a railmon commit:
+#   asp-spelling @ git+https://github.com/datrail/railmon@<commit>#subdirectory=python/asp_spelling
+# RailDash vendors asp_spelling.py byte-for-byte, as it does RailMon's schemas.
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asp-spelling"
+description = "One spelling for each Agent Security Profile value that can be written more than one way"
+version = "1"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools]
+py-modules = ["asp_spelling"]
