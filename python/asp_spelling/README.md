@@ -53,7 +53,9 @@ for agent_key, attributes in normalized(bundle, shapes=MY_SHAPES):
 - `shapes` maps an attribute name to a predicate: a read value its predicate
   rejects is marked `FAILED` with `PARSE_FAILED`, keeping its value and author
   (`unusable` tells it from a collector's own failure). Which shapes a rule can
-  use is the caller's: Rail Center passes its `SHAPES`, RailDash none.
+  use is the caller's: Rail Center passes its `SHAPES`. With none, nothing is
+  marked (the schemas leave `value` untyped), so two callers passing different
+  shapes differ only in which attributes are marked.
 - `steps(shapes)`, `chain`, `unliftable` and `lifted` read a map made under an
   older `RULES_VERSION` as the newer rules make the same evidence.
 

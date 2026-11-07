@@ -19,8 +19,9 @@ out stays out. The bundle itself is not changed.
 
 **What the caller keeps.** Which shapes its rules can use (`shapes`), what it builds around the
 maps (a typed ASP, a version of its own, an identity for an unkeyed agent), and what it leaves
-out of a profile. Rail Center passes its `SHAPES`; RailDash passes none, because its schema
-validation already refuses a bundle with an unusable value.
+out of a profile. Rail Center passes its `SHAPES`. A caller that passes none marks nothing: the
+bundle schemas leave `value` untyped, so a `user` of `0.0` arrives `ANSWERED`. Two callers passing
+different shapes get the same values and differ only in which attributes are marked.
 
 **Two scopes may not disagree.** RailMon gives each attribute to exactly one scope, so a v2
 bundle whose sandbox and agent scopes both carry an attribute with different readings is not
@@ -37,10 +38,11 @@ respelled every read value (`asp_spelling`, `SPELLING_VERSION` 1). These are Rai
 `ASP_VERSION` steps 1 to 3 as they stood when they moved here (RC-357, RC-382, RC-386, RC-468).
 
 **A step is frozen once a later version exists, and so is everything its lift reaches.** Lifting
-a version 2 map to 3 has to make what version 3 made, whatever a version 4 does. So a rule change
-is a new version with a step of its own: a changed spelling is a new `SPELLING_VERSION` whose
-step binds the new table, leaving step 3 bound to version 1's; a changed shape is a step given
-its own `shapes` map, leaving step 2 with the map it was given. A function changed in place
+a version 2 map to 3 has to make what version 3 made, whatever a version 4 does. Step 2 reaches
+only the `shapes` it is given, so a changed shape is a new step given its own map. Step 3 reaches
+`asp_spelling`'s `respelled` and `SPELLINGS` as they are today, so a spelling version that changes
+them first binds step 3 to version 1's table and functions, and only then changes the table
+(`test_each_step_changes_what_its_rules_name` fails until it does). A function changed in place
 changes every step that reaches it.
 """
 
