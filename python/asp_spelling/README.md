@@ -32,20 +32,56 @@ consumers respell `ANSWERED` and `PARTIAL` values and sort every value.
 RailMon's bundles don't go through it: a bundle keeps every value as it was
 observed.
 
+## asp_normalize
+
+The same package's second module turns an evidence bundle (decoded JSON, v1 or
+v2) into one attribute map per agent, so both consumers profile from the same
+normalized data:
+
+```python
+from asp_normalize import normalized, steps, lifted
+
+for agent_key, attributes in normalized(bundle, shapes=MY_SHAPES):
+    ...  # agent_key is None for a v1 bundle
+```
+
+- A v2 bundle's sandbox scope is merged into each agent scope. Where both
+  scopes carry an attribute with different readings (compared after
+  respelling), `ScopeConflict` names every `(agent_key, attribute)` pair.
+- Each read (`ANSWERED`/`PARTIAL`) value is respelled, every list is sorted,
+  and a `window`'s keys are sorted. Members the bundle left out stay out.
+- `shapes` maps an attribute name to a predicate: a read value its predicate
+  rejects is marked `FAILED` with `PARSE_FAILED`, keeping its value and author
+  (`unusable` tells it from a collector's own failure). Which shapes a rule can
+  use is the caller's: Rail Center passes its `SHAPES`, RailDash none.
+- `steps(shapes)`, `chain`, `unliftable` and `lifted` read a map made under an
+  older `RULES_VERSION` as the newer rules make the same evidence.
+
+What a caller builds around the maps (a typed profile, its own version, an
+identity for an unkeyed agent, a registration payload's profile) stays the
+caller's. Rail Center's `profiling/asp.normalize` is the reference these rules
+came from; its fixture corpus, run through both, is the check that they agree.
+
 ## Using it
 
-It is one file with no dependencies beyond the standard library (Python 3.10+).
+Two files with no dependencies beyond the standard library (Python 3.10+);
+`asp_normalize` imports `asp_spelling`.
 
 - **Install** it pinned to a railmon commit:
   `asp-spelling @ git+https://github.com/datrail/railmon@<commit>#subdirectory=python/asp_spelling`
-- **Vendor** `asp_spelling.py` byte-for-byte and test that your copy is
-  identical to railmon's, as RailDash does with RailMon's schemas.
+- **Vendor** the files byte-for-byte and test that your copy is identical to
+  railmon's, as RailDash does with `asp_spelling.py` and RailMon's schemas.
 
 ## Versioning
 
-`SPELLING_VERSION` (and the package version, which equals it) moves whenever a
-spelling is added, dropped or changed, since the same evidence then reads
-differently. Record it beside anything computed from a respelled value.
+`SPELLING_VERSION` moves whenever a spelling is added, dropped or changed, and
+`RULES_VERSION` whenever `normalized` would make something else of the same
+bundle, since the same evidence then reads differently. Record them beside
+anything computed from a normalized value. A rule change is a new version with
+a step of its own; an existing step never changes (`asp_normalize`'s docstring
+says why). The package version is `SPELLING_VERSION`, so a consumer pinning
+the package and one vendoring `asp_spelling.py` read the same number; pin the
+package to a commit, as above, and record `RULES_VERSION` from the module.
 
 ## Tests
 
