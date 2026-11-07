@@ -148,6 +148,29 @@ class Bundles(unittest.TestCase):
         self.assertEqual(raised.exception.conflicts, (("a", "privileged"), ("b", "user")))
 
 
+class Vendored(unittest.TestCase):
+    def test_both_files_vendored_into_a_package_import_each_other(self):
+        """RailDash vendors the files into its own package, where `asp_spelling` is not top-level."""
+        import shutil
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            package = Path(root) / "vendoring_package_under_test"
+            package.mkdir()
+            (package / "__init__.py").write_text("")
+            for name in ("asp_spelling.py", "asp_normalize.py"):
+                shutil.copyfile(HERE / name, package / name)
+            sys.path.insert(0, root)
+            try:
+                vendored = importlib.import_module("vendoring_package_under_test.asp_normalize")
+                self.assertEqual(vendored.normalized(v1(user=answered("0")))[0][1]["user"]["value"], "root")
+                self.assertTrue(vendored.respelled.__module__.startswith("vendoring_package_under_test."))
+            finally:
+                sys.path.remove(root)
+                for key in [key for key in sys.modules if key.startswith("vendoring_package_under_test")]:
+                    del sys.modules[key]
+
+
 class Versions(unittest.TestCase):
     def test_each_step_changes_what_its_rules_name(self):
         steps = N.steps(SHAPES)

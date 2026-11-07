@@ -53,7 +53,10 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Optional
 
-from asp_spelling import canonical, respelled, sorted_lists
+try:  # vendored beside asp_spelling.py inside a package, as RailDash does
+    from .asp_spelling import canonical, respelled, sorted_lists
+except ImportError:  # installed, or loaded as a top-level module
+    from asp_spelling import canonical, respelled, sorted_lists
 
 __all__ = [
     "READ",
