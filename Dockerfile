@@ -98,10 +98,12 @@ RUN case "${TARGETARCH:-$(uname -m)}" in \
 # (DR-249): it reads a sandbox's policy and log from OpenShell's gateway.
 # Pinned and checked as AgentSight is: the static musl build OpenShell
 # publishes per architecture, against the sha256 its release's
-# openshell-checksums-sha256.txt records. The version is the one
-# datrail-project's CI installs (tests/openshell/install.sh). It adds one
-# 26 MB static binary; nothing runs it unless the collector is started.
-# Bumping is one edit of the three ARGs, after the fixture workflow in
+# openshell-checksums-sha256.txt records. It can be older than the gateway:
+# datrail-project's CI runs this CLI against the gateway its
+# tests/openshell/install.sh pins (0.1.7 since DR-205), as a user who
+# installs OpenShell with its own installer has it. It adds one 26 MB
+# static binary; nothing runs it unless the collector is started. Bumping
+# is one edit of the three ARGs, after the fixture workflow in
 # datrail-project has recorded the new release's output.
 ARG OPENSHELL_VERSION=0.1.5
 ARG OPENSHELL_SHA256=ca1ad6e6fbb4a6cd407e95763391b8ecff02912e7d9c467e7ca22696fe80af69
