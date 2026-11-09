@@ -100,9 +100,9 @@ RUN case "${TARGETARCH:-$(uname -m)}" in \
 # publishes per architecture, against the sha256 its release's
 # openshell-checksums-sha256.txt records. It can be older than the gateway:
 # datrail-project's CI runs this CLI against the gateway its
-# tests/openshell/install.sh pins (0.1.7 since DR-205), as a user who
-# installs OpenShell with its own installer has it. It adds one 26 MB
-# static binary; nothing runs it unless the collector is started. Bumping
+# tests/openshell/install.sh pins, which follows the release OpenShell's
+# own installer gives a user (DR-205). It adds one 26 MB static binary;
+# nothing runs it unless the collector is started. Bumping
 # is one edit of the three ARGs, after the fixture workflow in
 # datrail-project has recorded the new release's output.
 ARG OPENSHELL_VERSION=0.1.5
