@@ -521,6 +521,51 @@ def collect_self_context() -> dict[str, Any]:
     }
 
 
+def _pod_mode() -> Any:
+    """tools/scan/gke/pod_mode.py, everything specific to running as a sidecar
+    in a Kubernetes pod (RC-504), loaded by path once and only in pod mode."""
+    module = sys.modules.get("gke_pod_mode")
+    if module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "gke_pod_mode", Path(__file__).resolve().parent / "gke" / "pod_mode.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["gke_pod_mode"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def mode_attributes(
+    context: dict[str, Any],
+    payload: dict[str, Any],
+    answered: Callable[..., dict[str, Any]],
+    blind: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    """The bundle attributes a scan mode fills its own way, replacing the
+    generic ones: pod mode's deployment, owner and agent_instance. Empty for
+    self and docker scans."""
+    if context.get("mode") != "pod":
+        return {}
+    return _pod_mode().bundle_attributes(context, payload, answered, blind)
+
+
+def collect_pod_context() -> dict[str, Any]:
+    """Self mode's view of the scanner's environment, plus which pod it is in
+    (gke/pod_mode.py): as a sidecar the scanner runs in its own container, so
+    everything about the pod comes from the downward API, never from the
+    scanner's hostname or its own container id."""
+    pod_mode = _pod_mode()
+    context = collect_self_context()
+    context["mode"] = "pod"
+    folder = pod_mode.info_dir()
+    context["pod"] = pod_mode.read_pod_metadata(context["env"], folder)
+    for line in pod_mode.gaps(context["pod"], context["env"], folder):
+        print(f"agent-environment-scanner: {line}", file=sys.stderr)
+    return context
+
+
 def docker_inspect(container: str) -> dict[str, Any]:
     output = run_command(["docker", "inspect", container], timeout=5.0)
     if not output:
@@ -626,6 +671,10 @@ def detect_sandbox_type(context: dict[str, Any], explicit: str | None = None) ->
         )
     ).lower()
 
+    if context["mode"] == "pod":
+        # The runtime (gVisor or not) is the manifest's to say through
+        # RAIL_SANDBOX_TYPE; without it, all a pod is known to be is a pod.
+        return "kubernetes"
     if "nemoclaw" in markers or "openshell" in markers:
         return "nemo_claw"
     if "openclaw" in markers or Path("/home/node/.openclaw").exists():
@@ -732,9 +781,11 @@ def collect_user_info(context: dict[str, Any], owner: str, owner_source: str) ->
         "uid": os.getuid() if hasattr(os, "getuid") else None,
         "gid": os.getgid() if hasattr(os, "getgid") else None,
         "home": env.get("HOME"),
-        "git_user_name": git_config_value("user.name"),
-        "git_user_email": git_config_value("user.email"),
     }
+    # The sidecar's own git identity says nothing about the agent beside it.
+    if context["mode"] != "pod":
+        user_info["git_user_name"] = git_config_value("user.name")
+        user_info["git_user_email"] = git_config_value("user.email")
 
     if context["mode"] == "docker" and context.get("container_name"):
         container = context["container_name"]
@@ -745,7 +796,7 @@ def collect_user_info(context: dict[str, Any], owner: str, owner_source: str) ->
     return drop_none(user_info)
 
 
-def detect_owner(env: dict[str, str], explicit: str | None = None) -> tuple[str, str]:
+def detect_owner(env: dict[str, str], explicit: str | None = None, mode: str = "self") -> tuple[str, str]:
     candidates = [
         ("cli", explicit),
         ("RAIL_OWNER", env.get("RAIL_OWNER")),
@@ -754,6 +805,9 @@ def detect_owner(env: dict[str, str], explicit: str | None = None) -> tuple[str,
         ("USER", env.get("USER")),
         ("LOGNAME", env.get("LOGNAME")),
     ]
+    if mode == "pod":
+        # Only the flag and RAIL_OWNER: the rest name the sidecar image's user.
+        candidates = candidates[:2]
     for source, value in candidates:
         if value and value.strip():
             return value.strip(), source
@@ -1341,14 +1395,17 @@ def container_labels(context: dict[str, Any]) -> dict[str, str]:
 def detect_sandbox_name(context: dict[str, Any], explicit: str | None = None) -> tuple[str | None, str]:
     """What this sandbox is called, and how we learned it.
 
-    Never read from an environment variable: an agent that was never onboarded
-    carries no Rail configuration, and those are exactly the ones worth
-    discovering, so the name has to come from metadata the operator or the
-    runtime owns.
+    Never read from a Rail environment variable: an agent that was never
+    onboarded carries no Rail configuration, and those are exactly the ones
+    worth discovering, so the name has to come from metadata the operator or
+    the runtime owns. (Pod mode's POD_NAME and POD_NAMESPACE are the
+    kubelet's, through the downward API.)
     """
     flag = first_nonempty(explicit)
     if flag:
         return flag[:SANDBOX_NAME_MAX], "flag"
+    if context["mode"] == "pod":
+        return _pod_mode().sandbox_name(context.get("pod") or {})
     label = first_nonempty(container_labels(context).get(SANDBOX_NAME_LABEL))
     if label:
         return label[:SANDBOX_NAME_MAX], "label"
@@ -2614,9 +2671,16 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         sandbox = _container_ref().sandbox_name(args.container)
         if sandbox:
             context["openshell_sandbox"] = sandbox
+    elif args.mode == "pod":
+        context = collect_pod_context()
     else:
         context = collect_self_context()
     identity = collect_identity(args, context)
+    if context["mode"] == "pod":
+        # Stop before anything is written or sent under a guessed key.
+        problem = _pod_mode().missing_key(identity)
+        if problem:
+            raise ScannerError(problem)
     payload = build_registration_payload(args, context, identity)
     identity["mcp_servers"] = collect_mcp_inventory(
         [Path(path).expanduser() for path in args.mcp_config] or default_mcp_paths(context["env"]),
@@ -2660,7 +2724,7 @@ def build_registration_payload(
         if container_config_models:
             llm_model = container_config_models[-1]
             model_source = "container_openclaw_config"
-    owner, owner_source = detect_owner(env, args.owner)
+    owner, owner_source = detect_owner(env, args.owner, context["mode"])
     mcp_skills = collect_skills(mcp_paths, env)
     scanned_skills = collect_skills_from_files(skill_files)
     payload = {
@@ -3860,13 +3924,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Scan the local agent environment and emit a rail-center registration payload."
     )
-    parser.add_argument("--mode", choices=["self", "docker"], default="self")
+    parser.add_argument("--mode", choices=["self", "docker", "pod"], default="self",
+                        help="pod: a sidecar in a Kubernetes pod (tools/scan/gke/README.md)")
     parser.add_argument("--container", help="Docker container name/id to scan when --mode docker is used, "
                         "or openshell:<sandbox> for an OpenShell sandbox's current container")
     parser.add_argument("--output", "-o", help="Write JSON payload to this file instead of stdout")
     parser.add_argument("--agent-type", default="personal", choices=["personal", "service"])
     parser.add_argument("--owner", help="Owner identity override")
-    parser.add_argument("--sandbox-type", help="Sandbox type override, e.g. nemo_claw or openclaw")
+    parser.add_argument("--sandbox-type", help="Sandbox type override, e.g. kubernetes, gvisor or docker")
     parser.add_argument("--llm-provider", help="LLM provider override, e.g. anthropic, openai, local")
     parser.add_argument("--llm-model", help="LLM model override")
     parser.add_argument(
@@ -3914,7 +3979,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host-id", help="Host identity override. Defaults to RAIL_HOST_ID.")
     parser.add_argument(
         "--sandbox-name",
-        help=f"Sandbox name override. Otherwise the {SANDBOX_NAME_LABEL} label, then the container name.",
+        help=f"Sandbox name override. Otherwise the {SANDBOX_NAME_LABEL} label, then the container name "
+        "(in pod mode, namespace/workload).",
     )
     parser.add_argument(
         "--feature-output",
