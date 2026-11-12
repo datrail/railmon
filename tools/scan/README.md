@@ -832,7 +832,7 @@ locked.
 | Field | Where it comes from |
 |---|---|
 | `host_id` | `RAIL_HOST_ID` (or `--host-id`), the same value every Rail component on the host reads. The scanner's own environment is read before the scanned container's, so a container cannot relabel the host it runs on; `host_id_source` distinguishes `flag`, `env` and `container_env`. **No fallback is invented** — an id this scanner made up would disagree with the proxy and the collector, so an unset variable is reported as unset. |
-| `sandbox_name` | the `rail.sandbox_name` container label, else the container name, else the hostname. **Never an environment variable**: an agent nobody onboarded carries no Rail configuration, and those are exactly the ones worth discovering. |
+| `sandbox_name` | in `--mode pod`, `namespace/workload` from the downward API ([gke/README.md](gke/README.md)); otherwise the `rail.sandbox_name` container label, else the container name, else the hostname. **Never a Rail environment variable**: an agent nobody onboarded carries no Rail configuration, and those are exactly the ones worth discovering. (Pod mode's `POD_NAME` and `POD_NAMESPACE` are the kubelet's, not Rail configuration.) |
 | `host_class` | DMI vendor/product — `gce_vm`, `ec2_vm`, `azure_vm`, `virtual_machine`, `bare_metal`, `container`, or `unknown` when the DMI is unreadable. |
 
 Both identity fields are optional on Rail Center's side and bounded to its
@@ -990,6 +990,12 @@ python3 tools/scan/scan_agent_environment.py \
   --llm-provider anthropic \
   --llm-model claude-sonnet-4-20250514
 ```
+
+## Pod mode
+
+`--mode pod` runs the scanner as a sidecar in a Kubernetes pod (RC-504). Its
+code and its own README are in [`gke/`](gke/README.md): what it reads from
+the downward API, how it names the workload, and what it refuses to guess.
 
 ## OpenClaw Integration
 

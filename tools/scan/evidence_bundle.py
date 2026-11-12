@@ -1583,6 +1583,9 @@ def build_evidence_bundle(
         )
 
     attributes.update(registration_attributes(payload))
+    # A scan mode that reads some attributes its own way fills them last
+    # (pod mode's are in tools/scan/gke/).
+    attributes.update(scanner.mode_attributes(context, payload, _answered, _blind))
 
     return {
         "bundle_version": BUNDLE_VERSION,
