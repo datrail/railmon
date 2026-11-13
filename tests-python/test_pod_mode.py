@@ -44,6 +44,12 @@ scanner = _load("scan_agent_environment", SCANNER)
 evidence_bundle = _load("evidence_bundle", SCANNER_DIR / "evidence_bundle.py")
 pod_mode = scanner._pod_mode()   # tools/scan/gke/pod_mode.py
 
+
+def collect_pod_context(config_paths=()):
+    """Pod mode's context, as scan() builds it."""
+    return pod_mode.collect_context(scanner.collect_self_context(), list(config_paths), scanner.redact_cmdline,
+                                   scanner.container_id_from_cgroup)
+
 POD = {
     "POD_NAME": "agent-finretail-58cd78b55d-48jcw",
     "POD_NAMESPACE": "gke-test",
@@ -199,7 +205,7 @@ class LabelsFileTest(unittest.TestCase):
         env = {**POD, "POD_NAME": ("a" * 60)[:58] + "48jcw", "RAIL_POD_INFO_DIR": str(self.tmp)}
         with mock.patch.dict(os.environ, env, clear=False), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            pod = scanner.collect_pod_context()["pod"]
+            pod = collect_pod_context()["pod"]
         self.assertIsNone(pod["workload"])
         self.assertIn("set --sandbox-name to namespace/<workload>", err.getvalue())
 
@@ -207,7 +213,7 @@ class LabelsFileTest(unittest.TestCase):
         env = {**POD, "RAIL_POD_INFO_DIR": str(self.tmp)}
         with mock.patch.dict(os.environ, env, clear=False), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
-            pod = scanner.collect_pod_context()["pod"]
+            pod = collect_pod_context()["pod"]
         self.assertIsNone(pod["workload"])
         self.assertEqual(pod["workload_source"], "no labels file")
         self.assertIn("missing the labels file", err.getvalue())
@@ -216,7 +222,7 @@ class LabelsFileTest(unittest.TestCase):
         (self.tmp / "labels").write_text(DEPLOYMENT_LABELS)
         env = {**POD, "RAIL_POD_INFO_DIR": str(self.tmp)}
         with mock.patch.dict(os.environ, env, clear=False):
-            context = scanner.collect_pod_context()
+            context = collect_pod_context()
         pod = context["pod"]
         self.assertEqual(context["mode"], "pod")
         # pod-template-hash changes with each rollout, so it is left out.
@@ -232,7 +238,7 @@ class LabelsFileTest(unittest.TestCase):
                                   side_effect=lambda path: read.append(path) or ({}, False)), \
                 contextlib.redirect_stderr(io.StringIO()):
             os.environ.pop("RAIL_POD_INFO_DIR", None)
-            scanner.collect_pod_context()
+            collect_pod_context()
         self.assertEqual(read, [Path("/etc/podinfo/labels")])
 
 
@@ -293,7 +299,7 @@ class PodModeScanTest(unittest.TestCase):
 
     def run_scan(self, args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(SCANNER), "--mode", "pod",
+            [sys.executable, str(SCANNER), "--mode", "pod", "--config-path", str(self.tmp / "config"),
              "--feature-output", str(self.tmp / "features.json"),
              "--evidence-bundle-output", str(self.tmp / "bundle.json"),
              "--output", str(self.tmp / "payload.json")] + args,
@@ -396,7 +402,9 @@ class PodModeScanTest(unittest.TestCase):
         written = (self.tmp / "bundle.json").read_text()
         for guess in ("author@example.com", "someone@example.com"):
             self.assertNotIn(guess, written)
-        user_info = bundle["attributes"]["user_info"]["value"]
+        # Without a readable agent process user_info is BLIND (RC-509); with
+        # one, it is the agent's user. Either way, never the sidecar's git.
+        user_info = bundle["attributes"]["user_info"]["value"] or {}
         self.assertNotIn("git_user_email", user_info)
         self.assertNotIn("git_user_name", user_info)
 

@@ -46,6 +46,56 @@ What pod mode refuses to guess:
 
 ```bash
 python3 tools/scan/scan_agent_environment.py --mode pod \
+  --config-path /root/.openclaw \
   --host-id gke-test \
   --register --center-url https://gke-scan.rail-system.svc
 ```
+
+## The agent's own process (RC-509)
+
+With `shareProcessNamespace: true`, the sidecar reads the agent's own process
+instead of its own ([`agent_process.py`](agent_process.py)). On every scan,
+`find_agent_process` looks under `/proc` for processes whose root filesystem
+isn't the sidecar's, leaves out the pause process, prefers one whose root
+holds the agent's config (`--config-path`), and otherwise takes the
+lowest-numbered. A restarted agent comes back under a new pid and is found
+again on the next scan.
+
+From `/proc/<pid>` it reads:
+
+| Source | Field |
+|---|---|
+| `environ` | `credential_inventory` and `system_info`'s `environment_keys` (names only, never values), `egress_proxy_declared` (the proxy variables, credentials removed), and model, provider and MCP detection |
+| `status` and the agent's own `/etc/passwd` | `user_info`: the uid, gid and user name the agent runs as |
+| `cmdline` | the command line, kept for the harness markers |
+| `root/…/openclaw/dist/build-info.json`, `NODE_VERSION`, `PYTHON_VERSION` | `framework_identity` and `system_info.runtimes`, read rather than run: nothing is executed in the agent's container |
+| `root/etc/os-release` | `system_info.os_release` |
+| `cgroup` | `system_info.container.id` (none when the cgroup namespace hides it) |
+
+Files under the agent's root are read one path component at a time inside
+that root: links resolve there, `..` stops at it, no step crosses into another
+filesystem (the agent's `/proc` is the sidecar's too), and only a regular file
+is opened, without blocking.
+
+The scan logs a warning when its choice of process was uncertain: no
+candidate's root holds the config, or processes in more than one other
+container could be read (counted by root, so the agent's own child processes
+don't count). An agent that runs code in its own container can still start a
+decoy beside itself; its fields are `authored_by: subject` for that reason.
+
+Pod mode needs `--config-path` (the webhook sets it): the agent's config
+folder on the config volume. It has no default, because the sidecar's own
+`$HOME` or cwd says nothing about the agent. Without `--mcp-config`, it reads
+`.mcp.json` in each `--config-path` folder, never the sidecar's own cwd or
+`$HOME`.
+
+The scan's own settings (`RAIL_OWNER`, `RAIL_DEPLOYMENT`, `RAIL_NAMESPACE`,
+`RAIL_HOST_ID`, `RAIL_SANDBOX_TYPE`) are still read from the sidecar's
+environment, which the webhook sets, so an agent can't choose the owner,
+deployment or key it is filed under.
+
+When no agent process can be read (no shared process namespace, a different
+UID, or the agent restarting mid-scan), `credential_inventory`, `user_info`,
+`framework_identity`, `egress_proxy_declared` and `system_info` are `BLIND`
+with `NO_SOURCE_ACCESS`, and the scan logs why. The sidecar's own process is
+never reported in the agent's place.
