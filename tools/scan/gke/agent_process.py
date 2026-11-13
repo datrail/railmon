@@ -101,10 +101,12 @@ def _passwd_name(root: Path, uid: int | None) -> str | None:
 _DIR_FLAGS = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
               | getattr(os, "O_PATH", 0))
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+# A directory opened to be listed needs read permission, so no O_PATH.
+_LIST_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = True,
-                  hops: int = 32) -> tuple[list[str], int | None] | None:
+                  hops: int = 32, open_dir: bool = False) -> tuple[list[str], int | None] | None:
     """Resolve `path` inside the container whose root is `root`, one
     component at a time from a handle on that root.
 
@@ -158,6 +160,16 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
                 names.append(part)
                 continue
             names.append(part)
+            if open_dir:
+                # A directory to list, opened as one: never a link swapped in.
+                if not stat.S_ISDIR(info.st_mode):
+                    return None
+                fd = os.open(part, _LIST_FLAGS, dir_fd=stack[-1])
+                opened = os.fstat(fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino) or (same_device and opened.st_dev != root_dev):
+                    os.close(fd)
+                    return None
+                return names, fd
             if not open_file:
                 return names, None
             if not stat.S_ISREG(info.st_mode):
@@ -193,6 +205,27 @@ def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES) -
             chunks.append(chunk)
             size += len(chunk)
         return b"".join(chunks).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def list_in_root(root: Path, path: str, same_device: bool = True) -> list[str] | None:
+    """The names in a directory inside the agent's root, resolved as
+    `_walk_in_root` resolves a path, or None when it isn't a directory there."""
+    if not [part for part in path.split("/") if part not in ("", ".")]:
+        try:  # the root itself (/proc/<pid>/root is a link to follow)
+            fd = os.open(root, _LIST_FLAGS & ~os.O_NOFOLLOW)
+        except OSError:
+            return None
+    else:
+        walked = _walk_in_root(root, path, open_file=False, same_device=same_device, open_dir=True)
+        if walked is None or walked[1] is None:
+            return None
+        fd = walked[1]
+    try:
+        return sorted(os.listdir(fd))
     except OSError:
         return None
     finally:

@@ -99,3 +99,25 @@ UID, or the agent restarting mid-scan), `credential_inventory`, `user_info`,
 `framework_identity`, `egress_proxy_declared` and `system_info` are `BLIND`
 with `NO_SOURCE_ACCESS`, and the scan logs why. The sidecar's own process is
 never reported in the agent's place.
+
+## The agent's harness fields (RC-510)
+
+The harness fields (`harness_identity`, `model_name`, `llm_provider`,
+`inference_endpoint`, `mcp_servers_declared`, `tool_allow_deny`,
+`approval_policy`, `tool_names`, `system_prompt_present`,
+`system_prompt_text`, `skills_inventory`) are read by the shared harness
+reader, [`harness/reader.py`](harness/README.md), from the profile whose
+markers match the agent's command line or environment. That reader is not
+specific to pods; `harness/harness_sources.py` is pod mode's side of it:
+
+- A path under a `--config-path` is read from the config volume, with the
+  volume as the root: a link the agent planted there can't leave it.
+- Any other path is read through the agent's root, with the same guards as
+  the agent's other files (links resolve inside it, no step crosses into
+  another filesystem, only regular files, without blocking).
+- `~` and `$VAR` in a profile's paths, and the markers, come from the agent's
+  process. Environment values are used to find files only.
+
+Pod mode replaces a harness field only when a profile matches. No profile
+ships yet (OpenClaw's is task 4, Claude Code's task 5, the generic reader for
+any other harness task 6), so until then the bundle's own values stand.
