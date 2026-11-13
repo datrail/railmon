@@ -777,7 +777,7 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
     import scan_agent_environment as scanner  # lazy: breaks the import cycle
 
     try:
-        with path.open("rb") as f:
+        with scanner.open_regular_file(path) as f:  # a FIFO can't hang the scan
             raw = f.read(64_000)
         text = raw.decode("utf-8", errors="replace")
     except OSError:
@@ -789,11 +789,6 @@ def _read_json_capped(path: Path) -> tuple[Any, str]:
     except json.JSONDecodeError:
         if len(raw) == 64_000:
             return None, "SIZE_CAP_EXCEEDED"
-        return None, "PARSE_FAILED"
-    except RecursionError:
-        # Deeply nested but under the cap: the reader raises, the document
-        # never parses. It is a parse failure like any other, and catching it
-        # here keeps it inside the writer's report-failure-don't-raise path.
         return None, "PARSE_FAILED"
 
 
@@ -877,14 +872,13 @@ def build_evidence_bundle(
     # ── inputs_attempted: the sources, and whether each was reached ──────
     raw_named = getattr(args, "config_path", []) or []
     config_paths = [Path(p).expanduser() for p in raw_named] \
-        or scanner.default_config_paths(env)
+        or scanner.default_config_paths(scanner.settings_env(context))
     # Roots the operator named are a promise: one that does not exist is a
     # failure the bundle names, unlike the pack's own default directory
     # guesses, whose absence is just "we looked and nothing was there". The
     # set holds the same expansion the reader compares against.
     named = {str(Path(p).expanduser()) for p in raw_named}
-    mcp_paths = [Path(p).expanduser() for p in (getattr(args, "mcp_config", []) or [])] \
-        or scanner.default_mcp_paths(env)
+    mcp_paths = scanner.mcp_config_paths(args, context, config_paths)
     scanned_roots = list(dict.fromkeys([str(p) for p in mcp_paths] + [str(p) for p in config_paths]))
 
     # The object is closed to runtime / image / manifest / repo. An entry holds
@@ -962,10 +956,14 @@ def build_evidence_bundle(
 
     runtimes: dict[str, Any] = system_info.get("runtimes") or {}
     openclaw_version = runtimes.get("openclaw")
+    # A scan of another process (pod mode) reads the versions from its files
+    # rather than running anything in its container.
+    read_not_run = "subject" in context
     if openclaw_version:
         attributes["harness_identity"] = _answered(
             f"openclaw/{openclaw_version}", "declared", authored_by="subject",
-            method="openclaw --version in the runtime",
+            method=("OpenClaw's build stamp (dist/build-info.json) under the agent's root" if read_not_run
+                    else "openclaw --version in the runtime"),
             note="declared: the harness answers for itself, and the version is a claim until the runtime proves it",
         )
     else:
@@ -978,7 +976,9 @@ def build_evidence_bundle(
         attributes["framework_identity"] = _answered(
             {name: str(version) for name, version in sorted(runtimes.items())}, "observed",
             authored_by="subject",
-            method="the runtime versions the harness reports for itself",
+            method=("the runtime versions in the agent's files and environment (build stamp, "
+                    "NODE_VERSION, PYTHON_VERSION), not run" if read_not_run
+                    else "the runtime versions the harness reports for itself"),
             note="the runtime versions observed; the framework build identity is not collected",
         )
     else:
@@ -1246,10 +1246,7 @@ def build_evidence_bundle(
             )
 
     # ── credentials ───────────────────────────────────────────────────────
-    secrets = scanner.collect_secret_hygiene(
-        env,
-        scanner.container_path_checker(str(context["container_name"])) if mode == "docker" else None,
-    )
+    secrets = scanner.collect_secret_hygiene(env, scanner.subject_path_checker(context))
     credentials = [
         {
             "name": secret["key"],
@@ -1540,9 +1537,12 @@ def build_evidence_bundle(
                     "NO_SOURCE_ACCESS", "observed", method=egress_method,
                     note="the container's network mode or its namespace owner could not be inspected",
                 )
-    elif scanner.in_container() or Path("/run/.containerenv").exists() or env.get("KUBERNETES_SERVICE_HOST"):
+    elif (scanner.is_pod_mode(context) or scanner.in_container() or Path("/run/.containerenv").exists()
+          or env.get("KUBERNETES_SERVICE_HOST")):
         # `in_container` misses Podman and Kubernetes on cgroup v2; saying
-        # "a host process" there would be a false fact, not a gap.
+        # "a host process" there would be a false fact, not a gap. A pod is a
+        # container by definition, even when the agent's environment, which
+        # would name KUBERNETES_SERVICE_HOST, can't be read.
         attributes["egress_containment"] = _blind(
             "NO_SOURCE_ACCESS", "observed",
             note="a scan inside a container cannot inspect its own network setting",

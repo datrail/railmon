@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -187,6 +188,83 @@ def read_pod_metadata(env: dict[str, str], info_dir: Path) -> dict[str, Any]:
     return pod
 
 
+def default_mcp_paths(config_paths: list[Path]) -> list[Path]:
+    """`.mcp.json` in each of the agent's config folders (beside a config
+    file, or inside a folder), on the config volume the sidecar mounts."""
+    folders = [path if path.suffix != ".json" else path.parent for path in config_paths]
+    return list(dict.fromkeys(folder / ".mcp.json" for folder in folders))
+
+
+def choice_warning(subject: dict[str, Any]) -> str | None:
+    """A note when the agent's process was a guess: no candidate's root holds
+    the config, or processes in more than one other container (counted by
+    their roots, so the agent's own children don't count) could be read."""
+    problems = []
+    if not subject.get("holds_config"):
+        problems.append("no process's root holds --config-path, so the lowest pid was taken")
+    if subject.get("containers", 1) > 1:
+        problems.append(f"processes in {subject['containers']} containers besides the sidecar's could be read")
+    if not problems:
+        return None
+    return (f"the agent's process (pid {subject.get('pid')}) may not be the agent's main process: "
+            + "; ".join(problems))
+
+
+def collect_context(base: dict[str, Any], config_paths: list[Path],
+                    redact_cmdline: Callable[[str], str | None],
+                    container_id_from_cgroup: Callable[[str | None], str | None]) -> dict[str, Any]:
+    """Pod mode's scan context, built on self mode's (`base`): which pod the
+    scanner is in, from the downward API, and the agent's own process beside
+    it (agent_process.py). As a sidecar the scanner runs in its own container,
+    so the agent's environment, user, command line and system files come from
+    the agent's process, never the scanner's. The scanner's own environment
+    stays the source of its settings (`settings_env`)."""
+    context = base
+    context["mode"] = "pod"
+    context["settings_env"] = context["env"]
+    folder = info_dir()
+    context["pod"] = read_pod_metadata(context["settings_env"], folder)
+    for line in gaps(context["pod"], context["settings_env"], folder):
+        print(f"agent-environment-scanner: {line}", file=sys.stderr)
+    subject, reason = _agent_process().read_subject(config_paths)
+    context["subject"] = subject
+    context["subject_reason"] = reason
+    if subject:
+        context["env"] = subject["env"]
+        context["proc1_cmdline"] = redact_cmdline(subject["cmdline"])
+        # The agent's container, from its own cgroup; none when the cgroup
+        # namespace hides it, never the sidecar's.
+        context["container_id"] = container_id_from_cgroup(subject.get("cgroup"))
+        warning = choice_warning(subject)
+        if warning:
+            print(f"agent-environment-scanner: pod mode: {warning}", file=sys.stderr)
+    else:
+        # Nothing of the agent's to read: the sidecar's own environment would
+        # describe the sidecar, so the scan reads none.
+        context["env"] = {}
+        context["proc1_cmdline"] = None
+        context["container_id"] = None
+        print(f"agent-environment-scanner: pod mode: {reason}; credential_inventory, user_info, "
+              "framework_identity, egress_proxy_declared and system_info are reported BLIND",
+              file=sys.stderr)
+    return context
+
+
+def _agent_process() -> Any:
+    """agent_process.py beside this file, loaded by path once, under the same
+    name the scanner uses, so both share one module."""
+    module = sys.modules.get("gke_agent_process")
+    if module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("gke_agent_process", Path(__file__).with_name("agent_process.py"))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["gke_agent_process"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
 def info_dir() -> Path:
     return Path(_first(os.environ.get(POD_INFO_DIR_ENV)) or DEFAULT_POD_INFO_DIR)
 
@@ -246,12 +324,56 @@ def bundle_attributes(context: dict[str, Any], payload: dict[str, Any],
                       answered: Builder, blind: Builder) -> dict[str, Any]:
     pod = context.get("pod") or {}
     user_info = (payload.get("environment") or {}).get("user_info") or {}
-    return {
-        "deployment": deployment_attribute(answered, blind, pod, context.get("env") or {}),
+    attributes = {
+        # The Rail settings are the sidecar's own variables, which the webhook
+        # sets; the agent's environment can't name its own deployment.
+        "deployment": deployment_attribute(answered, blind, pod, context.get("settings_env") or {}),
         "owner": owner_attribute(answered, blind, payload.get("owner"),
                                  user_info.get("owner_source") or "unset"),
         "agent_instance": agent_instance_attribute(answered, blind, pod),
+        "user": blind(
+            "NOT_COLLECTED_BY_PACK", "observed",
+            note="the process user is not reported by this pack; the agent process's uid "
+                 "is in the user_info attribute",
+        ),
     }
+    if context.get("subject") is None:
+        reason = context.get("subject_reason") or "no agent process"
+        attributes.update(subject_blind(blind, reason))
+        # Read from the agent's environment, which nobody read: not "unset".
+        attributes["inference_endpoint"] = blind(
+            "NO_SOURCE_ACCESS", "observed",
+            note=f"the base URL is read from the agent's environment, and {reason}",
+        )
+        # The config volume may still name the model; only its absence there
+        # too is unknown rather than "not set".
+        llm_model = str((payload.get("environment") or {}).get("llm_model") or "").strip()
+        if not llm_model or llm_model == "unknown":
+            attributes["model_name"] = blind(
+                "NO_SOURCE_ACCESS", "observed",
+                note=f"not in the config or capture files, and the agent's environment, "
+                     f"which may name it, was not read: {reason}",
+            )
+    return attributes
+
+
+# The attributes read from the agent's process (gke/agent_process.py). With no
+# readable agent they are BLIND: the sidecar's own process would describe the
+# sidecar, not the agent.
+SUBJECT_ATTRIBUTES = {
+    "credential_inventory": "observed",
+    "user_info": "observed",
+    "framework_identity": "observed",
+    "egress_proxy_declared": "declared",
+    "system_info": "observed",
+}
+
+
+def subject_blind(blind: Builder, reason: str) -> dict[str, Any]:
+    return {name: blind("NO_SOURCE_ACCESS", tier,
+                        note=f"read from the agent's process, and {reason}; "
+                             "the sidecar's own process is never reported in its place")
+            for name, tier in SUBJECT_ATTRIBUTES.items()}
 
 
 def deployment_attribute(answered: Builder, blind: Builder, pod: dict[str, Any],

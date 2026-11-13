@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import errno
 import getpass
 import hashlib
 import ipaddress
@@ -22,6 +23,7 @@ import platform
 import re
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -176,9 +178,23 @@ def run_command(cmd: list[str], timeout: float = 2.0) -> str | None:
     return proc.stdout.strip()
 
 
+def open_regular_file(path: Path) -> Any:
+    """`path` opened for binary reading only if it is a regular file, and
+    without blocking: a FIFO or device someone planted at a config path
+    raises OSError like a missing file, instead of hanging the scan."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def read_text(path: Path, max_bytes: int = 64_000) -> str | None:
     try:
-        with path.open("rb") as f:
+        with open_regular_file(path) as f:
             return f.read(max_bytes).decode("utf-8", errors="replace")
     except OSError:
         return None
@@ -325,22 +341,33 @@ def detect_provider(env: dict[str, str], model: str | None = None, explicit: str
 
 
 def collect_candidate_models(value: Any) -> list[str]:
+    """Model names under MODEL_KEYS anywhere in a parsed document, including
+    inside strings that hold JSON themselves (a transcript's tool arguments).
+
+    Walked with an explicit stack rather than recursion, so no document can
+    overflow Python's, and with one depth budget for the whole walk: each
+    string parsed on the way spends from it, so stacking JSON inside strings
+    can't buy fresh depth (MAX_JSON_DEPTH)."""
     found: list[str] = []
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in MODEL_KEYS and isinstance(item, str) and item.strip():
-                found.append(item.strip())
-            found.extend(collect_candidate_models(item))
-    elif isinstance(value, list):
-        for item in value:
-            found.extend(collect_candidate_models(item))
-    elif isinstance(value, str):
-        stripped = value.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            try:
-                found.extend(collect_candidate_models(strict_json_loads(stripped)))
-            except (json.JSONDecodeError, TypeError):
-                pass
+    # (item, depth, whether it is the value of a model key), in visit order.
+    pending: list[tuple[Any, int, bool]] = [(value, 0, False)]
+    while pending:
+        item, depth, model_key = pending.pop()
+        if model_key and isinstance(item, str) and item.strip():
+            found.append(item.strip())
+        if depth >= MAX_JSON_DEPTH:
+            continue
+        if isinstance(item, dict):
+            pending.extend(reversed([(child, depth + 1, key in MODEL_KEYS) for key, child in item.items()]))
+        elif isinstance(item, list):
+            pending.extend(reversed([(child, depth + 1, False) for child in item]))
+        elif isinstance(item, str):
+            stripped = item.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    pending.append((strict_json_loads(stripped), depth + 1, False))
+                except (json.JSONDecodeError, TypeError):
+                    pass
     return found
 
 
@@ -357,6 +384,28 @@ def _finite_json_float(text: str) -> float:
     return value
 
 
+# Deeper than any real config, and shallow enough that the scanner's
+# recursive walkers of one parsed document (the harness readers) stay far
+# inside Python's recursion limit. collect_candidate_models, which parses
+# strings inside a document again, walks without recursion and spends one
+# budget of this depth across all of them.
+MAX_JSON_DEPTH = 100
+
+
+def json_depth_exceeds(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
+    """Whether a parsed document nests deeper than `limit`, checked without
+    recursion."""
+    pending = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, (dict, list)):
+            if depth > limit:
+                return True
+            children = item.values() if isinstance(item, dict) else item
+            pending.extend((child, depth + 1) for child in children)
+    return False
+
+
 def strict_json_loads(text: str | bytes) -> Any:
     """`json.loads` without the three literals Python accepts and JSON does not.
 
@@ -366,7 +415,17 @@ def strict_json_loads(text: str | bytes) -> Any:
     as a JSONDecodeError, every caller's existing parse-failure path handles
     it: the file did not parse, as it does not for the agent.
     """
-    return json.loads(text, parse_constant=_refuse_non_json_constant, parse_float=_finite_json_float)
+    try:
+        value = json.loads(text, parse_constant=_refuse_non_json_constant, parse_float=_finite_json_float)
+    except RecursionError:
+        value = None
+    else:
+        if not json_depth_exceeds(value):
+            return value
+    # Nested past the parser's stack, or past MAX_JSON_DEPTH, where a walker
+    # of it would overflow: either way it did not parse, and takes the same
+    # JSONDecodeError path every caller has.
+    raise json.JSONDecodeError(f"nested deeper than {MAX_JSON_DEPTH} levels", "", 0)
 
 
 def load_json_file(path: Path) -> Any | None:
@@ -493,12 +552,16 @@ def dedupe(values: list[str]) -> list[str]:
     return result
 
 
-def detect_container_id() -> str | None:
-    cgroup = read_text(Path("/proc/self/cgroup"))
+def container_id_from_cgroup(cgroup: str | None) -> str | None:
+    """The container id in a /proc/<pid>/cgroup file, when it shows one."""
     if not cgroup:
         return None
     matches = re.findall(r"([0-9a-f]{64}|[0-9a-f]{12})(?:\.scope)?", cgroup)
     return matches[-1] if matches else None
+
+
+def detect_container_id() -> str | None:
+    return container_id_from_cgroup(read_text(Path("/proc/self/cgroup")))
 
 
 def in_container() -> bool:
@@ -521,20 +584,61 @@ def collect_self_context() -> dict[str, Any]:
     }
 
 
-def _pod_mode() -> Any:
-    """tools/scan/gke/pod_mode.py, everything specific to running as a sidecar
-    in a Kubernetes pod (RC-504), loaded by path once and only in pod mode."""
-    module = sys.modules.get("gke_pod_mode")
+def _gke(name: str) -> Any:
+    """tools/scan/gke/<name>.py, loaded by path once and only in pod mode:
+    everything specific to running as a sidecar in a Kubernetes pod."""
+    module = sys.modules.get(f"gke_{name}")
     if module is None:
         import importlib.util
 
         spec = importlib.util.spec_from_file_location(
-            "gke_pod_mode", Path(__file__).resolve().parent / "gke" / "pod_mode.py")
+            f"gke_{name}", Path(__file__).resolve().parent / "gke" / f"{name}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules["gke_pod_mode"] = module
+        sys.modules[f"gke_{name}"] = module
         spec.loader.exec_module(module)
     return module
+
+
+def _pod_mode() -> Any:
+    """The pod's identity and pod mode's own attributes (RC-504)."""
+    return _gke("pod_mode")
+
+
+def _agent_process() -> Any:
+    """The agent's own process, read through the pod's shared process
+    namespace (RC-509)."""
+    return _gke("agent_process")
+
+
+def is_pod_mode(context: dict[str, Any]) -> bool:
+    """Whether this scan runs as a sidecar in a Kubernetes pod. The context is
+    one dict shape for every mode (self, docker, pod); this names the pod
+    checks the generic code makes."""
+    return context.get("mode") == "pod"
+
+
+def settings_env(context: dict[str, Any]) -> dict[str, str]:
+    """Where the scan's own settings (RAIL_OWNER, RAIL_DEPLOYMENT,
+    RAIL_SANDBOX_TYPE and the like) are read. Normally the scanned environment;
+    when the scan describes another process (pod mode), the scanner's own, so
+    the subject can't set the settings it is filed under."""
+    return context.get("settings_env") or context["env"]
+
+
+def subject_path_checker(context: dict[str, Any]) -> Callable[[str], bool] | None:
+    """Existence of a path a secret's value names, asked of the filesystem the
+    scanned process sees: the container's in docker mode, the agent's root
+    when the scan describes another process, else the scanner's own."""
+    if context.get("mode") == "docker" and context.get("container_name"):
+        return container_path_checker(str(context["container_name"]))
+    root = (context.get("subject") or {}).get("root")
+    if root:
+        # Resolved as the agent's container would, so a link the agent planted
+        # can't make this answer about the sidecar's own filesystem.
+        resolve = _agent_process().resolve_under_root
+        return lambda path: resolve(Path(root), path, same_device=False) is not None
+    return None
 
 
 def mode_attributes(
@@ -546,24 +650,9 @@ def mode_attributes(
     """The bundle attributes a scan mode fills its own way, replacing the
     generic ones: pod mode's deployment, owner and agent_instance. Empty for
     self and docker scans."""
-    if context.get("mode") != "pod":
+    if not is_pod_mode(context):
         return {}
     return _pod_mode().bundle_attributes(context, payload, answered, blind)
-
-
-def collect_pod_context() -> dict[str, Any]:
-    """Self mode's view of the scanner's environment, plus which pod it is in
-    (gke/pod_mode.py): as a sidecar the scanner runs in its own container, so
-    everything about the pod comes from the downward API, never from the
-    scanner's hostname or its own container id."""
-    pod_mode = _pod_mode()
-    context = collect_self_context()
-    context["mode"] = "pod"
-    folder = pod_mode.info_dir()
-    context["pod"] = pod_mode.read_pod_metadata(context["env"], folder)
-    for line in pod_mode.gaps(context["pod"], context["env"], folder):
-        print(f"agent-environment-scanner: {line}", file=sys.stderr)
-    return context
 
 
 def docker_inspect(container: str) -> dict[str, Any]:
@@ -648,7 +737,7 @@ def collect_docker_context(container: str) -> dict[str, Any]:
 
 
 def detect_sandbox_type(context: dict[str, Any], explicit: str | None = None) -> str:
-    env = context["env"]
+    env = settings_env(context)
     sandbox = normalize_sandbox_type(
         first_nonempty(
             explicit,
@@ -671,7 +760,7 @@ def detect_sandbox_type(context: dict[str, Any], explicit: str | None = None) ->
         )
     ).lower()
 
-    if context["mode"] == "pod":
+    if is_pod_mode(context):
         # The runtime (gVisor or not) is the manifest's to say through
         # RAIL_SANDBOX_TYPE; without it, all a pod is known to be is a pod.
         return "kubernetes"
@@ -729,8 +818,17 @@ def collect_system_info(context: dict[str, Any], model_source: str, capture_file
     if not uname:
         uname = " ".join(platform.uname())
 
-    machine_id_hash = hash_identifier(machine_id_text if container else read_text(Path("/etc/machine-id"), max_bytes=256))
-    runtimes = runtime_versions(container)
+    if "subject" in context:
+        # The scan describes another process: its own files, read through its
+        # root, never the scanner's, and its runtimes read rather than run.
+        subject = context["subject"] or {}
+        # "" rather than None: parse_os_release(None) reads the scanner's own.
+        os_release_text = subject.get("os_release") or ""
+        machine_id_hash = hash_identifier(subject.get("machine_id"))
+        runtimes = dict(subject.get("runtimes") or {})
+    else:
+        machine_id_hash = hash_identifier(machine_id_text if container else read_text(Path("/etc/machine-id"), max_bytes=256))
+        runtimes = runtime_versions(container)
     info: dict[str, Any] = {
         "os": platform.system(),
         "os_release": parse_os_release(os_release_text),
@@ -743,16 +841,20 @@ def collect_system_info(context: dict[str, Any], model_source: str, capture_file
         "fqdn": socket.getfqdn(),
         "machine_id_sha256": machine_id_hash,
         "container": {
-            "is_container": context["mode"] == "docker" or in_container(),
+            # A pod's agent is in a container by definition: no need to ask the
+            # scanner's own cgroup.
+            "is_container": context["mode"] == "docker" or is_pod_mode(context) or in_container(),
             "id": context.get("container_id"),
             "name": context.get("container_name"),
             "image": context.get("image"),
             "host_pid": context.get("docker_state_pid"),
         },
+        # The scanned process's, not the scanner's: in pod mode the agent's pid,
+        # and no cwd (the sidecar's own would be a false fact about the agent).
         "process": {
-            "pid": os.getpid(),
+            "pid": (context.get("subject") or {}).get("pid") if "subject" in context else os.getpid(),
             "proc1_cmdline": context.get("proc1_cmdline"),
-            "cwd": str(Path.cwd()),
+            "cwd": None if "subject" in context else str(Path.cwd()),
         },
         "model_source": model_source,
         "capture_files": [str(path) for path in capture_files],
@@ -782,8 +884,13 @@ def collect_user_info(context: dict[str, Any], owner: str, owner_source: str) ->
         "gid": os.getgid() if hasattr(os, "getgid") else None,
         "home": env.get("HOME"),
     }
+    if "subject" in context:
+        # The user the scanned process runs as, not the scanner's.
+        subject = context["subject"] or {}
+        user_info.update(username=subject.get("username"), uid=subject.get("uid"),
+                         gid=subject.get("gid"), home=subject.get("home"))
     # The sidecar's own git identity says nothing about the agent beside it.
-    if context["mode"] != "pod":
+    if not is_pod_mode(context):
         user_info["git_user_name"] = git_config_value("user.name")
         user_info["git_user_email"] = git_config_value("user.email")
 
@@ -796,7 +903,7 @@ def collect_user_info(context: dict[str, Any], owner: str, owner_source: str) ->
     return drop_none(user_info)
 
 
-def detect_owner(env: dict[str, str], explicit: str | None = None, mode: str = "self") -> tuple[str, str]:
+def detect_owner(env: dict[str, str], explicit: str | None = None, pod: bool = False) -> tuple[str, str]:
     candidates = [
         ("cli", explicit),
         ("RAIL_OWNER", env.get("RAIL_OWNER")),
@@ -805,7 +912,7 @@ def detect_owner(env: dict[str, str], explicit: str | None = None, mode: str = "
         ("USER", env.get("USER")),
         ("LOGNAME", env.get("LOGNAME")),
     ]
-    if mode == "pod":
+    if pod:
         # Only the flag and RAIL_OWNER: the rest name the sidecar image's user.
         candidates = candidates[:2]
     for source, value in candidates:
@@ -1348,6 +1455,18 @@ def merge_skill_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return skills
 
 
+def mcp_config_paths(args: argparse.Namespace, context: dict[str, Any], config_paths: list[Path]) -> list[Path]:
+    """The MCP configs to read: --mcp-config, else the defaults. In pod mode
+    the defaults are in the agent's config folders on the config volume,
+    never the sidecar's own cwd or HOME, which say nothing about the agent."""
+    named = [Path(path).expanduser() for path in getattr(args, "mcp_config", []) or []]
+    if named:
+        return named
+    if is_pod_mode(context):
+        return _pod_mode().default_mcp_paths(config_paths)
+    return default_mcp_paths(settings_env(context))
+
+
 def default_mcp_paths(env: dict[str, str]) -> list[Path]:
     paths = [Path.cwd() / ".mcp.json", Path("/workdir/.mcp.json")]
     home = env.get("HOME")
@@ -1378,7 +1497,8 @@ def detect_host_id(context: dict[str, Any], explicit: str | None = None) -> tupl
     """
     candidates: list[tuple[str, str | None]] = [("flag", explicit)]
     candidates += [("env", os.environ.get(key)) for key in HOST_ID_KEYS]
-    candidates += [("container_env", context["env"].get(key)) for key in HOST_ID_KEYS]
+    if "settings_env" not in context:
+        candidates += [("container_env", context["env"].get(key)) for key in HOST_ID_KEYS]
     for source, candidate in candidates:
         value = first_nonempty(candidate)
         if value:
@@ -1404,7 +1524,7 @@ def detect_sandbox_name(context: dict[str, Any], explicit: str | None = None) ->
     flag = first_nonempty(explicit)
     if flag:
         return flag[:SANDBOX_NAME_MAX], "flag"
-    if context["mode"] == "pod":
+    if is_pod_mode(context):
         return _pod_mode().sandbox_name(context.get("pod") or {})
     label = first_nonempty(container_labels(context).get(SANDBOX_NAME_LABEL))
     if label:
@@ -2596,8 +2716,7 @@ def build_feature_file(
     """The artifact a scorer consumes. Metadata only, and no control plane needed."""
     env = context["env"]
     environment = payload.get("environment") or {}
-    container = context.get("container_name") if context["mode"] == "docker" else None
-    path_exists = container_path_checker(str(container)) if container else None
+    path_exists = subject_path_checker(context)
     return {
         "schema_version": FEATURE_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -2672,18 +2791,35 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         if sandbox:
             context["openshell_sandbox"] = sandbox
     elif args.mode == "pod":
-        context = collect_pod_context()
+        # gke/pod_mode.py: the pod from the downward API, and the agent's own
+        # process beside it. The agent's config is on the config volume at the
+        # path the webhook names; the sidecar's own HOME or cwd would describe
+        # the sidecar, so there is no default.
+        if not args.config_path:
+            raise ScannerError(
+                "--mode pod needs --config-path: the agent's config folder on the config volume "
+                "(the admission webhook sets it); the sidecar's own HOME says nothing about the agent"
+            )
+        context = _pod_mode().collect_context(
+            collect_self_context(),
+            [Path(path).expanduser() for path in args.config_path],
+            redact_cmdline,
+            container_id_from_cgroup,
+        )
     else:
         context = collect_self_context()
     identity = collect_identity(args, context)
-    if context["mode"] == "pod":
+    if is_pod_mode(context):
         # Stop before anything is written or sent under a guessed key.
         problem = _pod_mode().missing_key(identity)
         if problem:
             raise ScannerError(problem)
     payload = build_registration_payload(args, context, identity)
     identity["mcp_servers"] = collect_mcp_inventory(
-        [Path(path).expanduser() for path in args.mcp_config] or default_mcp_paths(context["env"]),
+        mcp_config_paths(
+            args, context,
+            [Path(path).expanduser() for path in args.config_path] or default_config_paths(settings_env(context)),
+        ),
         context["env"],
     )
     observed_file = resolve_observed_file(args)
@@ -2711,8 +2847,11 @@ def build_registration_payload(
 
     env = context["env"]
     capture_files = [Path(path).expanduser() for path in args.capture_file]
-    config_paths = [Path(path).expanduser() for path in args.config_path] or default_config_paths(env)
-    mcp_paths = [Path(path).expanduser() for path in args.mcp_config] or default_mcp_paths(env)
+    # The default paths are on the scanner's own filesystem, so they come from
+    # the scanner's settings: in pod mode the agent's HOME is a path in the
+    # agent's container, not the sidecar's.
+    config_paths = [Path(path).expanduser() for path in args.config_path] or default_config_paths(settings_env(context))
+    mcp_paths = mcp_config_paths(args, context, config_paths)
     skill_files = [Path(path).expanduser() for path in args.skills_file]
 
     llm_model, model_source = detect_model(env, capture_files, config_paths, args.llm_model)
@@ -2724,7 +2863,7 @@ def build_registration_payload(
         if container_config_models:
             llm_model = container_config_models[-1]
             model_source = "container_openclaw_config"
-    owner, owner_source = detect_owner(env, args.owner, context["mode"])
+    owner, owner_source = detect_owner(settings_env(context), args.owner, pod=is_pod_mode(context))
     mcp_skills = collect_skills(mcp_paths, env)
     scanned_skills = collect_skills_from_files(skill_files)
     payload = {
