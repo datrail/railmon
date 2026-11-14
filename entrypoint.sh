@@ -34,8 +34,17 @@ esac
 command_name="$1"
 shift
 
+# Each eBPF sensor first says what it is missing, if anything: a capability,
+# the kernel's tracing folder (DR-301). It reports and never blocks.
+preflight() {
+    if [ "${RAIL_PREFLIGHT:-1}" != "0" ]; then
+        python3 "$root/tools/listen/preflight.py" "$1" || true
+    fi
+}
+
 case "$command_name" in
     collect)
+        preflight collect
         # With RAIL_COLLECT_CONTAINER set, a supervisor finds that container's
         # TLS library, runs the collector scoped to it and to the container's
         # process tree, and re-attaches after the agent restarts (DR-187).
@@ -74,6 +83,7 @@ case "$command_name" in
         # RAIL_LISTEN_SOURCE=listensnoop runs an operator's own listensnoop
         # (ebpf-tls-tap) instead, from LISTENSNOOP_PATH: the image no longer
         # ships it.
+        preflight listen
         heartbeat="${RAIL_LISTEN_HEARTBEAT:-60}"
         case "${RAIL_LISTEN_SOURCE:-agentsight}" in
             agentsight)
@@ -120,6 +130,7 @@ case "$command_name" in
         # (DR-185), so an always-on file stays bounded.
         # RAIL_FILES_SOURCE=filesnoop runs an operator's own filesnoop from
         # FILESNOOP_PATH instead.
+        preflight files
         heartbeat="${RAIL_FILES_HEARTBEAT:-60}"
         case "${RAIL_FILES_SOURCE:-agentsight}" in
             agentsight)

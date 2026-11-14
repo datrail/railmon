@@ -470,7 +470,10 @@ class WiringTest(unittest.TestCase):
             other = self.dir / "other"
             other.mkdir()
             self.assertFalse(adapter.ensure_tracefs(logged.append, [str(other)], str(refuse)))
-        self.assertEqual(logged, [f"cannot mount tracefs at {other}: permission denied"])
+        self.assertEqual(len(logged), 1)
+        self.assertTrue(logged[0].startswith(f"cannot mount tracefs at {other}: permission denied; "),
+                        logged)
+        self.assertIn(f"mount {other} into this container read-only", logged[0])  # DR-301
 
     def test_one_failed_inspect_does_not_restart_the_probe(self):
         # A restart makes every attribute PARTIAL (drift in RailDash), so the

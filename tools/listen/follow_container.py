@@ -176,6 +176,26 @@ def load_container_ref():
 
 
 container_ref = load_container_ref()
+
+
+def load_preflight():
+    """preflight.py beside this file (DR-301), loaded by path as above."""
+    spec = importlib.util.spec_from_file_location(
+        "railmon_preflight", os.path.join(os.path.dirname(os.path.abspath(__file__)), "preflight.py"))
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+preflight = load_preflight()
+
+
+def waiting_reason(docker: str, container: str) -> str:
+    """Why the container isn't found running: Docker unreachable or no such
+    container when that is so (DR-301), else that it isn't running yet."""
+    return (preflight.container_problem(docker, container)
+            or f"waiting for container {container} to run")
 # The last problem logged for each reference, so a sandbox with two running
 # containers is logged once, not on every poll.
 _reported: dict[str, str | None] = {}
@@ -480,19 +500,22 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    waiting_logged = False
+    waiting = preflight.Waiting(log)
     while not stopping:
         pid = container_pid(docker, args.container, log)
         if not pid:
-            if not waiting_logged:
-                log(f"waiting for container {args.container} to run")
-                waiting_logged = True
+            waiting.wait("container", lambda: waiting_reason(docker, args.container))
             time.sleep(POLL_SECONDS)
             continue
-        waiting_logged = False
+        waiting.clear()
         if stopping:  # a signal that landed during docker inspect
             break
         log(f"attaching to {args.container} (pid {pid})")
+        # Reported, not enforced: the probe then fails as before, after a
+        # line that says why (DR-301).
+        hidden = preflight.pid_problem(pid)
+        if hidden:
+            log(hidden)
         if agentsight:
             # From here, in the host PID namespace: --pidns-of scopes it to
             # the agent's, which nsenter would otherwise do.
