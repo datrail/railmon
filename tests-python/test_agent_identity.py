@@ -272,6 +272,10 @@ class UrlRedactionTest(unittest.TestCase):
         for url in (
             "https://user:pw@gw.example.com/mcp/sk-live-abc123def456ghi789/sse?k=v",
             "https://gw.example.com/a[1]/b",
+            # 16-19 characters with brackets: encoded, it reaches the 20-character bound.
+            "https://gw.example.com/abcdefghijklmn[]/x",
+            "https://gw.example.com/ab[c]defghijklmnop/x",
+            "https://gw.example.com/ab%5bc%5ddef/x",
             "https://[::1]:8080/mcp",
         ):
             once = scanner.redact_url(url)
