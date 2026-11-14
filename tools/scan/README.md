@@ -202,7 +202,7 @@ or `RAIL_FEATURE_OUTPUT`; skip with `--no-feature-file`) and covers dimensions
 | `host_and_identity` | `sandbox_type`, `host_class`, `host_id` (+ source), `sandbox_name` (+ source), image, container id, owner |
 | `secrets_hygiene` | env key *names*, plus one entry per secret-looking variable with its `secret_type` and `secret_class` (`plaintext` / `reference` / `mount`) |
 | `model_and_egress` | provider, model, `base_url` and whether it is `canonical`, `local` or an `unknown_proxy` |
-| | URLs are recorded with userinfo, query strings, fragments and key-shaped path segments redacted — gateways routinely carry the key in the URL. A path segment is key-shaped if it is 20 characters or longer, or matches a known vendor key format (`sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, …) at any length |
+| | URLs are recorded with userinfo, query strings, fragments and key-shaped path segments redacted — gateways routinely carry the key in the URL. A path segment is key-shaped if it is 20 characters or longer, or matches a known vendor key format (`sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, …) at any length. What was taken out is marked, and a consumer can rely on the marks: a redacted segment reads `[redacted]`, a dropped query `?[redacted]`, an unparseable URL `[unparseable]`. A `[` or `]` elsewhere in a path is percent-encoded, so a `[redacted]` segment only ever comes from redaction (a capture plan skips a URL that has one, since its real path can't be matched) |
 | `tool_and_mcp_reach` | MCP inventory: name, the command's executable (not its arguments, which carry tokens), redacted url, transport, and the server's tool allow list: `includeTools`/`excludeTools` as `include_tools`/`exclude_tools`, each a sorted set of names, `null` when the config has none (no restriction) |
 | `skills` | name, description, destination endpoints, source type. A skills file is operator-written free text, so strings matching a known vendor key format are stripped from all three before they are recorded or POSTed. The formats carry their length and character shape, not just a prefix, so a skill called `asian-markets` keeps its name |
 | `observed_reach` | only with `--observed-file`: hosts actually reached, with counts, errors and a redacted path; the tool *names* used; the models seen; and `undeclared_destinations` |
@@ -362,6 +362,9 @@ past its first page (a cut list's tools carry `tools_truncated`), and
 `skills_inventory` is `PARTIAL` when a server wasn't reached or its list was
 cut (see [MCP Skills](#mcp-skills)). The schema's
 `$defs.skills_inventory_value` closes the three new fields' values.
+A server URL's path segment written with a raw `[` or `]` is now
+percent-encoded, so a `[redacted]` segment always means RailMon took a
+key-shaped segment out (see the `tool_and_mcp_reach` row above).
 
 ## RailDash delivery
 
