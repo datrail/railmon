@@ -13,6 +13,7 @@ import importlib.util
 import json
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -32,7 +33,8 @@ class FakeMcpServer:
     real socket without any external network dependency.
     """
 
-    def __init__(self, tools, *, require_auth=None, session_header=True):
+    def __init__(self, tools, *, require_auth=None, session_header=True, page_size=None, refuse_status=401,
+                 fail_after_pages=None):
         self.tools = tools
         self.require_auth = require_auth
         self.session_header = session_header
@@ -44,6 +46,7 @@ class FakeMcpServer:
         issued_session_id = self._issued_session_id
         send_session_header = self.session_header
         seen = self.seen_session_ids
+        cursors = self.seen_cursors = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -54,14 +57,26 @@ class FakeMcpServer:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if require_auth_ is not None and self.headers.get("Authorization") != require_auth_:
-                    self.send_response(401)
+                    self.send_response(refuse_status)
                     self.end_headers()
                     return
                 method = body.get("method")
                 if method == "initialize":
                     result = {"protocolVersion": scanner.MCP_PROTOCOL_VERSION, "capabilities": {}}
-                elif method == "tools/list":
+                elif method == "tools/list" and page_size is None:
                     result = {"tools": tools_by_call}
+                elif method == "tools/list":
+                    # MCP pagination: an opaque cursor, here the next offset.
+                    cursor = (body.get("params") or {}).get("cursor")
+                    cursors.append(cursor)
+                    if fail_after_pages is not None and len(cursors) > fail_after_pages:
+                        self.send_response(500)
+                        self.end_headers()
+                        return
+                    start = int(cursor[len("page-"):]) if cursor else 0
+                    result = {"tools": tools_by_call[start:start + page_size]}
+                    if start + page_size < len(tools_by_call):
+                        result["nextCursor"] = f"page-{start + page_size}"
                 else:
                     self.send_response(400)
                     self.end_headers()
@@ -307,9 +322,113 @@ class SkillShapeForRailCenterTest(unittest.TestCase):
         for _ in range(scanner.SKILL_SCHEMA_DEPTH + 2):
             node["items"] = {"type": "array"}
             node = node["items"]
-        for schema in (big, deep, "object", ["a"], {"n": float("nan")}):
+        # Left out, and said why (DR-293): a reader can tell it from a tool
+        # that declares no schema at all.
+        for schema, reason in ((big, "per_tool_budget"), (deep, "unrepresentable"), ("object", "unrepresentable"),
+                               (["a"], "unrepresentable"), ({"n": float("nan")}, "unrepresentable")):
             fields = scanner.tool_schema_fields({"inputSchema": schema, "annotations": {"note": "only"}})
-            self.assertEqual(fields, {}, repr(schema)[:60])
+            self.assertEqual(fields, {"schema_omitted": reason}, repr(schema)[:60])
+        self.assertEqual(scanner.tool_schema_fields({"annotations": {"note": "only"}}), {})
+
+
+class ReachabilityAndOmissionMarksTest(unittest.TestCase):
+    """DR-293: Rail Center's capture plan reads skills_inventory, and must be
+    able to tell a tool the server doesn't have from a server RailMon could
+    not ask, a dropped schema from none, and a cut list from a whole one."""
+
+    def test_each_kind_of_server_entry_says_how_it_answered(self):
+        with FakeMcpServer([{"name": "t", "description": "d"}]) as server:
+            tools = scanner.mcp_server_skills("ok", {"url": server.url}, Path("a.json"))
+        with FakeMcpServer([]) as server:
+            empty = scanner.mcp_server_skills("quiet", {"url": server.url}, Path("a.json"))
+        refused = scanner.mcp_server_skills("down", {"url": "http://127.0.0.1:1/mcp"}, Path("a.json"))
+        stdio = scanner.mcp_server_skills("local", {"command": "mcp-server"}, Path("a.json"))
+        bare = scanner.mcp_server_skills("mystery", {}, Path("a.json"))
+        for skills, entry, reachability in ((tools, "tool", "reached"), (empty, "server", "declares_none"),
+                                            (refused, "server", "unreachable"), (stdio, "server", "not_probed_stdio"),
+                                            (bare, "server", "unreachable")):
+            for skill in (*skills, *scanner.merge_skill_lists(skills)):
+                self.assertEqual((skill["entry"], skill["reachability"]), (entry, reachability))
+                self.assertNotIn("tools_truncated", skill)
+        # The descriptions read as they did before the marks.
+        self.assertEqual(empty[0]["description"], "MCP server configured via a.json: reachable, declares no tools")
+        self.assertEqual(refused[0]["description"], "MCP server configured via a.json: unreachable")
+
+    def test_a_401_or_403_is_auth_refused(self):
+        for status in (401, 403):
+            with FakeMcpServer([{"name": "t", "description": "d"}], require_auth="Bearer secret-1",
+                               refuse_status=status) as server:
+                probed = scanner.mcp_server_skills("crm", {"url": server.url}, Path("a.json"))
+            skills = scanner.merge_skill_lists(probed)
+            self.assertEqual([(s["entry"], s["reachability"]) for s in skills], [("server", "auth_refused")], status)
+            self.assertEqual(skills[0]["description"], "MCP server configured via a.json: unreachable")
+        with FakeMcpServer([], require_auth="Bearer secret-1", refuse_status=500) as server:
+            skills = scanner.mcp_server_skills("crm", {"url": server.url}, Path("a.json"))
+        self.assertEqual(skills[0]["reachability"], "unreachable")
+
+    def test_tools_list_follows_next_cursor(self):
+        tools = [{"name": f"t{i:02d}", "description": "d"} for i in range(7)]
+        with FakeMcpServer(tools, page_size=3) as server:
+            result = scanner.probe_mcp_server(server.url, None)
+        self.assertEqual(result, (tools, "reached", False))
+        self.assertEqual(server.seen_cursors, [None, "page-3", "page-6"])
+
+    def test_the_page_and_tool_bounds_truncate_and_say_so(self):
+        tools = [{"name": f"t{i:02d}", "description": "d"} for i in range(10)]
+        with mock.patch.object(scanner, "MCP_TOOLS_PAGES", 2), FakeMcpServer(tools, page_size=3) as server:
+            self.assertEqual(scanner.probe_mcp_server(server.url, None), (tools[:6], "reached", True))
+        with mock.patch.object(scanner, "MCP_TOOLS_MAX", 4), FakeMcpServer(tools, page_size=3) as server:
+            self.assertEqual(scanner.probe_mcp_server(server.url, None), (tools[:4], "reached", True))
+        with mock.patch.object(scanner, "MCP_TOOLS_MAX", 4), FakeMcpServer(tools) as server:
+            skills = scanner.merge_skill_lists(scanner.mcp_server_skills("big", {"url": server.url}, Path("a.json")))
+        self.assertEqual([s["name"] for s in skills], ["t00", "t01", "t02", "t03"])
+        for skill in skills:
+            self.assertEqual((skill["reachability"], skill["tools_truncated"]), ("reached", True))
+
+    def test_a_later_page_failing_keeps_what_was_read_as_truncated(self):
+        tools = [{"name": f"t{i:02d}", "description": "d"} for i in range(5)]
+        with FakeMcpServer(tools, page_size=2, fail_after_pages=1) as server:
+            self.assertEqual(scanner.probe_mcp_server(server.url, None), (tools[:2], "reached", True))
+
+    def test_a_schema_left_out_for_the_bundle_budget_says_so(self):
+        schema = {"type": "object", "properties": {f"p{i}": {"type": "string", "description": "x" * 40}
+                                                   for i in range(60)}}
+        tools = [{"name": f"t{i:03d}", "description": "d", "source_type": "mcp_config", "entry": "tool",
+                  "server": "big", "inputSchema": schema} for i in range(200)]
+        skills = scanner.merge_skill_lists(tools)
+        dropped = [s for s in skills if "inputSchema" not in s]
+        self.assertTrue(dropped)
+        for skill in skills:
+            self.assertEqual(skill.get("schema_omitted"), None if "inputSchema" in skill else "bundle_budget")
+        # The mark survives the scan's second merge (MCP skills with a skills file's).
+        again = scanner.merge_skill_lists(skills, [])
+        self.assertEqual([s.get("schema_omitted") for s in again], [s.get("schema_omitted") for s in skills])
+
+    def test_a_schema_too_large_for_one_tool_says_so_through_the_merge(self):
+        big = {"type": "object", "description": "x" * (scanner.SKILL_SCHEMA_BYTES + 1)}
+        with FakeMcpServer([{"name": "t", "description": "d", "inputSchema": big}]) as server:
+            (skill,) = scanner.merge_skill_lists(scanner.mcp_server_skills("s", {"url": server.url}, Path("a.json")))
+        self.assertNotIn("inputSchema", skill)
+        self.assertEqual(skill["schema_omitted"], "per_tool_budget")
+
+    def test_marks_are_closed_sets_and_a_skills_file_cannot_set_them(self):
+        odd = scanner.normalize_skill({"name": "n", "description": "d", "source_type": "mcp_config", "entry": "tool",
+                                       "reachability": "maybe", "schema_omitted": "felt_like_it",
+                                       "tools_truncated": "yes"}, "t")
+        for field in ("reachability", "schema_omitted", "tools_truncated"):
+            self.assertNotIn(field, odd)
+        filed = scanner.normalize_skill({"name": "n", "description": "d", "source_type": "skills_config",
+                                         "reachability": "reached", "tools_truncated": True}, "t")
+        self.assertNotIn("reachability", filed)
+        self.assertNotIn("tools_truncated", filed)
+
+    def test_one_server_read_from_two_configs_keeps_the_answer_that_reached_it(self):
+        down = {"name": "crm", "description": "MCP server configured via a.json: unreachable",
+                "destination_endpoints": [], "source_type": "mcp_config", "entry": "server", "server": "crm",
+                "reachability": "unreachable"}
+        refused = {**down, "reachability": "auth_refused"}
+        (merged,) = scanner.merge_skill_lists([down, refused])
+        self.assertEqual(merged["reachability"], "auth_refused")
 
 
 if __name__ == "__main__":

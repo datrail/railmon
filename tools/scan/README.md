@@ -354,6 +354,15 @@ carries an OpenShell sandbox's allow-list when `railmon openshell` read it
 and `annotations`, and says in `entry` whether it is a tool or a server
 whose tools couldn't be listed.
 
+Rule pack 15 (DR-293) says why an MCP skill's tools or schema are missing,
+so a pack-14 baseline is `CONTRACT_MISMATCH` until a pack-15 ASP is locked.
+Every MCP skill in `skills_inventory` carries `reachability`, a tool whose
+`inputSchema` was left out carries `schema_omitted`, `tools/list` is read
+past its first page (a cut list's tools carry `tools_truncated`), and
+`skills_inventory` is `PARTIAL` when a server wasn't reached or its list was
+cut (see [MCP Skills](#mcp-skills)). The schema's
+`$defs.skills_inventory_value` closes the three new fields' values.
+
 ## RailDash delivery
 
 A user should never have to run a CLI command to get an evidence bundle into
@@ -1106,7 +1115,34 @@ is asked for its tools and becomes one skill per tool it declares,
 can't be listed (unreachable, declaring none, or a `command` server) becomes
 one skill with `entry: "server"`: a server, not a tool. `source_type` is
 `mcp_config` or `skills_config` (Rail Center stores it in an enum); a skills
-file's entry is always `skills_config`, whatever the file says. Pass custom paths with:
+file's entry is always `skills_config`, whatever the file says.
+
+Every MCP skill says how its server answered, in `reachability` (DR-293), so
+a reader can tell a tool the server doesn't have from a server RailMon
+couldn't ask. It sits on each skill because a listed server has no record of
+its own, only its tools:
+
+| `reachability` | `entry` | Meaning |
+| --- | --- | --- |
+| `reached` | `tool` | the server listed this tool |
+| `declares_none` | `server` | the server answered and lists no tools |
+| `auth_refused` | `server` | the probe got HTTP 401 or 403 |
+| `unreachable` | `server` | no answer, another error status, a body that isn't MCP, or no `url` or `command` |
+| `not_probed_stdio` | `server` | a `command` server, which the scan never starts |
+
+`tools/list` follows `nextCursor` for at most 20 pages and 200 tools (Rail
+Center's default bound on a registration's skills); a list cut at either
+bound, or by a later page failing, gives each of that server's tools
+`tools_truncated: true`. A tool whose `inputSchema` is left out says why in
+`schema_omitted`: `per_tool_budget` (past 8 KiB), `bundle_budget` (past the
+256 KiB for all schemas) or `unrepresentable` (nested past 16 levels, or not
+a JSON object); a tool that declares no schema carries neither. The bundle's
+`skills_inventory` is `PARTIAL` with `NO_SOURCE_ACCESS` when a server is
+`unreachable` or `auth_refused`, or with `SIZE_CAP_EXCEEDED` when only a list
+was truncated, and its `note` names the servers. The descriptions are as
+before: an `auth_refused` server's still reads `unreachable`.
+
+Pass custom paths with:
 
 ```bash
 python3 tools/scan/scan_agent_environment.py \

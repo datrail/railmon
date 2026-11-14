@@ -319,7 +319,7 @@ class BundleTest(unittest.TestCase):
             build_args(), base, {"host_id": "h-1", "sandbox_name": "agent"}, identity(),
         )
         self.assertEqual(evidence_bundle.contract_problems(bundle), [])
-        self.assertEqual(bundle["rule_pack_version"], 14)
+        self.assertEqual(bundle["rule_pack_version"], 15)
         return bundle["attributes"]
 
     def docker(self, target, docker, env=None):
