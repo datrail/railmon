@@ -257,6 +257,14 @@ def harness_attributes(context: dict[str, Any], builders: dict[str, Builder],
             if not skills:
                 continue
             attribute = dict(attribute, value=shapers["merge_skill_lists"](prior or [], skills))
+        if shapers and field in ("mcp_servers_declared", "skills_inventory") and current.get("status") == "PARTIAL":
+            # The merged list keeps the bundle's entries, so whatever made
+            # them partial (DR-293: an MCP server not reached, a tool list
+            # cut short) still holds: its status, reason and note stand.
+            notes = [note for note in (current.get("note"), attribute.get("note")) if note]
+            attribute = dict(attribute, status="PARTIAL", reason=current.get("reason"))
+            if notes:
+                attribute["note"] = "; ".join(notes)
         attributes[field] = attribute
     if shapers and ({"mcp_servers_declared", "inference_endpoint"} & set(attributes)):
         attributes.update(_declared_destinations(attributes, existing, builders, shapers, harness))

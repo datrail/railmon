@@ -15,6 +15,7 @@ import copy
 import errno
 import getpass
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
@@ -1089,6 +1090,12 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
     now arrives as three skills, each carrying the tool's own description —
     and a server this cannot reach or authenticate to is still recorded, as
     unreachable, rather than dropped from the inventory silently.
+
+    Every skill says how its server answered, in `reachability` (DR-293):
+    a reader of the inventory can then tell a tool the server doesn't have
+    from a server RailMon couldn't ask. A tool is `reached`; a server entry
+    is why its tools aren't listed. `tools_truncated` marks the tools of a
+    server whose list was cut at MCP_TOOLS_MAX or MCP_TOOLS_PAGES.
     """
     endpoints = dedupe(
         redact_url(value) or "[unparseable]" for value in collect_strings(spec) if value.startswith(("http://", "https://"))
@@ -1097,9 +1104,9 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
     if isinstance(url, str) and url:
         headers = spec.get("headers")
         headers = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else None
-        tools = probe_mcp_tools(url, headers)
+        tools, reachability, truncated = probe_mcp_server(url, headers)
         if tools is None:
-            return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable")]
+            return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable", reachability)]
         result: list[dict[str, Any]] = []
         for tool in tools:
             if not isinstance(tool, dict):
@@ -1116,15 +1123,19 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
                     "source_type": "mcp_config",
                     "entry": "tool",
                     "server": name,
+                    "reachability": "reached",
+                    **({"tools_truncated": True} if truncated else {}),
                     **tool_schema_fields(tool),
                 }
             )
-        return result or [unreachable_mcp_skill(name, source_label, endpoints, "reachable, declares no tools")]
+        return result or [
+            unreachable_mcp_skill(name, source_label, endpoints, "reachable, declares no tools", "declares_none")
+        ]
 
     command = spec.get("command")
     reached = command_basename(command)
     if not reached:
-        return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable")]
+        return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable", "unreachable")]
     return [
         {
             "name": name,
@@ -1133,11 +1144,14 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
             "source_type": "mcp_config",
             "entry": "server",
             "server": name,
+            "reachability": "not_probed_stdio",
         }
     ]
 
 
-def unreachable_mcp_skill(name: str, source_label: str, endpoints: list[str], reason: str) -> dict[str, Any]:
+def unreachable_mcp_skill(
+    name: str, source_label: str, endpoints: list[str], reason: str, reachability: str
+) -> dict[str, Any]:
     return {
         "name": name,
         "description": f"MCP server configured via {source_label}: {reason}",
@@ -1145,24 +1159,46 @@ def unreachable_mcp_skill(name: str, source_label: str, endpoints: list[str], re
         "source_type": "mcp_config",
         "entry": "server",
         "server": name,
+        "reachability": reachability,
     }
 
 
 MCP_PROBE_TIMEOUT_SECONDS = 3.0
 MCP_PROTOCOL_VERSION = "2025-06-18"
+# How far tools/list's pagination is followed (DR-293). Past either bound the
+# rest of the list is not read and the server's tools say tools_truncated.
+# The tool bound is Rail Center's default bound on a registration's skills
+# (MAX_PAYLOAD_LIST_ITEMS, 200): one server can't usefully declare more.
+MCP_TOOLS_PAGES = 20
+MCP_TOOLS_MAX = 200
 
 
 def probe_mcp_tools(
     url: str, headers: dict[str, str] | None, timeout: float = MCP_PROBE_TIMEOUT_SECONDS
 ) -> list[dict[str, Any]] | None:
-    """Every tool a live MCP server declares, or `None` if it could not be asked.
+    """Every tool a live MCP server declares, or `None` if it could not be
+    asked: `probe_mcp_server`'s tools alone."""
+    return probe_mcp_server(url, headers, timeout)[0]
 
-    Speaks only the two Streamable HTTP messages this needs: `initialize` to
+
+def probe_mcp_server(
+    url: str, headers: dict[str, str] | None, timeout: float = MCP_PROBE_TIMEOUT_SECONDS
+) -> tuple[list[dict[str, Any]] | None, str, bool]:
+    """The tools a live MCP server declares, how it answered, and whether
+    the list was cut short: `(tools, reachability, truncated)`.
+
+    `tools` is None when it could not be asked, and `reachability` then says
+    why: `auth_refused` for a 401 or 403 (the config's credential, if any,
+    was not accepted), else `unreachable`. A listed server is `reached`.
+
+    Speaks only the Streamable HTTP messages this needs: `initialize` to
     open a session (some servers require the session id it returns on every
-    later call; stateless ones ignore it either way), then `tools/list`. Never
-    raises — an agent's configured MCP server is untrusted input the scan must
-    survive, and a probe failure is recorded as unreachable, not fatal to the
-    rest of the scan.
+    later call; stateless ones ignore it either way), then `tools/list`,
+    following `nextCursor` for at most MCP_TOOLS_PAGES pages and
+    MCP_TOOLS_MAX tools; a list cut at either bound, or by a later page
+    failing, is `truncated`. Never raises — an agent's configured MCP server
+    is untrusted input the scan must survive, and a probe failure is
+    recorded as unreachable, not fatal to the rest of the scan.
 
     Only ever `http(s)://`. `urllib` also has a handler for `file://`, and it
     does not care that this sends a POST body: a config entry of
@@ -1171,13 +1207,13 @@ def probe_mcp_tools(
     function must never become.
     """
     if not url.startswith(("http://", "https://")):
-        return None
+        return None, "unreachable", False
     base_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         **(headers or {}),
     }
-    init_result, response_headers = mcp_rpc_call(
+    init_result, response_headers, status = mcp_rpc_call(
         url,
         {
             "jsonrpc": "2.0",
@@ -1193,30 +1229,47 @@ def probe_mcp_tools(
         timeout,
     )
     if init_result is None:
-        return None
+        return None, mcp_failure_reachability(status), False
 
     call_headers = dict(base_headers)
     session_id = response_headers.get("Mcp-Session-Id")
     if session_id:
         call_headers["Mcp-Session-Id"] = session_id
 
-    list_result, _ = mcp_rpc_call(
-        url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, call_headers, timeout
-    )
-    if list_result is None:
-        return None
-    tools = list_result.get("tools")
-    return tools if isinstance(tools, list) else None
+    tools: list[Any] = []
+    cursor: Any = None
+    for page in range(MCP_TOOLS_PAGES):
+        params = {"cursor": cursor} if cursor is not None else {}
+        list_result, _, status = mcp_rpc_call(
+            url, {"jsonrpc": "2.0", "id": 2 + page, "method": "tools/list", "params": params}, call_headers, timeout
+        )
+        page_tools = list_result.get("tools") if list_result is not None else None
+        if not isinstance(page_tools, list):
+            if page == 0:
+                return None, mcp_failure_reachability(status), False
+            return tools, "reached", True
+        tools.extend(page_tools)
+        if len(tools) > MCP_TOOLS_MAX:
+            return tools[:MCP_TOOLS_MAX], "reached", True
+        cursor = list_result.get("nextCursor")
+        if not isinstance(cursor, str) or not cursor:
+            return tools, "reached", False
+    return tools, "reached", True
+
+
+def mcp_failure_reachability(status: int | None) -> str:
+    return "auth_refused" if status in (401, 403) else "unreachable"
 
 
 def mcp_rpc_call(
     url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
-) -> tuple[dict[str, Any] | None, Any]:
+) -> tuple[dict[str, Any] | None, Any, int | None]:
     """One JSON-RPC round trip to an MCP endpoint.
 
-    Returns the response's `result` object and its headers, or `(None, {})` on
-    any failure: refused connection, timeout, a non-2xx status, a body that
-    isn't JSON or SSE-framed JSON, or a response with no `result`.
+    Returns the response's `result` object, its headers and its HTTP status,
+    or `(None, {}, status)` on any failure: refused connection, timeout (no
+    status), a non-2xx status, a body that isn't JSON or SSE-framed JSON, or
+    a response with no `result`.
     """
     req = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
     try:
@@ -1224,13 +1277,19 @@ def mcp_rpc_call(
             content_type = resp.headers.get("Content-Type", "")
             raw = resp.read().decode("utf-8", errors="replace")
             response_headers = resp.headers
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
-        return None, {}
+            status = resp.status
+    except HTTPError as exc:
+        return None, {}, exc.code
+    except (URLError, TimeoutError, OSError, ValueError, http.client.HTTPException):
+        # HTTPException: a garbage status line, a truncated body or a bad
+        # port in the URL. The server is untrusted; none of these may abort
+        # the scan.
+        return None, {}, None
 
     payload = parse_mcp_body(raw, content_type)
     if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
-        return None, {}
-    return payload["result"], response_headers
+        return None, {}, status
+    return payload["result"], response_headers, status
 
 
 def parse_mcp_body(raw: str, content_type: str) -> Any:
@@ -1294,6 +1353,22 @@ def collect_skills(mcp_configs: list[Path], env: dict[str, str] | None = None) -
 # unreachable, declaring none, or run as a command): a server, not a tool.
 SKILL_SOURCE_TYPES = frozenset({"mcp_config", "skills_config"})
 MCP_ENTRIES = frozenset({"tool", "server"})
+# How an MCP skill's server answered the probe (DR-293), a closed set: a
+# listed tool is `reached`; a server entry is `unreachable` (no answer, an
+# error status, or a body that is not MCP), `auth_refused` (401 or 403),
+# `declares_none` (reached, no tools) or `not_probed_stdio` (a `command`
+# server, which the scan never starts). Ordered by what a merge of one
+# skill read from two configs keeps: the first an entry has.
+MCP_REACHABILITY = ("reached", "auth_refused", "unreachable", "declares_none", "not_probed_stdio")
+# What an MCP server's skills say to make skills_inventory PARTIAL: some
+# server's tools could not be listed.
+MCP_UNREACHED = frozenset({"unreachable", "auth_refused"})
+# Why a tool's inputSchema is not kept (DR-293), a closed set: past
+# SKILL_SCHEMA_BYTES (per_tool_budget), past SKILL_SCHEMAS_BYTES with the
+# others (bundle_budget), or nesting past SKILL_SCHEMA_DEPTH or holding a
+# value JSON has no form for (unrepresentable). A tool that declares no
+# schema carries neither.
+SCHEMA_OMITTED_REASONS = frozenset({"per_tool_budget", "bundle_budget", "unrepresentable"})
 # An MCP tool's inputSchema as kept, compact JSON with sorted keys: a larger
 # one is left out rather than letting one server's tools crowd the bundle.
 SKILL_SCHEMA_BYTES = 8192
@@ -1341,15 +1416,21 @@ def tool_schema_fields(tool: dict[str, Any]) -> dict[str, Any]:
     skill keeps them (DR-264): the schema redacted and within
     SKILL_SCHEMA_BYTES, the annotations' boolean hints and title. What the
     classifier needs to tell an upload (an argument named data, a binary
-    format) or a destructive call from a read-looking name."""
+    format) or a destructive call from a read-looking name. A schema left
+    out says why in `schema_omitted` (DR-293), so a reader can tell it from
+    a tool that declares none; one already left out stays so."""
     fields: dict[str, Any] = {}
     schema = tool.get("inputSchema")
-    if isinstance(schema, dict):
-        redacted = _redacted_json(schema)
-        if isinstance(redacted, dict) and len(
-            json.dumps(redacted, separators=(",", ":"), sort_keys=True)
-        ) <= SKILL_SCHEMA_BYTES:
+    if schema is not None:
+        redacted = _redacted_json(schema) if isinstance(schema, dict) else None
+        if not isinstance(redacted, dict):
+            fields["schema_omitted"] = "unrepresentable"
+        elif len(json.dumps(redacted, separators=(",", ":"), sort_keys=True)) > SKILL_SCHEMA_BYTES:
+            fields["schema_omitted"] = "per_tool_budget"
+        else:
             fields["inputSchema"] = redacted
+    elif tool.get("schema_omitted") in SCHEMA_OMITTED_REASONS:
+        fields["schema_omitted"] = tool["schema_omitted"]
     annotations = tool.get("annotations")
     if isinstance(annotations, dict):
         kept: dict[str, Any] = {
@@ -1409,7 +1490,11 @@ def normalize_skill(value: Any, source_hint: str) -> dict[str, Any]:
         server = first_nonempty(redact_text(str(value.get("server") or "")))
         if server:
             skill["server"] = server
+        if value.get("reachability") in MCP_REACHABILITY:
+            skill["reachability"] = value["reachability"]
         if entry == "tool":
+            if value.get("tools_truncated") is True:
+                skill["tools_truncated"] = True
             skill.update(tool_schema_fields(value))
     return skill
 
@@ -1453,6 +1538,13 @@ def merge_skill_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
             if len(skill["description"]) > len(merged[key]["description"]):
                 merged[key]["description"] = skill["description"]
+            if "reachability" in skill and (
+                "reachability" not in merged[key]
+                or MCP_REACHABILITY.index(skill["reachability"]) < MCP_REACHABILITY.index(merged[key]["reachability"])
+            ):
+                merged[key]["reachability"] = skill["reachability"]
+            if skill.get("tools_truncated"):
+                merged[key]["tools_truncated"] = True
     skills = [merged[key] for key in sorted(merged)]
     used = 0
     for skill in skills:
@@ -1463,6 +1555,7 @@ def merge_skill_lists(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         size = len(rendered) + SKILL_SCHEMA_INDENT * (rendered.count("\n") + 1)
         if used + size > SKILL_SCHEMAS_BYTES:
             del skill["inputSchema"]
+            skill["schema_omitted"] = "bundle_budget"
             continue
         used += size
     return skills
