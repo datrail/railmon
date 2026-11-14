@@ -15,6 +15,7 @@ import copy
 import errno
 import getpass
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
@@ -1279,7 +1280,10 @@ def mcp_rpc_call(
             status = resp.status
     except HTTPError as exc:
         return None, {}, exc.code
-    except (URLError, TimeoutError, OSError, ValueError):
+    except (URLError, TimeoutError, OSError, ValueError, http.client.HTTPException):
+        # HTTPException: a garbage status line, a truncated body or a bad
+        # port in the URL. The server is untrusted; none of these may abort
+        # the scan.
         return None, {}, None
 
     payload = parse_mcp_body(raw, content_type)

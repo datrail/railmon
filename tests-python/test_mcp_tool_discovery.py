@@ -431,5 +431,41 @@ class ReachabilityAndOmissionMarksTest(unittest.TestCase):
         self.assertEqual(merged["reachability"], "auth_refused")
 
 
+class MalformedMcpResponseTest(unittest.TestCase):
+    """A server that breaks HTTP itself is unreachable, never a scan abort."""
+
+    def _garbage_server(self, reply: bytes):
+        import socket
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                with conn:
+                    conn.recv(65536)
+                    conn.sendall(reply)
+
+        threading.Thread(target=serve, daemon=True).start()
+        self.addCleanup(listener.close)
+        return f"http://127.0.0.1:{listener.getsockname()[1]}/mcp"
+
+    def test_garbage_status_line_is_unreachable(self):
+        url = self._garbage_server(b"NOT-HTTP garbage\r\n\r\n")
+        self.assertEqual(scanner.probe_mcp_server(url, None), (None, "unreachable", False))
+
+    def test_truncated_body_is_unreachable(self):
+        url = self._garbage_server(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{}")
+        self.assertEqual(scanner.probe_mcp_server(url, None), (None, "unreachable", False))
+
+    def test_bad_port_is_unreachable(self):
+        self.assertEqual(scanner.probe_mcp_server("http://127.0.0.1:abc/mcp", None), (None, "unreachable", False))
+
+
 if __name__ == "__main__":
     unittest.main()
