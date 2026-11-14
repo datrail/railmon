@@ -1102,8 +1102,11 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # names it in the method and notes, with AgentSight v1.0.35 (DR-170);
         # pack 14 folds a crowded written group to <dir>/*.<ext> (DR-262) and
         # reads OpenShell's provider placeholder as a reference (DR-194), and
-        # skills carry their server, schema and annotations (DR-264).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 14)
+        # skills carry their server, schema and annotations (DR-264); pack
+        # 15 marks each MCP skill's reachability, an omitted schema and a
+        # truncated tool list, and reads a server it can't list as PARTIAL
+        # (DR-293).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 15)
 
     def test_the_method_and_notes_name_the_probe_that_wrote_the_file(self):
         # DR-170: `railmon listen` writes "probe": "agentsight" in its start
@@ -2398,6 +2401,57 @@ class RegistrationParityTest(unittest.TestCase):
         for name in ("agent_type", "owner", "llm_provider", "sandbox_type", "system_info", "user_info",
                      "agent_instance"):
             self.assertNotIn(name, composer.SANDBOX_ATTRIBUTES)
+
+
+class SkillsReachabilityTest(unittest.TestCase):
+    """DR-293: skills_inventory is PARTIAL when an MCP server was not reached
+    or its tool list was cut, and its closed marks are held by the schema."""
+
+    TOOL = {"name": "lookup", "description": "Look up a record.", "destination_endpoints": [],
+            "source_type": "mcp_config", "entry": "tool", "server": "crm", "reachability": "reached"}
+    DOWN = {"name": "files", "description": "MCP server configured via .mcp.json: unreachable",
+            "destination_endpoints": [], "source_type": "mcp_config", "entry": "server", "server": "files",
+            "reachability": "unreachable"}
+
+    def field(self, skills):
+        payload = {**HOST_PAIR, "skills": skills}
+        bundle = evidence_bundle.build_evidence_bundle(build_args(), docker_context(), payload, identity())
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+        return bundle["attributes"]["skills_inventory"]
+
+    def test_every_server_reached_is_answered(self):
+        stdio = {**self.DOWN, "name": "local", "server": "local", "reachability": "not_probed_stdio"}
+        empty = {**self.DOWN, "name": "quiet", "server": "quiet", "reachability": "declares_none"}
+        field = self.field([self.TOOL, stdio, empty])
+        self.assertEqual(field["status"], "ANSWERED")
+        self.assertEqual(field["value"], [self.TOOL, stdio, empty])
+
+    def test_a_server_not_reached_or_refused_makes_it_partial(self):
+        for reachability in ("unreachable", "auth_refused"):
+            down = {**self.DOWN, "reachability": reachability}
+            field = self.field([self.TOOL, down])
+            self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "NO_SOURCE_ACCESS"), reachability)
+            self.assertEqual(field["value"], [self.TOOL, down])
+            self.assertEqual(field["note"], "MCP server(s) not reached: files")
+
+    def test_a_truncated_tool_list_makes_it_partial(self):
+        field = self.field([{**self.TOOL, "tools_truncated": True}])
+        self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
+        self.assertEqual(field["note"], "MCP tool list(s) truncated: crm")
+
+    def test_the_schema_closes_the_marks(self):
+        good = self.field([self.TOOL, self.DOWN])
+        v2 = json.loads((ROOT / "tests" / "fixtures" / "evidence-bundle-v2.valid.json").read_text())
+        v2["agents"][0]["attributes"]["skills_inventory"] = good
+        self.assertEqual(evidence_bundle.contract_problems_v2(v2), [])
+        for bad in ({"reachability": "maybe"}, {"schema_omitted": "too_big"}, {"tools_truncated": False}):
+            payload = {**HOST_PAIR, "skills": [{**self.TOOL, **bad}]}
+            bundle = evidence_bundle.build_evidence_bundle(build_args(), docker_context(), payload, identity())
+            self.assertTrue(evidence_bundle.contract_problems(bundle), bad)
+            v2 = json.loads((ROOT / "tests" / "fixtures" / "evidence-bundle-v2.valid.json").read_text())
+            self.assertEqual(evidence_bundle.contract_problems_v2(v2), [])
+            v2["agents"][0]["attributes"]["skills_inventory"] = bundle["attributes"]["skills_inventory"]
+            self.assertTrue(evidence_bundle.contract_problems_v2(v2), bad)
 
 
 if __name__ == "__main__":

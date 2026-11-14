@@ -548,6 +548,22 @@ class PodSourcesTest(Fixture):
                                   "source_type": "skills_config"})
         self.assertEqual(attributes["declared_destinations"]["value"], ["egress.example", "gh.example", "llm.example"])
 
+    def test_a_partial_inventory_stays_partial_after_the_profile_merges_into_it(self):
+        # DR-293: an MCP server the scanner could not reach makes skills_inventory
+        # PARTIAL; the profile's skills join the list but don't make it complete.
+        server = scanner.normalize_skill({"name": "remote", "description": "x", "source_type": "mcp_config",
+                                          "server": "remote", "entry": "server", "reachability": "unreachable"}, "x")
+        existing = {"skills_inventory": evidence_bundle._partial(
+            [server], "declared", "NO_SOURCE_ACCESS", authored_by="subject", note="MCP server(s) not reached: remote")}
+        skills = self.merged(existing, {})["skills_inventory"]
+        self.assertEqual((skills["status"], skills["reason"], skills["note"]),
+                         ("PARTIAL", "NO_SOURCE_ACCESS", "MCP server(s) not reached: remote"))
+        self.assertEqual(sorted((s["name"], s.get("reachability")) for s in skills["value"]),
+                         [("lookup", None), ("remote", "unreachable")])
+        # An ANSWERED inventory merges to ANSWERED, as before.
+        existing = {"skills_inventory": evidence_bundle._answered([], "declared", authored_by="subject")}
+        self.assertEqual(self.merged(existing, {})["skills_inventory"]["status"], "ANSWERED")
+
     def test_a_host_the_profile_declares_is_no_longer_undeclared(self):
         existing = {"declared_destinations": evidence_bundle._answered([], "declared", authored_by="subject"),
                     "undeclared_destinations": evidence_bundle._answered(
