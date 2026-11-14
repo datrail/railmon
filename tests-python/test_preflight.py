@@ -79,6 +79,8 @@ class CapabilityTest(Tmp):
         self.assertIn("collect reads the agent's memory maps", problem)
         self.assertIn("add it with cap_add", problem)
         self.assertIsNone(preflight.capability_problem(caps(38, 39, 40), 40, "collect"))
+        # Run directly (--binary-path and the like), it reads no maps.
+        self.assertIsNone(preflight.capability_problem(caps(38, 39), 40, "collect", follows=False))
         # A kernel before CHECKPOINT_RESTORE: the bit means nothing there.
         self.assertIsNotNone(preflight.capability_problem(caps(38, 39, 40), 39, "collect"))
 
@@ -159,7 +161,8 @@ class ProcTest(Tmp):
         proc = str(self.dir / "proc")
         self.assertIsNone(preflight.maps_problem(77, proc))
         with mock.patch.object(preflight.os, "stat", side_effect=PermissionError):
-            self.assertIn("following them needs SYS_ADMIN", preflight.maps_problem(77, proc))
+            self.assertIn("following them needs SYS_ADMIN (or CHECKPOINT_RESTORE)",
+                          preflight.maps_problem(77, proc))
         with mock.patch.object(preflight.os, "listdir", side_effect=PermissionError):
             self.assertIn("SYS_PTRACE", preflight.maps_problem(77, proc))
         self.assertIsNone(preflight.maps_problem(78, proc))  # gone: nothing to say

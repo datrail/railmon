@@ -458,11 +458,12 @@ processes out of sight. Neither check blocks a sensor.
 | Missing | What it says | The fix |
 | --- | --- | --- |
 | `BPF` and `PERFMON` (Linux 5.8+; `SYS_ADMIN` covers both, and is the one before 5.8) | `start-up check: missing capabilities BPF and PERFMON (or SYS_ADMIN) …` | `cap_add` them, or run privileged |
-| `SYS_ADMIN` (or `CHECKPOINT_RESTORE`) for `collect`, to read the agent's `/proc/<pid>/map_files` | `start-up check: missing capability SYS_ADMIN: collect reads the agent's memory maps …` | `cap_add: [SYS_ADMIN]` |
+| `SYS_ADMIN` (or `CHECKPOINT_RESTORE`) for `collect` following a container, to read the agent's `/proc/<pid>/map_files` | `start-up check: missing capability SYS_ADMIN: collect reads the agent's memory maps …` | `cap_add: [SYS_ADMIN]` |
 | tracefs (`listen`, `files`), without `SYS_ADMIN` to mount it | `start-up check: the kernel's tracing folder isn't visible …` | mount `/sys/kernel/tracing:/sys/kernel/tracing:ro` |
 | Docker socket or `DOCKER_HOST` | `no Docker access …`, `no permission on the Docker socket …`, `Docker at DOCKER_HOST=… doesn't answer` | mount `/var/run/docker.sock`, or point `DOCKER_HOST` at a Docker API proxy |
 | The agent's container | `no container named …` | check `AGENT_CONTAINER` (`docker ps`) |
 | The host's PID namespace | `the agent's process (host pid N) isn't visible here …` | `pid: host` |
+| `SYS_ADMIN` (or `CHECKPOINT_RESTORE`), seen while following | `can't read the agent's memory maps …` | `cap_add: [SYS_ADMIN]` |
 | Ptrace access to the agent (`collect`) | `can't list the agent's memory maps …` | `cap_add: [SYS_PTRACE]`, or run privileged |
 
 Before these checks the same gaps read as "no process … loads libssl", "make

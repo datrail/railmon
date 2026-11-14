@@ -38,13 +38,13 @@ shift
 # the kernel's tracing folder (DR-301). It reports and never blocks.
 preflight() {
     if [ "${RAIL_PREFLIGHT:-1}" != "0" ]; then
-        python3 "$root/tools/listen/preflight.py" "$1" || true
+        python3 "$root/tools/listen/preflight.py" "$@" || true
     fi
 }
 
 case "$command_name" in
     collect)
-        preflight collect
+        if [ -n "${RAIL_COLLECT_CONTAINER:-}" ]; then preflight collect; else preflight collect --direct; fi
         # With RAIL_COLLECT_CONTAINER set, a supervisor finds that container's
         # TLS library, runs the collector scoped to it and to the container's
         # process tree, and re-attaches after the agent restarts (DR-187).

@@ -70,13 +70,16 @@ def _has(caps: int, cap: int) -> bool:
     return bool(caps >> cap & 1)
 
 
-def capability_problem(caps: int | None, last: int, command: str = "listen") -> str | None:
+def capability_problem(caps: int | None, last: int, command: str = "listen",
+                       follows: bool = True) -> str | None:
     """What the kernel checks, not what a deployment happens to grant.
     Loading and attaching the probes needs BPF and PERFMON, either of which
     SYS_ADMIN stands in for (bpf_capable, perfmon_capable); before Linux 5.8
     neither existed and SYS_ADMIN is the one. `collect` also resolves the
     agent's /proc/<pid>/map_files links, which needs SYS_ADMIN or (5.9+)
-    CHECKPOINT_RESTORE. SYS_ADMIN for mounting tracefs is tracefs_problem's."""
+    CHECKPOINT_RESTORE, but only when it follows a container (`follows`):
+    run directly, it is told what to attach to. SYS_ADMIN for mounting
+    tracefs is tracefs_problem's."""
     if caps is None:
         return None
     admin = _has(caps, CAP_SYS_ADMIN)
@@ -89,7 +92,7 @@ def capability_problem(caps: int | None, last: int, command: str = "listen") -> 
                     f"without {'it' if len(missing) == 1 else 'them'}; {grant(len(missing))}")
     elif not admin:
         return f"missing capability SYS_ADMIN: the eBPF probes can't load without it; {grant()}"
-    if command == "collect" and not (
+    if command == "collect" and follows and not (
             admin or (last >= CAP_CHECKPOINT_RESTORE and _has(caps, CAP_CHECKPOINT_RESTORE))):
         return ("missing capability SYS_ADMIN: collect reads the agent's memory maps "
                 "(/proc/<pid>/map_files) to find its TLS library, and can't without it; "
@@ -187,7 +190,8 @@ def maps_problem(pid: int, proc: str = PROC) -> str | None:
             os.stat(os.path.join(base, name))
         except PermissionError:
             return (f"can't read the agent's memory maps ({base}): following them needs "
-                    "SYS_ADMIN; add it with cap_add (or run the container privileged)")
+                    "SYS_ADMIN (or CHECKPOINT_RESTORE); add it with cap_add (or run the "
+                    "container privileged)")
         except OSError:
             return None
     return None
@@ -219,13 +223,14 @@ class Waiting:
         self.kind, self.logged, self.next = None, None, 0.0
 
 
-def startup_problems(command: str, container: str | None = None, *, proc: str = PROC,
+def startup_problems(command: str, container: str | None = None, *, follows: bool = True,
+                     proc: str = PROC,
                      tracefs=TRACEFS, docker: str = "docker", env=None,
                      socket: str = DOCKER_SOCKET) -> list[str]:
     """What `command` (collect, listen or files) is missing before it starts."""
     problems = []
     caps = effective_caps(proc)
-    problem = capability_problem(caps, last_cap(proc), command)
+    problem = capability_problem(caps, last_cap(proc), command, follows or bool(container))
     if problem:
         problems.append(problem)
     if command in ("listen", "files"):
@@ -260,9 +265,13 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("collect", "listen", "files"))
     parser.add_argument("--container", help="the agent's container, when the sensor follows one")
+    parser.add_argument("--direct", action="store_true",
+                        help="the sensor runs without following a container (collect: told "
+                        "what to attach to, so it reads no memory maps)")
     args = parser.parse_args(argv)
     docker = os.environ.get("RAIL_DOCKER", "docker")
-    for problem in startup_problems(args.command, args.container, docker=docker):
+    for problem in startup_problems(args.command, args.container, follows=not args.direct,
+                                    docker=docker):
         print(f"[railmon {args.command}] start-up check: {problem}", file=sys.stderr, flush=True)
     return 0
 
