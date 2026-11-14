@@ -26,7 +26,7 @@ RUN touch src/main.rs && cargo build --release --locked
 # a silent runtime downgrade, and drift in the direction where a 3.12-or-later
 # construct passes CI and dies in the image. This base is Debian too, so
 # AgentSight's libraries install the same way.
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 # libelf and zlib are AgentSight's, not ours: it loads eBPF objects at runtime.
 # openssl is `railmon demo`'s (tools/local-demo): it generates a throwaway
