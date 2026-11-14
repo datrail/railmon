@@ -188,6 +188,116 @@ def read_pod_metadata(env: dict[str, str], info_dir: Path) -> dict[str, Any]:
     return pod
 
 
+def _harness_sources() -> Any:
+    """harness/harness_sources.py, loaded by path once, like _agent_process
+    below."""
+    module = sys.modules.get("gke_harness_sources")
+    if module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("gke_harness_sources", Path(__file__).parent / "harness" / "harness_sources.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["gke_harness_sources"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def harness_attributes(context: dict[str, Any], builders: dict[str, Builder],
+                       known_profiles: list[dict[str, Any]] | None = None,
+                       existing: dict[str, Any] | None = None,
+                       shapers: dict[str, Callable[..., Any]] | None = None) -> dict[str, Any]:
+    """The harness fields the shared reader fills from the profile matching
+    the agent (harness/harness_sources.py), in place of the bundle's: only
+    values the profile found, and only when a profile matches.
+
+    `existing` is the bundle's attributes so far. A value the scanner
+    observed itself (authored_by none: AgentSight's wire-observed tool_names,
+    a model read from a capture) is never replaced by what the agent's own
+    files say. The declared lists are merged, in the bundle's own shapes, with
+    the scanner's own functions (`shapers`): mcp_servers_declared as
+    read_mcp_inventory's entries, skills_inventory as normalized skills, and
+    declared_destinations recomputed from the result."""
+    if not context.get("subject") or "absent" not in builders:
+        return {}
+    sources = _harness_sources()
+    harness, results = sources.read_agent_harness(
+        context, [Path(p) for p in context.get("config_paths") or []], known_profiles,
+        redact_url=(shapers or {}).get("redact_url"))
+    if harness is None:
+        return {}
+    existing = existing or {}
+    # Only a value the profile found; for any other field the bundle's own
+    # account stands (BLIND with GATEWAY_MANAGED for an undeclared policy, say),
+    # so a matching profile never turns "unknown" into "none".
+    found = sources.reader().to_attributes(results, builders, values_only=True)
+    attributes: dict[str, Any] = {}
+    for field, attribute in found.items():
+        current = existing.get(field) or {}
+        if current.get("status") in ("ANSWERED", "PARTIAL") and current.get("authored_by") == "none":
+            continue  # observed by the scanner itself: the agent's files don't override it
+        prior = current.get("value") if current.get("status") in ("ANSWERED", "PARTIAL") else None
+        if shapers and field == "mcp_servers_declared":
+            entries = shapers["mcp_inventory_entries"](attribute["value"], f"{harness} profile")
+            if not entries:
+                continue
+            merged = {entry["name"]: entry for entry in prior or [] if isinstance(entry, dict)}
+            merged.update({entry["name"]: entry for entry in entries})  # the harness's own config wins on a name
+            attribute = dict(attribute, value=[merged[name] for name in sorted(merged)])
+        elif shapers and field == "skills_inventory":
+            skills = []
+            for skill in attribute["value"]:
+                try:
+                    skills.append(shapers["normalize_skill"]({
+                        "name": skill.get("name"),
+                        "description": skill.get("description") or f"no description in {skill.get('path')}/SKILL.md",
+                        "source_type": "skills_config", "destination_endpoints": []}, f"{harness} profile"))
+                except Exception:  # a skill the bundle can't carry (no name) is left out of it
+                    continue
+            if not skills:
+                continue
+            attribute = dict(attribute, value=shapers["merge_skill_lists"](prior or [], skills))
+        attributes[field] = attribute
+    if shapers and ({"mcp_servers_declared", "inference_endpoint"} & set(attributes)):
+        attributes.update(_declared_destinations(attributes, existing, builders, shapers, harness))
+    return attributes
+
+
+def _declared_destinations(attributes: dict[str, Any], existing: dict[str, Any], builders: dict[str, Builder],
+                           shapers: dict[str, Callable[..., Any]], harness: str) -> dict[str, Any]:
+    """declared_destinations again, as evidence_bundle.py makes it (the hosts
+    of the MCP server URLs and the model endpoint), from the merged values."""
+    def value(field: str) -> Any:
+        attribute = attributes.get(field) or existing.get(field) or {}
+        return attribute.get("value") if attribute.get("status") in ("ANSWERED", "PARTIAL") else None
+
+    hosts = set(value("declared_destinations") or [])
+    for entry in value("mcp_servers_declared") or []:
+        if isinstance(entry, dict) and entry.get("url"):
+            hosts.add(shapers["url_host"](entry["url"]))
+    endpoint = value("inference_endpoint")
+    if isinstance(endpoint, str):
+        hosts.add(shapers["url_host"](endpoint))
+    hosts.discard(None)
+    hosts.discard("")
+    if not hosts:
+        return {}
+    out = {"declared_destinations": builders["answered"](
+        sorted(hosts), "declared", authored_by="subject",
+        method=f"hosts from the MCP server URLs and the model endpoint, the {harness} profile's included")}
+    # undeclared_destinations is observed minus declared: a host the profile
+    # now declares is no longer undeclared, so the two never contradict.
+    undeclared = existing.get("undeclared_destinations") or {}
+    if undeclared.get("status") == "ANSWERED" and isinstance(undeclared.get("value"), list):
+        left = sorted(set(undeclared["value"]) - hosts)
+        if left != sorted(undeclared["value"]):
+            out["undeclared_destinations"] = (
+                builders["answered"](left, "observed", authored_by="none",
+                                     method=f"observed hosts minus declared hosts, the {harness} profile's included")
+                if left else builders["absent"]("no observed host fell outside the declared set", "observed"))
+    return out
+
+
 def default_mcp_paths(config_paths: list[Path]) -> list[Path]:
     """`.mcp.json` in each of the agent's config folders (beside a config
     file, or inside a folder), on the config volume the sidecar mounts."""
@@ -221,6 +331,8 @@ def collect_context(base: dict[str, Any], config_paths: list[Path],
     stays the source of its settings (`settings_env`)."""
     context = base
     context["mode"] = "pod"
+    # Where the config volume is mounted, for the harness reader (harness/harness_sources.py).
+    context["config_paths"] = [str(path) for path in config_paths]
     context["settings_env"] = context["env"]
     folder = info_dir()
     context["pod"] = read_pod_metadata(context["settings_env"], folder)
@@ -321,7 +433,8 @@ DEPLOYMENT_ENV_KEYS = ("RAIL_DEPLOYMENT", "RAIL_NAMESPACE")
 
 
 def bundle_attributes(context: dict[str, Any], payload: dict[str, Any],
-                      answered: Builder, blind: Builder) -> dict[str, Any]:
+                      answered: Builder, blind: Builder, existing: dict[str, Any] | None = None,
+                      shapers: dict[str, Callable[..., Any]] | None = None, **builders: Builder) -> dict[str, Any]:
     pod = context.get("pod") or {}
     user_info = (payload.get("environment") or {}).get("user_info") or {}
     attributes = {
@@ -337,6 +450,8 @@ def bundle_attributes(context: dict[str, Any], payload: dict[str, Any],
                  "is in the user_info attribute",
         ),
     }
+    attributes.update(harness_attributes(context, {"answered": answered, "blind": blind, **builders},
+                                         existing=existing, shapers=shapers))
     if context.get("subject") is None:
         reason = context.get("subject_reason") or "no agent process"
         attributes.update(subject_blind(blind, reason))

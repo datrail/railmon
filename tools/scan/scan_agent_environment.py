@@ -646,13 +646,21 @@ def mode_attributes(
     payload: dict[str, Any],
     answered: Callable[..., dict[str, Any]],
     blind: Callable[..., dict[str, Any]],
+    existing: dict[str, Any] | None = None,
+    **builders: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     """The bundle attributes a scan mode fills its own way, replacing the
-    generic ones: pod mode's deployment, owner and agent_instance. Empty for
+    generic ones: pod mode's deployment, owner and agent_instance, and the
+    harness fields its profile fills. `existing` is the bundle's attributes so
+    far: a harness profile's value fills a field only where the scanner
+    observed nothing itself, and is merged into what it declared. Empty for
     self and docker scans."""
     if not is_pod_mode(context):
         return {}
-    return _pod_mode().bundle_attributes(context, payload, answered, blind)
+    shapers = {"mcp_inventory_entries": mcp_inventory_entries, "normalize_skill": normalize_skill,
+               "merge_skill_lists": merge_skill_lists, "url_host": url_host, "redact_url": redact_url}
+    return _pod_mode().bundle_attributes(context, payload, answered, blind, existing=existing or {},
+                                         shapers=shapers, **builders)
 
 
 def docker_inspect(container: str) -> dict[str, Any]:
@@ -941,10 +949,15 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
     data = load_json_file(path)
     if not isinstance(data, dict):
         return []
-    servers = data.get("mcpServers")
+    return mcp_inventory_entries(data.get("mcpServers"), path.name)
+
+
+def mcp_inventory_entries(servers: Any, source: str) -> list[dict[str, Any]]:
+    """An mcpServers object as inventory entries (read_mcp_inventory's shape),
+    for any reader that has one: a .mcp.json, or a harness's own config read
+    by its profile (gke/harness/)."""
     if not isinstance(servers, dict):
         return []
-
     inventory: list[dict[str, Any]] = []
     for name, spec in servers.items():
         if not isinstance(spec, dict):
@@ -963,7 +976,7 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
                 "command": command_basename(command),
                 "url": redact_url(url) if isinstance(url, str) else None,
                 "transport": "http" if url else ("stdio" if command else "unknown"),
-                "source": path.name,
+                "source": source,
                 # Which of the server's tools the agent may use (DR-218):
                 # widening the allow list changes what it can do.
                 "include_tools": mcp_tool_list(spec.get("includeTools")),
