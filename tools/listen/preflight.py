@@ -13,9 +13,11 @@ must not stop a capture that would have worked.
 
     python3 preflight.py collect|listen|files [--container NAME]
 
-checks what that sensor needs at start. The supervisors also call
-`container_problem`, `pid_problem` and `maps_problem` while they wait, so a
-wait that cannot end says why.
+checks what that sensor needs at start: its capabilities and, for listen and
+files, tracefs; with --container also Docker, the container and the host's
+PID namespace. The entrypoint runs it without --container, because the
+supervisors following a container call `container_problem`, `pid_problem`
+and `maps_problem` while they wait, so a wait that cannot end says why.
 """
 
 from __future__ import annotations
@@ -30,13 +32,15 @@ PROC = "/proc"
 TRACEFS = ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
 DOCKER_SOCKET = "/var/run/docker.sock"
 
+CAP_SYS_PTRACE = 19
 CAP_SYS_ADMIN = 21
 CAP_PERFMON = 38
 CAP_BPF = 39
-CAP_NAMES = {CAP_SYS_ADMIN: "SYS_ADMIN", CAP_PERFMON: "PERFMON", CAP_BPF: "BPF"}
+CAP_CHECKPOINT_RESTORE = 40
 
 # The fix the compose file needs, written once.
-GRANT_CAPS = "add them with cap_add (or run the container privileged)"
+def grant(n: int = 1) -> str:
+    return f"add {'it' if n == 1 else 'them'} with cap_add (or run the container privileged)"
 GRANT_PID = "run this container in the host's PID namespace (pid: host)"
 
 
@@ -62,19 +66,35 @@ def last_cap(proc: str = PROC) -> int:
         return CAP_BPF
 
 
-def capability_problem(caps: int | None, last: int) -> str | None:
-    """Every eBPF sensor loads programs and attaches probes (BPF, PERFMON),
-    and `collect` reads the agent's memory maps (/proc/<pid>/map_files,
-    SYS_ADMIN). SYS_ADMIN is also what mounts tracefs."""
+def _has(caps: int, cap: int) -> bool:
+    return bool(caps >> cap & 1)
+
+
+def capability_problem(caps: int | None, last: int, command: str = "listen") -> str | None:
+    """What the kernel checks, not what a deployment happens to grant.
+    Loading and attaching the probes needs BPF and PERFMON, either of which
+    SYS_ADMIN stands in for (bpf_capable, perfmon_capable); before Linux 5.8
+    neither existed and SYS_ADMIN is the one. `collect` also resolves the
+    agent's /proc/<pid>/map_files links, which needs SYS_ADMIN or (5.9+)
+    CHECKPOINT_RESTORE. SYS_ADMIN for mounting tracefs is tracefs_problem's."""
     if caps is None:
         return None
-    need = [CAP_SYS_ADMIN] + ([CAP_PERFMON, CAP_BPF] if last >= CAP_BPF else [])
-    missing = [CAP_NAMES[c] for c in need if not caps >> c & 1]
-    if not missing:
-        return None
-    return (f"missing capabilit{'y' if len(missing) == 1 else 'ies'} "
-            f"{', '.join(missing)}: the eBPF probes can't load without "
-            f"{'it' if len(missing) == 1 else 'them'}; {GRANT_CAPS}")
+    admin = _has(caps, CAP_SYS_ADMIN)
+    if last >= CAP_BPF:
+        missing = [name for cap, name in ((CAP_BPF, "BPF"), (CAP_PERFMON, "PERFMON"))
+                   if not (admin or _has(caps, cap))]
+        if missing:
+            return (f"missing capabilit{'y' if len(missing) == 1 else 'ies'} "
+                    f"{' and '.join(missing)} (or SYS_ADMIN): the eBPF probes can't load "
+                    f"without {'it' if len(missing) == 1 else 'them'}; {grant(len(missing))}")
+    elif not admin:
+        return f"missing capability SYS_ADMIN: the eBPF probes can't load without it; {grant()}"
+    if command == "collect" and not (
+            admin or (last >= CAP_CHECKPOINT_RESTORE and _has(caps, CAP_CHECKPOINT_RESTORE))):
+        return ("missing capability SYS_ADMIN: collect reads the agent's memory maps "
+                "(/proc/<pid>/map_files) to find its TLS library, and can't without it; "
+                f"{grant()}")
+    return None
 
 
 def tracefs_problem(roots=TRACEFS, caps: int | None = None) -> str | None:
@@ -148,22 +168,25 @@ def pid_problem(pid: int, proc: str = PROC) -> str | None:
 
 
 def maps_problem(pid: int, proc: str = PROC) -> str | None:
-    """`collect` finds a loaded libssl through /proc/<pid>/map_files, whose
-    links the kernel resolves only for SYS_ADMIN. Without it every lookup
-    fails and the agent looked as though it used no TLS."""
+    """`collect` finds a loaded libssl through /proc/<pid>/map_files. Listing
+    it is a ptrace access check (SYS_PTRACE when the agent holds capabilities
+    this sensor lacks); following a link needs SYS_ADMIN or
+    CHECKPOINT_RESTORE. Either refusal made the agent look as though it used
+    no TLS."""
     base = f"{proc}/{pid}/map_files"
     try:
         names = os.listdir(base)
     except PermissionError:
-        return (f"can't read the agent's memory maps ({base}): reading them needs "
-                "SYS_ADMIN; add it with cap_add (or run the container privileged)")
+        return (f"can't list the agent's memory maps ({base}): the kernel's ptrace access "
+                "check refused it, as when the agent holds capabilities this container "
+                "lacks; add SYS_PTRACE with cap_add (or run the container privileged)")
     except OSError:
         return None
     for name in names[:1]:
         try:
             os.stat(os.path.join(base, name))
         except PermissionError:
-            return (f"can't read the agent's memory maps ({base}): reading them needs "
+            return (f"can't read the agent's memory maps ({base}): following them needs "
                     "SYS_ADMIN; add it with cap_add (or run the container privileged)")
         except OSError:
             return None
@@ -202,7 +225,7 @@ def startup_problems(command: str, container: str | None = None, *, proc: str = 
     """What `command` (collect, listen or files) is missing before it starts."""
     problems = []
     caps = effective_caps(proc)
-    problem = capability_problem(caps, last_cap(proc))
+    problem = capability_problem(caps, last_cap(proc), command)
     if problem:
         problems.append(problem)
     if command in ("listen", "files"):

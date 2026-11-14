@@ -55,19 +55,36 @@ class CapabilityTest(Tmp):
         self.assertIsNone(preflight.effective_caps(str(self.dir / "none")))
 
     def test_names_each_missing_capability(self):
-        self.assertIsNone(preflight.capability_problem(ALL, 40))
-        self.assertIsNone(preflight.capability_problem((1 << 41) - 1, 40))  # privileged
-        problem = preflight.capability_problem(caps(21), 40)
-        self.assertIn("missing capabilities PERFMON, BPF", problem)
-        self.assertIn("cap_add", problem)
-        self.assertIn("missing capability SYS_ADMIN:",
-                      preflight.capability_problem(caps(38, 39), 40))
-        # Docker's default set: none of the three.
-        self.assertIn("SYS_ADMIN, PERFMON, BPF", preflight.capability_problem(0xa80425fb, 40))
+        self.assertIsNone(preflight.capability_problem(ALL, 40, "collect"))
+        self.assertIsNone(preflight.capability_problem((1 << 41) - 1, 40, "collect"))  # privileged
+        problem = preflight.capability_problem(0, 40)
+        self.assertIn("missing capabilities BPF and PERFMON (or SYS_ADMIN)", problem)
+        self.assertIn("add them with cap_add", problem)
+        self.assertIn("missing capability PERFMON (or SYS_ADMIN)",
+                      preflight.capability_problem(caps(39), 40))
+        # Docker's default set: none of them.
+        self.assertIn("BPF and PERFMON", preflight.capability_problem(0xa80425fb, 40))
 
-    def test_before_linux_5_8_sys_admin_is_enough(self):
-        self.assertIsNone(preflight.capability_problem(caps(21), 37))
-        self.assertIn("SYS_ADMIN", preflight.capability_problem(0, 37))
+    def test_sys_admin_stands_in_for_bpf_and_perfmon(self):
+        # bpf_capable() and perfmon_capable() accept SYS_ADMIN.
+        for command in ("collect", "listen", "files"):
+            self.assertIsNone(preflight.capability_problem(caps(21), 40, command))
+
+    def test_listen_and_files_need_no_sys_admin_once_tracefs_is_mounted(self):
+        self.assertIsNone(preflight.capability_problem(caps(38, 39), 40, "listen"))
+        self.assertIsNone(preflight.capability_problem(caps(38, 39), 40, "files"))
+
+    def test_collect_needs_sys_admin_or_checkpoint_restore_for_the_maps(self):
+        problem = preflight.capability_problem(caps(38, 39), 40, "collect")
+        self.assertIn("collect reads the agent's memory maps", problem)
+        self.assertIn("add it with cap_add", problem)
+        self.assertIsNone(preflight.capability_problem(caps(38, 39, 40), 40, "collect"))
+        # A kernel before CHECKPOINT_RESTORE: the bit means nothing there.
+        self.assertIsNotNone(preflight.capability_problem(caps(38, 39, 40), 39, "collect"))
+
+    def test_before_linux_5_8_sys_admin_is_the_one(self):
+        self.assertIsNone(preflight.capability_problem(caps(21), 37, "collect"))
+        self.assertIn("missing capability SYS_ADMIN:", preflight.capability_problem(0, 37))
 
     def test_an_unreadable_set_is_not_reported(self):
         self.assertIsNone(preflight.capability_problem(None, 40))
@@ -142,9 +159,9 @@ class ProcTest(Tmp):
         proc = str(self.dir / "proc")
         self.assertIsNone(preflight.maps_problem(77, proc))
         with mock.patch.object(preflight.os, "stat", side_effect=PermissionError):
-            self.assertIn("needs SYS_ADMIN", preflight.maps_problem(77, proc))
+            self.assertIn("following them needs SYS_ADMIN", preflight.maps_problem(77, proc))
         with mock.patch.object(preflight.os, "listdir", side_effect=PermissionError):
-            self.assertIn("needs SYS_ADMIN", preflight.maps_problem(77, proc))
+            self.assertIn("SYS_PTRACE", preflight.maps_problem(77, proc))
         self.assertIsNone(preflight.maps_problem(78, proc))  # gone: nothing to say
 
     def test_collect_says_why_it_finds_no_tls_user(self):
@@ -153,7 +170,7 @@ class ProcTest(Tmp):
         self.assertIn("pid: host", tls.no_target_reason("agent", 4242, str(proc)))
         self.assertIn("loads libssl", tls.no_target_reason("agent", 77, str(proc)))
         with mock.patch.object(preflight.os, "listdir", side_effect=PermissionError):
-            self.assertIn("needs SYS_ADMIN", tls.no_target_reason("agent", 77, str(proc)))
+            self.assertIn("ptrace access", tls.no_target_reason("agent", 77, str(proc)))
 
 
 class WaitingTest(unittest.TestCase):
@@ -206,7 +223,7 @@ class StartupTest(Tmp):
                                               tracefs=[str(missing)], docker=docker, env={},
                                               socket=str(self.dir / "docker.sock"))
         self.assertEqual(len(problems), 3, problems)
-        self.assertIn("SYS_ADMIN, PERFMON, BPF", problems[0])
+        self.assertIn("BPF and PERFMON (or SYS_ADMIN)", problems[0])
         self.assertIn("tracing folder", problems[1])
         self.assertIn("no Docker access", problems[2])
         # collect needs no tracefs.
