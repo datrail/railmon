@@ -1802,9 +1802,34 @@ def redact_url(url: str | None) -> str | None:
     # `::1:8080` would make this function crash on its own output.
     netloc = (f"[{host}]" if ":" in host else host) + (f":{port}" if port else "")
     segments = [segment for segment in parts.path.split("/") if segment]
-    path = "/".join("[redacted]" if looks_like_secret_segment(segment) else segment for segment in segments)
+    path = "/".join(redact_path_segment(segment) for segment in segments)
     suffix = "?[redacted]" if parts.query else ""
     return f"{parts.scheme}://{netloc}" + (f"/{path}" if path else "") + suffix
+
+
+# What a redacted path segment reads as. A consumer matching paths (Rail
+# Center's capture plan) skips a URL holding one, so it must not arise any
+# other way: `[` and `]` are not legal in a path (RFC 3986 gen-delims), and a
+# kept segment that has them anyway is percent-encoded below.
+REDACTED_SEGMENT = "[redacted]"
+
+
+def redact_path_segment(segment: str) -> str:
+    """One path segment: the marker if it could be a key, else as written.
+
+    A segment that already is the marker stays the marker, and any other
+    `[`/`]` is percent-encoded, so the marker in a redacted URL always means
+    "something was taken out here". The key test reads the segment with
+    those encodings undone: encoding grows a bracket to three characters,
+    and testing the encoded form would let a second pass (pod mode redacts a
+    harness URL, then the inventory redacts it again) push a 16-19
+    character segment past the length bound and redact what the first pass
+    kept.
+    """
+    raw = re.sub("%5[bB]", "[", re.sub("%5[dD]", "]", segment))
+    if raw == REDACTED_SEGMENT or looks_like_secret_segment(raw):
+        return REDACTED_SEGMENT
+    return raw.replace("[", "%5B").replace("]", "%5D")
 
 
 # A host as an operator writes one: dotted with an alphabetic TLD, or a short

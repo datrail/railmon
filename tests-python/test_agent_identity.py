@@ -257,6 +257,30 @@ class UrlRedactionTest(unittest.TestCase):
             "https://actions.zapier.com/mcp/[redacted]/sse",
         )
 
+    def test_the_marker_only_comes_from_redaction(self):
+        """A consumer skips a URL with a `[redacted]` segment; a raw bracket can't fake one."""
+        self.assertEqual(
+            scanner.redact_url("https://gw.example.com/a[1]/[x]/b"),
+            "https://gw.example.com/a%5B1%5D/%5Bx%5D/b",
+        )
+        self.assertEqual(
+            scanner.redact_url("https://gw.example.com/mcp/[redacted]/sse"),
+            "https://gw.example.com/mcp/[redacted]/sse",
+        )
+
+    def test_redaction_is_idempotent(self):
+        for url in (
+            "https://user:pw@gw.example.com/mcp/sk-live-abc123def456ghi789/sse?k=v",
+            "https://gw.example.com/a[1]/b",
+            # 16-19 characters with brackets: encoded, it reaches the 20-character bound.
+            "https://gw.example.com/abcdefghijklmn[]/x",
+            "https://gw.example.com/ab[c]defghijklmnop/x",
+            "https://gw.example.com/ab%5bc%5ddef/x",
+            "https://[::1]:8080/mcp",
+        ):
+            once = scanner.redact_url(url)
+            self.assertEqual(scanner.redact_url(once), once, url)
+
     def test_ordinary_paths_survive(self):
         self.assertEqual(scanner.redact_url("https://api.anthropic.com/v1"), "https://api.anthropic.com/v1")
 
