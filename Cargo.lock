@@ -1558,7 +1558,7 @@ dependencies = [
  "async-trait",
  "base64",
  "brotli 9.1.1",
- "brotli-decompressor 4.0.3",
+ "brotli-decompressor 6.3.1",
  "chrono",
  "clap",
  "env_logger",
