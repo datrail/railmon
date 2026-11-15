@@ -35,7 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # into text (src/http1_decode.rs). The same crates and versions AgentSight's
 # HTTPDecompressor already builds, so nothing new is compiled.
 flate2 = "1"
-brotli-decompressor = "4"
+brotli-decompressor = "6"
 zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
