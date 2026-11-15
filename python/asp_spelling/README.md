@@ -50,6 +50,11 @@ for agent_key, attributes in normalized(bundle, shapes=MY_SHAPES):
   respelling), `ScopeConflict` names every `(agent_key, attribute)` pair.
 - Each read (`ANSWERED`/`PARTIAL`) value is respelled, every list is sorted,
   and a `window`'s keys are sorted. Members the bundle left out stay out.
+- `unreached_server(name, item)` says an item of `skills_inventory` is the
+  placeholder for an MCP server RailMon could not reach (`reachability`
+  `unreachable` or `auth_refused`, rule pack 15). The map keeps it, since it
+  names the server; a comparison of items skips it, so an outage isn't a new
+  item. It is not a normalization rule and doesn't move `RULES_VERSION`.
 - `shapes` maps an attribute name to a predicate: a read value its predicate
   rejects is marked `FAILED` with `PARSE_FAILED`, keeping its value and author
   (`unusable` tells it from a collector's own failure). Which shapes a rule can
