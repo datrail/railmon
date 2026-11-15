@@ -36,7 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # HTTPDecompressor already builds, so nothing new is compiled.
 flate2 = "1"
 brotli-decompressor = "4"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
