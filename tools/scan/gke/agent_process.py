@@ -111,7 +111,8 @@ _LIST_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOE
 
 
 def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = True,
-                  hops: int = 32, open_dir: bool = False) -> tuple[list[str], int | None] | None:
+                  hops: int = 32, open_dir: bool = False,
+                  refuse: tuple[str, ...] = ()) -> tuple[list[str], int | None] | None:
     """Resolve `path` inside the container whose root is `root`, one
     component at a time from a handle on that root.
 
@@ -126,7 +127,9 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
 
     Returns the resolved components and, with `open_file`, a descriptor of
     the regular file (opened without blocking, so a FIFO can't hang the
-    scan), or None when there is no such path or it is refused."""
+    scan), or None when there is no such path or it is refused. `refuse`
+    names top-level folders the path may never pass through, checked as
+    each component is reached, so no link can lead into them afterwards."""
     try:
         root_fd = os.open(root, _DIR_FLAGS & ~os.O_NOFOLLOW)  # /proc/<pid>/root is a link to follow
     except OSError:
@@ -144,6 +147,8 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
                     os.close(stack.pop())
                     names.pop()
                 continue
+            if len(stack) == 1 and part in refuse:
+                return None
             info = os.stat(part, dir_fd=stack[-1], follow_symlinks=False)
             if same_device and info.st_dev != root_dev:
                 return None
@@ -195,10 +200,10 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
 
 
 def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
-                 same_device: bool = True) -> str | None:
+                 same_device: bool = True, refuse: tuple[str, ...] = ()) -> str | None:
     """A regular file's text inside the agent's root, read as `_walk_in_root`
     resolves it: never the sidecar's own file, never a FIFO or device."""
-    walked = _walk_in_root(root, path, open_file=True, same_device=same_device)
+    walked = _walk_in_root(root, path, open_file=True, same_device=same_device, refuse=refuse)
     if walked is None or walked[1] is None:
         return None
     fd = walked[1]
@@ -217,7 +222,8 @@ def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
         os.close(fd)
 
 
-def list_in_root(root: Path, path: str, same_device: bool = True) -> list[str] | None:
+def list_in_root(root: Path, path: str, same_device: bool = True,
+                 refuse: tuple[str, ...] = ()) -> list[str] | None:
     """The names in a directory inside the agent's root, resolved as
     `_walk_in_root` resolves a path, or None when it isn't a directory there."""
     if not [part for part in path.split("/") if part not in ("", ".")]:
@@ -226,7 +232,8 @@ def list_in_root(root: Path, path: str, same_device: bool = True) -> list[str] |
         except OSError:
             return None
     else:
-        walked = _walk_in_root(root, path, open_file=False, same_device=same_device, open_dir=True)
+        walked = _walk_in_root(root, path, open_file=False, same_device=same_device, open_dir=True,
+                               refuse=refuse)
         if walked is None or walked[1] is None:
             return None
         fd = walked[1]
@@ -238,10 +245,11 @@ def list_in_root(root: Path, path: str, same_device: bool = True) -> list[str] |
         os.close(fd)
 
 
-def resolve_under_root(root: Path, path: str, same_device: bool = True) -> str | None:
+def resolve_under_root(root: Path, path: str, same_device: bool = True,
+                       refuse: tuple[str, ...] = ()) -> str | None:
     """`path` as the agent's container resolves it, as an absolute path
     inside that container, or None when it doesn't exist or is refused."""
-    walked = _walk_in_root(root, path, open_file=False, same_device=same_device)
+    walked = _walk_in_root(root, path, open_file=False, same_device=same_device, refuse=refuse)
     return None if walked is None else "/" + "/".join(walked[0])
 
 

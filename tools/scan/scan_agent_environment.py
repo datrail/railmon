@@ -478,10 +478,10 @@ CONTAINER_CONFIG_MAX_ENTRIES = 4_000
 CONTAINER_CONFIG_MAX_FILES = 200
 
 
-def _off_limits(resolved: str) -> bool:
-    """A path in the container's kernel filesystems: never a config file,
-    and a way out of its root (its /proc names other processes)."""
-    return resolved.split("/")[1:2] in (["proc"], ["sys"], ["dev"])
+# The container's kernel filesystems: never a config file, and a way out of
+# its root (its /proc names other processes). Refused as each path is
+# walked, so no link can lead into them after a check.
+CONTAINER_KERNEL_DIRS = ("proc", "sys", "dev")
 
 
 def find_container_config_files(root: str | None, roots: list[str]) -> list[str]:
@@ -489,35 +489,39 @@ def find_container_config_files(root: str | None, roots: list[str]) -> list[str]
     paths inside the agent's container, read through its root (DR-300): no
     exec. As `find` without -L found them: a link is never followed, though
     a root given as a link is. Mounted volumes count (the config folder
-    usually is one); the container's /proc, /sys and /dev don't. A root the
-    scan can't read gives none."""
+    usually is one); the container's /proc, /sys and /dev don't. Each
+    folder's files come before its subfolders, so the bounds can't push
+    out a config file for its sessions. A root the scan can't read gives none."""
     if not root:
         return []
     reader = _agent_process()
     base = Path(root)
     found: list[str] = []
     budget = [CONTAINER_CONFIG_MAX_ENTRIES]
+    walk_options = {"same_device": False, "refuse": CONTAINER_KERNEL_DIRS}
 
     def walk(directory: str, depth: int) -> None:
-        names = reader.list_in_root(base, directory, same_device=False)
-        for name in names or []:
+        folders = []
+        for name in reader.list_in_root(base, directory, **walk_options) or []:
             budget[0] -= 1
             if budget[0] < 0 or len(found) >= CONTAINER_CONFIG_MAX_FILES:
                 return
             child = f"{directory.rstrip('/')}/{name}"
-            if reader.resolve_under_root(base, child, same_device=False) != child:
+            if reader.resolve_under_root(base, child, **walk_options) != child:
                 continue  # a link (find's -type f/d test it without following)
-            if reader.list_in_root(base, child, same_device=False) is not None:
-                if depth < 3:
-                    walk(child, depth + 1)
+            if reader.list_in_root(base, child, **walk_options) is not None:
+                folders.append(child)
             elif name.endswith((".json", ".jsonl")):
                 found.append(child)
+        if depth < 3:
+            for folder in folders:
+                walk(folder, depth + 1)
 
     for config_root in roots:
-        resolved = reader.resolve_under_root(base, config_root, same_device=False) if config_root else None
-        if resolved is None or _off_limits(resolved):
+        resolved = reader.resolve_under_root(base, config_root, **walk_options) if config_root else None
+        if resolved is None:
             continue
-        if reader.list_in_root(base, resolved, same_device=False) is not None:
+        if reader.list_in_root(base, resolved, **walk_options) is not None:
             walk(resolved, 0)
         else:
             found.append(resolved)
@@ -529,11 +533,8 @@ def read_container_file(root: str | None, path: str, max_bytes: int = 256_000) -
     mounted volume included; never one in its /proc, /sys or /dev."""
     if not root:
         return None
-    reader = _agent_process()
-    resolved = reader.resolve_under_root(Path(root), path, same_device=False)
-    if resolved is None or _off_limits(resolved):
-        return None
-    return reader.read_in_root(Path(root), resolved, max_bytes, same_device=False)
+    return _agent_process().read_in_root(Path(root), path, max_bytes, same_device=False,
+                                         refuse=CONTAINER_KERNEL_DIRS)
 
 
 def find_models_in_container_openclaw_config(root: str | None, roots: list[str]) -> list[str]:

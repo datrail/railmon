@@ -212,8 +212,17 @@ class DockerScanRunsNothingInTheContainer(unittest.TestCase):
         (config / "deep/a/b/c/five.json").write_text("{}")
         root = self.context()["container_root"]
         found = scanner.find_container_config_files(root, ["/home/node/.openclaw"])
-        self.assertEqual(found, ["/home/node/.openclaw/deep/a/b/four.json",
-                                 "/home/node/.openclaw/openclaw.json"])
+        self.assertEqual(found, ["/home/node/.openclaw/openclaw.json",
+                                 "/home/node/.openclaw/deep/a/b/four.json"])
+
+    def test_a_config_file_comes_before_a_full_sessions_folder(self):
+        sessions = self.fake.root / "home/node/.openclaw/agents/main/sessions"
+        sessions.mkdir(parents=True)
+        for i in range(scanner.CONTAINER_CONFIG_MAX_FILES + 5):
+            (sessions / f"s{i:04}.jsonl").write_text("")
+        found = scanner.find_container_config_files(self.context()["container_root"], ["/home/node/.openclaw"])
+        self.assertEqual(found[0], "/home/node/.openclaw/openclaw.json")
+        self.assertEqual(len(found), scanner.CONTAINER_CONFIG_MAX_FILES)
 
     def test_a_root_or_file_in_the_containers_proc_is_never_read(self):
         (self.fake.root / "proc/1").mkdir(parents=True)
@@ -223,6 +232,10 @@ class DockerScanRunsNothingInTheContainer(unittest.TestCase):
         self.assertEqual(scanner.find_container_config_files(root, ["/proc/1", "/home/node/.openclaw/sneaky"]), [])
         self.assertIsNone(scanner.read_container_file(root, "/proc/1/environ.json"))
         self.assertIsNone(scanner.read_container_file(root, "/home/node/.openclaw/sneaky/environ.json"))
+        # A file that is itself a link into /proc, as os-release could be made.
+        (self.fake.root / "etc/os-release").unlink()
+        (self.fake.root / "etc/os-release").symlink_to("../proc/1/environ.json")
+        self.assertIsNone(scanner.read_container_file(root, "/etc/os-release"))
 
     def test_another_containers_process_under_that_pid_is_never_read(self):
         (self.fake.proc / str(PID) / "cgroup").write_text("0::/system.slice/docker-" + "f" * 64 + ".scope\n")
