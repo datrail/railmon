@@ -6,9 +6,12 @@ any harness from a **profile**: a JSON file in `profiles/` that says where
 that harness keeps each field. Supporting a harness means writing its profile
 (and fixtures), not code.
 
-No profile ships yet: OpenClaw's is RC-516 and Claude Code's RC-526. Until
-one matches an agent, its harness fields come from the scanner's generic code;
-the generic reader for any other harness is RC-520.
+| Profile | Harness | Hooks |
+|---|---|---|
+| `profiles/openclaw.json` (RC-516) | OpenClaw, as 2026.9.2 lays out its files | `profiles/openclaw.py`: the installed version, the model's provider and endpoint, exec approvals and transcripts from its SQLite databases |
+
+Claude Code's is RC-526. For an agent no profile matches, the harness fields
+come from the scanner's generic code until the generic reader (RC-520) lands.
 
 ## The reader
 
@@ -34,6 +37,7 @@ Each field comes back as one of:
 | `FAILED`, `SIZE_CAP_EXCEEDED` | None had it and one was larger than the cap, so it was not read |
 | `PARTIAL`, `PARSE_FAILED` or `SIZE_CAP_EXCEEDED` | Tool names read, with some transcript lines unparsed, or a transcript read only up to its cap (whole lines only) |
 | `BLIND`, `NO_SOURCE_ACCESS` | No source could be read |
+| `FAILED`, `PARSE_FAILED`, "hook … failed" | A hook raised (a malformed database, a full or read-only `/tmp`): that field only, never the scan |
 | `BLIND`, `NOT_COLLECTED_BY_PACK` | The profile doesn't name the field, or prompt text without the flag |
 | `BLIND`, `UNKNOWN_HARNESS` | No profile matched |
 
@@ -111,8 +115,19 @@ entries beside the `.mcp.json` ones, `skills_inventory` as normalized skills
 ```
 
 - **`markers`**: a word of the agent's command line (its basename, so
-  `node /usr/bin/toyagent` matches `toyagent`), or an environment variable it
-  sets.
+  `node /usr/bin/toyagent` matches `toyagent`), an npm package it runs from
+  (`packages`: a word inside `node_modules/<package>/`, so `node
+  /usr/local/lib/node_modules/openclaw/openclaw.mjs` matches `openclaw`), or
+  an environment variable it sets.
+- **`flags`** and **`variables`** (optional): names a profile derives, for a
+  harness that picks its folder by a rule. A `flags` name is the value of a
+  command-line flag (`--profile x` or `--profile=x`; a flag with a `value`
+  takes none and sets that value); a `variables` name is the first of its
+  templates whose names are all known. `profiles/openclaw.json` derives
+  `$OPENCLAW_DIR` this way, from `$OPENCLAW_STATE_DIR`, `$OPENCLAW_HOME`,
+  `--profile` and `--dev`. Like the environment, a derived name finds files
+  and is never reported, and the agent's environment never sets one; a flag
+  value with a `/` in it is ignored.
 - **`sources`**: JSON files, **highest precedence first**. `~` is the agent's
   `HOME` and `$VAR` its environment; a source whose variable isn't set is
   skipped, and so is a file that isn't there.
@@ -124,9 +139,11 @@ entries beside the `.mcp.json` ones, `skills_inventory` as normalized skills
     takes the highest source that has it);
   - `{"keys": {"allow": "...", "deny": "..."}}` to build an object from
     several key paths;
-  - `{"hook": "name"}` for a format a key path can't reach. A hook is a
-    function registered with `@reader.hook("name")` that gets the profile, the
-    agent and its files.
+  - `{"hook": "name"}` for a format a key path can't reach. Hooks ship beside
+    the profile as `profiles/<harness>.py`, whose `register(reader)` registers
+    them with `@reader.hook("name")`; a hook gets the profile, the agent, its
+    files (`read_text`, `read_bytes`, `list_dir`) and the parsed config sources
+    (`ctx.config_value`, `ctx.parsed_sources`).
 - **`workspace`**: prompt files (`system_prompt_present`; their text only with
   prompt collection on), skills folders (a subfolder holding `SKILL.md` is a
   skill), and transcripts (JSON lines, `tool_name` a key path in each line;

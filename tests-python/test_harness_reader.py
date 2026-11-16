@@ -196,6 +196,21 @@ class SharedReaderTest(Fixture):
         missing = dict(TOY, fields={"llm_provider": {"hook": "no_such_hook"}})
         self.assertEqual(self.read(missing)["llm_provider"]["status"], "FAILED")
 
+    def test_a_hook_that_raises_fails_its_field_not_the_scan(self):
+        @reader.hook("toy_raises")
+        def toy_raises(ctx, field, spec):
+            raise RuntimeError("detail with /home/toy/private")
+        self.addCleanup(reader.HOOKS.pop, "toy_raises", None)
+        raising = dict(TOY, fields={**TOY["fields"], "llm_provider": {"hook": "toy_raises"}},
+                       workspace={**TOY.get("workspace", {}), "transcripts": {"hook": "toy_raises"}})
+        self.write("/home/toy/.toy/settings.json", {"model": "toy-large"})
+        results = self.read(raising)
+        for field in ("llm_provider", "tool_names"):
+            self.assertEqual((results[field]["status"], results[field]["reason"]), ("FAILED", "PARSE_FAILED"))
+            self.assertIn("RuntimeError", results[field]["note"])
+        self.assertNotIn("/home/toy/private", json.dumps(results))
+        self.assertEqual(results["model_name"]["value"], "toy-large")
+
     def test_an_agent_no_profile_matches_gets_unknown_harness(self):
         other = reader.Agent("python3 some_other_agent.py", {"HOME": "/home/toy"})
         self.assertIsNone(reader.harness_reader_for([TOY], other))
@@ -434,9 +449,59 @@ class SafetyTest(Fixture):
         for bad in ({}, {"harness": "X Y", "markers": {"commands": ["x"]}},
                     {"harness": "x", "markers": {}},
                     {"harness": "x", "markers": {"commands": ["x"]}, "fields": {"not_a_field": "a"}},
-                    {"harness": "x", "markers": {"commands": ["x"]}, "sources": [{"path": "a.yaml", "format": "yaml"}]}):
+                    {"harness": "x", "markers": {"commands": ["x"]}, "sources": [{"path": "a.yaml", "format": "yaml"}]},
+                    {"harness": "x", "markers": {"commands": ["x"]}, "flags": {"X": ["--x"]}},
+                    {"harness": "x", "markers": {"commands": ["x"]}, "flags": {"X": [{"flag": "x"}]}},
+                    {"harness": "x", "markers": {"commands": ["x"]}, "variables": {"X": "~/.x"}},
+                    {"harness": "x", "markers": {"packages": ["../x"]}}):
             with self.assertRaises(reader.ProfileError):
                 reader.validate_profile(bad)
+
+
+class DerivedNamesTest(unittest.TestCase):
+    """A profile's `flags` and `variables`: names derived from the agent's
+    command line and environment, for finding files only."""
+
+    PROFILE = {"harness": "toyagent", "markers": {"commands": ["toyagent"]},
+               "flags": {"TOY_PROFILE": [{"flag": "--profile"}, {"flag": "--dev", "value": "dev"}]},
+               "variables": {"TOY_DIR": ["$TOY_STATE", "~/.toy-$TOY_PROFILE", "~/.toy"],
+                             "TOY_CONFIG": ["$TOY_DIR/settings.json"]}}
+
+    def derived(self, cmdline, **env):
+        return reader.with_derived(self.PROFILE, reader.Agent(cmdline, {"HOME": "/home/toy", **env})).env
+
+    def test_a_flag_with_or_without_equals_and_a_flag_with_a_fixed_value(self):
+        self.assertEqual(self.derived("toyagent --profile work run")["TOY_DIR"], "/home/toy/.toy-work")
+        self.assertEqual(self.derived("toyagent --profile=work run")["TOY_DIR"], "/home/toy/.toy-work")
+        self.assertEqual(self.derived("toyagent --dev run")["TOY_DIR"], "/home/toy/.toy-dev")
+        self.assertEqual(self.derived("toyagent run")["TOY_DIR"], "/home/toy/.toy")
+        self.assertNotIn("TOY_PROFILE", self.derived("toyagent run"))
+
+    def test_the_first_template_that_resolves_wins_and_later_names_use_earlier_ones(self):
+        env = self.derived("toyagent --profile work", TOY_STATE="/srv/toy")
+        self.assertEqual((env["TOY_DIR"], env["TOY_CONFIG"]), ("/srv/toy", "/srv/toy/settings.json"))
+
+    def test_the_environment_never_sets_a_derived_name_and_a_path_is_not_a_flag_value(self):
+        env = self.derived("toyagent", TOY_DIR="/elsewhere", TOY_PROFILE="work")
+        self.assertEqual(env["TOY_DIR"], "/home/toy/.toy")
+        for value in ("../../etc", "a/b", ".."):
+            self.assertEqual(self.derived(f"toyagent --profile {value}")["TOY_DIR"], "/home/toy/.toy")
+        # A flag at the end with no value, or followed by another flag, sets nothing.
+        self.assertEqual(self.derived("toyagent --profile")["TOY_DIR"], "/home/toy/.toy")
+        self.assertEqual(self.derived("toyagent --profile --verbose")["TOY_DIR"], "/home/toy/.toy")
+
+    def test_sources_read_through_a_derived_name_report_the_name(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "home" / "toy" / ".toy-work").mkdir(parents=True)
+        (tmp / "home" / "toy" / ".toy-work" / "settings.json").write_text(json.dumps({"model": "from-work"}))
+        (tmp / "home" / "toy" / ".toy").mkdir()
+        (tmp / "home" / "toy" / ".toy" / "settings.json").write_text(json.dumps({"model": "from-default"}))
+        profile = reader.validate_profile({**self.PROFILE, "sources": [{"path": "$TOY_CONFIG"}],
+                                           "fields": {"model_name": "model"}})
+        result = reader.read_harness_fields(profile, reader.Agent("toyagent --profile work", {"HOME": "/home/toy"}),
+                                            reader.LocalSources(tmp))["model_name"]
+        self.assertEqual((result["value"], result["source"]), ("from-work", "$TOY_CONFIG"))
 
 
 class PodSourcesTest(Fixture):
@@ -586,8 +651,9 @@ class PodSourcesTest(Fixture):
         self.assertEqual(attributes["inference_endpoint"]["value"], "https://gw.example/mcp/[redacted]/sse")
         self.assertNotIn("sk-live-abcdefghijklmnop", json.dumps(attributes))
 
-    def test_no_profiles_ship_yet(self):
-        self.assertEqual(harness_sources.profiles(), [])
+    def test_the_shipped_profiles(self):
+        # OpenClaw's (RC-516); Claude Code's is RC-526.
+        self.assertEqual([p["harness"] for p in harness_sources.profiles()], ["openclaw"])
 
 
 if __name__ == "__main__":

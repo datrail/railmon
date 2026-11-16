@@ -366,6 +366,17 @@ A server URL's path segment written with a raw `[` or `]` is now
 percent-encoded, so a `[redacted]` segment always means RailMon took a
 key-shaped segment out (see the `tool_and_mcp_reach` row above).
 
+Rule pack 16 (RC-516) fills a pod's harness fields from the harness's own
+files when a harness profile matches the agent, so a pack-15 baseline of a
+pod scan is `CONTRACT_MISMATCH` until a pack-16 ASP is locked. OpenClaw's
+profile is the first to ship: `harness_identity`, `model_name`,
+`llm_provider`, `inference_endpoint`, `mcp_servers_declared`,
+`tool_allow_deny`, `approval_policy`, `tool_names`, `system_prompt_present`
+and `skills_inventory` can be `ANSWERED` from `openclaw.json`, OpenClaw's
+package, its state and transcript databases and its workspace (see
+[gke/harness/README.md](gke/harness/README.md)). Self and docker scans are
+unchanged.
+
 ## RailDash delivery
 
 A user should never have to run a CLI command to get an evidence bundle into

@@ -115,6 +115,8 @@ class Sources(Protocol):
 
     def read_text(self, path: str, max_bytes: int) -> str | None: ...
 
+    def read_bytes(self, path: str, max_bytes: int) -> bytes | None: ...
+
     def list_dir(self, path: str) -> list[str] | None: ...
 
 
@@ -128,7 +130,7 @@ class LocalSources:
     def _path(self, path: str) -> Path:
         return self.root / path.lstrip("/") if self.root else Path(path)
 
-    def read_text(self, path: str, max_bytes: int) -> str | None:
+    def read_bytes(self, path: str, max_bytes: int) -> bytes | None:
         try:
             fd = os.open(self._path(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
         except OSError:
@@ -136,11 +138,22 @@ class LocalSources:
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return None
-            return os.read(fd, max_bytes).decode("utf-8", errors="replace")
+            chunks, size = [], 0
+            while size < max_bytes:
+                chunk = os.read(fd, max_bytes - size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            return b"".join(chunks)
         except OSError:
             return None
         finally:
             os.close(fd)
+
+    def read_text(self, path: str, max_bytes: int) -> str | None:
+        data = self.read_bytes(path, max_bytes)
+        return None if data is None else data.decode("utf-8", errors="replace")
 
     def list_dir(self, path: str) -> list[str] | None:
         try:
@@ -196,14 +209,27 @@ def validate_profile(profile: Any) -> dict[str, Any]:
     if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
         raise ProfileError("harness: a lower-case name")
     markers = profile.get("markers")
-    if not isinstance(markers, dict) or not any(markers.get(k) for k in ("commands", "env")):
-        raise ProfileError(f"{name}: markers needs commands or env")
+    if not isinstance(markers, dict) or not any(markers.get(k) for k in ("commands", "packages", "env")):
+        raise ProfileError(f"{name}: markers needs commands, packages or env")
+    if not all(isinstance(package, str) and re.fullmatch(r"(@[\w.-]+/)?[\w.-]+", package)
+               for package in markers.get("packages", [])):
+        raise ProfileError(f"{name}: markers.packages are npm package names")
     sources = profile.get("sources", [])
     if not isinstance(sources, list) or not all(isinstance(s, dict) and isinstance(s.get("path"), str) for s in sources):
         raise ProfileError(f"{name}: sources is a list of {{\"path\": ...}}")
     for source in sources:
         if source.get("format", "json") != "json":
             raise ProfileError(f"{name}: {source['path']}: only json sources are read; use a hook for others")
+    flags = profile.get("flags", {})
+    if not isinstance(flags, dict) or not all(
+            isinstance(specs, list) and all(isinstance(f, dict) and isinstance(f.get("flag"), str)
+                                            and f["flag"].startswith("-") for f in specs)
+            for specs in flags.values()):
+        raise ProfileError(f"{name}: flags maps a name to a list of {{\"flag\": \"--x\"[, \"value\": ...]}}")
+    variables = profile.get("variables", {})
+    if not isinstance(variables, dict) or not all(
+            isinstance(templates, list) and all(isinstance(t, str) for t in templates) for templates in variables.values()):
+        raise ProfileError(f"{name}: variables maps a name to a list of path templates")
     fields = profile.get("fields", {})
     if not isinstance(fields, dict):
         raise ProfileError(f"{name}: fields is an object")
@@ -216,13 +242,31 @@ def validate_profile(profile: Any) -> dict[str, Any]:
 
 
 def load_profiles(folder: Path = PROFILES_DIR) -> list[dict[str, Any]]:
-    """The profiles shipped in `folder` (one *.json each), validated."""
+    """The profiles shipped in `folder` (one *.json each), validated. A
+    profile's hooks ship beside it as <harness>.py, whose register(reader)
+    registers them; it is loaded with the profile."""
+    import importlib.util
+    import sys
+
     profiles = []
     for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         try:
-            profiles.append(validate_profile(json.loads(path.read_text(encoding="utf-8"))))
+            profile = validate_profile(json.loads(path.read_text(encoding="utf-8")))
         except (ValueError, OSError) as exc:
             raise ProfileError(f"{path.name}: {exc}") from exc
+        hooks = path.with_suffix(".py")
+        if hooks.is_file():
+            name = f"harness_profile_{profile['harness'].replace('-', '_').replace('.', '_')}"
+            module = sys.modules.get(name)
+            if module is None:
+                spec = importlib.util.spec_from_file_location(name, hooks)
+                if spec is None or spec.loader is None:
+                    raise ProfileError(f"{hooks.name}: cannot be loaded")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+            module.register(sys.modules[__name__])
+        profiles.append(profile)
     return profiles
 
 
@@ -232,6 +276,57 @@ def _command_words(cmdline: str) -> set[str]:
     return {word.rsplit("/", 1)[-1] for word in cmdline.split()}
 
 
+def _runs_package(cmdline: str, packages: Iterable[str]) -> bool:
+    # A word inside an installed package, so `node
+    # /usr/local/lib/node_modules/openclaw/openclaw.mjs gateway` matches the
+    # package `openclaw`.
+    return any(f"/node_modules/{package}/" in word for word in cmdline.split() for package in packages)
+
+
+def _flag_value(words: list[str], spec: dict[str, Any]) -> str | None:
+    """A command-line flag's value: `--flag value` or `--flag=value`, or for a
+    flag that takes none, the spec's fixed `value` when the flag is there."""
+    flag = spec["flag"]
+    for index, word in enumerate(words):
+        if "value" in spec:
+            if word == flag:
+                return str(spec["value"])
+        elif word == flag and index + 1 < len(words) and not words[index + 1].startswith("-"):
+            return words[index + 1]
+        elif word.startswith(flag + "="):
+            return word[len(flag) + 1:] or None
+    return None
+
+
+def with_derived(profile: dict[str, Any], agent: Agent) -> Agent:
+    """The agent with the names a profile derives, for finding its files only
+    (never reported, like the environment): each `flags` name from the
+    agent's command line, then each `variables` name as the first of its
+    templates whose names are all known, in order, so a later variable can
+    use an earlier one. A harness that picks one folder by a rule (OpenClaw:
+    $OPENCLAW_STATE_DIR, else ~/.openclaw-<profile>, else ~/.openclaw) says it
+    once here and uses the name everywhere. The agent's own environment never
+    sets a derived name."""
+    derived_names = [*profile.get("flags", {}), *profile.get("variables", {})]
+    env = {key: value for key, value in agent.env.items() if key not in derived_names}
+    words = agent.cmdline.split()
+    for name, specs in profile.get("flags", {}).items():
+        for spec in specs:
+            value = _flag_value(words, spec)
+            if value and "/" not in value and value not in (".", ".."):  # a name, never a path
+                env[name] = value
+                break
+    derived = Agent(agent.cmdline, env)
+    for name, templates in profile.get("variables", {}).items():
+        for template in templates:
+            value = derived.expand(template)
+            if value:
+                env[name] = value
+                derived = Agent(agent.cmdline, env)
+                break
+    return derived
+
+
 def harness_reader_for(profiles: Iterable[dict[str, Any]], agent: Agent) -> dict[str, Any] | None:
     """The first profile whose markers match the agent, or None (then the
     generic reader runs, task 6; until it lands the harness fields are BLIND
@@ -239,7 +334,8 @@ def harness_reader_for(profiles: Iterable[dict[str, Any]], agent: Agent) -> dict
     words = _command_words(agent.cmdline)
     for profile in profiles:
         markers = profile.get("markers", {})
-        if words & set(markers.get("commands", [])) or set(agent.env) & set(markers.get("env", [])):
+        if (words & set(markers.get("commands", [])) or _runs_package(agent.cmdline, markers.get("packages", []))
+                or set(agent.env) & set(markers.get("env", []))):
             return profile
     return None
 
@@ -515,6 +611,22 @@ class Context:
         self.profile, self.agent, self.sources = profile, agent, sources
         self.loads, self.collect_prompt = loads, collect_prompt
         self.harness = profile["harness"]
+        self.config_sources: list[dict[str, Any]] = []
+
+    def parsed_sources(self) -> list[tuple[str, Any]]:
+        """The profile's config sources that parsed, as (path, document),
+        highest precedence first: for a hook whose field depends on another
+        (a model's provider, that provider's endpoint)."""
+        return [(s["path"], s["doc"]) for s in self.config_sources if s["doc"] is not _MISSING]
+
+    def config_value(self, path: str) -> tuple[Any, str | None]:
+        """The value at a key path in the highest source that has it, and
+        that source; (None, None) when none does."""
+        for source, doc in self.parsed_sources():
+            value = extract(doc, path)  # a credential path's value is replaced (credential_path)
+            if value is not _MISSING:
+                return value, source
+        return None, None
 
     def result(self, status: str, field: str, **extra: Any) -> dict[str, Any]:
         return _result(status, field, **extra)
@@ -570,12 +682,25 @@ def _read_sources(ctx: Context) -> list[dict[str, Any]]:
     return read
 
 
+def _run_hook(ctx: Context, field: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """A hook's result, or FAILED for that one field when it raises: a hook
+    reads files the agent writes, and one bad file or a full /tmp must never
+    stop the scan. As the scanner records a collector that raised, the reason
+    is PARSE_FAILED; the note names the exception's type only, since its
+    message can hold a path the agent's environment expanded."""
+    function = HOOKS.get(spec["hook"])
+    if function is None:
+        return _result("FAILED", field, reason="NOT_COLLECTED_BY_PACK", note=f"no hook named {spec['hook']}")
+    try:
+        return function(ctx, field, spec)
+    except Exception as error:  # noqa: BLE001 - any failure is this field's, never the scan's
+        return _result("FAILED", field, reason="PARSE_FAILED",
+                       note=f"{ctx.harness}: hook {spec['hook']} failed ({type(error).__name__})")
+
+
 def _config_field(ctx: Context, field: str, spec: Any, sources: list[dict[str, Any]]) -> dict[str, Any]:
     if isinstance(spec, dict) and "hook" in spec:
-        function = HOOKS.get(spec["hook"])
-        if function is None:
-            return _result("FAILED", field, reason="NOT_COLLECTED_BY_PACK", note=f"no hook named {spec['hook']}")
-        return function(ctx, field, spec)
+        return _run_hook(ctx, field, spec)
     merge = spec.get("merge", "first") if isinstance(spec, dict) else "first"
     if isinstance(spec, dict) and "paths" in spec:
         paths = spec["paths"]
@@ -695,10 +820,7 @@ def _skills_field(ctx: Context, spec: list[str]) -> dict[str, Any]:
 
 def _transcript_field(ctx: Context, spec: dict[str, Any]) -> dict[str, Any]:
     if "hook" in spec:
-        function = HOOKS.get(spec["hook"])
-        if function is None:
-            return _result("FAILED", "tool_names", reason="NOT_COLLECTED_BY_PACK", note=f"no hook named {spec['hook']}")
-        return function(ctx, "tool_names", spec)
+        return _run_hook(ctx, "tool_names", spec)
     if spec.get("format", "jsonl") != "jsonl" or not isinstance(spec.get("tool_name"), str):
         return _result("FAILED", "tool_names", reason="NOT_COLLECTED_BY_PACK", note="transcripts need format jsonl and tool_name, or a hook")
     counts: dict[str, int] = {}
@@ -757,9 +879,11 @@ def read_harness_fields(profile: dict[str, Any] | None, agent: Agent, sources: S
     profile doesn't name is BLIND with NOT_COLLECTED_BY_PACK."""
     if profile is None:
         return unknown_harness_fields()
+    agent = with_derived(profile, agent)
     ctx = Context(profile, agent, sources, loads, collect_prompt)
     results: dict[str, dict[str, Any]] = {}
     config_sources = _read_sources(ctx)
+    ctx.config_sources = config_sources
     for field, spec in profile.get("fields", {}).items():
         if field in CONFIG_FIELDS:
             results[field] = _config_field(ctx, field, spec, config_sources)
