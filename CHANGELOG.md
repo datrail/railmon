@@ -13,6 +13,8 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+## [v0.1.0-m17] - 2026-11-16
+
 **Rule pack 15** (was 14 since v0.1.0-m15). A baseline locked on pack 14 reads `CONTRACT_MISMATCH` until it is re-locked.
 
 ### Added
@@ -21,12 +23,15 @@ Each PR adds its line under `## Unreleased`.
 - Pod mode reads the agent's own process, found again after a restart, instead of the sidecar's ([#123](https://github.com/datrail/railmon/pull/123)).
 - `asp_spelling`, a standard-library package holding the one ASP value spelling RailDash and Rail Center both read ([#118](https://github.com/datrail/railmon/pull/118)).
 - `asp_normalize`, one normalization from an evidence bundle (v1 or v2) to each agent's attributes ([#119](https://github.com/datrail/railmon/pull/119)).
-- `asp_normalize.unreached_server`, so a comparison of `skills_inventory` items skips the placeholder for an MCP server RailMon could not reach instead of reading an outage as a new tool. Normalized maps are unchanged.
+- `asp_normalize.unreached_server`, so a comparison of `skills_inventory` items skips the placeholder for an MCP server RailMon could not reach instead of reading an outage as a new tool. Normalized maps are unchanged ([#138](https://github.com/datrail/railmon/pull/138)).
 - One harness reader (`tools/scan/gke/harness/`) reads any agent harness's fields from a profile per harness ([#124](https://github.com/datrail/railmon/pull/124)).
 - **Rule pack 15:** each MCP skill says whether its server was reached (`reachability`), why a tool's input schema was left out (`schema_omitted`) and when `tools/list` was cut short (`tools_truncated`); the v1 schema closes these values ([#126](https://github.com/datrail/railmon/pull/126)).
 
 ### Changed
 
+- **Rule pack 15:** a `[redacted]` path segment only ever comes from redaction: `[` and `]` in a kept path segment are percent-encoded, so a consumer can rely on the marker ([#129](https://github.com/datrail/railmon/pull/129)).
+- Each sensor names the capability, tracefs mount or Docker access it is missing, instead of pointing at the kernel or the agent's libssl ([#137](https://github.com/datrail/railmon/pull/137)).
+- Dependency updates: base64 0.23, brotli 9.1, brotli-decompressor 6.3, sha2 0.11, zstd 0.14 and the cargo group ([#131](https://github.com/datrail/railmon/pull/131) – [#136](https://github.com/datrail/railmon/pull/136)).
 - **Rule pack 15:** `tools/list` follows `nextCursor` for up to 20 pages and 200 tools, and a malformed MCP response marks that server unreachable instead of aborting the scan ([#126](https://github.com/datrail/railmon/pull/126)).
 - A tag's GitHub Release notes open with the annotated tag's message ([#121](https://github.com/datrail/railmon/pull/121)).
 - The Dockerfile's comment on the OpenShell CLI no longer says CI installs the same release ([#120](https://github.com/datrail/railmon/pull/120)).
@@ -231,6 +236,7 @@ The initial public release, commit `45c58a8`. The work merged before it
 Note: the `v0.1.0` tag points at the same commit `45c58a8`. It is a stray
 tag, not a release; the milestone is `v0.1.0-m2`.
 
+[v0.1.0-m17]: https://github.com/datrail/railmon/compare/v0.1.0-m16...v0.1.0-m17
 [v0.1.0-m16]: https://github.com/datrail/railmon/compare/v0.1.0-m15...v0.1.0-m16
 [v0.1.0-m15]: https://github.com/datrail/railmon/compare/v0.1.0-m14...v0.1.0-m15
 [v0.1.0-m14]: https://github.com/datrail/railmon/compare/v0.1.0-m13...v0.1.0-m14
