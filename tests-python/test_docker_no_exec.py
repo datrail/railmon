@@ -59,7 +59,7 @@ def tearDownModule() -> None:
 
 CONTAINER_ID = "c0ffee" * 10 + "abcd"
 PID = 4242
-PASSWD = "root:x:0:0:root:/root:/bin/bash\nnode:x:1000:1000::/home/node:/bin/bash\n"
+USER_TABLE = "root:x:0:0:root:/root:/bin/bash\nnode:x:1000:1000::/home/node:/bin/bash\n"
 GROUP = "root:x:0:\nnode:x:1000:\nagents:x:2000:\n"
 OS_RELEASE = 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nID=debian\nVERSION_ID="12"\n'
 
@@ -83,7 +83,7 @@ class FakeContainer:
     def __init__(self, tmp: Path) -> None:
         self.root = tmp / "rootfs"
         self.proc = tmp / "proc"
-        for path, text in {"etc/passwd": PASSWD, "etc/group": GROUP,
+        for path, text in {"etc/passwd": USER_TABLE, "etc/group": GROUP,
                            "usr/lib/os-release": OS_RELEASE, "etc/machine-id": "0123456789abcdef\n"}.items():
             self.write(path, text)
         # As Debian ships it: an absolute link, which must resolve in the
