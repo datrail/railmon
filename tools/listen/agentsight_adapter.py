@@ -418,7 +418,9 @@ def ensure_tracefs(log=lambda message: print(message, file=sys.stderr, flush=Tru
         log(f"cannot mount tracefs at {roots[0]}: {exc}")
         return False
     if done.returncode != 0:
-        log(f"cannot mount tracefs at {roots[0]}: {done.stderr.strip() or done.returncode}")
+        log(f"cannot mount tracefs at {roots[0]}: {done.stderr.strip() or done.returncode}; "
+            f"the process probe needs it: mount {roots[0]} into this container read-only, "
+            "or grant SYS_ADMIN")
         return False
     return os.path.isdir(os.path.join(roots[0], "events"))
 

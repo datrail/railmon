@@ -447,6 +447,28 @@ pinned AgentSight release, checked against its SHA-256 at build time (the
 Dockerfile's `AGENTSIGHT_VERSION`; [CONTRIBUTING.md](CONTRIBUTING.md) says how
 to bump it).
 
+### What each sensor needs, and what it says when something is missing
+
+At start, `collect`, `listen` and `files` check their capabilities and (for
+`listen` and `files`) tracefs, and print one `start-up check:` line per missing
+piece (`RAIL_PREFLIGHT=0` skips it). A supervisor following a container says
+why it is waiting: Docker unreachable, no such container, or the agent's
+processes out of sight. Neither check blocks a sensor.
+
+| Missing | What it says | The fix |
+| --- | --- | --- |
+| `BPF` and `PERFMON` (Linux 5.8+; `SYS_ADMIN` covers both, and is the one before 5.8) | `start-up check: missing capabilities BPF and PERFMON (or SYS_ADMIN) …` | `cap_add` them, or run privileged |
+| `SYS_ADMIN` (or `CHECKPOINT_RESTORE`) for `collect` following a container, to read the agent's `/proc/<pid>/map_files` | `start-up check: missing capability SYS_ADMIN: collect reads the agent's memory maps …` | `cap_add: [SYS_ADMIN]` |
+| tracefs (`listen`, `files`), without `SYS_ADMIN` to mount it | `start-up check: the kernel's tracing folder isn't visible …` | mount `/sys/kernel/tracing:/sys/kernel/tracing:ro` |
+| Docker socket or `DOCKER_HOST` | `no Docker access …`, `no permission on the Docker socket …`, `Docker at DOCKER_HOST=… doesn't answer` | mount `/var/run/docker.sock`, or point `DOCKER_HOST` at a Docker API proxy |
+| The agent's container | `no container named …` | check `AGENT_CONTAINER` (`docker ps`) |
+| The host's PID namespace | `the agent's process (host pid N) isn't visible here …` | `pid: host` |
+| `SYS_ADMIN` (or `CHECKPOINT_RESTORE`), seen while following | `can't read the agent's memory maps …` | `cap_add: [SYS_ADMIN]` |
+| Ptrace access to the agent (`collect`) | `can't list the agent's memory maps …` | `cap_add: [SYS_PTRACE]`, or run privileged |
+
+Before these checks the same gaps read as "no process … loads libssl", "make
+sure your kernel supports BPF" or "waiting for container … to run".
+
 Captured bodies are neither guaranteed complete nor redacted and may contain
 credentials or private conversation data. Protect capture files as sensitive,
 limit the monitored process, and do not run raw mode against a shared sink.

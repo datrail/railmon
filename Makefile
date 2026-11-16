@@ -46,6 +46,7 @@ test-python:
 		tools/scan/gke/harness/reader.py \
 		tools/listen/follow_container.py \
 		tools/listen/agentsight_adapter.py \
+		tools/listen/preflight.py \
 		tools/collect/follow_container_tls.py \
 		tools/skills/skill_scanner.py \
 		tools/forward/forward.py \

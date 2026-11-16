@@ -48,7 +48,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "listen"))
-from follow_container import container_pid, container_ref  # noqa: E402
+from follow_container import container_pid, container_ref, preflight, waiting_reason  # noqa: E402
 
 POLL_SECONDS = 2.0
 PROC = "/proc"
@@ -177,6 +177,14 @@ def find_tls_target(init_pid: int, cache: dict, proc: str = PROC) -> tuple[int, 
     return None
 
 
+def no_target_reason(container: str, init: int, proc: str = PROC) -> str:
+    """Why no TLS user was found: the agent's processes aren't visible, or
+    their memory maps can't be read (DR-301), or truly none uses TLS yet."""
+    return (preflight.pid_problem(init, proc) or preflight.maps_problem(init, proc)
+            or f"no process in container {container} loads libssl or has TLS built in yet; "
+               f"nothing to capture until one does (checking every {POLL_SECONDS:.0f}s)")
+
+
 def file_identity(path: str) -> tuple[int, int] | None:
     try:
         st = os.stat(path)
@@ -231,25 +239,20 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    waiting_for = None
+    waiting = preflight.Waiting(log)
     fast_exits = 0
     while not stopping:
         init = container_pid(docker, args.container, log)
         if not init:
-            if waiting_for != "container":
-                log(f"waiting for container {args.container} to run")
-                waiting_for = "container"
+            waiting.wait("container", lambda: waiting_reason(docker, args.container))
             time.sleep(POLL_SECONDS)
             continue
         target = find_tls_target(init, cache)
         if not target:
-            if waiting_for != "tls":
-                log(f"no process in container {args.container} loads libssl or has TLS built in yet; "
-                    f"nothing to capture until one does (checking every {POLL_SECONDS:.0f}s)")
-                waiting_for = "tls"
+            waiting.wait("tls", lambda: no_target_reason(args.container, init))
             time.sleep(POLL_SECONDS)
             continue
-        waiting_for = None
+        waiting.clear()
         if stopping:  # a signal that landed during docker inspect
             break
         pid, path, how = target
