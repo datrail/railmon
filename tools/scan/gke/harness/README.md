@@ -9,14 +9,16 @@ that harness keeps each field. Supporting a harness means writing its profile
 | Profile | Harness | Hooks |
 |---|---|---|
 | `profiles/openclaw.json` (RC-516) | OpenClaw, as 2026.9.2 lays out its files | `profiles/openclaw.py`: the installed version, the model's provider and endpoint, exec approvals and transcripts from its SQLite databases |
+| `profiles/claude-code.json` (RC-526) | Claude Code, as 2.1.325 lays out and reads its files | `profiles/claude-code.py`: the version (npm package or native install), the model, provider and endpoint in Claude Code's own order (`--model`, `ANTHROPIC_MODEL`, `model`), MCP servers by scope (user, project `.mcp.json`, local, or `managed-mcp.json` alone), permission rules merged across settings files with an untrusted project's allow rules left out, the permission mode and hooks (by event and matcher only), and `tool_use` names from its JSONL transcripts |
 
-Claude Code's is RC-526. For an agent no profile matches, the harness fields
+For an agent no profile matches, the harness fields
 come from the scanner's generic code until the generic reader (RC-520) lands.
 
 ## The reader
 
-- `harness_reader_for(profiles, agent)` picks the first profile whose markers
-  match the agent's command line or environment, or None.
+- `harness_reader_for(profiles, agent)` picks the profile with the strongest
+  sign on the agent's command line, else the first whose environment markers
+  it sets, or None.
 - `read_harness_fields(profile, agent, sources)` reads each field. With no
   profile, every field is `BLIND` with `UNKNOWN_HARNESS`.
 - `to_attributes(results, builders)` turns the results into bundle attributes.
@@ -114,11 +116,21 @@ entries beside the `.mcp.json` ones, `skills_inventory` as normalized skills
 }
 ```
 
-- **`markers`**: a word of the agent's command line (its basename, so
-  `node /usr/bin/toyagent` matches `toyagent`), an npm package it runs from
-  (`packages`: a word inside `node_modules/<package>/`, so `node
+- **`markers`**: the program the agent runs (`commands`, by its basename),
+  or the npm package it runs from (`packages`: inside
+  `node_modules/<package>/`, so `node
   /usr/local/lib/node_modules/openclaw/openclaw.mjs` matches `openclaw`), or
-  an environment variable it sets.
+  an environment variable it sets (`env`). Every word of the command line
+  is looked at, since the program can come after any wrapper (`npm run`,
+  `uv run`, `sh -c cd /app && ...`, an entrypoint script, a launcher's flags)
+  and `/proc` gives the command line with its quoting lost. Of the profiles
+  it shows a sign of, a word inside a profile's package wins, as that is
+  where the code being run lives; otherwise the earliest command word wins,
+  as a program comes before its arguments, so a prompt or note that names
+  another harness doesn't change the answer. A prompt that holds a path
+  into another harness's package still would. An `env` marker counts only
+  when the command line shows no harness, since an agent's environment can
+  carry another harness's variables.
 - **`flags`** and **`variables`** (optional): names a profile derives, for a
   harness that picks its folder by a rule. A `flags` name is the value of a
   command-line flag (`--profile x` or `--profile=x`; a flag with a `value`
@@ -127,10 +139,17 @@ entries beside the `.mcp.json` ones, `skills_inventory` as normalized skills
   `$OPENCLAW_DIR` this way, from `$OPENCLAW_STATE_DIR`, `$OPENCLAW_HOME`,
   `--profile` and `--dev`. Like the environment, a derived name finds files
   and is never reported, and the agent's environment never sets one; a flag
-  value with a `/` in it is ignored.
+  value with a `/` in it is ignored. `$AGENT_CWD`, the agent's working
+  directory (pod mode reads `/proc/<pid>/cwd`), is derived for every profile
+  the same way: `profiles/claude-code.json` finds the project's settings
+  through it.
 - **`sources`**: JSON files, **highest precedence first**. `~` is the agent's
   `HOME` and `$VAR` its environment; a source whose variable isn't set is
-  skipped, and so is a file that isn't there.
+  skipped, and so is a file that isn't there. A source whose last part is a
+  pattern (`/etc/claude-code/managed-settings.d/*.json`) is the drop-in files
+  matching it, a later name over an earlier one (at most 50), each reported by
+  its own name. A source is read up to 64 KB, or up to its own `max_bytes`
+  (1 MB at most) for a file that also holds caches, such as `~/.claude.json`.
 - **`fields`**, one per harness field:
   - a key path (`model.primary`; `*` takes every item), or a list tried in
     order;

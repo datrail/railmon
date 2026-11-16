@@ -1,0 +1,44 @@
+{
+  "harness": "claude-code",
+  "markers": {
+    "commands": ["claude", "claude.exe"],
+    "packages": ["@anthropic-ai/claude-code"],
+    "env": ["CLAUDE_CONFIG_DIR"]
+  },
+  "variables": {
+    "CLAUDE_DIR": ["$CLAUDE_CONFIG_DIR", "~/.claude"],
+    "CLAUDE_JSON": ["$CLAUDE_CONFIG_DIR/.claude.json", "~/.claude.json"],
+    "CLAUDE_PROJECT": ["$AGENT_CWD", "$PWD"]
+  },
+  "sources": [
+    {"path": "/etc/claude-code/managed-settings.d/*.json"},
+    {"path": "/etc/claude-code/managed-settings.json"},
+    {"path": "$CLAUDE_PROJECT/.claude/settings.local.json"},
+    {"path": "$CLAUDE_PROJECT/.claude/settings.json"},
+    {"path": "$CLAUDE_DIR/settings.json"},
+    {"path": "$CLAUDE_JSON", "max_bytes": 1000000}
+  ],
+  "fields": {
+    "harness_identity": {"hook": "claude_identity"},
+    "model_name": {"hook": "claude_model"},
+    "llm_provider": {"hook": "claude_model"},
+    "inference_endpoint": {"hook": "claude_model"},
+    "mcp_servers_declared": {"hook": "claude_mcp"},
+    "tool_allow_deny": {"hook": "claude_permissions"},
+    "approval_policy": {"hook": "claude_approvals"}
+  },
+  "workspace": {
+    "prompt_files": [
+      "/etc/claude-code/CLAUDE.md",
+      "$CLAUDE_PROJECT/CLAUDE.md",
+      "$CLAUDE_PROJECT/.claude/CLAUDE.md",
+      "$CLAUDE_PROJECT/CLAUDE.local.md",
+      "$CLAUDE_DIR/CLAUDE.md"
+    ],
+    "skills": [
+      "$CLAUDE_PROJECT/.claude/skills",
+      "$CLAUDE_DIR/skills"
+    ],
+    "transcripts": {"hook": "claude_transcripts"}
+  }
+}

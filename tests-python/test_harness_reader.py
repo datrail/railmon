@@ -235,6 +235,49 @@ class SharedReaderTest(Fixture):
         by_env = reader.Agent("node server.js", {"TOYAGENT_HOME": "/x"})
         self.assertEqual(reader.harness_reader_for(profiles, by_env)["harness"], "toyagent")
 
+    # Two harnesses, the first in profile order, so order alone must never
+    # decide: a prompt or note on the command line can name either one.
+    AAA = {"harness": "aaagent", "markers": {"commands": ["aaagent"], "packages": ["aaagent"],
+                                             "env": ["AAAGENT_HOME"]}}
+    ZZZ = {"harness": "zzzagent", "markers": {"commands": ["zzzagent"], "packages": ["zzzagent"],
+                                              "env": ["ZZZAGENT_HOME"]}}
+
+    def picks(self, cmdline, env=None):
+        profile = reader.harness_reader_for([self.AAA, self.ZZZ], reader.Agent(cmdline, env or {}))
+        return profile and profile["harness"]
+
+    def test_the_earliest_command_word_wins_over_later_arguments(self):
+        for cmdline in ("zzzagent run --note aaagent", "node /usr/bin/zzzagent serve aaagent",
+                        "zzzagent -p look at /usr/local/bin/aaagent"):
+            with self.subTest(cmdline=cmdline):
+                self.assertEqual(self.picks(cmdline), "zzzagent")
+        self.assertEqual(self.picks("aaagent -p review the zzzagent config"), "aaagent")
+
+    def test_a_package_path_wins_over_any_command_word(self):
+        # Where the code being run lives, even after a launcher flag's value.
+        for cmdline in ("node --title aaagent /usr/lib/node_modules/zzzagent/main.mjs",
+                        "node --max-old-space-size 4096 /app/node_modules/zzzagent/cli.js"):
+            with self.subTest(cmdline=cmdline):
+                self.assertEqual(self.picks(cmdline), "zzzagent")
+        # A package's name must be the whole folder name.
+        self.assertIsNone(self.picks("node /app/node_modules/zzzagent-lite/index.js"))
+
+    def test_the_program_is_found_after_any_wrapper(self):
+        # /proc gives the command line with its quoting lost.
+        for cmdline in ("sh -c cd /app && zzzagent gateway", "npm run zzzagent", "pnpm zzzagent gateway",
+                        "uv run zzzagent", "/docker-entrypoint.sh zzzagent gateway", "env -u FOO zzzagent",
+                        "node --import tsx /usr/lib/node_modules/zzzagent/main.mjs gateway",
+                        "tini -- zzzagent serve"):
+            with self.subTest(cmdline=cmdline):
+                self.assertEqual(self.picks(cmdline), "zzzagent")
+        self.assertIsNone(self.picks("python3 other_agent.py"))
+
+    def test_the_command_line_decides_before_the_environment(self):
+        # Another harness's variable in the environment doesn't override it.
+        self.assertEqual(self.picks("zzzagent serve", {"AAAGENT_HOME": "/x"}), "zzzagent")
+        # With no sign on the command line, the environment still identifies the harness.
+        self.assertEqual(self.picks("python3 runner.py", {"ZZZAGENT_HOME": "/x"}), "zzzagent")
+
     def test_a_field_the_profile_doesnt_name_is_not_collected(self):
         minimal = {"harness": "minimal", "markers": {"commands": ["minimal"]}, "fields": {}}
         self.assertEqual(self.read(minimal)["model_name"]["reason"], "NOT_COLLECTED_BY_PACK")
@@ -503,6 +546,60 @@ class DerivedNamesTest(unittest.TestCase):
                                             reader.LocalSources(tmp))["model_name"]
         self.assertEqual((result["value"], result["source"]), ("from-work", "$TOY_CONFIG"))
 
+    def test_the_agents_working_directory_is_agent_cwd_and_its_environment_cannot_set_it(self):
+        agent = reader.Agent("toyagent", {"HOME": "/home/toy", "AGENT_CWD": "/elsewhere"}, cwd="/srv/project")
+        self.assertEqual(reader.with_derived(self.PROFILE, agent).env["AGENT_CWD"], "/srv/project")
+        # A working directory that isn't an absolute path, or was deleted, is none.
+        for cwd in (None, "relative/dir", "/srv/gone (deleted)"):
+            agent = reader.Agent("toyagent", {"HOME": "/home/toy", "AGENT_CWD": "/elsewhere"}, cwd=cwd)
+            self.assertNotIn("AGENT_CWD", reader.with_derived(self.PROFILE, agent).env, cwd)
+
+
+class SourceShapesTest(Fixture):
+    """A source that is a folder of drop-in files, and one with its own cap."""
+
+    PROFILE = reader.validate_profile({
+        "harness": "toyagent", "markers": {"commands": ["toyagent"]},
+        "sources": [{"path": "/etc/toy/conf.d/*.json"}, {"path": "/etc/toy/conf.json"},
+                    {"path": "~/.toy/settings.json"}, {"path": "~/.toy/state.json", "max_bytes": 200_000}],
+        "fields": {"model_name": "model", "approval_policy": "approvals", "harness_identity": "version"}})
+
+    def test_drop_in_files_are_read_a_later_one_over_an_earlier_one_and_over_the_base(self):
+        self.write("/etc/toy/conf.json", {"model": "base", "approvals": "base"})
+        self.write("/etc/toy/conf.d/10-a.json", {"model": "ten", "approvals": "ten"})
+        self.write("/etc/toy/conf.d/20-b.json", {"model": "twenty"})
+        self.write("/etc/toy/conf.d/README.md", "not a drop-in")
+        results = self.read(self.PROFILE)
+        self.assertEqual((results["model_name"]["value"], results["model_name"]["source"]),
+                         ("twenty", "/etc/toy/conf.d/20-b.json"))
+        self.assertEqual((results["approval_policy"]["value"], results["approval_policy"]["source"]),
+                         ("ten", "/etc/toy/conf.d/10-a.json"))
+
+    def test_a_drop_in_folder_that_isnt_there_is_skipped(self):
+        self.write("/home/toy/.toy/settings.json", {"model": "user"})
+        self.assertEqual(self.read(self.PROFILE)["model_name"]["value"], "user")
+
+    def test_a_drop_in_that_doesnt_parse_is_named(self):
+        self.write("/etc/toy/conf.d/10-a.json", "{not json")
+        self.write("/home/toy/.toy/settings.json", {"model": "user"})
+        result = self.read(self.PROFILE)["model_name"]
+        self.assertEqual(result["value"], "user")
+        self.assertIn("/etc/toy/conf.d/10-a.json", result["note"])
+
+    def test_a_source_reads_up_to_its_own_cap(self):
+        large = {"version": "toyagent 2.0", "cache": "x" * 100_000}
+        self.write("/home/toy/.toy/state.json", large)
+        self.assertEqual(self.read(self.PROFILE)["harness_identity"]["value"], "toyagent 2.0")
+        self.write("/home/toy/.toy/settings.json", large)  # the default 64 KB cap
+        profile = {**self.PROFILE, "sources": [{"path": "~/.toy/settings.json"}]}
+        self.assertEqual(self.read(profile)["harness_identity"]["reason"], "SIZE_CAP_EXCEEDED")
+
+    def test_a_cap_or_pattern_out_of_bounds_is_refused(self):
+        for source in ({"path": "~/.x", "max_bytes": reader.SOURCE_MAX_BYTES_LIMIT + 1}, {"path": "~/.x", "max_bytes": 0},
+                       {"path": "~/.x", "max_bytes": True}, {"path": "/etc/*/conf.json"}, {"path": "*.json"}):
+            with self.subTest(source=source), self.assertRaises(reader.ProfileError):
+                reader.validate_profile({"harness": "x", "markers": {"commands": ["x"]}, "sources": [source]})
+
 
 class PodSourcesTest(Fixture):
     """Pod mode reads the config volume under the volume, and anything else
@@ -653,7 +750,7 @@ class PodSourcesTest(Fixture):
 
     def test_the_shipped_profiles(self):
         # OpenClaw's (RC-516); Claude Code's is RC-526.
-        self.assertEqual([p["harness"] for p in harness_sources.profiles()], ["openclaw"])
+        self.assertEqual([p["harness"] for p in harness_sources.profiles()], ["claude-code", "openclaw"])
 
 
 if __name__ == "__main__":

@@ -59,6 +59,15 @@ POLICY_FIELDS = ("tool_allow_deny", "approval_policy")
 CONFIG_FIELDS = ("harness_identity", "model_name", "llm_provider", "inference_endpoint",
                  "mcp_servers_declared", "tool_allow_deny", "approval_policy")
 SOURCE_MAX_BYTES = 64_000
+# A source may raise its own cap (`max_bytes`) up to this, for a harness file
+# that also holds caches (Claude Code's ~/.claude.json).
+SOURCE_MAX_BYTES_LIMIT = 1_000_000
+# A source whose last part is a pattern (drop-in files) reads at most this
+# many files.
+SOURCE_GLOB_MAX_FILES = 50
+# The agent's working directory, as a derived name a profile's paths can use
+# ($AGENT_CWD). Like every derived name, the agent's environment never sets it.
+CWD_NAME = "AGENT_CWD"
 PROMPT_TEXT_MAX_CHARS = 16_000
 TRANSCRIPT_MAX_BYTES = 1_000_000
 TRANSCRIPT_MAX_FILES = 50
@@ -163,12 +172,16 @@ class LocalSources:
 
 
 class Agent:
-    """What the reader knows about the agent: its command line and
-    environment (from its process), for markers and path expansion."""
+    """What the reader knows about the agent: its command line, environment
+    and working directory (from its process), for markers and path
+    expansion."""
 
-    def __init__(self, cmdline: str = "", env: dict[str, str] | None = None):
+    def __init__(self, cmdline: str = "", env: dict[str, str] | None = None, cwd: str | None = None):
         self.cmdline = cmdline or ""
         self.env = dict(env or {})
+        # Only an absolute path is a working directory; anything else (a
+        # deleted folder's "(deleted)", nothing at all) is none.
+        self.cwd = cwd if isinstance(cwd, str) and cwd.startswith("/") and " (deleted)" not in cwd else None
 
     def expand(self, path: str) -> str | None:
         """`~` and `$VAR` as the agent's environment gives them; None when a
@@ -220,6 +233,12 @@ def validate_profile(profile: Any) -> dict[str, Any]:
     for source in sources:
         if source.get("format", "json") != "json":
             raise ProfileError(f"{name}: {source['path']}: only json sources are read; use a hook for others")
+        cap = source.get("max_bytes", SOURCE_MAX_BYTES)
+        if isinstance(cap, bool) or not isinstance(cap, int) or not 0 < cap <= SOURCE_MAX_BYTES_LIMIT:
+            raise ProfileError(f"{name}: {source['path']}: max_bytes is a number of bytes up to {SOURCE_MAX_BYTES_LIMIT}")
+        folder, _, last = source["path"].rpartition("/")
+        if any(c in folder for c in "*?[") or (any(c in last for c in "*?[") and not folder):
+            raise ProfileError(f"{name}: {source['path']}: only a source's last part can be a pattern")
     flags = profile.get("flags", {})
     if not isinstance(flags, dict) or not all(
             isinstance(specs, list) and all(isinstance(f, dict) and isinstance(f.get("flag"), str)
@@ -270,17 +289,31 @@ def load_profiles(folder: Path = PROFILES_DIR) -> list[dict[str, Any]]:
     return profiles
 
 
-def _command_words(cmdline: str) -> set[str]:
-    # The basename of each word, so `node /usr/local/bin/openclaw gateway`
-    # matches the command `openclaw`.
-    return {word.rsplit("/", 1)[-1] for word in cmdline.split()}
+PACKAGE_EVIDENCE, COMMAND_EVIDENCE = 0, 1  # lower is stronger
 
 
-def _runs_package(cmdline: str, packages: Iterable[str]) -> bool:
-    # A word inside an installed package, so `node
-    # /usr/local/lib/node_modules/openclaw/openclaw.mjs gateway` matches the
-    # package `openclaw`.
-    return any(f"/node_modules/{package}/" in word for word in cmdline.split() for package in packages)
+def _command_line_evidence(cmdline: str, markers: dict[str, Any]) -> tuple[int, int] | None:
+    """The strongest sign on the command line that it runs this harness, as
+    (strength, word position), or None. A word inside one of its packages
+    (`node /usr/lib/node_modules/openclaw/openclaw.mjs`) is the strongest:
+    that is where the code being run lives. Otherwise a word that is one of
+    its commands, by basename (`/usr/local/bin/openclaw`, `openclaw`), the
+    earliest one: a program comes before its arguments. Every word is looked
+    at, since the program can come after any wrapper (`npm run`, `uv run`,
+    `sh -c cd /app && ...`, an entrypoint script, a launcher's flags and
+    their values), and /proc gives the command line with its quoting lost."""
+    packages, commands = markers.get("packages", []), set(markers.get("commands", []))
+    best: tuple[int, int] | None = None
+    for position, word in enumerate(cmdline.split()):
+        if any(f"/node_modules/{package}/" in word for package in packages):
+            found = (PACKAGE_EVIDENCE, position)
+        elif word.rsplit("/", 1)[-1] in commands:
+            found = (COMMAND_EVIDENCE, position)
+        else:
+            continue
+        if best is None or found < best:
+            best = found
+    return best
 
 
 def _flag_value(words: list[str], spec: dict[str, Any]) -> str | None:
@@ -306,9 +339,12 @@ def with_derived(profile: dict[str, Any], agent: Agent) -> Agent:
     use an earlier one. A harness that picks one folder by a rule (OpenClaw:
     $OPENCLAW_STATE_DIR, else ~/.openclaw-<profile>, else ~/.openclaw) says it
     once here and uses the name everywhere. The agent's own environment never
-    sets a derived name."""
-    derived_names = [*profile.get("flags", {}), *profile.get("variables", {})]
+    sets a derived name. $AGENT_CWD, the agent's working directory, is
+    derived for every profile."""
+    derived_names = [CWD_NAME, *profile.get("flags", {}), *profile.get("variables", {})]
     env = {key: value for key, value in agent.env.items() if key not in derived_names}
+    if agent.cwd:
+        env[CWD_NAME] = agent.cwd
     words = agent.cmdline.split()
     for name, specs in profile.get("flags", {}).items():
         for spec in specs:
@@ -316,26 +352,34 @@ def with_derived(profile: dict[str, Any], agent: Agent) -> Agent:
             if value and "/" not in value and value not in (".", ".."):  # a name, never a path
                 env[name] = value
                 break
-    derived = Agent(agent.cmdline, env)
+    derived = Agent(agent.cmdline, env, agent.cwd)
     for name, templates in profile.get("variables", {}).items():
         for template in templates:
             value = derived.expand(template)
             if value:
                 env[name] = value
-                derived = Agent(agent.cmdline, env)
+                derived = Agent(agent.cmdline, env, agent.cwd)
                 break
     return derived
 
 
 def harness_reader_for(profiles: Iterable[dict[str, Any]], agent: Agent) -> dict[str, Any] | None:
-    """The first profile whose markers match the agent, or None (then the
-    generic reader runs, task 6; until it lands the harness fields are BLIND
-    with UNKNOWN_HARNESS)."""
-    words = _command_words(agent.cmdline)
+    """The profile whose markers match the agent, or None (then the generic
+    reader runs, task 6; until it lands the harness fields are BLIND with
+    UNKNOWN_HARNESS). The command line decides first: of the profiles it
+    shows any sign of, the one with the strongest (_command_line_evidence),
+    so an OpenClaw agent whose prompt or note says "claude" stays OpenClaw
+    and a Claude Code agent asked about OpenClaw stays Claude Code; on a tie,
+    the first in order. An environment marker counts only when the command
+    line shows no harness, since an agent's environment can carry another
+    harness's variables (an OpenClaw agent with CLAUDE_CONFIG_DIR set)."""
+    profiles = list(profiles)
+    ranked = [(evidence, order, profile) for order, profile in enumerate(profiles)
+              if (evidence := _command_line_evidence(agent.cmdline, profile.get("markers", {}))) is not None]
+    if ranked:
+        return min(ranked, key=lambda item: item[:2])[2]
     for profile in profiles:
-        markers = profile.get("markers", {})
-        if (words & set(markers.get("commands", [])) or _runs_package(agent.cmdline, markers.get("packages", []))
-                or set(agent.env) & set(markers.get("env", []))):
+        if set(agent.env) & set(profile.get("markers", {}).get("env", [])):
             return profile
     return None
 
@@ -657,6 +701,22 @@ def _read_capped(ctx: Context, path: str, cap: int) -> tuple[str | None, bool]:
     return text, False
 
 
+def _source_paths(ctx: Context, spec: dict[str, Any]) -> list[tuple[str, str | None]]:
+    """(the path reported, the path read) for a source. A source whose last
+    part is a pattern (`/etc/x/managed-settings.d/*.json`) is the matching
+    files in its folder, as drop-in files are read: in name order, a later
+    one overriding an earlier one, so the last is listed first (highest
+    precedence first, like the sources themselves). It is reported by the
+    folder as the profile writes it and each file's own name."""
+    folder, _, pattern = spec["path"].rpartition("/")
+    if not any(c in pattern for c in "*?["):
+        return [(spec["path"], ctx.agent.expand(spec["path"]))]
+    expanded = ctx.agent.expand(folder)
+    names = ctx.sources.list_dir(expanded) if expanded else None
+    matching = sorted(n for n in names or [] if fnmatch.fnmatchcase(n, pattern) and n not in (".", ".."))
+    return [(f"{folder}/{n}", f"{expanded.rstrip('/')}/{n}") for n in reversed(matching[-SOURCE_GLOB_MAX_FILES:])]
+
+
 def _read_sources(ctx: Context) -> list[dict[str, Any]]:
     """Each source in profile order: the path it is read at (expanded with the
     agent's environment, to find it) and the path it is reported as (as the
@@ -664,21 +724,22 @@ def _read_sources(ctx: Context) -> list[dict[str, Any]]:
     document, parse error, or nothing (missing or unreadable)."""
     read = []
     for spec in ctx.profile.get("sources", []):
-        path = ctx.agent.expand(spec["path"])
-        entry: dict[str, Any] = {"spec": spec["path"], "path": spec["path"], "read_at": path,
-                                 "doc": _MISSING, "error": None, "reason": None}
-        if path is not None:
-            text, cut = _read_capped(ctx, path, SOURCE_MAX_BYTES)
-            if text is not None and cut:
-                entry["error"] = f"{spec['path']}: larger than {SOURCE_MAX_BYTES} bytes, so not read"
-                entry["reason"] = "SIZE_CAP_EXCEEDED"
-            elif text is not None:
-                try:
-                    entry["doc"] = ctx.loads(text)
-                except ValueError as exc:
-                    entry["error"] = f"{spec['path']}: {exc}"
-                    entry["reason"] = "PARSE_FAILED"
-        read.append(entry)
+        cap = spec.get("max_bytes", SOURCE_MAX_BYTES)
+        for shown, path in _source_paths(ctx, spec):
+            entry: dict[str, Any] = {"spec": spec["path"], "path": shown, "read_at": path,
+                                     "doc": _MISSING, "error": None, "reason": None}
+            if path is not None:
+                text, cut = _read_capped(ctx, path, cap)
+                if text is not None and cut:
+                    entry["error"] = f"{shown}: larger than {cap} bytes, so not read"
+                    entry["reason"] = "SIZE_CAP_EXCEEDED"
+                elif text is not None:
+                    try:
+                        entry["doc"] = ctx.loads(text)
+                    except ValueError as exc:
+                        entry["error"] = f"{shown}: {exc}"
+                        entry["reason"] = "PARSE_FAILED"
+            read.append(entry)
     return read
 
 

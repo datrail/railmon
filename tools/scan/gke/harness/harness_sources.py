@@ -97,7 +97,8 @@ def profiles() -> list[dict[str, Any]]:
 
 
 def agent_view(subject: dict[str, Any]) -> Any:
-    return reader().Agent(cmdline=subject.get("cmdline") or "", env=subject.get("env") or {})
+    return reader().Agent(cmdline=subject.get("cmdline") or "", env=subject.get("env") or {},
+                          cwd=subject.get("cwd"))
 
 
 def read_agent_harness(context: dict[str, Any], config_paths: list[Path],
