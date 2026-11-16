@@ -78,6 +78,12 @@ class PodSources:
             return None
         return _agent_process().read_in_root(located[0], located[1], max_bytes)
 
+    def read_bytes(self, path: str, max_bytes: int) -> bytes | None:
+        located = self._locate(path)
+        if located is None:
+            return None
+        return _agent_process().read_bytes_in_root(located[0], located[1], max_bytes)
+
     def list_dir(self, path: str) -> list[str] | None:
         located = self._locate(path)
         if located is None:

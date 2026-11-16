@@ -13,7 +13,7 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
-**Rule pack 15** (was 14 since v0.1.0-m15). A baseline locked on pack 14 reads `CONTRACT_MISMATCH` until it is re-locked.
+**Rule pack 16** (was 14 since v0.1.0-m15). A baseline locked on pack 14 or 15 reads `CONTRACT_MISMATCH` until it is re-locked.
 
 ### Added
 
@@ -23,6 +23,7 @@ Each PR adds its line under `## Unreleased`.
 - `asp_normalize`, one normalization from an evidence bundle (v1 or v2) to each agent's attributes ([#119](https://github.com/datrail/railmon/pull/119)).
 - `asp_normalize.unreached_server`, so a comparison of `skills_inventory` items skips the placeholder for an MCP server RailMon could not reach instead of reading an outage as a new tool. Normalized maps are unchanged.
 - One harness reader (`tools/scan/gke/harness/`) reads any agent harness's fields from a profile per harness ([#124](https://github.com/datrail/railmon/pull/124)).
+- **Rule pack 16:** OpenClaw's harness profile, the first to ship: in pod mode an OpenClaw agent's `harness_identity`, `model_name`, `llm_provider`, `inference_endpoint`, `mcp_servers_declared`, `tool_allow_deny`, `approval_policy`, `tool_names`, `system_prompt_present` and `skills_inventory` are read from its own files (`openclaw.json`, its package, its state and transcript databases, its workspace), in the folder OpenClaw itself picks for `--profile`, `--dev`, `OPENCLAW_HOME` or `OPENCLAW_STATE_DIR`. Self and docker scans are unchanged.
 - **Rule pack 15:** each MCP skill says whether its server was reached (`reachability`), why a tool's input schema was left out (`schema_omitted`) and when `tools/list` was cut short (`tools_truncated`); the v1 schema closes these values ([#126](https://github.com/datrail/railmon/pull/126)).
 
 ### Changed
