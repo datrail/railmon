@@ -1770,8 +1770,9 @@ def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
         stable, instance = _split_system_info(system_info)
         attributes["system_info"] = _answered(
             stable, "observed", authored_by="none",
-            method="uname, and /etc/os-release and runtime versions read in the scanned "
-                   "runtime's files; the scan's own platform otherwise",
+            method="uname, /etc/os-release and runtime versions of the scanned runtime: "
+                   "read from its files for a container or another process, run in the "
+                   "scan's own environment otherwise",
             note="static: what the agent runs on. Where this copy runs now (hostname and "
                  "the node name in uname, fqdn, container id, host pid, the scan's pid and "
                  "cwd) is agent_instance. PID 1's command line is left out as contents",

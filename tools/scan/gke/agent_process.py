@@ -194,10 +194,11 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
             os.close(fd)
 
 
-def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES) -> str | None:
+def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
+                 same_device: bool = True) -> str | None:
     """A regular file's text inside the agent's root, read as `_walk_in_root`
     resolves it: never the sidecar's own file, never a FIFO or device."""
-    walked = _walk_in_root(root, path, open_file=True)
+    walked = _walk_in_root(root, path, open_file=True, same_device=same_device)
     if walked is None or walked[1] is None:
         return None
     fd = walked[1]

@@ -199,6 +199,31 @@ class DockerScanRunsNothingInTheContainer(unittest.TestCase):
         self.assertIn("anthropic/claude-opus-4",
                       scanner.find_models_in_container_openclaw_config(root, ["/home/node/.openclaw"]))
 
+    def test_the_config_walk_follows_no_link_and_stays_bounded(self):
+        config = self.fake.root / "home/node/.openclaw"
+        # Links back to the folder itself: `find` never followed them, and
+        # followed they would multiply the walk.
+        for i in range(50):
+            (config / f"loop{i}").symlink_to(".")
+        (config / "linked.json").symlink_to("/etc/passwd")
+        # find -maxdepth 4: deep/a/b/x.json is depth 4, deep/a/b/c/y.json is 5.
+        (config / "deep/a/b/c").mkdir(parents=True)
+        (config / "deep/a/b/four.json").write_text("{}")
+        (config / "deep/a/b/c/five.json").write_text("{}")
+        root = self.context()["container_root"]
+        found = scanner.find_container_config_files(root, ["/home/node/.openclaw"])
+        self.assertEqual(found, ["/home/node/.openclaw/deep/a/b/four.json",
+                                 "/home/node/.openclaw/openclaw.json"])
+
+    def test_a_root_or_file_in_the_containers_proc_is_never_read(self):
+        (self.fake.root / "proc/1").mkdir(parents=True)
+        (self.fake.root / "proc/1/environ.json").write_text("{}")
+        (self.fake.root / "home/node/.openclaw/sneaky").symlink_to("/proc/1")
+        root = self.context()["container_root"]
+        self.assertEqual(scanner.find_container_config_files(root, ["/proc/1", "/home/node/.openclaw/sneaky"]), [])
+        self.assertIsNone(scanner.read_container_file(root, "/proc/1/environ.json"))
+        self.assertIsNone(scanner.read_container_file(root, "/home/node/.openclaw/sneaky/environ.json"))
+
     def test_another_containers_process_under_that_pid_is_never_read(self):
         (self.fake.proc / str(PID) / "cgroup").write_text("0::/system.slice/docker-" + "f" * 64 + ".scope\n")
         context = self.context()

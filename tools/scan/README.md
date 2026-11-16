@@ -375,7 +375,10 @@ is `Config.User` resolved in the container's own `/etc/passwd` and
 and a secret path's existence are read through `/proc/<pid>/root`; and the
 runtimes come from build stamps (OpenClaw's `dist/build-info.json`, Claude
 Code's package or versioned file) and the image's `NODE_VERSION` and
-`PYTHON_VERSION`, as pod mode reads them. The container's process must be
+`PYTHON_VERSION`, as pod mode reads them (pod mode now reads Claude Code's
+version too, so a Claude Code agent's `framework_identity` gains `claude`).
+The config walk follows no link below a root and skips the container's
+`/proc`, `/sys` and `/dev`; a mounted config volume is read. The container's process must be
 visible (`pid: host`) and its cgroup must name the container; otherwise those
 fields are left out, never filled from the scanner's own.
 

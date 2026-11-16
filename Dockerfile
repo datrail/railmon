@@ -60,8 +60,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # so the build host's own architecture stands in for it.
 #
 # The Docker client is the scanner's, and it is not optional: `scan --mode
-# docker` reaches the scanned container only through `docker inspect` and
-# `docker exec`, so without a client on PATH that mode fails with a message
+# docker` finds the scanned container only through `docker inspect` (since
+# DR-300 it runs nothing there and reads the container's files through
+# /proc/<pid>/root), so without a client on PATH that mode fails with a message
 # naming the container rather than the missing binary. RailScan's image carried
 # it for exactly this reason and the consolidation has to carry it too,
 # otherwise the single container is less capable than the two it replaces.

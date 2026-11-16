@@ -473,42 +473,67 @@ def find_models_in_openclaw_config(paths: list[Path]) -> list[str]:
     return dedupe(models)
 
 
+# Bounds on the config walk, so a tree the agent controls can't stall its scan.
+CONTAINER_CONFIG_MAX_ENTRIES = 4_000
+CONTAINER_CONFIG_MAX_FILES = 200
+
+
+def _off_limits(resolved: str) -> bool:
+    """A path in the container's kernel filesystems: never a config file,
+    and a way out of its root (its /proc names other processes)."""
+    return resolved.split("/")[1:2] in (["proc"], ["sys"], ["dev"])
+
+
 def find_container_config_files(root: str | None, roots: list[str]) -> list[str]:
     """The *.json/*.jsonl files up to four levels under each of `roots`, as
     paths inside the agent's container, read through its root (DR-300): no
-    exec. A root the scan can't read gives none."""
+    exec. As `find` without -L found them: a link is never followed, though
+    a root given as a link is. Mounted volumes count (the config folder
+    usually is one); the container's /proc, /sys and /dev don't. A root the
+    scan can't read gives none."""
     if not root:
         return []
     reader = _agent_process()
+    base = Path(root)
     found: list[str] = []
+    budget = [CONTAINER_CONFIG_MAX_ENTRIES]
 
-    def walk(path: str, depth: int) -> None:
-        names = reader.list_in_root(Path(root), path)
-        if names is None:
-            return
-        for name in names:
-            child = f"{path.rstrip('/')}/{name}"
-            if reader.list_in_root(Path(root), child) is not None:
+    def walk(directory: str, depth: int) -> None:
+        names = reader.list_in_root(base, directory, same_device=False)
+        for name in names or []:
+            budget[0] -= 1
+            if budget[0] < 0 or len(found) >= CONTAINER_CONFIG_MAX_FILES:
+                return
+            child = f"{directory.rstrip('/')}/{name}"
+            if reader.resolve_under_root(base, child, same_device=False) != child:
+                continue  # a link (find's -type f/d test it without following)
+            if reader.list_in_root(base, child, same_device=False) is not None:
                 if depth < 3:
                     walk(child, depth + 1)
-            elif name.endswith((".json", ".jsonl")) and reader.resolve_under_root(Path(root), child) is not None:
+            elif name.endswith((".json", ".jsonl")):
                 found.append(child)
 
     for config_root in roots:
-        if not config_root:
+        resolved = reader.resolve_under_root(base, config_root, same_device=False) if config_root else None
+        if resolved is None or _off_limits(resolved):
             continue
-        if reader.list_in_root(Path(root), config_root) is not None:
-            walk(config_root, 0)
-        elif reader.resolve_under_root(Path(root), config_root) is not None:
-            found.append(config_root)
-    return dedupe(found)
+        if reader.list_in_root(base, resolved, same_device=False) is not None:
+            walk(resolved, 0)
+        else:
+            found.append(resolved)
+    return dedupe(found)[:CONTAINER_CONFIG_MAX_FILES]
 
 
 def read_container_file(root: str | None, path: str, max_bytes: int = 256_000) -> str | None:
-    """A file in the agent's container, read through its root (DR-300)."""
+    """A file in the agent's container, read through its root (DR-300), a
+    mounted volume included; never one in its /proc, /sys or /dev."""
     if not root:
         return None
-    return _agent_process().read_in_root(Path(root), path, max_bytes)
+    reader = _agent_process()
+    resolved = reader.resolve_under_root(Path(root), path, same_device=False)
+    if resolved is None or _off_limits(resolved):
+        return None
+    return reader.read_in_root(Path(root), resolved, max_bytes, same_device=False)
 
 
 def find_models_in_container_openclaw_config(root: str | None, roots: list[str]) -> list[str]:
@@ -3038,7 +3063,8 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
             # The scan still runs: the container's inspect output is all
             # there, and the fields its files give are left out, not guessed.
             print(f"agent-environment-scanner: {context['container_root_problem']}; "
-                  "the container's os-release, machine-id, runtimes and user are left out",
+                  "the container's os-release, machine-id, runtimes, user and config files are "
+                  "left out, and a secret's path can't be checked, so it reads as a reference",
                   file=sys.stderr)
         sandbox = _container_ref().sandbox_name(args.container)
         if sandbox:
