@@ -89,6 +89,53 @@ class OneAttribute(unittest.TestCase):
         self.assertEqual(attribute, before)
 
 
+def partial(value, note="MCP server(s) not reached: docs"):
+    return {"status": "PARTIAL", "tier": "declared", "value": value, "authored_by": "subject",
+            "reason": "NO_SOURCE_ACCESS", "note": note}
+
+
+def _tool(name, server="docs"):
+    return {"name": name, "description": f"{name} tool", "destination_endpoints": ["https://docs.example/mcp"],
+            "source_type": "mcp_config", "entry": "tool", "server": server, "reachability": "reached"}
+
+
+def _server(reachability, server="docs"):
+    return {"name": server, "description": "MCP server configured via settings: unreachable",
+            "destination_endpoints": ["https://docs.example/mcp"], "source_type": "mcp_config",
+            "entry": "server", "server": server, "reachability": reachability}
+
+
+class UnreachedServers(unittest.TestCase):
+    """DR-303: an MCP server RailMon could not reach is not a skill the agent has."""
+
+    def counted(self, attributes):
+        value = attributes["skills_inventory"]["value"]
+        return [item for item in value if not N.unreached_server("skills_inventory", item)]
+
+    def test_an_outage_adds_no_item_to_a_baseline_sealed_while_the_server_answered(self):
+        other = _tool("query", server="db")
+        [(_, baseline)] = N.normalized(v1(skills_inventory=answered([_tool("search"), _tool("fetch"), other])))
+        for reachability in ("unreachable", "auth_refused"):
+            [(_, scan)] = N.normalized(v1(skills_inventory=partial([other, _server(reachability)])))
+            added = [item for item in self.counted(scan) if item not in self.counted(baseline)]
+            self.assertEqual(added, [], reachability)
+            self.assertEqual(self.counted(scan), [other])
+
+    def test_the_map_keeps_the_placeholder_that_names_the_server(self):
+        [(_, scan)] = N.normalized(v1(skills_inventory=partial([_server("unreachable")])))
+        self.assertEqual(scan["skills_inventory"]["value"], [_server("unreachable")])
+        self.assertEqual(scan["skills_inventory"]["status"], "PARTIAL")
+
+    def test_a_server_that_is_the_same_item_every_scan_is_counted(self):
+        for reachability in ("not_probed_stdio", "declares_none", "reached"):
+            self.assertFalse(N.unreached_server("skills_inventory", _server(reachability)), reachability)
+
+    def test_only_skills_inventory_has_unreached_servers(self):
+        self.assertFalse(N.unreached_server("skills", _server("unreachable")))
+        self.assertFalse(N.unreached_server("skills_inventory", _tool("search")))
+        self.assertFalse(N.unreached_server("skills_inventory", "docs"))
+
+
 class Readable(unittest.TestCase):
     def test_an_unusable_read_value_is_marked_failed_and_kept(self):
         out = N.readable({"user": answered(0.0), "tool_names": answered([{"x": 1}])}, SHAPES)
