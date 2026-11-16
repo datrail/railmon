@@ -69,10 +69,38 @@ identity for an unkeyed agent, a registration payload's profile) stays the
 caller's. Rail Center's `profiling/asp.normalize` is the reference these rules
 came from; its fixture corpus, run through both, is the check that they agree.
 
+## asp_redaction
+
+The third module is the rule RailMon redacts every URL in a bundle by, so a
+consumer that matches a URL it sees itself (Rail Center's capture plan, the
+proxy) against one from a bundle redacts its side the same way and matches on
+the redacted form, markers included. Import it rather than re-implementing it:
+
+```python
+from asp_redaction import redact_url
+
+redact_url("https://gw.example.com/mcp/sk-live-abc12345/sse?api_key=x")
+# 'https://gw.example.com/mcp/[redacted]/sse?[redacted]'
+```
+
+- `redact_url(url)` keeps scheme, host and port, drops userinfo and fragment,
+  replaces a query with `REDACTED_QUERY` (`?[redacted]`) and a key-shaped path
+  segment with `REDACTED_SEGMENT` (`[redacted]`), and gives `UNPARSEABLE`
+  (`[unparseable]`) for a URL with no scheme or host or one `urllib` refuses
+  (an unbracketed IPv6 literal). It is idempotent.
+- A segment is key-shaped if it is 20 characters or longer, or matches a
+  vendor key shape in `SECRET_TOKEN_RES` (`is_secret_token`,
+  `looks_like_secret_segment`). A kept segment's `[` and `]` are
+  percent-encoded, so a marker only ever comes from redaction.
+
+`REDACTION_VERSION` moves only with RailMon's `rule_pack_version`: changing the
+rule changes what a bundle carries.
+
 ## Using it
 
-Two files with no dependencies beyond the standard library (Python 3.10+);
-`asp_normalize` imports `asp_spelling`.
+Three files with no dependencies beyond the standard library (Python 3.10+);
+`asp_normalize` imports `asp_spelling`, and `asp_redaction` imports nothing of
+the package. RailMon's scanner loads `asp_redaction.py` from this directory.
 
 - **Install** it pinned to a railmon commit:
   `asp-spelling @ git+https://github.com/datrail/railmon@<commit>#subdirectory=python/asp_spelling`

@@ -22,6 +22,7 @@ Each PR adds its line under `## Unreleased`.
 - `asp_spelling`, a standard-library package holding the one ASP value spelling RailDash and Rail Center both read ([#118](https://github.com/datrail/railmon/pull/118)).
 - `asp_normalize`, one normalization from an evidence bundle (v1 or v2) to each agent's attributes ([#119](https://github.com/datrail/railmon/pull/119)).
 - `asp_normalize.unreached_server`, so a comparison of `skills_inventory` items skips the placeholder for an MCP server RailMon could not reach instead of reading an outage as a new tool. Normalized maps are unchanged.
+- `asp_redaction`, RailMon's URL redaction rule in the `asp_spelling` package, so Rail Center's capture plan and the proxy match on the redacted path with the rule RailMon applies instead of re-implementing it. Bundles are unchanged.
 - One harness reader (`tools/scan/gke/harness/`) reads any agent harness's fields from a profile per harness ([#124](https://github.com/datrail/railmon/pull/124)).
 - **Rule pack 15:** each MCP skill says whether its server was reached (`reachability`), why a tool's input schema was left out (`schema_omitted`) and when `tools/list` was cut short (`tools_truncated`); the v1 schema closes these values ([#126](https://github.com/datrail/railmon/pull/126)).
 
