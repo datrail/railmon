@@ -13,6 +13,12 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+**Rule pack 16** (was 15 since v0.1.0-m17). A baseline locked on pack 15 reads `CONTRACT_MISMATCH` until it is re-locked.
+
+### Changed
+
+- `railmon scan --mode docker` runs nothing in the agent's container, so it needs no write access to Docker: inspect is the only Docker call (a read-only Docker API proxy is enough). What `docker exec` printed is read from inspect and from the container's own files through `/proc/<pid>/root`, which needs `pid: host` and `cap_add: [SYS_PTRACE]` on the scan's container. Runtime versions come from build stamps and the image's `NODE_VERSION`/`PYTHON_VERSION` instead of `--version`, so a Python without `PYTHON_VERSION` is no longer listed, and the scan's own `sh`/`id`/`env` no longer appear in `observed_file_access` (DR-300).
+
 **Rule pack 15** (was 14 since v0.1.0-m15). A baseline locked on pack 14 reads `CONTRACT_MISMATCH` until it is re-locked.
 
 ### Added

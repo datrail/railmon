@@ -1106,7 +1106,7 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # 15 marks each MCP skill's reachability, an omitted schema and a
         # truncated tool list, and reads a server it can't list as PARTIAL
         # (DR-293).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 15)
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 16)
 
     def test_the_method_and_notes_name_the_probe_that_wrote_the_file(self):
         # DR-170: `railmon listen` writes "probe": "agentsight" in its start

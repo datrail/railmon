@@ -473,34 +473,48 @@ def find_models_in_openclaw_config(paths: list[Path]) -> list[str]:
     return dedupe(models)
 
 
-def find_container_config_files(container: str, roots: list[str]) -> list[str]:
-    quoted_roots = " ".join(shlex.quote(root) for root in roots if root)
-    if not quoted_roots:
+def find_container_config_files(root: str | None, roots: list[str]) -> list[str]:
+    """The *.json/*.jsonl files up to four levels under each of `roots`, as
+    paths inside the agent's container, read through its root (DR-300): no
+    exec. A root the scan can't read gives none."""
+    if not root:
         return []
-    script = f"""
-for root in {quoted_roots}; do
-  if [ -d "$root" ]; then
-    find "$root" -maxdepth 4 -type f \\( -name '*.json' -o -name '*.jsonl' \\) 2>/dev/null
-  elif [ -f "$root" ]; then
-    printf '%s\\n' "$root"
-  fi
-done
-"""
-    output = run_command(["docker", "exec", container, "sh", "-lc", script], timeout=10.0)
-    if not output:
-        return []
-    return dedupe([line.strip() for line in output.splitlines() if line.strip()])
+    reader = _agent_process()
+    found: list[str] = []
+
+    def walk(path: str, depth: int) -> None:
+        names = reader.list_in_root(Path(root), path)
+        if names is None:
+            return
+        for name in names:
+            child = f"{path.rstrip('/')}/{name}"
+            if reader.list_in_root(Path(root), child) is not None:
+                if depth < 3:
+                    walk(child, depth + 1)
+            elif name.endswith((".json", ".jsonl")) and reader.resolve_under_root(Path(root), child) is not None:
+                found.append(child)
+
+    for config_root in roots:
+        if not config_root:
+            continue
+        if reader.list_in_root(Path(root), config_root) is not None:
+            walk(config_root, 0)
+        elif reader.resolve_under_root(Path(root), config_root) is not None:
+            found.append(config_root)
+    return dedupe(found)
 
 
-def read_container_file(container: str, path: str, max_bytes: int = 256_000) -> str | None:
-    script = f"head -c {int(max_bytes)} {shlex.quote(path)}"
-    return run_command(["docker", "exec", container, "sh", "-lc", script], timeout=5.0)
+def read_container_file(root: str | None, path: str, max_bytes: int = 256_000) -> str | None:
+    """A file in the agent's container, read through its root (DR-300)."""
+    if not root:
+        return None
+    return _agent_process().read_in_root(Path(root), path, max_bytes)
 
 
-def find_models_in_container_openclaw_config(container: str, roots: list[str]) -> list[str]:
+def find_models_in_container_openclaw_config(root: str | None, roots: list[str]) -> list[str]:
     models: list[str] = []
-    for path in find_container_config_files(container, roots):
-        text = read_container_file(container, path)
+    for path in find_container_config_files(root, roots):
+        text = read_container_file(root, path)
         if not text:
             continue
         for line in text.splitlines() if path.endswith(".jsonl") else [text]:
@@ -586,8 +600,10 @@ def collect_self_context() -> dict[str, Any]:
 
 
 def _gke(name: str) -> Any:
-    """tools/scan/gke/<name>.py, loaded by path once and only in pod mode:
-    everything specific to running as a sidecar in a Kubernetes pod."""
+    """tools/scan/gke/<name>.py, loaded by path once, when first used:
+    everything specific to running as a sidecar in a Kubernetes pod, and
+    agent_process's reader of another process's files, which docker mode
+    uses too (DR-300)."""
     module = sys.modules.get(f"gke_{name}")
     if module is None:
         import importlib.util
@@ -632,7 +648,7 @@ def subject_path_checker(context: dict[str, Any]) -> Callable[[str], bool] | Non
     scanned process sees: the container's in docker mode, the agent's root
     when the scan describes another process, else the scanner's own."""
     if context.get("mode") == "docker" and context.get("container_name"):
-        return container_path_checker(str(context["container_name"]))
+        return container_path_checker(context.get("container_root"))
     root = (context.get("subject") or {}).get("root")
     if root:
         # Resolved as the agent's container would, so a link the agent planted
@@ -716,20 +732,98 @@ def collect_egress_containment(inspect: dict[str, Any]) -> dict[str, Any]:
     return inputs
 
 
+# What `docker exec` puts in front of the container's own Env (moby's
+# CreateDaemonEnvironment), and the HOME runc adds from the exec user's
+# passwd entry when Env has none.
+DOCKER_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def container_root(container_id: str | None, pid: Any) -> tuple[str | None, str | None]:
+    """/proc/<pid>/root of the container's main process, the way the scan
+    reads the agent's files without running anything in its container
+    (DR-300), or None and why not.
+
+    The pid is the host's (State.Pid), so it names the container only when
+    the scan shares the host's process namespace (compose's `pid: host`);
+    the process's cgroup must name the container, or the scan would read
+    some other process's files. Reading another user's root also takes
+    CAP_SYS_PTRACE."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None, "the container is not running"
+    proc = _agent_process().PROC_DIR / str(pid)
+    cgroup = read_text(proc / "cgroup")
+    if not container_id or not cgroup or container_id not in cgroup:
+        return None, ("the container's process is not visible here "
+                      "(the scan needs the host's process namespace)")
+    root = proc / "root"
+    try:
+        os.listdir(root)
+    except OSError:
+        return None, "the container's root can't be read (the scan needs CAP_SYS_PTRACE)"
+    return str(root), None
+
+
+def _passwd_entries(root: str, path: str) -> list[list[str]]:
+    text = _agent_process().read_in_root(Path(root), path) or ""
+    return [line.split(":") for line in text.splitlines() if line and not line.startswith("#")]
+
+
+def exec_user(root: str | None, spec: str | None) -> dict[str, Any] | None:
+    """The user `docker exec` runs as: Config.User resolved in the
+    container's own /etc/passwd and /etc/group, as runc resolves it (name or
+    uid, then an optional group). None when the root can't be read, or when
+    runc would refuse the user (a name or group the container doesn't know)."""
+    if not root:
+        return None
+    user_part, _, group_part = (spec or "").partition(":")
+    user: dict[str, Any] = {"name": None, "uid": 0, "gid": 0, "home": "/"}
+    if not user_part:
+        user_part = "0"
+    entry = next((e for e in _passwd_entries(root, "/etc/passwd")
+                  if len(e) >= 6 and (e[0] == user_part or (user_part.isdigit() and e[2] == user_part))), None)
+    if entry is not None:
+        user.update(name=entry[0], uid=int(entry[2]) if entry[2].isdigit() else 0,
+                    gid=int(entry[3]) if entry[3].isdigit() else 0, home=entry[5] or "/")
+    elif user_part.isdigit():
+        user["uid"] = int(user_part)
+    else:
+        return None
+    if group_part:
+        group = next((e for e in _passwd_entries(root, "/etc/group")
+                      if len(e) >= 3 and (e[0] == group_part or (group_part.isdigit() and e[2] == group_part))), None)
+        if group is not None and group[2].isdigit():
+            user["gid"] = int(group[2])
+        elif group_part.isdigit():
+            user["gid"] = int(group_part)
+        else:
+            return None
+    return user
+
+
+def exec_environment(config: dict[str, Any], user: dict[str, Any] | None) -> dict[str, str]:
+    """The environment `docker exec <container> env` printed, built from
+    inspect and the exec user instead of running it (DR-300)."""
+    env = {"PATH": DOCKER_DEFAULT_PATH}
+    if config.get("Hostname"):
+        env["HOSTNAME"] = str(config["Hostname"])
+    env.update(parse_env_lines("\n".join(config.get("Env") or [])))
+    if "HOME" not in env and user is not None:
+        env["HOME"] = user["home"]
+    return env
+
+
 def collect_docker_context(container: str) -> dict[str, Any]:
     inspect = docker_inspect(container)
     config = inspect.get("Config") or {}
     state = inspect.get("State") or {}
     name = str(inspect.get("Name") or "").lstrip("/") or container
-    env = parse_env_lines("\n".join(config.get("Env") or []))
-
-    exec_env = run_command(["docker", "exec", container, "env"], timeout=5.0)
-    env.update(parse_env_lines(exec_env))
-    hostname = first_nonempty(
-        run_command(["docker", "exec", container, "hostname"], timeout=2.0),
-        config.get("Hostname"),
-        name,
-    )
+    # Nothing is run in the agent's container (DR-300): what `docker exec`
+    # used to print comes from inspect and the container's own files, read
+    # through its root, so the scan needs no write access to Docker.
+    root, root_problem = container_root(inspect.get("Id"), state.get("Pid"))
+    user = exec_user(root, config.get("User"))
+    env = exec_environment(config, user)
+    hostname = first_nonempty(config.get("Hostname"), name)
     cmd_parts = [str(config.get("Entrypoint") or ""), str(config.get("Cmd") or ""), str(inspect.get("Path") or "")]
     return {
         "mode": "docker",
@@ -741,6 +835,9 @@ def collect_docker_context(container: str) -> dict[str, Any]:
         "proc1_cmdline": redact_cmdline(" ".join(cmd_parts)),
         "docker_inspect": inspect,
         "docker_state_pid": state.get("Pid"),
+        "container_root": root,
+        "container_root_problem": root_problem,
+        "exec_user": user,
         "egress_inputs": collect_egress_containment(inspect),
     }
 
@@ -796,7 +893,10 @@ def parse_os_release(text: str | None = None) -> dict[str, str]:
     return result
 
 
-def runtime_versions(container: str | None = None) -> dict[str, str]:
+def runtime_versions() -> dict[str, str]:
+    """The scanner's own runtimes, for a scan of the environment it runs in.
+    A scan of a container or another process reads them from its files
+    instead (agent_process.runtime_versions), never running them there."""
     commands = {
         "python": ["python3", "--version"],
         "node": ["node", "--version"],
@@ -805,8 +905,7 @@ def runtime_versions(container: str | None = None) -> dict[str, str]:
     }
     versions: dict[str, str] = {}
     for name, cmd in commands.items():
-        full_cmd = ["docker", "exec", container, *cmd] if container else cmd
-        output = run_command(full_cmd, timeout=3.0)
+        output = run_command(cmd, timeout=3.0)
         if output:
             versions[name] = output.splitlines()[0]
     return versions
@@ -820,14 +919,23 @@ def primary_runtime(runtimes: dict[str, str]) -> str | None:
 
 
 def collect_system_info(context: dict[str, Any], model_source: str, capture_files: list[Path]) -> dict[str, Any]:
-    container = context.get("container_name") if context["mode"] == "docker" else None
-    uname = run_command(["docker", "exec", container, "uname", "-srm"], timeout=3.0) if container else None
-    os_release_text = run_command(["docker", "exec", container, "cat", "/etc/os-release"], timeout=3.0) if container else None
-    machine_id_text = run_command(["docker", "exec", container, "cat", "/etc/machine-id"], timeout=3.0) if container else None
+    uname = None
+    if context["mode"] == "docker":
+        # A container runs on the host's kernel: `uname -srm` in it printed
+        # the scanner's own.
+        own = os.uname()
+        uname = f"{own.sysname} {own.release} {own.machine}"
     if not uname:
         uname = " ".join(platform.uname())
 
-    if "subject" in context:
+    if context["mode"] == "docker":
+        # Read through the container's root, never run there (DR-300). No
+        # root, no values: "" rather than None, which reads the scanner's own.
+        root = context.get("container_root")
+        os_release_text = read_container_file(root, "/etc/os-release") or ""
+        machine_id_hash = hash_identifier(read_container_file(root, "/etc/machine-id", 256))
+        runtimes = _agent_process().runtime_versions(Path(root), context["env"]) if root else {}
+    elif "subject" in context:
         # The scan describes another process: its own files, read through its
         # root, never the scanner's, and its runtimes read rather than run.
         subject = context["subject"] or {}
@@ -836,8 +944,9 @@ def collect_system_info(context: dict[str, Any], model_source: str, capture_file
         machine_id_hash = hash_identifier(subject.get("machine_id"))
         runtimes = dict(subject.get("runtimes") or {})
     else:
-        machine_id_hash = hash_identifier(machine_id_text if container else read_text(Path("/etc/machine-id"), max_bytes=256))
-        runtimes = runtime_versions(container)
+        os_release_text = None
+        machine_id_hash = hash_identifier(read_text(Path("/etc/machine-id"), max_bytes=256))
+        runtimes = runtime_versions()
     info: dict[str, Any] = {
         "os": platform.system(),
         "os_release": parse_os_release(os_release_text),
@@ -904,10 +1013,14 @@ def collect_user_info(context: dict[str, Any], owner: str, owner_source: str) ->
         user_info["git_user_email"] = git_config_value("user.email")
 
     if context["mode"] == "docker" and context.get("container_name"):
-        container = context["container_name"]
-        user_info["container_username"] = run_command(["docker", "exec", container, "id", "-un"], timeout=2.0)
-        user_info["container_uid"] = run_command(["docker", "exec", container, "id", "-u"], timeout=2.0)
-        user_info["container_gid"] = run_command(["docker", "exec", container, "id", "-g"], timeout=2.0)
+        # Who `docker exec` ran as: Config.User in the container's own
+        # passwd and group files (DR-300). `id -un` printed nothing for a uid
+        # with no name.
+        user = context.get("exec_user")
+        if user is not None:
+            user_info["container_username"] = user["name"]
+            user_info["container_uid"] = str(user["uid"])
+            user_info["container_gid"] = str(user["gid"])
 
     return drop_none(user_info)
 
@@ -1700,19 +1813,22 @@ def local_path_exists(path: str) -> bool:
         return True
 
 
-def container_path_checker(container: str) -> Callable[[str], bool]:
+def container_path_checker(root: str | None) -> Callable[[str], bool]:
     """Existence, asked of the filesystem the value actually refers to.
 
     A secret mounted into the scanned container is not present on the machine
     running the scanner, so checking locally would report every mount in a
-    `--mode docker` scan as a dangling reference. Only the verdict is kept; the
-    path is a pointer, and the secret it points at is never read.
+    `--mode docker` scan as a dangling reference. The path is resolved inside
+    the container's root, as the container would (DR-300), and only the
+    verdict is kept; the secret it points at is never read. Without the root
+    nothing exists, as when `test -e` couldn't run.
     """
     cache: dict[str, bool] = {}
 
     def exists(path: str) -> bool:
         if path not in cache:
-            cache[path] = run_command(["docker", "exec", container, "test", "-e", path], timeout=2.0) is not None
+            cache[path] = bool(root) and _agent_process().resolve_under_root(
+                Path(str(root)), path, same_device=False) is not None
         return cache[path]
 
     return exists
@@ -2918,6 +3034,12 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         if not args.container:
             raise ScannerError("--container is required with --mode docker")
         context = collect_docker_context(resolve_container(args.container))
+        if context.get("container_root_problem"):
+            # The scan still runs: the container's inspect output is all
+            # there, and the fields its files give are left out, not guessed.
+            print(f"agent-environment-scanner: {context['container_root_problem']}; "
+                  "the container's os-release, machine-id, runtimes and user are left out",
+                  file=sys.stderr)
         sandbox = _container_ref().sandbox_name(args.container)
         if sandbox:
             context["openshell_sandbox"] = sandbox
@@ -2989,7 +3111,7 @@ def build_registration_payload(
     if llm_model == "unknown" and context["mode"] == "docker" and context.get("container_name"):
         container_config_roots = [str(path) for path in config_paths] or list(DEFAULT_CONTAINER_CONFIG_ROOTS)
         container_config_models = find_models_in_container_openclaw_config(
-            str(context["container_name"]), container_config_roots
+            context.get("container_root"), container_config_roots
         )
         if container_config_models:
             llm_model = container_config_models[-1]

@@ -34,6 +34,11 @@ OPENCLAW_PACKAGE_DIRS = (
     "/opt/openclaw",
     "/app",
 )
+# Claude Code's npm package, under the agent's root.
+CLAUDE_PACKAGE_DIRS = (
+    "/usr/local/lib/node_modules/@anthropic-ai/claude-code",
+    "/usr/lib/node_modules/@anthropic-ai/claude-code",
+)
 
 
 def _read(path: Path, max_bytes: int = SMALL_FILE_MAX_BYTES) -> str | None:
@@ -243,8 +248,10 @@ def runtime_versions(root: Path, env: dict[str, str]) -> dict[str, str]:
     """The agent's runtimes, read rather than run: OpenClaw's build stamp
     (dist/build-info.json, else package.json) for the openclaw on the agent's
     PATH or in a usual install folder, and the base image's NODE_VERSION and
-    PYTHON_VERSION. The same strings `openclaw --version`, `node --version`
-    and `python3 --version` print."""
+    PYTHON_VERSION, and Claude Code's version from its npm package or the
+    native installer's versions/<version> file the `claude` on PATH links
+    to. The same strings `openclaw --version`, `claude --version`,
+    `node --version` and `python3 --version` print."""
     versions: dict[str, str] = {}
     package_dirs: list[str] = []
     for directory in (env.get("PATH") or "").split(":"):
@@ -272,11 +279,37 @@ def runtime_versions(root: Path, env: dict[str, str]) -> dict[str, str]:
             commit = str(info.get("commit") or "")[:7]
             versions["openclaw"] = f"OpenClaw {version}" + (f" ({commit})" if commit else "")
             break
+    claude = _claude_version(root, env)
+    if claude:
+        versions["claude"] = f"{claude} (Claude Code)"
     if env.get("NODE_VERSION"):
         versions["node"] = "v" + env["NODE_VERSION"].lstrip("v")
     if env.get("PYTHON_VERSION"):
         versions["python"] = "Python " + env["PYTHON_VERSION"]
     return versions
+
+
+def _claude_version(root: Path, env: dict[str, str]) -> str | None:
+    """Claude Code's version, read rather than run."""
+    package_dirs: list[str] = []
+    for directory in (env.get("PATH") or "").split(":"):
+        resolved = resolve_under_root(root, f"{directory.rstrip('/')}/claude") if directory else None
+        if resolved is None:
+            continue
+        marker = "/node_modules/@anthropic-ai/claude-code/"
+        if marker in resolved:
+            package_dirs.append(resolved.split(marker, 1)[0] + marker.rstrip("/"))
+        else:
+            # The native installer: ~/.local/bin/claude -> .../claude/versions/<version>
+            parts = resolved.rsplit("/", 3)
+            if len(parts) == 4 and parts[1:3] == ["claude", "versions"] and parts[3][:1].isdigit():
+                return parts[3]
+        break
+    for directory in dict.fromkeys(package_dirs + list(CLAUDE_PACKAGE_DIRS)):
+        package = _json(root, f"{directory}/package.json")
+        if isinstance(package, dict) and package.get("name") == "@anthropic-ai/claude-code" and package.get("version"):
+            return str(package["version"])
+    return None
 
 
 def _is_pause(cmdline: str) -> bool:
