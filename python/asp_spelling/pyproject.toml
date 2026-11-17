@@ -1,5 +1,6 @@
-# One spelling for each ASP value, and one normalization from an evidence bundle to
-# each agent's attributes, shared by RailDash and Rail Center.
+# One spelling for each ASP value, one normalization from an evidence bundle to
+# each agent's attributes, shared by RailDash and Rail Center, and the URL
+# redaction rule RailMon applies (asp_redaction), for consumers that match on it.
 # Standard library only. Rail Center installs it pinned to a railmon commit:
 #   asp-spelling @ git+https://github.com/datrail/railmon@<commit>#subdirectory=python/asp_spelling
 # RailDash vendors asp_spelling.py byte-for-byte, as it does RailMon's schemas.
@@ -17,4 +18,4 @@ requires-python = ">=3.10"
 dependencies = []
 
 [tool.setuptools]
-py-modules = ["asp_spelling", "asp_normalize"]
+py-modules = ["asp_spelling", "asp_normalize", "asp_redaction"]

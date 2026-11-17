@@ -105,7 +105,14 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # left out carries schema_omitted, tools/list follows nextCursor (bounded,
 # with tools_truncated), and skills_inventory is PARTIAL when a server was
 # not reached or its list was cut.
-RULE_PACK_VERSION = 15
+# Pack 16 fills a pod's harness fields from the harness's own files when a
+# harness profile matches the agent (RC-516: OpenClaw's, the first to ship):
+# harness_identity, model_name, llm_provider, inference_endpoint,
+# mcp_servers_declared, tool_allow_deny, approval_policy, tool_names,
+# system_prompt_present and skills_inventory can be ANSWERED from
+# openclaw.json, OpenClaw's package, its state and transcript databases and
+# its workspace, where pack 15 left them to environment variables or BLIND.
+RULE_PACK_VERSION = 16
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an

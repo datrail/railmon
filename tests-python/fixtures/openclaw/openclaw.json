@@ -1,0 +1,56 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "external": {
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "apiKey": "fixture-placeholder-not-a-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "gemini-flash-latest",
+            "name": "gemini-flash-latest",
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "meta": {
+    "migrations": {
+      "modelPolicyAllowlist": true
+    },
+    "lastTouchedVersion": "2026.9.2"
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "external/gemini-flash-latest"
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "bonjour": {
+        "enabled": false
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "finretail": {
+        "url": "http://finretail-mcp-server:23004/mcp",
+        "transport": "streamable-http"
+      }
+    }
+  },
+  "tools": {
+    "deny": [
+      "browser"
+    ],
+    "exec": {
+      "host": "gateway",
+      "mode": "ask"
+    }
+  }
+}
