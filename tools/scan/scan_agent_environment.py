@@ -545,6 +545,32 @@ def read_container_file(root: str | None, path: str, max_bytes: int = 256_000) -
                                          refuse=CONTAINER_KERNEL_DIRS)
 
 
+# ELF e_machine values to the name `uname -m` prints for them.
+ELF_MACHINES = {0x03: "i686", 0x08: "mips", 0x14: "ppc", 0x15: "ppc64", 0x16: "s390x",
+                0x28: "armv7l", 0x3E: "x86_64", 0xB7: "aarch64", 0xF3: "riscv64"}
+# Binaries nearly every image carries, read in this order.
+MACHINE_PROBE_PATHS = ("/bin/sh", "/usr/bin/env", "/usr/local/bin/node", "/usr/bin/python3")
+
+
+def container_machine(root: str | None) -> str | None:
+    """The machine `uname -m` printed in the agent's container, from the ELF
+    header of one of its own binaries, read through its root (DR-300), or
+    None when none of them is a known ELF file."""
+    if not root:
+        return None
+    for path in MACHINE_PROBE_PATHS:
+        head = _agent_process().read_bytes_in_root(Path(root), path, 20, same_device=False,
+                                                   refuse=CONTAINER_KERNEL_DIRS)
+        if not head or len(head) < 20 or head[:4] != b"\x7fELF" or head[5] not in (1, 2):
+            continue
+        machine = ELF_MACHINES.get(int.from_bytes(head[18:20], "little" if head[5] == 1 else "big"))
+        if machine == "ppc64" and head[5] == 1:
+            machine = "ppc64le"
+        if machine:
+            return machine
+    return None
+
+
 def find_models_in_container_openclaw_config(root: str | None, roots: list[str]) -> list[str]:
     models: list[str] = []
     for path in find_container_config_files(root, roots):
@@ -956,9 +982,11 @@ def collect_system_info(context: dict[str, Any], model_source: str, capture_file
     uname = None
     if context["mode"] == "docker":
         # A container runs on the host's kernel: `uname -srm` in it printed
-        # the scanner's own.
+        # the scanner's own sysname and release. The machine is the image's:
+        # an emulated amd64 agent on an arm64 host printed x86_64.
         own = os.uname()
-        uname = f"{own.sysname} {own.release} {own.machine}"
+        machine = container_machine(context.get("container_root")) or own.machine
+        uname = f"{own.sysname} {own.release} {machine}"
     if not uname:
         uname = " ".join(platform.uname())
 

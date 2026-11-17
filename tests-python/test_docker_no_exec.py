@@ -184,6 +184,31 @@ class DockerScanRunsNothingInTheContainer(unittest.TestCase):
         self.assertEqual((user["container_username"], user["container_uid"], user["container_gid"]),
                          ("node", "1000", "1000"))
 
+    def test_the_machine_is_the_images_not_the_hosts(self):
+        # An amd64 image emulated on an arm64 host: `uname -m` in it printed
+        # x86_64, and the scanner's own uname says aarch64.
+        def elf(machine: int, little: bool = True) -> bytes:
+            order = "little" if little else "big"
+            return (b"\x7fELF\x02" + (b"\x01" if little else b"\x02") + b"\x01" + bytes(9)
+                    + (2).to_bytes(2, order) + machine.to_bytes(2, order))
+
+        (self.fake.root / "bin").mkdir()
+        (self.fake.root / "bin/busybox").write_bytes(elf(0x3E))
+        (self.fake.root / "bin/sh").symlink_to("/bin/busybox")
+        context = self.context()
+        own = os.uname()
+        info = scanner.collect_system_info(context, "unset", [])
+        self.assertEqual(info["uname"], f"{own.sysname} {own.release} x86_64")
+        # A script where /bin/sh should be is skipped for the next binary.
+        (self.fake.root / "bin/sh").unlink()
+        (self.fake.root / "bin/sh").write_text("#!/bin/false\n")
+        self.fake.write("usr/bin/env", "")
+        (self.fake.root / "usr/bin/env").write_bytes(elf(0xB7))
+        self.assertEqual(scanner.container_machine(context["container_root"]), "aarch64")
+        (self.fake.root / "usr/bin/env").write_bytes(elf(0x16, little=False))
+        self.assertEqual(scanner.container_machine(context["container_root"]), "s390x")
+        self.assertIsNone(scanner.container_machine(None))
+
     def test_a_secrets_path_is_checked_in_the_containers_root(self):
         exists = scanner.subject_path_checker(self.context())
         self.assertTrue(exists("/run/secrets/llm_key"))
