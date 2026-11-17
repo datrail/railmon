@@ -15,7 +15,7 @@ Checked:
 
 1. the scan through the proxy made only GET/HEAD calls, the proxy refused
    nothing, and each call is one of the reads the scan is known to make
-   (`_ping`, the agent's container inspect, a network inspect), so a new
+   (`_ping`, a container inspect, a network inspect), so a new
    Docker call fails here before a stricter read-only proxy refuses it;
 2. the two bundles' attributes are equal (instance fields aside);
 3. the fields `docker exec` used to give are there: the image's Python, its
@@ -125,20 +125,23 @@ def scan(image: str, agent: str, out: Path, name: str, docker_args: list[str]) -
     return json.loads(text)
 
 
-# Every Docker API call the scan may make, after an optional version prefix
-# and before any query string. A new one fails the check until it is added
-# here and to the read-only proxy the install runs.
+# Every kind of Docker API call the scan may make, after an optional
+# version prefix and before any query string: _ping, a container inspect
+# (the agent's, and for egress containment the owner of its network
+# namespace or another container on an internal network) and a network
+# inspect. A new kind fails the check until it is added here and to the
+# read-only proxy the install runs.
 EXPECTED_CALLS = (
     ("HEAD", r"/_ping"),
     ("GET", r"/_ping"),
-    ("GET", r"/containers/{agent}/json"),
+    ("GET", r"/containers/[^/?]+/json"),
     ("GET", r"/networks/[^/?]+"),
 )
 
 
-def unexpected_calls(calls: list[tuple[str, str, int]], agent: str) -> list[tuple[str, str, int]]:
-    """The calls that are not one of EXPECTED_CALLS for this agent."""
-    patterns = [(method, re.compile(r"^(?:/v[0-9.]+)?" + path.format(agent=re.escape(agent)) + r"(?:\?.*)?$"))
+def unexpected_calls(calls: list[tuple[str, str, int]]) -> list[tuple[str, str, int]]:
+    """The calls that are not one of EXPECTED_CALLS."""
+    patterns = [(method, re.compile(r"^(?:/v[0-9.]+)?" + path + r"(?:\?.*)?$"))
                 for method, path in EXPECTED_CALLS]
     return [call for call in calls
             if not any(call[0] == method and pattern.match(call[1]) for method, pattern in patterns)]
@@ -174,11 +177,11 @@ def main() -> int:
         checks["both scans produced a bundle"] = on_socket is not None and through_proxy is not None
         checks["the proxied scan made calls, only GET/HEAD, none refused, no exec"] = bool(calls) and all(
             method in ("GET", "HEAD") and status != 403 and "/exec" not in path for method, path, status in calls)
-        unexpected = unexpected_calls(calls, agent)
+        unexpected = unexpected_calls(calls)
         if unexpected:
             print("Docker API calls not in EXPECTED_CALLS:", *(f"  {m} {p}" for m, p, _ in unexpected),
                   sep="\n", file=sys.stderr)
-        checks["every call is a known read: _ping, the agent's inspect, a network inspect"] = not unexpected
+        checks["every call is a known read: _ping, a container inspect, a network inspect"] = not unexpected
         checks["the scan inspected the agent's container"] = any(
             re.search(rf"/containers/{re.escape(agent)}/json", path) for _, path, _ in calls)
         if on_socket is not None and through_proxy is not None:
