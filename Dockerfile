@@ -143,6 +143,11 @@ COPY rail-collector/ /opt/railmon/rail-collector/
 # test-only copies. A missing one is a FileNotFoundError on every scan, which
 # is what v2 was until CI started running a scan in the built image.
 COPY schemas/evidence-bundle-v1.schema.json schemas/evidence-bundle-v2.schema.json /opt/railmon/schemas/
+# The URL redaction rule lives in the asp_spelling package (Rail Center and the
+# proxy import it), and the scanner loads it by path from the same place
+# relative to tools/ as in the checkout. Only that one file: the rest of the
+# package is its consumers', not the scanner's.
+COPY python/asp_spelling/asp_redaction.py /opt/railmon/python/asp_spelling/asp_redaction.py
 COPY entrypoint.sh /usr/local/bin/railmon
 RUN chmod +x /usr/local/bin/railmon /opt/railmon/tools/local-demo/run_local_demo.sh
 

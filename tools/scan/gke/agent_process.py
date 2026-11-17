@@ -199,10 +199,11 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
             os.close(fd)
 
 
-def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
-                 same_device: bool = True, refuse: tuple[str, ...] = ()) -> str | None:
-    """A regular file's text inside the agent's root, read as `_walk_in_root`
-    resolves it: never the sidecar's own file, never a FIFO or device."""
+def read_bytes_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
+                       same_device: bool = True, refuse: tuple[str, ...] = ()) -> bytes | None:
+    """A regular file's bytes inside the agent's root, at most `max_bytes`,
+    read as `_walk_in_root` resolves it: never the sidecar's own file, never a
+    FIFO or device."""
     walked = _walk_in_root(root, path, open_file=True, same_device=same_device, refuse=refuse)
     if walked is None or walked[1] is None:
         return None
@@ -215,11 +216,18 @@ def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
                 break
             chunks.append(chunk)
             size += len(chunk)
-        return b"".join(chunks).decode("utf-8", errors="replace")
+        return b"".join(chunks)
     except OSError:
         return None
     finally:
         os.close(fd)
+
+
+def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
+                 same_device: bool = True, refuse: tuple[str, ...] = ()) -> str | None:
+    """A regular file's text inside the agent's root (read_bytes_in_root)."""
+    data = read_bytes_in_root(root, path, max_bytes, same_device=same_device, refuse=refuse)
+    return None if data is None else data.decode("utf-8", errors="replace")
 
 
 def list_in_root(root: Path, path: str, same_device: bool = True,

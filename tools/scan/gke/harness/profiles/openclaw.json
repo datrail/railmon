@@ -1,0 +1,59 @@
+{
+  "harness": "openclaw",
+  "markers": {
+    "commands": ["openclaw"],
+    "packages": ["openclaw"],
+    "env": ["OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_HOME"]
+  },
+  "flags": {
+    "OPENCLAW_CLI_PROFILE": [
+      {"flag": "--profile"},
+      {"flag": "--dev", "value": "dev"}
+    ]
+  },
+  "variables": {
+    "OPENCLAW_DIR": [
+      "$OPENCLAW_STATE_DIR",
+      "$OPENCLAW_HOME/.openclaw-$OPENCLAW_CLI_PROFILE",
+      "$OPENCLAW_HOME/.openclaw",
+      "~/.openclaw-$OPENCLAW_CLI_PROFILE",
+      "~/.openclaw"
+    ]
+  },
+  "sources": [
+    {"path": "$OPENCLAW_CONFIG_PATH"},
+    {"path": "$OPENCLAW_DIR/openclaw.json"}
+  ],
+  "fields": {
+    "harness_identity": {"hook": "openclaw_identity"},
+    "model_name": {"hook": "openclaw_model"},
+    "llm_provider": {"hook": "openclaw_model"},
+    "inference_endpoint": {"hook": "openclaw_model"},
+    "mcp_servers_declared": "mcp.servers",
+    "tool_allow_deny": {
+      "keys": {
+        "profile": "tools.profile",
+        "allow": "tools.allow",
+        "alsoAllow": "tools.alsoAllow",
+        "deny": "tools.deny",
+        "byProvider": "tools.byProvider"
+      }
+    },
+    "approval_policy": {"hook": "openclaw_approvals"}
+  },
+  "workspace": {
+    "prompt_files": [
+      "$OPENCLAW_DIR/workspace/AGENTS.md",
+      "$OPENCLAW_DIR/workspace/SOUL.md",
+      "$OPENCLAW_DIR/workspace/USER.md",
+      "$OPENCLAW_DIR/workspace/IDENTITY.md",
+      "$OPENCLAW_DIR/workspace/TOOLS.md",
+      "$OPENCLAW_DIR/workspace/BOOTSTRAP.md"
+    ],
+    "skills": [
+      "$OPENCLAW_DIR/skills",
+      "$OPENCLAW_DIR/workspace/skills"
+    ],
+    "transcripts": {"hook": "openclaw_transcripts"}
+  }
+}

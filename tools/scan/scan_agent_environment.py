@@ -36,6 +36,38 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
+def _load_asp_redaction() -> Any:
+    """The URL redaction rule, from `python/asp_spelling/asp_redaction.py`.
+
+    The rule lives in the asp_spelling package so Rail Center and the proxy
+    import the very rule this scanner applies. It is loaded by path from the
+    same tree as this file (the checkout, or /opt/railmon in the image, whose
+    Dockerfile copies it to the same place), never from an installed package,
+    so a scan always applies the rule its own rule pack was cut with.
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent.parent / "python" / "asp_spelling" / "asp_redaction.py"
+    spec = importlib.util.spec_from_file_location("asp_redaction", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_asp_redaction = _load_asp_redaction()
+# Re-exported under the names the scanner, evidence_bundle, pod mode and the
+# tests have always used.
+SECRET_TOKEN_RES = _asp_redaction.SECRET_TOKEN_RES
+REDACTED_SEGMENT = _asp_redaction.REDACTED_SEGMENT
+REDACTED_QUERY = _asp_redaction.REDACTED_QUERY
+UNPARSEABLE = _asp_redaction.UNPARSEABLE
+is_secret_token = _asp_redaction.is_secret_token
+looks_like_secret_segment = _asp_redaction.looks_like_secret_segment
+redact_path_segment = _asp_redaction.redact_path_segment
+redact_url = _asp_redaction.redact_url
+
+
 LOCAL_BASE_HOSTS = (
     "127.0.0.1",
     "0.0.0.0",
@@ -131,30 +163,6 @@ SECRET_REFERENCE_PREFIXES = (
     # sandbox's supervisor swaps in the real value on the way out, so the
     # agent never holds it (DR-194 §4.6; Daniel, 2026-10-28).
     "openshell:",
-)
-
-# Credentials in the shapes their vendors actually issue. Length alone cannot
-# catch these — `sk-live-abc12` is thirteen characters and still opens the
-# account — but a bare prefix cannot be used either: `asia`, `akia` and `aiza`
-# are the leading letters of AWS and Google keys *and* of ordinary words, so
-# prefix matching would silently delete a skill named `asian-markets` and a host
-# called `aizawa-metrics.internal`. Each entry therefore carries the length and
-# character shape that distinguishes the key from the word.
-SECRET_TOKEN_RES = (
-    re.compile(r"sk-[A-Za-z0-9_-]{8,}"),  # OpenAI, Anthropic, and lookalikes
-    re.compile(r"(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{20,}"),  # Stripe
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{12,}"),  # GitHub
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"glpat-[A-Za-z0-9_-]{6,}"),  # GitLab
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),  # Slack
-    re.compile(r"xapp-[0-9]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"npm_[A-Za-z0-9]{30,}"),
-    re.compile(r"shpat_[a-f0-9]{20,}"),  # Shopify
-    re.compile(r"hf_[A-Za-z0-9]{30,}"),  # Hugging Face
-    re.compile(r"dop_v1_[a-f0-9]{32,}"),  # DigitalOcean
-    re.compile(r"AIza[0-9A-Za-z_-]{30,}"),  # Google API key
-    re.compile(r"ya29\.[A-Za-z0-9_-]{20,}"),  # Google OAuth
-    re.compile(r"A(?:KIA|SIA)[0-9A-Z]{16}"),  # AWS access key id
 )
 
 
@@ -1237,7 +1245,7 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
     server whose list was cut at MCP_TOOLS_MAX or MCP_TOOLS_PAGES.
     """
     endpoints = dedupe(
-        redact_url(value) or "[unparseable]" for value in collect_strings(spec) if value.startswith(("http://", "https://"))
+        redact_url(value) or UNPARSEABLE for value in collect_strings(spec) if value.startswith(("http://", "https://"))
     )
     url = spec.get("url")
     if isinstance(url, str) and url:
@@ -1915,65 +1923,6 @@ def url_host(url: str) -> str:
         return ""
 
 
-def redact_url(url: str | None) -> str | None:
-    """A URL with everything that could be a credential removed.
-
-    Gateways routinely carry the key in the URL — `https://host/mcp/sk-live-…/sse`
-    or `?api_key=…` or `https://user:pass@host` or `#access_token=…` — so
-    recording a base_url or an MCP endpoint verbatim would put a live secret in a
-    file whose whole premise is that it holds none. Scheme, host and a path shape
-    are what the scorer needs; userinfo, query and fragment are dropped whole
-    rather than trusted to look harmless.
-
-    Idempotent: re-redacting an already-redacted URL returns it unchanged, so a
-    value can pass through more than one collector safely.
-    """
-    if not url:
-        return None
-    try:
-        parts = urlsplit(url)
-        host = parts.hostname
-        port = parts.port
-    except ValueError:
-        # A netloc urlsplit refuses to parse — an unbracketed IPv6 literal is the
-        # usual one. Nothing here can be reported as a host without guessing.
-        return "[unparseable]"
-    if not parts.scheme or not host:
-        return "[unparseable]"
-    # Re-bracketed, so the result parses back the same way. Emitting a bare
-    # `::1:8080` would make this function crash on its own output.
-    netloc = (f"[{host}]" if ":" in host else host) + (f":{port}" if port else "")
-    segments = [segment for segment in parts.path.split("/") if segment]
-    path = "/".join(redact_path_segment(segment) for segment in segments)
-    suffix = "?[redacted]" if parts.query else ""
-    return f"{parts.scheme}://{netloc}" + (f"/{path}" if path else "") + suffix
-
-
-# What a redacted path segment reads as. A consumer matching paths (Rail
-# Center's capture plan) skips a URL holding one, so it must not arise any
-# other way: `[` and `]` are not legal in a path (RFC 3986 gen-delims), and a
-# kept segment that has them anyway is percent-encoded below.
-REDACTED_SEGMENT = "[redacted]"
-
-
-def redact_path_segment(segment: str) -> str:
-    """One path segment: the marker if it could be a key, else as written.
-
-    A segment that already is the marker stays the marker, and any other
-    `[`/`]` is percent-encoded, so the marker in a redacted URL always means
-    "something was taken out here". The key test reads the segment with
-    those encodings undone: encoding grows a bracket to three characters,
-    and testing the encoded form would let a second pass (pod mode redacts a
-    harness URL, then the inventory redacts it again) push a 16-19
-    character segment past the length bound and redact what the first pass
-    kept.
-    """
-    raw = re.sub("%5[bB]", "[", re.sub("%5[dD]", "]", segment))
-    if raw == REDACTED_SEGMENT or looks_like_secret_segment(raw):
-        return REDACTED_SEGMENT
-    return raw.replace("[", "%5B").replace("]", "%5D")
-
-
 # A host as an operator writes one: dotted with an alphabetic TLD, or a short
 # single label like `ollama` or `localhost`. Long single labels are excluded on
 # purpose — that is the shape a pasted key has.
@@ -2003,7 +1952,7 @@ def redact_endpoint(value: str) -> str:
     """
     text = value.strip()
     if "://" in text:
-        return redact_url(text) or "[unparseable]"
+        return redact_url(text) or UNPARSEABLE
     # The vendor shape is checked before the host shape, not after: `sk-live-abc12`
     # is a perfectly legal DNS label, so a host test that ran first would wave
     # through every short hyphenated key there is.
@@ -2059,25 +2008,6 @@ def redact_cmdline(value: str | None) -> str | None:
     for pattern in CMDLINE_SECRET_RES:
         redacted = pattern.sub(r"\1[redacted]", redacted)
     return redact_text(redacted)
-
-
-def is_secret_token(value: str) -> bool:
-    """Whether the whole value is a credential in a shape some vendor issues."""
-    return any(pattern.fullmatch(value) for pattern in SECRET_TOKEN_RES)
-
-
-def looks_like_secret_segment(segment: str) -> bool:
-    """A path segment that could be a key rather than a route.
-
-    Deliberately over-inclusive. The earlier shape test — long, no character
-    outside `[A-Za-z0-9._~-]`, at least one digit — let two whole families
-    through: base64 keys, whose `+` and `/` and `=` fail the character class, and
-    all-alphabetic keys, which carry no digit. Redacting a long route segment
-    costs a scorer a path component; keeping one live key costs the file its
-    entire premise, so length alone is now enough, and a recognised vendor shape
-    redacts a short one.
-    """
-    return is_secret_token(segment) or len(segment) >= 20
 
 
 def command_basename(command: Any) -> str | None:

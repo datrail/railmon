@@ -13,14 +13,7 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
-**Rule pack 16** (was 15 since v0.1.0-m17). A baseline locked on pack 15 reads `CONTRACT_MISMATCH` until it is re-locked.
-
-### Changed
-
-- `railmon scan --mode docker` runs nothing in the agent's container, so it needs no write access to Docker: inspect is the only Docker call (a read-only Docker API proxy is enough). What `docker exec` printed is read from inspect and from the container's own files through `/proc/<pid>/root`, which needs `pid: host` and `cap_add: [SYS_PTRACE]` on the scan's container. Runtime versions come from build stamps and the image's `NODE_VERSION`/`PYTHON_VERSION` instead of `--version`, so a Python without `PYTHON_VERSION` is no longer listed, and the scan's own `sh`/`id`/`env` no longer appear in `observed_file_access` (DR-300).
-- The runtimes read from an agent's files, in docker and pod mode, include Claude Code (its npm package, or the native installer's `versions/<version>` file the `claude` on PATH links to), as `<version> (Claude Code)`. A pod-mode scan of a Claude Code agent gains `claude` in `framework_identity`, and `system_info.runtime` names it (DR-300).
-
-**Rule pack 15** (was 14 since v0.1.0-m15). A baseline locked on pack 14 reads `CONTRACT_MISMATCH` until it is re-locked.
+**Rule pack 16** (was 14 since v0.1.0-m15). A baseline locked on pack 14 or 15 reads `CONTRACT_MISMATCH` until it is re-locked.
 
 ### Added
 
@@ -29,11 +22,15 @@ Each PR adds its line under `## Unreleased`.
 - `asp_spelling`, a standard-library package holding the one ASP value spelling RailDash and Rail Center both read ([#118](https://github.com/datrail/railmon/pull/118)).
 - `asp_normalize`, one normalization from an evidence bundle (v1 or v2) to each agent's attributes ([#119](https://github.com/datrail/railmon/pull/119)).
 - `asp_normalize.unreached_server`, so a comparison of `skills_inventory` items skips the placeholder for an MCP server RailMon could not reach instead of reading an outage as a new tool. Normalized maps are unchanged.
+- `asp_redaction`, RailMon's URL redaction rule in the `asp_spelling` package, so Rail Center's capture plan and the proxy match on the redacted path with the rule RailMon applies instead of re-implementing it. Bundles are unchanged.
 - One harness reader (`tools/scan/gke/harness/`) reads any agent harness's fields from a profile per harness ([#124](https://github.com/datrail/railmon/pull/124)).
+- **Rule pack 16:** OpenClaw's harness profile, the first to ship: in pod mode an OpenClaw agent's `harness_identity`, `model_name`, `llm_provider`, `inference_endpoint`, `mcp_servers_declared`, `tool_allow_deny`, `approval_policy`, `tool_names`, `system_prompt_present` and `skills_inventory` are read from its own files (`openclaw.json`, its package, its state and transcript databases, its workspace), in the folder OpenClaw itself picks for `--profile`, `--dev`, `OPENCLAW_HOME` or `OPENCLAW_STATE_DIR`. Self and docker scans are unchanged.
 - **Rule pack 15:** each MCP skill says whether its server was reached (`reachability`), why a tool's input schema was left out (`schema_omitted`) and when `tools/list` was cut short (`tools_truncated`); the v1 schema closes these values ([#126](https://github.com/datrail/railmon/pull/126)).
 
 ### Changed
 
+- **Rule pack 16:** `railmon scan --mode docker` runs nothing in the agent's container, so it needs no write access to Docker: inspect is the only Docker call (a read-only Docker API proxy is enough). What `docker exec` printed is read from inspect and from the container's own files through `/proc/<pid>/root`, which needs `pid: host` and `cap_add: [SYS_PTRACE]` on the scan's container. Runtime versions come from build stamps and the image's `NODE_VERSION`/`PYTHON_VERSION` instead of `--version`, so a Python without `PYTHON_VERSION` is no longer listed, and the scan's own `sh`/`id`/`env` no longer appear in `observed_file_access` (DR-300).
+- **Rule pack 16:** the runtimes read from an agent's files, in docker and pod mode, include Claude Code (its npm package, or the native installer's `versions/<version>` file the `claude` on PATH links to), as `<version> (Claude Code)`. A pod-mode scan of a Claude Code agent gains `claude` in `framework_identity`, and `system_info.runtime` names it (DR-300).
 - **Rule pack 15:** `tools/list` follows `nextCursor` for up to 20 pages and 200 tools, and a malformed MCP response marks that server unreachable instead of aborting the scan ([#126](https://github.com/datrail/railmon/pull/126)).
 - A tag's GitHub Release notes open with the annotated tag's message ([#121](https://github.com/datrail/railmon/pull/121)).
 - The Dockerfile's comment on the OpenShell CLI no longer says CI installs the same release ([#120](https://github.com/datrail/railmon/pull/120)).
