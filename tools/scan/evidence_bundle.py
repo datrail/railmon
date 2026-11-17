@@ -112,6 +112,10 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # system_prompt_present and skills_inventory can be ANSWERED from
 # openclaw.json, OpenClaw's package, its state and transcript databases and
 # its workspace, where pack 15 left them to environment variables or BLIND.
+# Pack 16 also: a docker-mode scan runs nothing in the agent's container (DR-300).
+# It reads the container's files through its root instead, so the runtime
+# versions come from build stamps and the image's NODE_VERSION/PYTHON_VERSION
+# (as pod mode reads them) rather than `--version`, and the methods say so.
 RULE_PACK_VERSION = 16
 
 # The value shape of observed_file_access (DR-154), published in the v1
@@ -981,7 +985,7 @@ def build_evidence_bundle(
     openclaw_version = runtimes.get("openclaw")
     # A scan of another process (pod mode) reads the versions from its files
     # rather than running anything in its container.
-    read_not_run = "subject" in context
+    read_not_run = "subject" in context or context.get("mode") == "docker"
     if openclaw_version:
         attributes["harness_identity"] = _answered(
             f"openclaw/{openclaw_version}", "declared", authored_by="subject",
@@ -999,7 +1003,7 @@ def build_evidence_bundle(
         attributes["framework_identity"] = _answered(
             {name: str(version) for name, version in sorted(runtimes.items())}, "observed",
             authored_by="subject",
-            method=("the runtime versions in the agent's files and environment (build stamp, "
+            method=("the runtime versions in the agent's files and environment (build stamps, "
                     "NODE_VERSION, PYTHON_VERSION), not run" if read_not_run
                     else "the runtime versions the harness reports for itself"),
             note="the runtime versions observed; the framework build identity is not collected",
@@ -1773,8 +1777,9 @@ def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
         stable, instance = _split_system_info(system_info)
         attributes["system_info"] = _answered(
             stable, "observed", authored_by="none",
-            method="uname, /etc/os-release and runtime versions in the scanned runtime; "
-                   "the scan's own platform otherwise",
+            method="uname, /etc/os-release and runtime versions of the scanned runtime: "
+                   "read from its files for a container or another process, run in the "
+                   "scan's own environment otherwise",
             note="static: what the agent runs on. Where this copy runs now (hostname and "
                  "the node name in uname, fqdn, container id, host pid, the scan's pid and "
                  "cwd) is agent_instance. PID 1's command line is left out as contents",
@@ -1797,8 +1802,8 @@ def registration_attributes(payload: dict[str, Any]) -> dict[str, Any]:
     if user_info:
         attributes["user_info"] = _answered(
             user_info, "observed", authored_by="none",
-            method="the scanning user, its git identity, and id -un/-u/-g in the container "
-                   "in docker mode",
+            method="the scanning user, its git identity, and in docker mode the container's "
+                   "Config.User resolved in its own /etc/passwd and /etc/group",
             note="the uid the agent runs as is container_uid in docker mode; "
                  "the user attribute is Config.User",
         )

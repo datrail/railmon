@@ -378,6 +378,22 @@ package, its state and transcript databases and its workspace (see
 [gke/harness/README.md](gke/harness/README.md)). Self and docker scans are
 unchanged.
 
+Rule pack 16 (DR-300): a docker-mode scan runs nothing in the agent's
+container, so a pack-15 baseline is `CONTRACT_MISMATCH` until a pack-16 ASP
+is locked. The environment is inspect's `Env` with what `docker exec` added
+(Docker's default `PATH`, `HOSTNAME`, and the exec user's `HOME`); the user
+is `Config.User` resolved in the container's own `/etc/passwd` and
+`/etc/group`; `/etc/os-release`, `/etc/machine-id`, the OpenClaw config files
+and a secret path's existence are read through `/proc/<pid>/root`; and the
+runtimes come from build stamps (OpenClaw's `dist/build-info.json`, Claude
+Code's package or versioned file) and the image's `NODE_VERSION` and
+`PYTHON_VERSION`, as pod mode reads them (pod mode now reads Claude Code's
+version too, so a Claude Code agent's `framework_identity` gains `claude`).
+The config walk follows no link below a root and skips the container's
+`/proc`, `/sys` and `/dev`; a mounted config volume is read. The container's process must be
+visible (`pid: host`) and its cgroup must name the container; otherwise those
+fields are left out, never filled from the scanner's own.
+
 ## RailDash delivery
 
 A user should never have to run a CLI command to get an evidence bundle into
@@ -726,7 +742,7 @@ Folding is new in rule pack 5: RailDash shows a baseline locked under pack 4 as
 A procfs path under a process or thread ID folds the same way, with no note:
 `/proc/2266/task/2270/attr/apparmor/exec` is listed as
 `/proc/*/task/*/attr/apparmor/exec`. The ID is new for every process, and
-every `docker exec` into the agent, including the scanner's own, has the
+every `docker exec` into the agent has the
 container runtime's init read and write a few of these in the agent's PID
 namespace, so without the fold each scan would add new paths and soon fill
 the list. No real file is named `/proc/*`, so the folded path can't pass for
@@ -763,10 +779,9 @@ prefix with no `__pycache__` directory; those are not folded and still drift. Th
 baseline locked under pack 9 as `CONTRACT_MISMATCH` until a pack-10 ASP is
 locked.
 
-The files those `docker exec` commands open (the runtime init's, and the
-scanner's `sh`, `id`, `env`, `hostname` and `uname`) are in the list too,
-since they run in the agent's PID namespace. They are the same on every scan,
-so they are part of the baseline and not drift.
+A `docker exec` into the agent (yours, not the scan's: since rule pack 16 a
+docker-mode scan runs nothing there) puts the files it opens in the list
+too, since it runs in the agent's PID namespace.
 
 ### Schema and limits
 

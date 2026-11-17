@@ -225,11 +225,19 @@ docker run -d --name rail-listen --restart unless-stopped --privileged --pid hos
   -v /var/run/docker.sock:/var/run/docker.sock -v rail-listen:/data \
   -e RAIL_LISTEN_CONTAINER=my-agent -e RAIL_LISTEN_FILE=/data/listen.jsonl \
   railmon listen
-docker run -d --name rail-scan -v rail-listen:/data:ro \
+docker run -d --name rail-scan --pid host --cap-add SYS_PTRACE -v rail-listen:/data:ro \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e RAIL_LISTEN_FILE=/data/listen.jsonl -e RAIL_RAILDASH_URL=... -e RAIL_RAILDASH_TOKEN=... \
   railmon scan --mode docker --container my-agent --interval 300
 ```
+
+The scan runs nothing in the agent's container. Docker inspect is the only
+Docker call it makes, so the socket can be a read-only Docker API proxy. It reads the agent's
+`/etc/os-release`, `/etc/passwd`, runtime build stamps and config files
+through the container's root, `/proc/<pid>/root`, which takes the host PID
+namespace (`--pid host`) and, for an agent that doesn't run as root,
+`SYS_PTRACE`. Without them the scan still runs and says on stderr that
+those fields are left out.
 
 With `RAIL_LISTEN_CONTAINER`, a supervisor in the host PID namespace waits for
 the agent container and runs the probe beside itself, scoped to the
@@ -318,7 +326,7 @@ docker run -d --name rail-files --restart unless-stopped --privileged --pid host
   -v /var/run/docker.sock:/var/run/docker.sock -v rail-listen:/data \
   -e RAIL_FILES_CONTAINER=my-agent -e RAIL_FILES_FILE=/data/files.jsonl \
   railmon files
-docker run -d --name rail-scan -v rail-listen:/data:ro \
+docker run -d --name rail-scan --pid host --cap-add SYS_PTRACE -v rail-listen:/data:ro \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e RAIL_LISTEN_FILE=/data/listen.jsonl -e RAIL_FILES_FILE=/data/files.jsonl \
   -e RAIL_RAILDASH_URL=... -e RAIL_RAILDASH_TOKEN=... \
