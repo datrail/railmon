@@ -191,6 +191,12 @@ jobs:
       - name: files and scan from the built image
         run: python3 tests/files_image_acceptance.py --image railmon:ci
 
+      # DR-300: a docker-mode scan of a real container, once on the socket and
+      # once through a GET-only Docker API proxy the script runs and logs. The
+      # scan must make no exec call, and both bundles must be the same.
+      - name: docker-mode scan through a read-only Docker API
+        run: python3 tests/docker_readonly_acceptance.py --image railmon:ci
+
       # DR-109 M4: this image and RailDash's, run together the way a user runs
       # them (raildash/docs/asp-v1-acceptance.md). RailDash is built from its
       # own master, so a break on either side of the seam shows up here. Not

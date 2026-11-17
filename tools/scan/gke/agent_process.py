@@ -34,6 +34,11 @@ OPENCLAW_PACKAGE_DIRS = (
     "/opt/openclaw",
     "/app",
 )
+# Claude Code's npm package, under the agent's root.
+CLAUDE_PACKAGE_DIRS = (
+    "/usr/local/lib/node_modules/@anthropic-ai/claude-code",
+    "/usr/lib/node_modules/@anthropic-ai/claude-code",
+)
 
 
 def _read(path: Path, max_bytes: int = SMALL_FILE_MAX_BYTES) -> str | None:
@@ -106,7 +111,8 @@ _LIST_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOE
 
 
 def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = True,
-                  hops: int = 32, open_dir: bool = False) -> tuple[list[str], int | None] | None:
+                  hops: int = 32, open_dir: bool = False,
+                  refuse: tuple[str, ...] = ()) -> tuple[list[str], int | None] | None:
     """Resolve `path` inside the container whose root is `root`, one
     component at a time from a handle on that root.
 
@@ -121,7 +127,9 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
 
     Returns the resolved components and, with `open_file`, a descriptor of
     the regular file (opened without blocking, so a FIFO can't hang the
-    scan), or None when there is no such path or it is refused."""
+    scan), or None when there is no such path or it is refused. `refuse`
+    names top-level folders the path may never pass through, checked as
+    each component is reached, so no link can lead into them afterwards."""
     try:
         root_fd = os.open(root, _DIR_FLAGS & ~os.O_NOFOLLOW)  # /proc/<pid>/root is a link to follow
     except OSError:
@@ -139,6 +147,8 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
                     os.close(stack.pop())
                     names.pop()
                 continue
+            if len(stack) == 1 and part in refuse:
+                return None
             info = os.stat(part, dir_fd=stack[-1], follow_symlinks=False)
             if same_device and info.st_dev != root_dev:
                 return None
@@ -189,11 +199,12 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
             os.close(fd)
 
 
-def read_bytes_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES) -> bytes | None:
+def read_bytes_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
+                       same_device: bool = True, refuse: tuple[str, ...] = ()) -> bytes | None:
     """A regular file's bytes inside the agent's root, at most `max_bytes`,
     read as `_walk_in_root` resolves it: never the sidecar's own file, never a
     FIFO or device."""
-    walked = _walk_in_root(root, path, open_file=True)
+    walked = _walk_in_root(root, path, open_file=True, same_device=same_device, refuse=refuse)
     if walked is None or walked[1] is None:
         return None
     fd = walked[1]
@@ -212,13 +223,15 @@ def read_bytes_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BY
         os.close(fd)
 
 
-def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES) -> str | None:
+def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
+                 same_device: bool = True, refuse: tuple[str, ...] = ()) -> str | None:
     """A regular file's text inside the agent's root (read_bytes_in_root)."""
-    data = read_bytes_in_root(root, path, max_bytes)
+    data = read_bytes_in_root(root, path, max_bytes, same_device=same_device, refuse=refuse)
     return None if data is None else data.decode("utf-8", errors="replace")
 
 
-def list_in_root(root: Path, path: str, same_device: bool = True) -> list[str] | None:
+def list_in_root(root: Path, path: str, same_device: bool = True,
+                 refuse: tuple[str, ...] = ()) -> list[str] | None:
     """The names in a directory inside the agent's root, resolved as
     `_walk_in_root` resolves a path, or None when it isn't a directory there."""
     if not [part for part in path.split("/") if part not in ("", ".")]:
@@ -227,7 +240,8 @@ def list_in_root(root: Path, path: str, same_device: bool = True) -> list[str] |
         except OSError:
             return None
     else:
-        walked = _walk_in_root(root, path, open_file=False, same_device=same_device, open_dir=True)
+        walked = _walk_in_root(root, path, open_file=False, same_device=same_device, open_dir=True,
+                               refuse=refuse)
         if walked is None or walked[1] is None:
             return None
         fd = walked[1]
@@ -239,10 +253,11 @@ def list_in_root(root: Path, path: str, same_device: bool = True) -> list[str] |
         os.close(fd)
 
 
-def resolve_under_root(root: Path, path: str, same_device: bool = True) -> str | None:
+def resolve_under_root(root: Path, path: str, same_device: bool = True,
+                       refuse: tuple[str, ...] = ()) -> str | None:
     """`path` as the agent's container resolves it, as an absolute path
     inside that container, or None when it doesn't exist or is refused."""
-    walked = _walk_in_root(root, path, open_file=False, same_device=same_device)
+    walked = _walk_in_root(root, path, open_file=False, same_device=same_device, refuse=refuse)
     return None if walked is None else "/" + "/".join(walked[0])
 
 
@@ -250,8 +265,10 @@ def runtime_versions(root: Path, env: dict[str, str]) -> dict[str, str]:
     """The agent's runtimes, read rather than run: OpenClaw's build stamp
     (dist/build-info.json, else package.json) for the openclaw on the agent's
     PATH or in a usual install folder, and the base image's NODE_VERSION and
-    PYTHON_VERSION. The same strings `openclaw --version`, `node --version`
-    and `python3 --version` print."""
+    PYTHON_VERSION, and Claude Code's version from its npm package or the
+    native installer's versions/<version> file the `claude` on PATH links
+    to. The same strings `openclaw --version`, `claude --version`,
+    `node --version` and `python3 --version` print."""
     versions: dict[str, str] = {}
     package_dirs: list[str] = []
     for directory in (env.get("PATH") or "").split(":"):
@@ -279,11 +296,37 @@ def runtime_versions(root: Path, env: dict[str, str]) -> dict[str, str]:
             commit = str(info.get("commit") or "")[:7]
             versions["openclaw"] = f"OpenClaw {version}" + (f" ({commit})" if commit else "")
             break
+    claude = _claude_version(root, env)
+    if claude:
+        versions["claude"] = f"{claude} (Claude Code)"
     if env.get("NODE_VERSION"):
         versions["node"] = "v" + env["NODE_VERSION"].lstrip("v")
     if env.get("PYTHON_VERSION"):
         versions["python"] = "Python " + env["PYTHON_VERSION"]
     return versions
+
+
+def _claude_version(root: Path, env: dict[str, str]) -> str | None:
+    """Claude Code's version, read rather than run."""
+    package_dirs: list[str] = []
+    for directory in (env.get("PATH") or "").split(":"):
+        resolved = resolve_under_root(root, f"{directory.rstrip('/')}/claude") if directory else None
+        if resolved is None:
+            continue
+        marker = "/node_modules/@anthropic-ai/claude-code/"
+        if marker in resolved:
+            package_dirs.append(resolved.split(marker, 1)[0] + marker.rstrip("/"))
+        else:
+            # The native installer: ~/.local/bin/claude -> .../claude/versions/<version>
+            parts = resolved.rsplit("/", 3)
+            if len(parts) == 4 and parts[1:3] == ["claude", "versions"] and parts[3][:1].isdigit():
+                return parts[3]
+        break
+    for directory in dict.fromkeys(package_dirs + list(CLAUDE_PACKAGE_DIRS)):
+        package = _json(root, f"{directory}/package.json")
+        if isinstance(package, dict) and package.get("name") == "@anthropic-ai/claude-code" and package.get("version"):
+            return str(package["version"])
+    return None
 
 
 def _is_pause(cmdline: str) -> bool:
