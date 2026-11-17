@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": ["mcp__finretail", "Read", "Bash(echo:*)"],
+    "deny": ["WebFetch", "WebSearch", "Bash(curl:*)"],
+    "ask": ["Bash(rm:*)"],
+    "defaultMode": "dontAsk"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/agent-bash-guard"}]}
+    ]
+  }
+}

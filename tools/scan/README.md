@@ -367,16 +367,19 @@ percent-encoded, so a `[redacted]` segment always means RailMon took a
 key-shaped segment out and a consumer can match on the redacted path (see the
 `tool_and_mcp_reach` row above; the rule is `asp_redaction`).
 
-Rule pack 16 (RC-516) fills a pod's harness fields from the harness's own
-files when a harness profile matches the agent, so a pack-15 baseline of a
-pod scan is `CONTRACT_MISMATCH` until a pack-16 ASP is locked. OpenClaw's
-profile is the first to ship: `harness_identity`, `model_name`,
-`llm_provider`, `inference_endpoint`, `mcp_servers_declared`,
+Rule pack 16 (RC-516, with RC-526 in the same pack) fills a pod's harness
+fields from the harness's own files when a harness profile matches the agent,
+so a pack-15 baseline of a pod scan is `CONTRACT_MISMATCH` until a pack-16
+ASP is locked. OpenClaw's profile is the first to ship: `harness_identity`,
+`model_name`, `llm_provider`, `inference_endpoint`, `mcp_servers_declared`,
 `tool_allow_deny`, `approval_policy`, `tool_names`, `system_prompt_present`
 and `skills_inventory` can be `ANSWERED` from `openclaw.json`, OpenClaw's
 package, its state and transcript databases and its workspace (see
-[gke/harness/README.md](gke/harness/README.md)). Self and docker scans are
-unchanged.
+[gke/harness/README.md](gke/harness/README.md)). Claude Code's profile
+(RC-526) answers the same fields from its managed, project, local and user
+settings, `~/.claude.json`, the project's `.mcp.json`, its package or native
+install, its transcripts and its `CLAUDE.md` files and skills. Self and
+docker scans are unchanged.
 
 Rule pack 16 (DR-300): a docker-mode scan runs nothing in the agent's
 container, so a pack-15 baseline is `CONTRACT_MISMATCH` until a pack-16 ASP
