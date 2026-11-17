@@ -151,9 +151,11 @@ def agent_view(subject: dict[str, Any]) -> Any:
 def read_agent_harness(context: dict[str, Any], config_paths: list[Path],
                        known_profiles: list[dict[str, Any]] | None = None,
                        redact_url: Any = None) -> tuple[str | None, dict[str, Any]]:
-    """The matched profile's name (None if none) and the harness fields for
-    the agent in `context`, read through PodSources. `redact_url` is the
-    scanner's, which also masks a secret in a URL's path (a gateway's
+    """The matched profile's name and the harness fields for the agent in
+    `context`, read through PodSources. When no profile matches, the generic
+    reader (generic.py, RC-520) reads them and the name is
+    reader.GENERIC_HARNESS; with no agent process, (None, {}). `redact_url`
+    is the scanner's, which also masks a secret in a URL's path (a gateway's
     /mcp/<key>/sse), so a URL a profile reads is redacted as the bundle's own
     are."""
     subject = context.get("subject")
@@ -163,5 +165,5 @@ def read_agent_harness(context: dict[str, Any], config_paths: list[Path],
     agent = agent_view(subject)
     profile = harness_reader.harness_reader_for(profiles() if known_profiles is None else known_profiles, agent)
     results = harness_reader.read_harness_fields(profile, agent, PodSources(subject.get("root"), config_paths),
-                                                 redact_url=redact_url)
-    return (profile or {}).get("harness"), results
+                                                 redact_url=redact_url, config_paths=[str(p) for p in config_paths])
+    return (profile or {}).get("harness", harness_reader.GENERIC_HARNESS), results

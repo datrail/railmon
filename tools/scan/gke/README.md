@@ -120,6 +120,11 @@ specific to pods; `harness/harness_sources.py` is pod mode's side of it:
   Environment values and the working directory are used to find files only.
 
 Pod mode replaces a harness field only with a value a matching profile
-found. OpenClaw's profile (RC-516) and Claude Code's (RC-526) ship; the
-generic reader for any other harness is RC-520. For an agent no profile matches,
-the bundle's own values stand.
+found. OpenClaw's profile (RC-516) and Claude Code's (RC-526) ship. For an
+agent no profile matches, the generic reader (`harness/generic.py`, RC-520)
+reads what any harness may use (`.mcp.json`, `AGENTS.md`, `*_MODEL` and
+`*_BASE_URL` variables, and model-like and permission-named keys in the
+top-level `*.json` under `--config-path`); its values are merged as a
+profile's are, and every harness field it can't fill is `BLIND` with
+`UNKNOWN_HARNESS` where the bundle would only have said "not found", with
+`tool_schemas` `BLIND`, not `ABSENT`, when there is no MCP config.
