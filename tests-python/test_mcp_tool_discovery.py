@@ -39,6 +39,8 @@ class FakeMcpServer:
         self.require_auth = require_auth
         self.session_header = session_header
         self.seen_session_ids = []
+        # Every request's Authorization header, None when it had none (RC-511).
+        self.seen_authorization = []
         self._issued_session_id = "test-session-1"
 
         tools_by_call = self.tools
@@ -46,6 +48,7 @@ class FakeMcpServer:
         issued_session_id = self._issued_session_id
         send_session_header = self.session_header
         seen = self.seen_session_ids
+        seen_auth = self.seen_authorization
         cursors = self.seen_cursors = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -54,6 +57,7 @@ class FakeMcpServer:
 
             def do_POST(self):
                 seen.append(self.headers.get("Mcp-Session-Id"))
+                seen_auth.append(self.headers.get("Authorization"))
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if require_auth_ is not None and self.headers.get("Authorization") != require_auth_:
@@ -465,6 +469,259 @@ class MalformedMcpResponseTest(unittest.TestCase):
 
     def test_bad_port_is_unreachable(self):
         self.assertEqual(scanner.probe_mcp_server("http://127.0.0.1:abc/mcp", None), (None, "unreachable", False))
+
+
+# ── RC-511: tool_schemas ─────────────────────────────────────────────────────
+
+_evidence_spec = importlib.util.spec_from_file_location(
+    "evidence_bundle", ROOT / "tools" / "scan" / "evidence_bundle.py"
+)
+evidence_bundle = importlib.util.module_from_spec(_evidence_spec)
+assert _evidence_spec.loader is not None
+_evidence_spec.loader.exec_module(evidence_bundle)
+
+KEY = "sk-live-" + "a1B2c3D4" * 4
+FINRETAIL_TOOLS = [
+    {
+        "name": "getInterestRate",
+        "description": "The interest rate for a product.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["product"],
+            "properties": {
+                "product": {"type": "string", "enum": ["savings", "mortgage"], "description": "Which product"},
+                "term_months": {"type": "integer", "minimum": 1, "maximum": 360, "default": 12},
+                "as_of": {"type": "string", "format": "date", "examples": ["2026-11-01"]},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "Interest rate", "readOnlyHint": True, "x-owner": "retail"},
+    },
+    {"name": "listBranches", "description": "Every branch."},
+]
+
+
+def tool_schemas_from(servers: list[tuple[str, dict]], *, send_headers: bool = True) -> list[dict]:
+    """tool_schemas' servers, as build_registration_payload collects them."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / ".mcp.json"
+        path.write_text(json.dumps({"mcpServers": dict(servers)}))
+        schemas: list[dict] = []
+        scanner.collect_skills([path], {}, send_headers=send_headers, schemas=schemas)
+    return scanner.cap_tool_schemas(schemas)
+
+
+class RecordToolSchemaTest(unittest.TestCase):
+    """record_tool_schema, redact_json and the tool_schemas attribute against
+    a live loopback MCP server."""
+
+    def test_the_schema_matches_what_the_server_declares(self):
+        with FakeMcpServer(FINRETAIL_TOOLS) as server:
+            (entry,) = tool_schemas_from([("finretail", {"url": server.url})])
+        self.assertEqual((entry["server"], entry["reachability"]), ("finretail", "reached"))
+        self.assertEqual(entry["endpoints"], [server.url])
+        rate, branches = entry["tools"]
+        self.assertEqual(rate, {
+            "name": "getInterestRate",
+            "inputSchema": FINRETAIL_TOOLS[0]["inputSchema"],
+            "annotations": FINRETAIL_TOOLS[0]["annotations"],
+        })
+        self.assertEqual(branches, {"name": "listBranches"})  # declares no schema: none, and no omission mark
+
+        field = evidence_bundle.tool_schemas_attribute([entry], [])
+        self.assertEqual((field["status"], field["tier"], field["authored_by"]), ("ANSWERED", "declared", "subject"))
+        self.assertEqual(field["value"], [entry])
+
+    def test_a_key_in_a_default_is_redacted(self):
+        tools = [{
+            "name": "callPartner",
+            "inputSchema": {"type": "object", "properties": {
+                "api_key": {"type": "string", "default": KEY},
+                "note": {"type": "string", "examples": [f"use {KEY} here"], "description": f"demo {KEY}"},
+                KEY: {"type": "string"},
+            }},
+            "annotations": {"title": f"Partner {KEY}"},
+        }]
+        with FakeMcpServer(tools) as server:
+            (entry,) = tool_schemas_from([("partner", {"url": server.url})])
+        (tool,) = entry["tools"]
+        self.assertNotIn(KEY, json.dumps(entry))
+        properties = tool["inputSchema"]["properties"]
+        self.assertEqual(properties["api_key"], {"type": "string", "default": "[redacted]"})
+        self.assertEqual(properties["note"]["examples"], ["use [redacted] here"])
+        self.assertIn("[redacted]", properties)  # a key used as a property name, too
+        self.assertEqual(tool["annotations"], {"title": "Partner [redacted]"})
+
+    def test_redact_json_redacts_every_string_and_keeps_the_rest(self):
+        self.assertEqual(
+            scanner.redact_json({"a": [KEY, 1, 2.5, True, None], KEY: {"b": "plain"}}),
+            {"a": ["[redacted]", 1, 2.5, True, None], "[redacted]": {"b": "plain"}},
+        )
+
+    def test_without_headers_the_server_sees_no_authorization(self):
+        spec = {"url": None, "headers": {"Authorization": f"Bearer {KEY}"}}
+        with FakeMcpServer(FINRETAIL_TOOLS) as server:
+            spec["url"] = server.url
+            (entry,) = tool_schemas_from([("finretail", spec)], send_headers=False)
+        self.assertTrue(server.seen_authorization)
+        self.assertEqual(set(server.seen_authorization), {None})
+        self.assertEqual(entry["reachability"], "reached")
+        # Self and docker mode still send the config's header, as before.
+        with FakeMcpServer(FINRETAIL_TOOLS) as server:
+            spec["url"] = server.url
+            tool_schemas_from([("finretail", spec)])
+        self.assertEqual(set(server.seen_authorization), {f"Bearer {KEY}"})
+
+    def test_a_server_that_needs_auth_is_blind_with_private_store(self):
+        with FakeMcpServer(FINRETAIL_TOOLS, require_auth="Bearer secret-1") as server:
+            (entry,) = tool_schemas_from(
+                [("crm", {"url": server.url, "headers": {"Authorization": "Bearer secret-1"}})], send_headers=False
+            )
+        self.assertEqual(server.seen_authorization, [None])  # asked once, never retried with a credential
+        self.assertEqual((entry["reachability"], entry["tools"]), ("auth_refused", []))
+        field = evidence_bundle.tool_schemas_attribute([entry], [])
+        self.assertEqual((field["status"], field["reason"], field["value"]), ("BLIND", "PRIVATE_STORE", None))
+        self.assertIn("crm", field["note"])
+
+    def test_one_private_server_beside_a_public_one_is_partial_with_private_store(self):
+        with FakeMcpServer(FINRETAIL_TOOLS) as public, \
+                FakeMcpServer(FINRETAIL_TOOLS, require_auth="Bearer secret-1") as private:
+            servers = tool_schemas_from([("finretail", {"url": public.url}), ("crm", {"url": private.url})])
+        field = evidence_bundle.tool_schemas_attribute(servers, [])
+        self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "PRIVATE_STORE"))
+        self.assertEqual([s["server"] for s in field["value"]], ["crm", "finretail"])
+
+    def test_an_oversized_schema_is_partial_with_size_cap_exceeded(self):
+        big = {"type": "object", "description": "x" * (scanner.TOOL_SCHEMA_BYTES + 1)}
+        with FakeMcpServer([{"name": "bulkImport", "inputSchema": big}, FINRETAIL_TOOLS[1]]) as server:
+            (entry,) = tool_schemas_from([("bulk", {"url": server.url})])
+        self.assertEqual(entry["tools"][0], {"name": "bulkImport", "schema_omitted": "per_tool_budget"})
+        field = evidence_bundle.tool_schemas_attribute([entry], [])
+        self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
+        self.assertIn("bulk", field["note"])
+
+    def test_all_schemas_together_stay_within_their_budget(self):
+        schema = {"type": "object", "properties": {f"p{i}": {"type": "string", "description": "x" * 40}
+                                                   for i in range(60)}}
+        tools = [{"name": f"t{i:03d}", "inputSchema": schema} for i in range(200)]
+        servers = scanner.cap_tool_schemas([scanner.tool_schema_server("big", "a.json", [], "reached", tools, False)])
+        kept = [tool for tool in servers[0]["tools"] if "inputSchema" in tool]
+        self.assertTrue(0 < len(kept) < 200)
+        self.assertEqual([t["name"] for t in servers[0]["tools"]], [f"t{i:03d}" for i in range(200)])
+        self.assertEqual({t.get("schema_omitted") for t in servers[0]["tools"][len(kept):]}, {"bundle_budget"})
+        field = evidence_bundle.tool_schemas_attribute(servers, [])
+        self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
+
+        # The budget is what the bundle writes: render_json's indent=2, at the
+        # value's deepest place (a v2 agent scope), not compact JSON.
+        def rendered(value):
+            bundle = {"agents": [{"attributes": {"tool_schemas": {"value": value}}}]}
+            return len(scanner.render_json(bundle, compact=False))
+
+        self.assertLessEqual(rendered(field["value"]) - rendered([]), scanner.TOOL_SCHEMAS_BYTES)
+        self.assertGreater(rendered(field["value"]) - rendered([]), scanner.TOOL_SCHEMAS_BYTES * 0.9)
+
+    def test_a_large_server_keeps_the_rendered_bundle_under_its_1_mib_bound(self):
+        # The review's case: one server's 200 large schemas land in both
+        # tool_schemas and skills_inventory, each within its own budget.
+        schema = {"type": "object", "properties": {f"p{i}": {"type": "string", "description": "x" * 40}
+                                                   for i in range(60)}}
+        tools = [{"name": f"t{i:03d}", "description": "d", "inputSchema": schema} for i in range(200)]
+        servers = scanner.cap_tool_schemas([scanner.tool_schema_server("big", "a.json", [], "reached", tools, False)])
+        skills = scanner.merge_skill_lists([
+            {"name": t["name"], "description": "d", "source_type": "mcp_config", "entry": "tool", "server": "big",
+             "inputSchema": schema} for t in tools
+        ])
+        bundle = {"attributes": {
+            "tool_schemas": evidence_bundle.tool_schemas_attribute(servers, []),
+            "skills_inventory": {"value": skills, "status": "ANSWERED", "tier": "declared"},
+        }}
+        size = len(scanner.render_json(bundle, compact=False))
+        self.assertLess(size, 600 * 1024)  # leaves the rest of the 1 MiB for the other attributes
+
+    def test_down_stdio_and_no_config(self):
+        servers = tool_schemas_from([("down", {"url": "http://127.0.0.1:1/mcp"})])
+        field = evidence_bundle.tool_schemas_attribute(servers, [])
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "NO_SOURCE_ACCESS"))
+        servers = tool_schemas_from([("local", {"command": "mcp-server", "args": ["--token", KEY]})])
+        self.assertNotIn(KEY, json.dumps(servers))
+        field = evidence_bundle.tool_schemas_attribute(servers, [])
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "NOT_COLLECTED_BY_PACK"))
+        field = evidence_bundle.tool_schemas_attribute([], ["/agent/.mcp.json"])
+        self.assertEqual((field["status"], field["method"]), ("ABSENT", "scanned /agent/.mcp.json"))
+        field = evidence_bundle.tool_schemas_attribute(None, [])
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "NOT_COLLECTED_BY_PACK"))
+
+
+class PodModeToolSchemasTest(unittest.TestCase):
+    """The real scanner in pod mode, as a subprocess, against a local fake
+    MCP server named in the agent's .mcp.json with a credential header."""
+
+    POD = {
+        "POD_NAME": "agent-finretail-58cd78b55d-48jcw",
+        "POD_NAMESPACE": "gke-test",
+        "POD_UID": "f3fe5e58-b328-40cb-9b03-1acf558d773d",
+        "NODE_NAME": "gke-gke-test-default-pool-1c6529e9-aqik",
+    }
+
+    def scan(self, server_url: str) -> dict:
+        import os
+        import subprocess
+        import sys
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, ignore_errors=True)
+        (tmp / "config").mkdir()
+        (tmp / "config" / ".mcp.json").write_text(json.dumps({"mcpServers": {
+            "finretail": {"url": server_url, "headers": {"Authorization": f"Bearer {KEY}"}},
+        }}))
+        (tmp / "podinfo").mkdir()
+        (tmp / "podinfo" / "labels").write_text('app="agent-finretail"\npod-template-hash="58cd78b55d"\n')
+        (tmp / "home").mkdir()
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("RAIL_", "GCE_", "POD_", "GIT_")) and key not in ("NODE_NAME", "USER", "LOGNAME")}
+        env.update(self.POD, HOME=str(tmp / "home"), RAIL_POD_INFO_DIR=str(tmp / "podinfo"))
+        proc = subprocess.run(
+            [sys.executable, str(SCANNER), "--mode", "pod", "--config-path", str(tmp / "config"),
+             "--host-id", "gke-test",
+             "--feature-output", str(tmp / "features.json"),
+             "--evidence-bundle-output", str(tmp / "bundle.json"),
+             "--output", str(tmp / "payload.json")],
+            cwd=tmp, capture_output=True, text=True, env=env, timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        bundle = json.loads((tmp / "bundle.json").read_text())
+        evidence_bundle.verify_bundle(bundle)
+        self.assertNotIn(KEY, (tmp / "bundle.json").read_text())
+        self.assertNotIn("tool_schemas", json.loads((tmp / "payload.json").read_text()))
+        return bundle["attributes"]
+
+    def test_the_sidecar_sends_no_credential_and_records_the_schemas(self):
+        with FakeMcpServer(FINRETAIL_TOOLS) as server:
+            field = self.scan(server.url)["tool_schemas"]
+        self.assertTrue(server.seen_authorization)
+        self.assertEqual(set(server.seen_authorization), {None})
+        self.assertEqual(field["status"], "ANSWERED")
+        (entry,) = field["value"]
+        self.assertEqual(entry["tools"][0]["inputSchema"], FINRETAIL_TOOLS[0]["inputSchema"])
+
+    def test_a_server_that_needs_the_agents_credential_is_private_store(self):
+        with FakeMcpServer(FINRETAIL_TOOLS, require_auth=f"Bearer {KEY}") as server:
+            attributes = self.scan(server.url)
+        self.assertEqual(set(server.seen_authorization), {None})
+        field = attributes["tool_schemas"]
+        self.assertEqual((field["status"], field["reason"]), ("BLIND", "PRIVATE_STORE"))
+        # The same credential-free probe feeds skills_inventory: the server is
+        # an auth_refused server entry, and the inventory is PARTIAL, rather
+        # than the sidecar presenting the agent's credential to list it.
+        skills = attributes["skills_inventory"]
+        self.assertEqual((skills["status"], skills["reason"]), ("PARTIAL", "NO_SOURCE_ACCESS"))
+        (entry,) = [skill for skill in skills["value"] if skill.get("server") == "finretail"]
+        self.assertEqual((entry["entry"], entry["reachability"]), ("server", "auth_refused"))
+        self.assertIn("finretail", skills["note"])
 
 
 if __name__ == "__main__":
