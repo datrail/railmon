@@ -131,6 +131,9 @@ def main() -> int:
     agent, probe = "ci-listen-agent", "ci-listen-probe"
     listen_file = data / "listen.jsonl"
     checks: dict[str, bool] = {}
+    # What a check compared, printed only when it fails, so a failure in CI
+    # says what the bundle held rather than only that it was wrong.
+    seen: dict[str, object] = {}
     finished = False
 
     def attaches() -> int:
@@ -193,6 +196,7 @@ def main() -> int:
         )
         wait_for("a heartbeat", lambda: any(e.get("kind") == "alive" for e in records()), timeout=15)
         listeners = scan()
+        seen["the bundle names the port and process"] = listeners
         checks["the bundle names the port and process"] = bool(listeners) and (
             listeners["status"] == "ANSWERED"
             and {"protocol": "tcp", "addr": "0.0.0.0", "port": PORT, "process": "python3"}
@@ -217,6 +221,7 @@ def main() -> int:
             (e["pid"], e["peer"]) for e in peer_events()] == [(agent_pid, client_ip)] and all(
             e.get("peers") is True for e in records() if e.get("kind") == "start")
         peers = scan("observed_ingress_peers")
+        seen["the bundle names the peer, scoped private"] = {"client": client_ip, "attribute": peers}
         checks["the bundle names the peer, scoped private"] = bool(peers) and (
             peers["status"] == "ANSWERED"
             and {"protocol": "tcp", "addr": "0.0.0.0", "port": PORT, "process": "python3",
@@ -273,6 +278,8 @@ def main() -> int:
 
     for name, passed in checks.items():
         print(("ok:   " if passed else "FAIL: ") + name)
+        if not passed and name in seen:
+            print("      got: " + json.dumps(seen[name], sort_keys=True))
     if len(checks) < 12 or not all(checks.values()):  # twelve checks, all passed
         return 1
     print(json.dumps({"result": "PASS", "port": PORT, "agent_pid": agent_pid}))

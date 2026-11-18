@@ -161,10 +161,15 @@ class Adapter:
     filesnoop's (`files`) records. `feed` takes a line and returns the
     records it completes; `flush` ends the current network batch."""
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, proc: str | None = None) -> None:
         if mode not in ("listen", "files"):
             raise ValueError(f"mode must be listen or files, not {mode!r}")
         self.mode = mode
+        # The host's /proc, so a listener or peer is named for its process,
+        # not the thread that acted (see _process_name). Only for a caller in
+        # the host's PID namespace, as AgentSight's pids are the host's:
+        # follow_container (--pid host). None names it as the record does.
+        self.proc = proc
         # (pid, process start, port) a process asked bind() for.
         self.asked: OrderedDict = OrderedDict()
         # (pid, process start, protocol, port) -> (family, addr, ephemeral).
@@ -275,9 +280,32 @@ class Adapter:
         if kind in ("NET_LISTEN", "NET_BIND", "NET_ACCEPT") and "protocol" in record:
             self.pending.append(record)
 
+    def _process_name(self, record: dict[str, Any], pid: int) -> str:
+        """The name of the process `pid` belongs to: its main thread's comm,
+        as `railmon listen`'s snapshot reads it (follow_container's
+        _namespace_sockets), so a listener keys the same whether the probe or
+        the snapshot saw it. AgentSight's `comm` is the acting thread's, and
+        a runtime that names its threads (Python from 3.14, the JVM) would
+        otherwise report a peer accepted on a worker as `Thread-1 (serve`.
+        The record's own comm stands when the process is gone or unreadable.
+        It is read for every record, not cached, so a process that renames
+        itself keys as the snapshot at the next attach reads it."""
+        comm = _comm(record.get("comm"))
+        if self.proc is None or pid <= 0:
+            return comm
+        try:
+            with open(f"{self.proc}/{pid}/status", "rb") as f:
+                tgid = next(int(line.split()[1]) for line in f if line.startswith(b"Tgid:"))
+            with open(f"{self.proc}/{tgid}/comm", "rb") as f:
+                name = f.read().decode("latin-1").removesuffix("\n")
+        except (OSError, StopIteration, ValueError, IndexError):
+            return comm
+        return name
+
     def _base(self, record: dict[str, Any], kind: str) -> dict[str, Any]:
         pid = _int(record.get("pid")) or 0
-        out = {"kind": kind, "pid": pid, "host_pid": pid, "comm": _comm(record.get("comm"))}
+        comm = self._process_name(record, pid) if kind in ("listen", "bind", "peer") else _comm(record.get("comm"))
+        out = {"kind": kind, "pid": pid, "host_pid": pid, "comm": comm}
         timestamp = _int(record.get("timestamp"))
         return {"timestamp_ns": timestamp, **out} if timestamp is not None else out
 
@@ -472,6 +500,9 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    # No proc: run directly, this may share the agent's PID namespace
+    # (`--pid container:<agent>`), whose /proc doesn't hold the host pids
+    # AgentSight writes, so records keep AgentSight's comm.
     for line in adapt_stream(child.stdout, Adapter(args.mode)):
         sink.write(line)
         sink.flush()
