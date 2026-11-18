@@ -128,3 +128,69 @@ top-level `*.json` under `--config-path`); its values are merged as a
 profile's are, and every harness field it can't fill is `BLIND` with
 `UNKNOWN_HARNESS` where the bundle would only have said "not found", with
 `tool_schemas` `BLIND`, not `ABSENT`, when there is no MCP config.
+
+## HTTP operations (RC-512)
+
+The code is [`spec_probe.py`](spec_probe.py) (the prober and the bundle
+attribute) and [`probe_pool.py`](probe_pool.py) (the pool and the deadline).
+Like the other modules here they import nothing of railmon's: the scanner
+hands itself over with `register`, and what every scan mode shares stays in
+`scan_agent_environment.py` (the MCP probe and its memory bounds, and the
+redaction `tool_schemas` and `skills_inventory` use).
+
+The sidecar asks each HTTP destination for its public API spec, for the
+bundle's `http_operations`. The destinations are the origins
+(`scheme://host:port`) of the MCP servers the MCP probe asks
+([`../README.md`](../README.md#tool-schemas)), the harness profile's included, so OpenClaw's and Claude Code's servers are
+covered; the model endpoint is not one. Each is sent `GET /openapi.json`,
+`/v3/api-docs`, `/swagger.json` and `/api-docs`, in that order, with no
+credentials, 5 seconds a path, until one serves an OpenAPI 3 or Swagger 2 JSON
+document. When the origin serves none, the same four paths are asked under
+the path its MCP servers are mounted at (`/finretail/v3/api-docs` for a server
+at `/finretail/mcp`), up to two mount paths a destination, and `spec_path`
+says where the spec was found. A server whose URL carries a credential is
+neither a destination nor a mount path, as the MCP probe doesn't ask it
+either: it is usually a tenant of a shared service, whose origin's spec
+wouldn't describe what the agent calls. Only `http` and `https` are asked,
+and a redirect is followed only to the same origin, so a config entry can
+never make the sidecar read a `file://` URL or ask another host. The prober
+follows a redirect itself, at most 3 times, from its `Location` header alone,
+so a redirect's body is never read. At most 4 MB of a spec is read
+(`OPENAPI_MAX_BYTES`), and the whole request, redirects included, has its
+5 seconds.
+
+`http_operations` holds one entry per destination: its `destination`, its own
+`status` (and `reason` and `note` when it isn't `ANSWERED`), and for a spec
+found its `spec_path`, `spec_version` and `operations`. Each operation keeps
+its `method`, `path`, `operationId`, and the `request_content_types` and
+`response_content_types` the spec declares, every string through
+`redact_text`; nothing else of the spec (parameters, schemas, examples) is
+kept. A destination keeps at most 1,000 operations, and the whole value at
+most 128 KiB as the bundle writes it; past either, `operations_truncated`.
+With `skills_inventory`'s and `tool_schemas`' 256 KiB and
+`observed_file_access`'s 256 KiB (only with a files snapshot), that leaves
+128 KiB of a pod-mode bundle's 1 MiB for every other attribute, and a test
+fails if the budgets grow past it. The caps are to be revisited with the
+overhead benchmark (RC-525).
+
+| Status, reason | When |
+| --- | --- |
+| `ANSWERED` | some destination served a spec, and every other answered without one |
+| `PARTIAL` / `BLIND`, `PRIVATE_STORE` | a destination answered 401 or 403 and served no spec: it isn't public |
+| `PARTIAL` / `BLIND`, `NO_SOURCE_ACCESS` | a destination didn't answer, answered 5xx, or was still unanswered at the scan's deadline (`deadline_exceeded`) |
+| `PARTIAL`, `SIZE_CAP_EXCEEDED` | a spec past 4 MB or 500,000 JSON elements (the operations in the part read are kept), or past the operation caps |
+| `BLIND`, `NOT_COLLECTED_BY_PACK` | a self or docker scan: only the sidecar probes specs |
+| `BLIND`, `tool_schemas`' reason | no MCP server found at all, and `tool_schemas` is `BLIND` or `FAILED` with no server: the servers the destinations come from weren't established (a profile that couldn't read the MCP config, or a harness no profile matches with none) |
+| `ABSENT` | no HTTP destination (no MCP server, or only command servers and URLs carrying a credential, none with an origin to ask), or none serves a spec |
+
+### The probe pool and the scan deadline
+
+The sidecar's MCP and spec probes run 4 at a time (`PROBE_POOL_WORKERS`),
+3 seconds an MCP call and 5 seconds a spec path, and the whole scan gets 60
+seconds from its start (`SCAN_DEADLINE_SECONDS`). A probe that hasn't answered
+by then is reported for its server alone: its `tool_schemas` entry is
+`unreachable` with `deadline_exceeded`, its `http_operations` entry `BLIND`,
+`NO_SOURCE_ACCESS` with `deadline_exceeded`, and the rest of the bundle is
+built and sent as usual. A late probe isn't waited for: it ends on its own
+per-call timeout, in the background. Self and docker scans probe one server
+after another, with no deadline, as before.

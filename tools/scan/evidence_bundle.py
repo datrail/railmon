@@ -108,6 +108,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 16 adds tool_schemas (RC-511): every MCP tool's input schema and
 # annotations, redacted and capped, and in pod mode the MCP probe drops the
 # agent's MCP headers, so a server that needs them is auth_refused.
+# Pack 16 adds http_operations (RC-512): in pod mode, each MCP server's
+# origin's public API spec operations (tools/scan/gke/spec_probe.py);
+# elsewhere BLIND, NOT_COLLECTED_BY_PACK.
 # Pack 16 fills a pod's harness fields from the harness's own files when a
 # harness profile matches the agent (RC-516: OpenClaw's, the first to ship):
 # harness_identity, model_name, llm_provider, inference_endpoint,
@@ -1642,6 +1645,10 @@ def build_evidence_bundle(
 
     attributes["tool_schemas"] = tool_schemas_attribute(identity.get("tool_schemas"), scanned_roots,
                                                         unread=identity.get("tool_schemas_unread"))
+    # Only the pod-mode sidecar probes API specs (RC-512): pod mode puts its
+    # own http_operations in place of this (tools/scan/gke/spec_probe.py).
+    attributes["http_operations"] = _blind("NOT_COLLECTED_BY_PACK", "declared",
+                                           note="API specs are probed by the pod-mode sidecar only")
 
     attributes.update(registration_attributes(payload))
     # A scan mode that reads some attributes its own way fills them last
@@ -1702,6 +1709,9 @@ def tool_schemas_attribute(servers: list[dict[str, Any]] | None, scanned_roots: 
         return list(dict.fromkeys(server["server"] for server in servers if server["reachability"] == reachability))
 
     refused, unreached, stdio = named("auth_refused"), named("unreachable"), named("not_probed_stdio")
+    # RC-512: unreachable because it was still unanswered at the scan's deadline.
+    late = list(dict.fromkeys(server["server"] for server in servers if server.get("deadline_exceeded")))
+    unreached = [name for name in unreached if name not in late]
     capped = list(dict.fromkeys(
         server["server"] for server in servers
         if server.get("tools_truncated")
@@ -1713,13 +1723,15 @@ def tool_schemas_attribute(servers: list[dict[str, Any]] | None, scanned_roots: 
         notes.append("needs a credential, not public: " + ", ".join(refused))
     if unreached:
         notes.append("not reached: " + ", ".join(unreached))
+    if late:
+        notes.append("no answer within the scan's deadline: " + ", ".join(late))
     if capped:
         notes.append("schemas or tool list cut for size: " + ", ".join(capped))
     if stdio:
         notes.append("command servers, never started: " + ", ".join(stdio))
     reason = (
         "PRIVATE_STORE" if refused
-        else "NO_SOURCE_ACCESS" if unreached
+        else "NO_SOURCE_ACCESS" if unreached or late
         else "SIZE_CAP_EXCEEDED" if capped
         else "NOT_COLLECTED_BY_PACK" if stdio
         else None
@@ -1732,7 +1744,6 @@ def tool_schemas_attribute(servers: list[dict[str, Any]] | None, scanned_roots: 
                         note="; ".join(notes))
     return _answered(servers, "declared", authored_by="subject", method=TOOL_SCHEMAS_METHOD,
                      note="each tool as its server declares it; strings that look like keys are redacted")
-
 
 # ── the registration payload's fields (DR-189, DR-193) ──────────────────────
 # The bundle carries everything the registration payload does, so Rail Center

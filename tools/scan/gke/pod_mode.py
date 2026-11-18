@@ -451,6 +451,21 @@ def collect_context(base: dict[str, Any], config_paths: list[Path],
     return context
 
 
+def _spec_probe() -> Any:
+    """spec_probe.py beside this file, under the name the scanner loads it by
+    (its attribute builder needs nothing the scanner registers)."""
+    module = sys.modules.get("gke_spec_probe")
+    if module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("gke_spec_probe", Path(__file__).with_name("spec_probe.py"))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["gke_spec_probe"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
 def _agent_process() -> Any:
     """agent_process.py beside this file, loaded by path once, under the same
     name the scanner uses, so both share one module."""
@@ -541,6 +556,14 @@ def bundle_attributes(context: dict[str, Any], payload: dict[str, Any],
     }
     attributes.update(harness_attributes(context, {"answered": answered, "blind": blind, **builders},
                                          existing=existing, shapers=shapers))
+    if context.get("http_operations") is not None:
+        # RC-512: the API spec prober's results (spec_probe.py, run in
+        # probe_pool.py's probe stage), against tool_schemas as it now stands,
+        # after the harness reader, since the destinations are its servers'.
+        tool_schemas = attributes.get("tool_schemas") or (existing or {}).get("tool_schemas") or {}
+        attributes["http_operations"] = _spec_probe().http_operations_attribute(
+            context["http_operations"], tool_schemas, {"answered": answered, "blind": blind, **builders},
+            servers=context.get("http_operations_servers") or 0)
     if context.get("subject") is None:
         reason = context.get("subject_reason") or "no agent process"
         attributes.update(subject_blind(blind, reason))
