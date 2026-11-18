@@ -1106,7 +1106,8 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # 15 marks each MCP skill's reachability, an omitted schema and a
         # truncated tool list, and reads a server it can't list as PARTIAL
         # (DR-293); pack 16 fills a pod's harness fields from OpenClaw's and
-        # Claude Code's harness profiles (RC-516, RC-526).
+        # Claude Code's harness profiles (RC-516, RC-526) and adds tool_schemas
+        # (RC-511).
         self.assertEqual(self.bundle(None)["rule_pack_version"], 16)
 
     def test_the_method_and_notes_name_the_probe_that_wrote_the_file(self):

@@ -105,6 +105,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # left out carries schema_omitted, tools/list follows nextCursor (bounded,
 # with tools_truncated), and skills_inventory is PARTIAL when a server was
 # not reached or its list was cut.
+# Pack 16 adds tool_schemas (RC-511): every MCP tool's input schema and
+# annotations, redacted and capped, and in pod mode the MCP probe drops the
+# agent's MCP headers, so a server that needs them is auth_refused.
 # Pack 16 fills a pod's harness fields from the harness's own files when a
 # harness profile matches the agent (RC-516: OpenClaw's, the first to ship):
 # harness_identity, model_name, llm_provider, inference_endpoint,
@@ -1629,6 +1632,9 @@ def build_evidence_bundle(
             note="no skills in the MCP config or skills files",
         )
 
+    attributes["tool_schemas"] = tool_schemas_attribute(identity.get("tool_schemas"), scanned_roots,
+                                                        unread=identity.get("tool_schemas_unread"))
+
     attributes.update(registration_attributes(payload))
     # A scan mode that reads some attributes its own way fills them last
     # (pod mode's are in tools/scan/gke/).
@@ -1654,6 +1660,69 @@ def build_evidence_bundle(
         "attestations": [],
         "attributes": attributes,
     }
+
+TOOL_SCHEMAS_METHOD = "MCP initialize and tools/list on each configured server, without credentials in pod mode"
+# What leaves a tool's schema out for size, as opposed to unrepresentable.
+TOOL_SCHEMA_SIZE_OMISSIONS = frozenset({"per_tool_budget", "bundle_budget"})
+
+
+def tool_schemas_attribute(servers: list[dict[str, Any]] | None, scanned_roots: list[str],
+                           unread: dict[str, str] | None = None) -> dict[str, Any]:
+    """tool_schemas (RC-511): each configured MCP server's tools with their
+    input schemas, from `record_tool_schema`.
+
+    The status names the worst gap, in this order: a server that needs a
+    credential (PRIVATE_STORE: the scan sends none, so it is not public), one
+    that did not answer (NO_SOURCE_ACCESS), a schema or tool list cut for
+    size (SIZE_CAP_EXCEEDED), a command server the scan never starts
+    (NOT_COLLECTED_BY_PACK). BLIND when no server could be listed at all,
+    PARTIAL when some could; the note names every server affected. With no
+    server and `unread` (the harness profile couldn't read the MCP config,
+    RC-531), BLIND with its reason, never ABSENT: "none" wasn't established."""
+    if servers is None:
+        return _blind("NOT_COLLECTED_BY_PACK", "declared", note="the MCP servers were not probed in this scan")
+    if not servers and unread:
+        return _blind(unread["reason"], "declared", note=unread["note"])
+    if not servers:
+        return _absent(
+            "scanned " + (", ".join(scanned_roots) or "no MCP config roots"), "declared",
+            note="no MCP server in the MCP config",
+        )
+
+    def named(reachability: str) -> list[str]:
+        return [server["server"] for server in servers if server["reachability"] == reachability]
+
+    refused, unreached, stdio = named("auth_refused"), named("unreachable"), named("not_probed_stdio")
+    capped = [
+        server["server"] for server in servers
+        if server.get("tools_truncated")
+        or any(tool.get("schema_omitted") in TOOL_SCHEMA_SIZE_OMISSIONS for tool in server["tools"])
+    ]
+    notes = []
+    if refused:
+        notes.append("needs a credential, not public: " + ", ".join(refused))
+    if unreached:
+        notes.append("not reached: " + ", ".join(unreached))
+    if capped:
+        notes.append("schemas or tool list cut for size: " + ", ".join(capped))
+    if stdio:
+        notes.append("command servers, never started: " + ", ".join(stdio))
+    reason = (
+        "PRIVATE_STORE" if refused
+        else "NO_SOURCE_ACCESS" if unreached
+        else "SIZE_CAP_EXCEEDED" if capped
+        else "NOT_COLLECTED_BY_PACK" if stdio
+        else None
+    )
+    listed = [server for server in servers if server["reachability"] in ("reached", "declares_none")]
+    if not listed:
+        return _blind(reason or "NO_SOURCE_ACCESS", "declared", method=TOOL_SCHEMAS_METHOD, note="; ".join(notes))
+    if reason:
+        return _partial(servers, "declared", reason, authored_by="subject", method=TOOL_SCHEMAS_METHOD,
+                        note="; ".join(notes))
+    return _answered(servers, "declared", authored_by="subject", method=TOOL_SCHEMAS_METHOD,
+                     note="each tool as its server declares it; strings that look like keys are redacted")
+
 
 # ── the registration payload's fields (DR-189, DR-193) ──────────────────────
 # The bundle carries everything the registration payload does, so Rail Center

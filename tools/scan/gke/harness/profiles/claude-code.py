@@ -415,7 +415,9 @@ def register(reader: Any) -> None:
                 return ctx.result("FAILED", field, reason="PARSE_FAILED", note=f"{MANAGED_MCP} could not be parsed")
         if isinstance(managed, dict):
             # Exclusive control: Claude Code loads these and no others.
-            return ctx.result("ANSWERED", field, value=managed, source=MANAGED_MCP,
+            # `exclusive` tells the MCP probe (RC-531) to ask these servers
+            # and no others; the bundle's attribute doesn't carry it.
+            return ctx.result("ANSWERED", field, value=managed, source=MANAGED_MCP, exclusive=True,
                               note="managed-mcp.json takes exclusive control: no other server is loaded")
         servers: dict[str, Any] = {}
         sources: list[str] = []
