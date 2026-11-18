@@ -397,6 +397,13 @@ The config walk follows no link below a root and skips the container's
 visible (`pid: host`) and its cgroup must name the container; otherwise those
 fields are left out, never filled from the scanner's own.
 
+Rule pack 16 (RC-511) adds `tool_schemas`, every MCP tool's input schema for
+Data GuardRail's before-run rules, so a pack-15 baseline is
+`CONTRACT_MISMATCH` until a pack-16 ASP is locked (see
+[Tool schemas](#tool-schemas)). In pod mode the probe no longer sends the
+agent's MCP `headers`, so a server that needs them is `auth_refused` in
+`skills_inventory` too. Self and docker scans send them as before.
+
 ## RailDash delivery
 
 A user should never have to run a CLI command to get an evidence bundle into
@@ -1174,6 +1181,54 @@ a JSON object); a tool that declares no schema carries neither. The bundle's
 `unreachable` or `auth_refused`, or with `SIZE_CAP_EXCEEDED` when only a list
 was truncated, and its `note` names the servers. The descriptions are as
 before: an `auth_refused` server's still reads `unreachable`.
+
+### Tool schemas
+
+The same probe fills the bundle's `tool_schemas` (RC-511): one entry per
+configured MCP server, sorted by name, with its `source`, its redacted
+`endpoints`, its `reachability` (the values above) and its `tools`. Each tool
+keeps its `name`, its raw `inputSchema` and its `annotations`, every string in
+them (keys, descriptions, defaults and examples) run through `redact_json`, so
+a key pasted into a default is `[redacted]`. A schema left out says why in
+`schema_omitted`, as in `skills_inventory`: past 8 KiB for one tool
+(`per_tool_budget`), past 256 KiB for the whole value as the bundle writes
+it, pretty-printed at its deepest indentation, with every server entry and
+tool name counted (`bundle_budget`; the tool keeps its name), or
+`unrepresentable`. Annotations that would take a tool past 8 KiB are left
+out. A server read from two configs keeps the entry that reached it.
+
+In pod mode the probe sends none of the agent's MCP `headers`, so the sidecar
+never presents the agent's credential, and a server that needs one is not
+public. A URL that carries a credential itself (userinfo, a query parameter
+named like one or holding a key-shaped value, or a key-shaped path segment)
+isn't asked at all, and the server is `auth_refused`.
+
+In pod mode the servers the agent's harness profile declares are probed too
+(RC-531): OpenClaw's `openclaw.json` (`mcp.servers`), and Claude Code's user,
+project and local scopes, or `/etc/claude-code/managed-mcp.json` alone when it
+exists, since Claude Code then loads no other server. Each server is asked
+once: a `.mcp.json` server of the same name is left to the profile's
+declaration, and its entry's `source` is `<harness> profile`. Without a
+matching profile, `.mcp.json` and the environment are probed as before. A
+profile's servers reach the probe with only their address or command (`url`,
+`command`, `args`, `type`, `transport`), never their `headers` or `env`, and
+their URLs are judged for a credential the same way.
+
+The status names the worst gap:
+
+| Status, reason | When |
+| --- | --- |
+| `ANSWERED` | every server was listed in full |
+| `PARTIAL` / `BLIND`, `PRIVATE_STORE` | a server answered 401 or 403 |
+| `PARTIAL` / `BLIND`, `NO_SOURCE_ACCESS` | a server didn't answer, or answered with something other than MCP |
+| `PARTIAL`, `SIZE_CAP_EXCEEDED` | a schema was left out for size, or a tool list was cut |
+| `PARTIAL` / `BLIND`, `NOT_COLLECTED_BY_PACK` | a `command` server, which the scan never starts |
+| `BLIND`, the profile's reason | no server, and the harness profile couldn't read its MCP config (`PARSE_FAILED`, `NO_SOURCE_ACCESS`) |
+| `ABSENT` | no MCP server in the MCP config |
+
+It's `BLIND` when no server could be listed at all, and `PARTIAL` when some
+could. The `note` names every server affected. The schemas aren't a
+registration field: they reach Rail Center in the bundle only.
 
 Pass custom paths with:
 
