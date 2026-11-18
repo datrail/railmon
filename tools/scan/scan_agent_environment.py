@@ -1263,7 +1263,9 @@ def config_origin(path: Path, home: str | None) -> str:
     """Where an MCP config file is, as tool_schemas names a copy's origin
     (DR-294): the path, with the agent's HOME as `~`, so `./.mcp.json` and
     `~/.mcp.json` are two sources rather than one `.mcp.json`, and a home
-    folder's user name isn't shipped. Redacted like a server's name."""
+    folder's user name isn't shipped with it. A path outside that HOME
+    (--mcp-config, or the scan's own working directory) is shipped as it is,
+    as scanned_roots already ships it. Redacted like a server's name."""
     text = str(path)
     if home and home.strip("/"):
         prefix = home.rstrip("/")
@@ -1799,10 +1801,12 @@ def _rendered_size(value: Any, indent: int) -> int:
 def tool_schema_digest(description: str | None, schema: Any, annotations: Any) -> str:
     """A tool_schemas copy's identity (DR-294): SHA-256 of what the client
     is shown, as RailDash's `tool_schemas.schema_hash` spells it (sorted
-    keys, compact, UTF-8), over the redacted description, input schema and
-    annotations before any size cap, so a copy keeps its digest when the
-    budget leaves its schema out. With nothing redacted it equals the hash
-    RailDash takes of the same tool seen in captured traffic."""
+    keys, compact, UTF-8). record_tool_schema passes what RailDash would
+    hash, redacted and before any size cap: the description as the server
+    sent it if it is a string (whitespace kept, "" kept), the annotations if
+    they are an object (`{}` kept). So a copy keeps its digest when the
+    budget leaves its schema out, and with nothing redacted it equals the
+    hash RailDash takes of the same tool seen in captured traffic."""
     canonical = json.dumps(
         {"description": description, "input_schema": schema, "annotations": annotations},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -1824,33 +1828,34 @@ def record_tool_schema(tool: Any) -> dict[str, Any] | None:
     name = first_nonempty(str(tool.get("name") or ""))
     if not name:
         return None
-    record: dict[str, Any] = {"name": name}
-    description = first_nonempty(redact_text(str(tool.get("description") or ""))) or None
-    schema = tool.get("inputSchema")
-    redacted = None
-    if schema is not None:
-        redacted = redact_json(schema) if isinstance(schema, dict) else None
-        if not isinstance(redacted, dict):
-            redacted = None
+    # What RailDash would hash (tool_schema_digest), redacted: a string
+    # description as sent, an object's annotations ({} included), an object
+    # schema. Every field the record keeps is taken from these.
+    raw_description = tool.get("description")
+    description = redact_text(raw_description) if isinstance(raw_description, str) else None
+    raw_annotations = tool.get("annotations")
+    annotations = redact_json(raw_annotations) if isinstance(raw_annotations, dict) else None
+    annotations = annotations if isinstance(annotations, dict) else None
+    raw_schema = tool.get("inputSchema")
+    schema = redact_json(raw_schema) if isinstance(raw_schema, dict) else None
+    schema = schema if isinstance(schema, dict) else None
+    # The digest goes in first, so every size check below counts it.
+    record: dict[str, Any] = {"name": name, "schema_sha256": tool_schema_digest(description, schema, annotations)}
+    if raw_schema is not None:
+        if schema is None:
             record["schema_omitted"] = "unrepresentable"
-        elif _compact_size(redacted) > TOOL_SCHEMA_BYTES:
+        elif _compact_size({**record, "inputSchema": schema}) > TOOL_SCHEMA_BYTES:
             record["schema_omitted"] = "per_tool_budget"
         else:
-            record["inputSchema"] = redacted
-    annotations = tool.get("annotations")
-    redacted_annotations = None
-    if isinstance(annotations, dict) and annotations:
-        redacted_annotations = redact_json(annotations)
-        if not isinstance(redacted_annotations, dict):
-            redacted_annotations = None
-        elif _compact_size({**record, "annotations": redacted_annotations}) <= TOOL_SCHEMA_BYTES:
-            record["annotations"] = redacted_annotations
-    if description is not None:
-        if _compact_size({**record, "description": description}) <= TOOL_SCHEMA_BYTES:
-            record["description"] = description
+            record["inputSchema"] = schema
+    if annotations and _compact_size({**record, "annotations": annotations}) <= TOOL_SCHEMA_BYTES:
+        record["annotations"] = annotations
+    shown = first_nonempty(description or "")
+    if shown:
+        if _compact_size({**record, "description": shown}) <= TOOL_SCHEMA_BYTES:
+            record["description"] = shown
         else:
             record["description_omitted"] = "per_tool_budget"
-    record["schema_sha256"] = tool_schema_digest(description, redacted, redacted_annotations)
     return record
 
 

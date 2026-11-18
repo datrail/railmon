@@ -1204,9 +1204,11 @@ Each tool keeps its `name`, its server's `description` (through
 `redact_text`), its raw `inputSchema` and its `annotations`, every string in
 them (keys, descriptions, defaults and examples) run through `redact_json`, so
 a key pasted into a default is `[redacted]`. `schema_sha256` identifies the
-copy: SHA-256 of the redacted description, schema and annotations, sorted-key
-compact JSON, as RailDash's `schema_hash` takes it from captured traffic, so
-with nothing redacted the two match. It is taken before any size cap, so a
+copy: SHA-256 of the redacted description, schema and annotations as the
+server sent them (a description with its whitespace, `{}` annotations kept),
+sorted-key compact JSON, as RailDash's `schema_hash` takes it from captured
+traffic, so with nothing redacted the two match. The `description` field
+itself is shown stripped. It is taken before any size cap, so a
 copy keeps it when its schema is left out; a copy's identity across scans is
 server, source, tool name and `schema_sha256`. A schema left out says why in
 `schema_omitted`, as in `skills_inventory`: past 8 KiB for one tool

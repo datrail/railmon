@@ -546,15 +546,42 @@ class RecordToolSchemaTest(unittest.TestCase):
     def test_the_digest_is_raildash_schema_hash_of_the_same_tool(self):
         # DR-294: with nothing redacted, a copy's identity is the hash RailDash
         # takes of the same tool seen in captured traffic (raildash
-        # tool_schemas.schema_hash), so the two can be matched.
-        tool = FINRETAIL_TOOLS[0]
-        canonical = json.dumps(
-            {"description": tool["description"], "input_schema": tool["inputSchema"],
-             "annotations": tool["annotations"]},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-        )
-        self.assertEqual(scanner.record_tool_schema(tool)["schema_sha256"],
-                         hashlib.sha256(canonical.encode()).hexdigest())
+        # tool_schemas.schema_hash: a string description as sent, annotations
+        # as sent when an object), so the two can be matched. Whitespace, an
+        # empty description and empty annotations are hashed as sent too.
+        def raildash_hash(description, input_schema, annotations):
+            description = description if isinstance(description, str) else None
+            annotations = annotations if isinstance(annotations, dict) else None
+            canonical = json.dumps(
+                {"description": description, "input_schema": input_schema, "annotations": annotations},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            )
+            return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+
+        schema = FINRETAIL_TOOLS[0]["inputSchema"]
+        for description, annotations in [
+            ("The interest rate for a product.", FINRETAIL_TOOLS[0]["annotations"]),
+            ("    Search files.\n", None),
+            ("", {}),
+            (None, {"readOnlyHint": True}),
+            ("Zinssatz für ein Produkt", {}),
+        ]:
+            tool = {"name": "t", "inputSchema": schema}
+            if description is not None:
+                tool["description"] = description
+            if annotations is not None:
+                tool["annotations"] = annotations
+            with self.subTest(description=description, annotations=annotations):
+                self.assertEqual(scanner.record_tool_schema(tool)["schema_sha256"],
+                                 raildash_hash(description, schema, annotations))
+        record = scanner.record_tool_schema({"name": "t", "description": "  Search files.\n"})
+        self.assertEqual(record["description"], "Search files.")  # shown stripped, hashed as sent
+
+    def test_the_per_tool_cap_counts_every_field_kept(self):
+        tool = {"name": "t", "description": "d" * 200, "annotations": {"title": "a" * 200},
+                "inputSchema": {"type": "object", "description": "x" * (scanner.TOOL_SCHEMA_BYTES - 120)}}
+        record = scanner.record_tool_schema(tool)
+        self.assertLessEqual(scanner._compact_size(record), scanner.TOOL_SCHEMA_BYTES)
 
     def test_a_copy_keeps_its_digest_when_the_budget_drops_its_schema(self):
         schema = {"type": "object", "properties": {f"p{i}": {"type": "string", "description": "x" * 40}
