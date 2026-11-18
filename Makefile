@@ -44,6 +44,7 @@ test-python:
 		tools/scan/gke/agent_process.py \
 		tools/scan/gke/harness/harness_sources.py \
 		tools/scan/gke/harness/reader.py \
+		tools/scan/gke/harness/generic.py \
 		tools/scan/gke/harness/profiles/openclaw.py \
 		tools/scan/gke/harness/profiles/claude-code.py \
 		tools/listen/follow_container.py \

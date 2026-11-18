@@ -217,7 +217,12 @@ def harness_attributes(context: dict[str, Any], builders: dict[str, Builder],
     files say. The declared lists are merged, in the bundle's own shapes, with
     the scanner's own functions (`shapers`): mcp_servers_declared as
     read_mcp_inventory's entries, skills_inventory as normalized skills, and
-    declared_destinations recomputed from the result."""
+    declared_destinations recomputed from the result.
+
+    When no profile matches, the generic reader's results (RC-520) are
+    applied the same way, and where it found no value its account (BLIND
+    with UNKNOWN_HARNESS, mostly) also replaces a bundle account that would
+    claim more than is known: see generic_accounts."""
     if not context.get("subject") or "absent" not in builders:
         return {}
     sources = _harness_sources()
@@ -238,7 +243,7 @@ def harness_attributes(context: dict[str, Any], builders: dict[str, Builder],
             continue  # observed by the scanner itself: the agent's files don't override it
         prior = current.get("value") if current.get("status") in ("ANSWERED", "PARTIAL") else None
         if shapers and field == "mcp_servers_declared":
-            entries = shapers["mcp_inventory_entries"](attribute["value"], f"{harness} profile")
+            entries = shapers["mcp_inventory_entries"](attribute["value"], reader_label(harness))
             if not entries:
                 continue
             merged = {entry["name"]: entry for entry in prior or [] if isinstance(entry, dict)}
@@ -251,7 +256,7 @@ def harness_attributes(context: dict[str, Any], builders: dict[str, Builder],
                     skills.append(shapers["normalize_skill"]({
                         "name": skill.get("name"),
                         "description": skill.get("description") or f"no description in {skill.get('path')}/SKILL.md",
-                        "source_type": "skills_config", "destination_endpoints": []}, f"{harness} profile"))
+                        "source_type": "skills_config", "destination_endpoints": []}, reader_label(harness)))
                 except Exception:  # a skill the bundle can't carry (no name) is left out of it
                     continue
             if not skills:
@@ -268,7 +273,73 @@ def harness_attributes(context: dict[str, Any], builders: dict[str, Builder],
         attributes[field] = attribute
     if shapers and ({"mcp_servers_declared", "inference_endpoint"} & set(attributes)):
         attributes.update(_declared_destinations(attributes, existing, builders, shapers, harness))
+    if harness == sources.reader().GENERIC_HARNESS:
+        attributes.update(generic_accounts(sources.reader().to_attributes(results, builders), results,
+                                           existing, builders))
     return attributes
+
+
+# A bundle account of a harness field that says no more than "not found" or
+# "not looked at": for an agent no profile matches, the generic reader's
+# account replaces it, since a harness without a profile may keep the field
+# anywhere. Any other account (a value, a read or parse failure, an MCP
+# config that names only a gateway) is more specific and stands.
+WEAK_BLIND_REASONS = frozenset({"NOT_COLLECTED_BY_PACK", "UNKNOWN_HARNESS"})
+POLICY_FIELDS = ("tool_allow_deny", "approval_policy")
+
+
+def _weak(attribute: dict[str, Any] | None, field: str) -> bool:
+    if not attribute:
+        return True
+    status, reason = attribute.get("status"), attribute.get("reason")
+    if status == "ABSENT":
+        return True
+    # An undeclared policy is BLIND with GATEWAY_MANAGED in the bundle: a
+    # guess that a gateway holds it. For an unknown harness the truth is that
+    # its own files weren't understood.
+    return status == "BLIND" and (reason in WEAK_BLIND_REASONS or (field in POLICY_FIELDS and reason == "GATEWAY_MANAGED"))
+
+
+def generic_accounts(accounts: dict[str, Any], results: dict[str, dict[str, Any]], existing: dict[str, Any],
+                     builders: dict[str, Builder]) -> dict[str, Any]:
+    """For an agent no profile matches: the generic reader's account of each
+    harness field it found no value for, in place of a bundle account that is
+    only "not found" (_weak), and tool_schemas never ABSENT when the MCP
+    servers are unknown: BLIND with UNKNOWN_HARNESS when no MCP config could
+    be found (the harness may declare servers where no one has looked), and
+    FAILED with the config's own reason when one couldn't be read or parsed
+    (it may hold the servers). Either way an empty tool list would be a claim
+    the scan can't make."""
+    out: dict[str, Any] = {}
+    for field, account in accounts.items():
+        if account.get("status") in ("ANSWERED", "PARTIAL"):
+            continue  # values are merged above, as a profile's are
+        if _weak(existing.get(field), field):
+            out[field] = account
+    mcp = results.get("mcp_servers_declared") or {}
+    declared = existing.get("mcp_servers_declared") or {}
+    servers_unknown = declared.get("status") not in ("ANSWERED", "PARTIAL") \
+        and not (declared.get("status") == "BLIND" and declared.get("reason") == "GATEWAY_MANAGED")
+    if not servers_unknown or not _weak(existing.get("tool_schemas"), "tool_schemas"):
+        return out
+    if (mcp.get("status"), mcp.get("reason")) == ("BLIND", "UNKNOWN_HARNESS"):
+        out["tool_schemas"] = builders["blind"](
+            "UNKNOWN_HARNESS", "declared",
+            note="no harness profile matched the agent and no MCP config was found, so no MCP server was "
+                 "listed; the harness may declare servers where the scan can't see them, so this is not "
+                 "an empty tool list")
+    elif mcp.get("status") == "FAILED":
+        out["tool_schemas"] = builders["failed"](
+            mcp.get("reason") or "PARSE_FAILED", "declared",
+            note="an MCP config could not be read, so the MCP servers it may declare were never listed; "
+                 "this is not an empty tool list")
+    return out
+
+
+def reader_label(harness: str) -> str:
+    """How the bundle names what read a harness field: "openclaw profile",
+    or "generic reader" for an agent no profile matched."""
+    return "generic reader" if harness == _harness_sources().reader().GENERIC_HARNESS else f"{harness} profile"
 
 
 def _declared_destinations(attributes: dict[str, Any], existing: dict[str, Any], builders: dict[str, Builder],
@@ -292,7 +363,7 @@ def _declared_destinations(attributes: dict[str, Any], existing: dict[str, Any],
         return {}
     out = {"declared_destinations": builders["answered"](
         sorted(hosts), "declared", authored_by="subject",
-        method=f"hosts from the MCP server URLs and the model endpoint, the {harness} profile's included")}
+        method=f"hosts from the MCP server URLs and the model endpoint, the {reader_label(harness)}'s included")}
     # undeclared_destinations is observed minus declared: a host the profile
     # now declares is no longer undeclared, so the two never contradict.
     undeclared = existing.get("undeclared_destinations") or {}
@@ -301,7 +372,7 @@ def _declared_destinations(attributes: dict[str, Any], existing: dict[str, Any],
         if left != sorted(undeclared["value"]):
             out["undeclared_destinations"] = (
                 builders["answered"](left, "observed", authored_by="none",
-                                     method=f"observed hosts minus declared hosts, the {harness} profile's included")
+                                     method=f"observed hosts minus declared hosts, the {reader_label(harness)}'s included")
                 if left else builders["absent"]("no observed host fell outside the declared set", "observed"))
     return out
 
