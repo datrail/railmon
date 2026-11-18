@@ -398,6 +398,23 @@ def find_agent_process(config_paths: list[Path], proc: Path | None = None,
     return None, "no other container's process is visible (the pod doesn't share its process namespace)"
 
 
+CWD_MAX_CHARS = 4096
+
+
+def _working_dir(process: Path) -> str | None:
+    """The agent's working directory, as /proc/<pid>/cwd names it: the path
+    inside the agent's own root (a sidecar reads another mount namespace's
+    folder by its path there). None when it can't be read, isn't an absolute
+    path, or was deleted. It finds files only, as the environment does."""
+    try:
+        cwd = os.readlink(process / "cwd")
+    except OSError:
+        return None
+    if not cwd.startswith("/") or cwd.endswith(" (deleted)") or len(cwd) > CWD_MAX_CHARS or "\x00" in cwd:
+        return None
+    return cwd
+
+
 def read_subject(config_paths: list[Path], proc: Path | None = None,
                  own_pid: int | None = None) -> tuple[dict[str, Any] | None, str]:
     """What the scan describes in place of the sidecar: the agent process's
@@ -415,6 +432,7 @@ def read_subject(config_paths: list[Path], proc: Path | None = None,
         "root": str(root),
         "env": env,
         "cmdline": agent["cmdline"],
+        "cwd": _working_dir(root.parent),
         "cgroup": cgroup,
         "holds_config": agent.get("holds_config", False),
         "containers": agent.get("containers", 1),

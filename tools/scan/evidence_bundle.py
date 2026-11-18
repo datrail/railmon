@@ -116,6 +116,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # It reads the container's files through its root instead, so the runtime
 # versions come from build stamps and the image's NODE_VERSION/PYTHON_VERSION
 # (as pod mode reads them) rather than `--version`, and the methods say so.
+# Pack 16 also: Claude Code's harness profile (RC-526), the same harness
+# fields as OpenClaw's, from its settings files, ~/.claude.json, .mcp.json,
+# its package or native install, its transcripts and CLAUDE.md.
 RULE_PACK_VERSION = 16
 
 # The value shape of observed_file_access (DR-154), published in the v1

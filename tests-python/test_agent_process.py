@@ -37,6 +37,8 @@ def _load(name: str, path: Path):
 scanner = _load("scan_agent_environment", SCANNER_DIR / "scan_agent_environment.py")
 evidence_bundle = _load("evidence_bundle", SCANNER_DIR / "evidence_bundle.py")
 agent_process = scanner._agent_process()   # tools/scan/gke/agent_process.py
+harness_sources = _load("gke_harness_sources_for_agent_process_test",
+                        SCANNER_DIR / "gke" / "harness" / "harness_sources.py")
 pod_mode = scanner._pod_mode()             # tools/scan/gke/pod_mode.py
 
 _PATCHED = {"scan_agent_environment": scanner, "evidence_bundle": evidence_bundle}
@@ -276,6 +278,20 @@ class ReadSubjectTest(unittest.TestCase):
         self.fake.process(7, "agent", ["node", "/usr/local/bin/openclaw"], env=AGENT_ENV, uid=1000)
         subject, _ = agent_process.read_subject([CONFIG], self.fake.proc, own_pid=99999)
         self.assertEqual((subject["uid"], subject["username"]), (1000, "node"))
+
+    def test_the_agents_working_directory_is_read_from_its_process(self):
+        # As /proc/<pid>/cwd names it: the path inside the agent's own root.
+        (self.fake.proc / "7" / "cwd").symlink_to("/srv/agent-workdir")
+        subject, _ = agent_process.read_subject([CONFIG], self.fake.proc, own_pid=99999)
+        self.assertEqual(subject["cwd"], "/srv/agent-workdir")
+        self.assertEqual(harness_sources.agent_view(subject).cwd, "/srv/agent-workdir")
+        for target in ("/srv/gone (deleted)", "relative"):
+            (self.fake.proc / "7" / "cwd").unlink()
+            (self.fake.proc / "7" / "cwd").symlink_to(target)
+            subject, _ = agent_process.read_subject([CONFIG], self.fake.proc, own_pid=99999)
+            self.assertIsNone(subject["cwd"], target)
+        (self.fake.proc / "7" / "cwd").unlink()  # not readable at all
+        self.assertIsNone(agent_process.read_subject([CONFIG], self.fake.proc, own_pid=99999)[0]["cwd"])
 
 
 class AgentRootConfinementTest(unittest.TestCase):

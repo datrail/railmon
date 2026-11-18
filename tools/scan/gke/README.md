@@ -116,9 +116,10 @@ specific to pods; `harness/harness_sources.py` is pod mode's side of it:
   the agent's other files (links resolve inside it, no step crosses into
   another filesystem, only regular files, without blocking).
 - `~` and `$VAR` in a profile's paths, and the markers, come from the agent's
-  process. Environment values are used to find files only.
+  process, and `$AGENT_CWD` from its working directory (`/proc/<pid>/cwd`).
+  Environment values and the working directory are used to find files only.
 
 Pod mode replaces a harness field only with a value a matching profile
-found. OpenClaw's profile ships (RC-516); Claude Code's is RC-526 and the
-generic reader for any other harness RC-520. For an agent no profile matches,
+found. OpenClaw's profile (RC-516) and Claude Code's (RC-526) ship; the
+generic reader for any other harness is RC-520. For an agent no profile matches,
 the bundle's own values stand.

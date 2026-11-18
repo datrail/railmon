@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "claude-sonnet-4-5",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://llm-gateway.example.internal:8443",
+    "ANTHROPIC_API_KEY": "fixture-placeholder-not-a-key",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_AUTOUPDATER": "1"
+  }
+}

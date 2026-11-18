@@ -1,0 +1,38 @@
+{
+  "firstStartTime": "2026-11-16T19:44:28.690Z",
+  "firstStartVersion": "2.1.325",
+  "machineID": "d4165fa12a9f782ea200981ad554d9e3b85503bc44adca1f9eaccb4a04838cb3",
+  "opusProMigrationComplete": true,
+  "seenNotifications": {},
+  "hasResetAutoModeOptInForDefaultOffer": true,
+  "migrationVersion": 15,
+  "mcpServers": {
+    "finretail": {
+      "type": "http",
+      "url": "http://finretail-mcp-server:23004/mcp"
+    }
+  },
+  "projects": {
+    "/work": {
+      "hasTrustDialogAccepted": true
+    }
+  },
+  "userID": "52f06c7da2171130a3dc5f4b4d5ff61b6b8af2654231389bf5cec06307a98055",
+  "pluginUsage": {
+    "cc-plugin-agents-md@builtin": {
+      "usageCount": 0,
+      "lastUsedAt": 1794858269358,
+      "lastUsedNumStartups": 0
+    },
+    "cc-plugin-privacy@builtin": {
+      "usageCount": 0,
+      "lastUsedAt": 1794858269358,
+      "lastUsedNumStartups": 0
+    },
+    "cc-plugin-plugin-authoring@builtin": {
+      "usageCount": 0,
+      "lastUsedAt": 1794858269358,
+      "lastUsedNumStartups": 0
+    }
+  }
+}
