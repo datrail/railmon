@@ -20,13 +20,15 @@ COPY src/ ./src/
 # force it — otherwise the stub above is what gets shipped.
 RUN touch src/main.rs && cargo build --release --locked
 
-# python:3.13-slim, not debian-slim, and the version is the point. RailScan's
-# image was 3.13 and its CI pinned 3.13; folding the scanner in on top of
-# debian-bookworm would have handed it Python 3.11 while CI kept testing 3.13 —
-# a silent runtime downgrade, and drift in the direction where a 3.12-or-later
-# construct passes CI and dies in the image. This base is Debian too, so
+# python:3.15-slim, not debian-slim, and the version is the point: CI's
+# setup-python pins the same version (.github/workflows/ci.yml), so the tests
+# run on the Python the image ships. RailScan's image was 3.13 and its CI
+# pinned 3.13; folding the scanner in on top of debian-bookworm would have
+# handed it Python 3.11 while CI kept testing 3.13 — a silent runtime
+# downgrade, and drift in the direction where a newer construct passes CI and
+# dies in the image. This base is Debian too, so
 # AgentSight's libraries install the same way.
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 # libelf and zlib are AgentSight's, not ours: it loads eBPF objects at runtime.
 # openssl is `railmon demo`'s (tools/local-demo): it generates a throwaway
