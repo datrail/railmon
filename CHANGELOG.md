@@ -35,6 +35,7 @@ Each PR adds its line under `## Unreleased`.
 - **Rule pack 15:** `tools/list` follows `nextCursor` for up to 20 pages and 200 tools, and a malformed MCP response marks that server unreachable instead of aborting the scan ([#126](https://github.com/datrail/railmon/pull/126)).
 - A tag's GitHub Release notes open with the annotated tag's message ([#121](https://github.com/datrail/railmon/pull/121)).
 - The Dockerfile's comment on the OpenShell CLI no longer says CI installs the same release ([#120](https://github.com/datrail/railmon/pull/120)).
+- An `--interval` scan that delivers to RailDash waits up to 120 s for RailDash to answer before its first scan, so after a reboot, when both start together, the log says RailDash isn't up yet instead of reporting a failed delivery. Bundles are unchanged.
 
 ## [v0.1.0-m16] - 2026-11-03
 

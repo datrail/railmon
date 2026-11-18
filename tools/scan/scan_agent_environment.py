@@ -4058,6 +4058,65 @@ def post_evidence_bundle(
         raise ScannerError(f"raildash evidence-bundle delivery failed: {exc}") from exc
 
 
+# DR-316: after a host reboot the container runtime starts RailDash and
+# railmon-scan together (compose's `depends_on` only orders the first `up`), so
+# the first delivery of an `--interval` scanner used to fail with "Connection
+# refused" while RailDash was still starting, and a user reading the logs saw an
+# error for something that fixed itself one tick later. Before its first scan,
+# an interval scanner waits for RailDash to answer at all: any HTTP response
+# counts (the ingest route answers a GET with 405), through the same urlopen and
+# proxy settings delivery uses. A RailDash still silent after the budget is
+# reported once and the scan goes ahead, so a deployment that never brings
+# RailDash up still fails its delivery the way it always did.
+RAILDASH_START_WAIT_SECONDS = 120.0
+RAILDASH_START_POLL_SECONDS = 2.0
+
+
+def wait_for_raildash(
+    raildash_url: str,
+    budget: float = RAILDASH_START_WAIT_SECONDS,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """True once RailDash answers; False when it still hasn't after `budget`."""
+    url = evidence_bundle_ingest_url(raildash_url, None)
+    deadline = clock() + budget
+    waiting = False
+    while True:
+        try:
+            with urlopen(Request(url, method="GET"), timeout=5):
+                pass
+            answered = True
+        except HTTPError:
+            answered = True
+        except (URLError, TimeoutError, OSError):
+            answered = False
+        except ValueError:
+            # A URL urlopen can't use: waiting won't fix it, and the delivery
+            # reports it.
+            return True
+        if answered:
+            if waiting:
+                print("[agent-environment-scanner] RailDash is up", file=sys.stderr)
+            return True
+        if clock() >= deadline:
+            print(
+                f"[agent-environment-scanner] RailDash at {raildash_url} still isn't answering after "
+                f"{budget:.0f}s; scanning anyway",
+                file=sys.stderr,
+            )
+            return False
+        if not waiting:
+            print(
+                f"[agent-environment-scanner] RailDash at {raildash_url} isn't up yet; waiting up to "
+                f"{budget:.0f}s before the first delivery",
+                file=sys.stderr,
+            )
+            waiting = True
+        sleep(RAILDASH_START_POLL_SECONDS)
+
+
 def registration_output_path(args: argparse.Namespace) -> Path:
     configured = first_nonempty(
         args.registration_output,
@@ -4662,6 +4721,9 @@ def main(argv: list[str] | None = None) -> int:
     # sees a failing scan as a failure rather than this loop swallowing it.
     exit_code = 0
     try:
+        raildash_url = configured_raildash_url(args)
+        if raildash_url:
+            wait_for_raildash(raildash_url)
         while True:
             exit_code = run_collection(args)
             time.sleep(interval)
