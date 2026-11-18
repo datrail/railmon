@@ -47,6 +47,7 @@ test-python:
 		tools/scan/gke/harness/generic.py \
 		tools/scan/gke/harness/profiles/openclaw.py \
 		tools/scan/gke/harness/profiles/claude-code.py \
+		tools/scan/gke/watcher.py \
 		tools/listen/follow_container.py \
 		tools/listen/agentsight_adapter.py \
 		tools/listen/preflight.py \

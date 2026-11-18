@@ -18,6 +18,7 @@ Like pod_mode.py, this module imports nothing of railmon's.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -217,6 +218,35 @@ def read_bytes_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BY
             chunks.append(chunk)
             size += len(chunk)
         return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+DIGEST_CHUNK_BYTES = 1 << 20
+
+
+def digest_in_root(root: Path, path: str, max_bytes: int, same_device: bool = True,
+                   refuse: tuple[str, ...] = ()) -> tuple[str, int] | None:
+    """The SHA-256 of a regular file's first `max_bytes` inside the agent's
+    root, and how many bytes that was, read as read_bytes_in_root reads it
+    but a chunk at a time, so a large database is hashed without being held
+    in memory. None when it can't be read there (missing, not a regular
+    file, out of the root)."""
+    walked = _walk_in_root(root, path, open_file=True, same_device=same_device, refuse=refuse)
+    if walked is None or walked[1] is None:
+        return None
+    fd = walked[1]
+    digest, size = hashlib.sha256(), 0
+    try:
+        while size < max_bytes:
+            chunk = os.read(fd, min(DIGEST_CHUNK_BYTES, max_bytes - size))
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        return digest.hexdigest(), size
     except OSError:
         return None
     finally:

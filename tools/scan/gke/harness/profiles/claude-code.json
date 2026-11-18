@@ -40,5 +40,8 @@
       "$CLAUDE_DIR/skills"
     ],
     "transcripts": {"hook": "claude_transcripts"}
+  },
+  "watch": {
+    "list": ["$CLAUDE_DIR/projects"]
   }
 }

@@ -100,6 +100,81 @@ UID, or the agent restarting mid-scan), `credential_inventory`, `user_info`,
 with `NO_SOURCE_ACCESS`, and the scan logs why. The sidecar's own process is
 never reported in the agent's place.
 
+## Rescans, shutdown and health (RC-523)
+
+With `--interval` (or `RAIL_SCAN_INTERVAL_IN_SECONDS`; the sidecar design's
+hourly rescan is 3600), pod mode runs [`watcher.py`](watcher.py) in place of
+the plain interval loop:
+
+- **What it hashes, every 10 seconds.** The sources the agent's harness
+  profile names (its config `sources`, workspace `prompt_files` and `skills`,
+  and `watch.content`) by content, and its transcripts (`watch.list`) by file
+  list only, so a new session triggers a scan and a longer one doesn't. Every
+  harness also has `.mcp.json` in each `--config-path` and each
+  `--mcp-config`; an agent no profile matches has what the generic reader
+  reads (`.mcp.json`, `AGENTS.md` and the top-level `*.json` under
+  `--config-path`). The agent's command line, environment and working
+  directory are hashed too, so a restart with a new environment is a change.
+
+  | Harness | By content | By file list |
+  |---|---|---|
+  | OpenClaw | `openclaw.json` and the other top-level `*.json` in its folder, `state/openclaw.sqlite` and its `-wal`, `skills/`, `workspace/skills/`, the workspace prompt files | `agents/` |
+  | Claude Code | managed, project, local and user settings, `~/.claude.json`, its `CLAUDE.md` files, `.claude/skills/` | `~/.claude/projects/` |
+  | Any other | `.mcp.json`, `AGENTS.md`, top-level `*.json` under `--config-path` | |
+
+  OpenClaw's `openclaw.json.bak*` and `openclaw.json.last-good`, which it
+  writes beside `openclaw.json` on each change, don't match `*.json`.
+- **What a poll may read.** One budget for the whole poll, never per path:
+  64 MiB of file content and 5,000 files and folders, 8 deep. Config comes
+  first and the agent's own skill folders last, so a folder the agent stuffs
+  (links in it are followed inside its root) spends only what is left; what
+  doesn't fit is left to the interval scan, and the log says so once. The
+  file lists, which read no content, have their own 5,000 files and folders,
+  so a full budget can't hide a new agent or session.
+- **When it scans.** After a change, once nothing has changed for 5
+  seconds, so a config written in several steps is scanned once, but never
+  more than 60 seconds after the change was first seen: files that never
+  stop changing (a busy agent, or one rewriting a watched file on purpose)
+  get a scan at most about once a minute, and can't put one off for good.
+  The same content rewritten changes no hash. The interval still rescans,
+  whether or not a change is pending. One scan runs at a time: what changes
+  during a scan is seen on the next poll and gives exactly one more scan.
+- **Waiting at start.** OpenClaw's gateway creates `agents/main/` 70 to 100
+  seconds after it starts, and a scan before that reports `agent_count` 0, so
+  for OpenClaw the first scan waits until `openclaw.json` (or
+  `$OPENCLAW_CONFIG_PATH`) and `agents/main/` exist, for up to 300 seconds;
+  after that it scans anyway and what is missing is `BLIND`. Any other
+  harness is scanned as soon as its process is found. With no agent process
+  at all, it waits up to 300 seconds for one, then scans. The profile says
+  what to wait for (`watch.wait_for`, see [the harness README](harness/README.md)).
+  With a RailDash URL, the first scan then also waits up to 120 seconds for
+  RailDash to answer (DR-316), as any interval scan does.
+- **Shutdown.** On SIGTERM a scan in progress is abandoned, and nothing is
+  written or sent for it. A bundle being written or sent gets up to 5
+  seconds to finish; the sidecar exits well inside the pod's 30-second
+  default grace period.
+- **Health.** After each scan and delivery, the time and interval are
+  written to `RAIL_HEALTH_FILE` (default `/tmp/railmon-health.json`, in the
+  sidecar's writable emptyDir). `railmon scan --health-check` exits 1 when
+  the last scan is older than two intervals, or there is no health file, for
+  the exec liveness probe. At start it writes when the first scan is due at
+  the latest: the longest wait for the agent (300 seconds), then the wait
+  for RailDash if there is one (about 130 seconds), then two intervals. The
+  check passes until then, so a slow start isn't restarted, and fails after,
+  so a start that is stuck is:
+
+  ```yaml
+  livenessProbe:
+    exec:
+      command: ["railmon", "scan", "--health-check"]
+    periodSeconds: 60
+  ```
+- **Logs.** One line per event on stderr (`watcher: change in
+  $OPENCLAW_DIR/openclaw.json`, `watcher: scan: interval`), with paths as the
+  profile writes them: no environment value, secret or token.
+
+Without an interval, a pod-mode scan runs once, as before, without waiting.
+
 ## The agent's harness fields (RC-510)
 
 The harness fields (`harness_identity`, `model_name`, `llm_provider`,

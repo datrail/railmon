@@ -3925,6 +3925,7 @@ def _deliver_v2_collection(
 
     collection_registered: bool | None = False
     registered: dict[str, bool] = {}
+    _delivering(args, True)
     if args.register:
         collection_registered, registered, complete = _register_v2_collection(
             args, data, agent_entries, agent_scans or {}
@@ -3956,6 +3957,7 @@ def _deliver_v2_collection(
         except ScannerError as exc:
             print(f"agent-environment-scanner: {exc}", file=sys.stderr)
             exit_code = 2
+    _delivering(args, False)
     return exit_code, collection_registered, registered
 
 
@@ -4745,6 +4747,13 @@ def make_parser() -> argparse.ArgumentParser:
         "stays running and scans again on this interval instead of exiting after one scan. Omit both for "
         "the existing single-scan-and-exit behavior.",
     )
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="RC-523: exit 0 if pod mode's watcher scanned within the last two intervals, else 1, from its "
+        "health file (RAIL_HEALTH_FILE, default /tmp/railmon-health.json). For the sidecar's exec liveness probe; "
+        "scans nothing.",
+    )
     parser.add_argument("--compact", action="store_true", help="Emit compact JSON")
     return parser
 
@@ -4846,6 +4855,7 @@ def _deliver_v1(
         else:
             bundle = evidence_bundle.reuse_unchanged_bundle(bundle, configured_agent_key(args))
             data = evidence_bundle.render_bundle_bytes(bundle, args.compact)
+    _delivering(args, True)
     try:
         if args.register:
             if register_bundle(args, data, payload):
@@ -4885,7 +4895,16 @@ def _deliver_v1(
                 except ScannerError as exc:
                     print(f"agent-environment-scanner: {exc}", file=sys.stderr)
                     failed = True
+    _delivering(args, False)
     return 2 if failed else 0
+
+
+def _delivering(args: argparse.Namespace, active: bool) -> None:
+    """RC-523: tell pod mode's watcher when a scan starts and stops writing
+    or sending its bundle, so SIGTERM gives a delivery in flight a few
+    seconds to finish instead of abandoning it. Nothing in other modes."""
+    if args.mode == "pod":
+        _gke("watcher").delivering(active)
 
 
 def run_one_scan(args: argparse.Namespace) -> int:
@@ -4957,6 +4976,8 @@ def _write_deferred_feature_file(scan_args: argparse.Namespace, registered: bool
 def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
+    if args.health_check:
+        return _gke("watcher").health_check_main()
     interval = configured_scan_interval(args)
     # DR-109 M2: a target manifest turns each collection from one scan into
     # the sandbox-wide scan plus one agent-scoped scan per resolved key.
@@ -4965,6 +4986,17 @@ def main(argv: list[str] | None = None) -> int:
     run_collection = run_one_collection if configured_target_manifest(args) else run_one_scan
     if interval is None:
         return run_collection(args)
+    if args.mode == "pod":
+        # RC-523: a sidecar also rescans when the agent's config changes,
+        # waits for an agent still starting, and shuts down on SIGTERM
+        # without sending a half-built bundle (gke/watcher.py). It waits for
+        # RailDash (DR-316) too, right before its first scan.
+        raildash_url = configured_raildash_url(args)
+        return _gke("watcher").run(
+            args, run_collection, interval,
+            before_first_scan=(lambda: wait_for_raildash(raildash_url)) if raildash_url else None,
+            # Its budget, and at most one more attempt (5 s timeout) and poll past it.
+            before_first_scan_seconds=RAILDASH_START_WAIT_SECONDS + RAILDASH_START_POLL_SECONDS + 5 if raildash_url else 0.0)
 
     # DR-83: stays running, scanning again on the interval. An agent that
     # first appears after scan N reaches the control plane on scan N+1
