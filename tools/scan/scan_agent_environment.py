@@ -1237,10 +1237,12 @@ def read_mcp_config(
     send_headers: bool = True,
     schemas: list[dict[str, Any]] | None = None,
     skip: frozenset[str] = frozenset(),
+    home: str | None = None,
 ) -> list[dict[str, Any]]:
     """Skills for each server in an MCP config's mcpServers; a server named
     in `skip` is left to whoever probes it instead (RC-531: the harness
-    profile's declaration of the same name)."""
+    profile's declaration of the same name). Its tool_schemas entries name
+    the file itself (`config_origin`), `home` read as `~`."""
     data = load_json_file(path)
     if not isinstance(data, dict):
         return []
@@ -1249,10 +1251,25 @@ def read_mcp_config(
         return []
 
     skills: list[dict[str, Any]] = []
+    origin = config_origin(path, home)
     for name, spec in servers.items():
         if isinstance(spec, dict) and str(name) not in skip:
-            skills.extend(mcp_server_skills(str(name), spec, path.name, send_headers=send_headers, schemas=schemas))
+            skills.extend(mcp_server_skills(str(name), spec, path.name, send_headers=send_headers, schemas=schemas,
+                                            origin=(origin, "file")))
     return skills
+
+
+def config_origin(path: Path, home: str | None) -> str:
+    """Where an MCP config file is, as tool_schemas names a copy's origin
+    (DR-294): the path, with the agent's HOME as `~`, so `./.mcp.json` and
+    `~/.mcp.json` are two sources rather than one `.mcp.json`, and a home
+    folder's user name isn't shipped. Redacted like a server's name."""
+    text = str(path)
+    if home and home.strip("/"):
+        prefix = home.rstrip("/")
+        if text == prefix or text.startswith(prefix + "/"):
+            text = "~" + text[len(prefix):]
+    return redact_text(text)
 
 
 # A query parameter whose name says it carries a credential (RC-531).
@@ -1295,7 +1312,8 @@ def read_mcp_config_from_env(
     url = env.get(ENV_MCP_URL_KEY)
     if not name or not url:
         return []
-    return mcp_server_skills(name, {"url": url}, "environment", send_headers=send_headers, schemas=schemas)
+    return mcp_server_skills(name, {"url": url}, "environment", send_headers=send_headers, schemas=schemas,
+                             origin=("environment", "environment"))
 
 
 def mcp_server_skills(
@@ -1305,6 +1323,7 @@ def mcp_server_skills(
     *,
     send_headers: bool = True,
     schemas: list[dict[str, Any]] | None = None,
+    origin: tuple[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """One skill per tool a reachable MCP server declares.
 
@@ -1325,8 +1344,11 @@ def mcp_server_skills(
     `send_headers` False (pod mode, RC-511) probes without the config's
     `headers`: the sidecar never presents the agent's credential, and a
     server that needs one answers 401 or 403, `auth_refused`. `schemas`, when
-    given, gets this server's `tool_schema_server` entry from the same probe.
+    given, gets this server's `tool_schema_server` entry from the same probe,
+    under `origin` (its source and TOOL_SCHEMA_SOURCE_KINDS kind, DR-294;
+    `source_label` as a file when not given).
     """
+    schema_source, schema_kind = origin or (str(source_label), "file")
     endpoints = dedupe(
         redact_url(value) or UNPARSEABLE for value in collect_strings(spec) if value.startswith(("http://", "https://"))
     )
@@ -1340,7 +1362,8 @@ def mcp_server_skills(
         else:
             tools, reachability, truncated = probe_mcp_server(url, headers)
         if schemas is not None:
-            schemas.append(tool_schema_server(name, source_label, endpoints, reachability, tools, truncated))
+            schemas.append(tool_schema_server(name, schema_source, endpoints, reachability, tools, truncated,
+                                              source_kind=schema_kind))
         if tools is None:
             return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable", reachability)]
         result: list[dict[str, Any]] = []
@@ -1372,7 +1395,8 @@ def mcp_server_skills(
     reached = command_basename(command)
     if schemas is not None:
         schemas.append(tool_schema_server(
-            name, source_label, endpoints, "not_probed_stdio" if reached else "unreachable", None, False
+            name, schema_source, endpoints, "not_probed_stdio" if reached else "unreachable", None, False,
+            source_kind=schema_kind,
         ))
     if not reached:
         return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable", "unreachable")]
@@ -1598,11 +1622,12 @@ def collect_skills(
         for path in mcp_configs:
             if path.exists():
                 skills.extend(read_mcp_config(path, send_headers=send_headers, schemas=schemas,
-                                              skip=frozenset(profile_servers)))
+                                              skip=frozenset(profile_servers), home=(env or {}).get("HOME")))
         if (env or {}).get(ENV_MCP_NAME_KEY) not in profile_servers:  # else the profile's, probed below
             skills.extend(read_mcp_config_from_env(env or {}, send_headers=send_headers, schemas=schemas))
     for name, spec in profile_servers.items():
-        skills.extend(mcp_server_skills(name, spec, label, send_headers=send_headers, schemas=schemas))
+        skills.extend(mcp_server_skills(name, spec, label, send_headers=send_headers, schemas=schemas,
+                                        origin=(label, "harness_profile")))
     return merge_skill_lists(skills)
 
 
@@ -1749,6 +1774,14 @@ TOOL_SCHEMA_BYTES = SKILL_SCHEMA_BYTES
 TOOL_SCHEMAS_BYTES = 256 * 1024
 TOOL_SCHEMA_SERVER_INDENT = 12
 TOOL_SCHEMA_TOOL_INDENT = 16
+# Where a tool_schemas copy was read from (DR-294), a closed set: an MCP
+# config file (`source` is its path, config_origin), the environment's
+# AGENT_MCP_NAME/AGENT_MCP_URL, or a harness profile's own declaration
+# (pod mode, RC-531).
+TOOL_SCHEMA_SOURCE_KINDS = frozenset({"file", "environment", "harness_profile"})
+# What a tool_schemas tool keeps besides its name, and what the size caps
+# leave out first.
+TOOL_SCHEMA_DROPPABLE = ("description", "inputSchema", "annotations")
 
 
 def _compact_size(value: Any) -> int:
@@ -1763,34 +1796,61 @@ def _rendered_size(value: Any, indent: int) -> int:
     return len(rendered) + indent * (rendered.count("\n") + 1) + 2
 
 
+def tool_schema_digest(description: str | None, schema: Any, annotations: Any) -> str:
+    """A tool_schemas copy's identity (DR-294): SHA-256 of what the client
+    is shown, as RailDash's `tool_schemas.schema_hash` spells it (sorted
+    keys, compact, UTF-8), over the redacted description, input schema and
+    annotations before any size cap, so a copy keeps its digest when the
+    budget leaves its schema out. With nothing redacted it equals the hash
+    RailDash takes of the same tool seen in captured traffic."""
+    canonical = json.dumps(
+        {"description": description, "input_schema": schema, "annotations": annotations},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def record_tool_schema(tool: Any) -> dict[str, Any] | None:
     """One tools/list entry as tool_schemas keeps it, or None for an entry
-    with no name: `name`, the raw `inputSchema` and `annotations` with every
-    string redacted (redact_json). A schema that is not a JSON object, nests
-    past SKILL_SCHEMA_DEPTH or is past TOOL_SCHEMA_BYTES is left out, and
-    `schema_omitted` says why (the closed set skills_inventory uses);
-    annotations that would push the tool past the cap are left out too."""
+    with no name: `name`, the server's own `description` (redact_text), the
+    raw `inputSchema` and `annotations` with every string redacted
+    (redact_json), and `schema_sha256` (tool_schema_digest). A schema that is
+    not a JSON object, nests past SKILL_SCHEMA_DEPTH or is past
+    TOOL_SCHEMA_BYTES is left out, and `schema_omitted` says why (the closed
+    set skills_inventory uses); a description or annotations that would push
+    the tool past the cap are left out too."""
     if not isinstance(tool, dict):
         return None
     name = first_nonempty(str(tool.get("name") or ""))
     if not name:
         return None
     record: dict[str, Any] = {"name": name}
+    description = first_nonempty(redact_text(str(tool.get("description") or ""))) or None
     schema = tool.get("inputSchema")
+    redacted = None
     if schema is not None:
         redacted = redact_json(schema) if isinstance(schema, dict) else None
         if not isinstance(redacted, dict):
+            redacted = None
             record["schema_omitted"] = "unrepresentable"
         elif _compact_size(redacted) > TOOL_SCHEMA_BYTES:
             record["schema_omitted"] = "per_tool_budget"
         else:
             record["inputSchema"] = redacted
     annotations = tool.get("annotations")
+    redacted_annotations = None
     if isinstance(annotations, dict) and annotations:
         redacted_annotations = redact_json(annotations)
-        if isinstance(redacted_annotations, dict) \
-                and _compact_size({**record, "annotations": redacted_annotations}) <= TOOL_SCHEMA_BYTES:
+        if not isinstance(redacted_annotations, dict):
+            redacted_annotations = None
+        elif _compact_size({**record, "annotations": redacted_annotations}) <= TOOL_SCHEMA_BYTES:
             record["annotations"] = redacted_annotations
+    if description is not None:
+        if _compact_size({**record, "description": description}) <= TOOL_SCHEMA_BYTES:
+            record["description"] = description
+        else:
+            record["description_omitted"] = "per_tool_budget"
+    record["schema_sha256"] = tool_schema_digest(description, redacted, redacted_annotations)
     return record
 
 
@@ -1801,14 +1861,20 @@ def tool_schema_server(
     reachability: str,
     tools: list[Any] | None,
     truncated: bool,
+    *,
+    source_kind: str = "file",
 ) -> dict[str, Any]:
-    """One configured MCP server's entry in tool_schemas: how it answered
+    """One configured MCP server's entry in tool_schemas, as read from one
+    source (DR-294): where (`source`, `source_kind`), how it answered
     (MCP_REACHABILITY) and, when it was listed, each tool's
     `record_tool_schema`. A server that needed a credential is
     `auth_refused`, never retried with one."""
+    if source_kind not in TOOL_SCHEMA_SOURCE_KINDS:
+        raise ValueError(f"unknown tool_schemas source kind {source_kind!r}")
     entry: dict[str, Any] = {
         "server": name,
         "source": source_label,
+        "source_kind": source_kind,
         "endpoints": endpoints,
         "reachability": reachability,
         "tools": [record for record in map(record_tool_schema, tools or []) if record is not None],
@@ -1819,29 +1885,34 @@ def tool_schema_server(
 
 
 def cap_tool_schemas(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """tool_schemas' servers, one per name (a server read from two configs
-    keeps the entry that reached it, as merge_skill_lists does), sorted, and
-    within TOOL_SCHEMAS_BYTES as the bundle renders them (`_rendered_size`):
-    every server entry and tool counts, and past the budget a tool keeps its
-    name but its schema and annotations are left out, the schema as
-    `bundle_budget`, in order. Names alone are bounded by MCP_TOOLS_MAX a
-    server."""
-    kept: dict[str, dict[str, Any]] = {}
+    """tool_schemas' servers, one per server and source (DR-294: a server
+    read from two configs is two copies, each with its own tools, never
+    merged; the same server and source read twice keeps the entry that
+    reached it), sorted by server then source, and within TOOL_SCHEMAS_BYTES
+    as the bundle renders them (`_rendered_size`): every server entry and
+    tool counts, and past the budget a tool keeps its name and
+    `schema_sha256` but its description, schema and annotations are left
+    out, the schema as `bundle_budget`, in order. Names alone are bounded by
+    MCP_TOOLS_MAX a server."""
+    kept: dict[tuple[str, str], dict[str, Any]] = {}
     for server in servers:
-        current = kept.get(server["server"])
+        key = (server["server"], server["source"])
+        current = kept.get(key)
         if current is None or MCP_REACHABILITY.index(server["reachability"]) < MCP_REACHABILITY.index(
             current["reachability"]
         ):
-            kept[server["server"]] = server
-    result = [kept[name] for name in sorted(kept)]
+            kept[key] = server
+    result = [kept[key] for key in sorted(kept)]
     # Room for what every entry keeps whatever happens (the server entries,
     # and each tool as it reads with its schema and annotations left out) is
     # set aside first, so the tools past the budget still fit in it; then
     # each schema, in order, takes what it adds over that.
     def without_schema(tool: dict[str, Any]) -> dict[str, Any]:
-        stripped = {key: value for key, value in tool.items() if key not in ("inputSchema", "annotations")}
+        stripped = {key: value for key, value in tool.items() if key not in TOOL_SCHEMA_DROPPABLE}
         if "inputSchema" in tool:
             stripped["schema_omitted"] = "bundle_budget"
+        if "description" in tool:
+            stripped["description_omitted"] = "bundle_budget"
         return stripped
 
     used = sum(_rendered_size({**server, "tools": []}, TOOL_SCHEMA_SERVER_INDENT) for server in result)
@@ -1849,7 +1920,7 @@ def cap_tool_schemas(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 for server in result for tool in server["tools"])
     for server in result:
         for index, tool in enumerate(server["tools"]):
-            if "inputSchema" not in tool and "annotations" not in tool:
+            if not any(key in tool for key in TOOL_SCHEMA_DROPPABLE):
                 continue
             stripped = without_schema(tool)
             extra = _rendered_size(tool, TOOL_SCHEMA_TOOL_INDENT) - _rendered_size(stripped, TOOL_SCHEMA_TOOL_INDENT)

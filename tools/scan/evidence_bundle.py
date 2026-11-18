@@ -122,6 +122,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 16 also: Claude Code's harness profile (RC-526), the same harness
 # fields as OpenClaw's, from its settings files, ~/.claude.json, .mcp.json,
 # its package or native install, its transcripts and CLAUDE.md.
+# Pack 16 also: tool_schemas keeps a copy per server and source with its
+# origin (source, source_kind), and each tool's description and
+# schema_sha256 (DR-294).
 RULE_PACK_VERSION = 16
 
 # The value shape of observed_file_access (DR-154), published in the v1
@@ -1690,14 +1693,16 @@ def tool_schemas_attribute(servers: list[dict[str, Any]] | None, scanned_roots: 
         )
 
     def named(reachability: str) -> list[str]:
-        return [server["server"] for server in servers if server["reachability"] == reachability]
+        # One name per server, however many sources it was read from (DR-294).
+        return list(dict.fromkeys(server["server"] for server in servers if server["reachability"] == reachability))
 
     refused, unreached, stdio = named("auth_refused"), named("unreachable"), named("not_probed_stdio")
-    capped = [
+    capped = list(dict.fromkeys(
         server["server"] for server in servers
         if server.get("tools_truncated")
-        or any(tool.get("schema_omitted") in TOOL_SCHEMA_SIZE_OMISSIONS for tool in server["tools"])
-    ]
+        or any(tool.get("schema_omitted") in TOOL_SCHEMA_SIZE_OMISSIONS
+               or tool.get("description_omitted") in TOOL_SCHEMA_SIZE_OMISSIONS for tool in server["tools"])
+    ))
     notes = []
     if refused:
         notes.append("needs a credential, not public: " + ", ".join(refused))

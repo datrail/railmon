@@ -103,8 +103,9 @@ class OpenClawTest(AgentRoot):
             self.mcp_json({"finretail": {"url": server.url}, "docs": {"url": other.url}})
             _, _, servers, attribute = self.probe(subject)
         self.assertEqual(len(server.seen_authorization), 2)  # initialize and tools/list, once
-        self.assertEqual([(s["server"], s["source"]) for s in servers],
-                         [("docs", ".mcp.json"), ("finretail", "openclaw profile")])
+        self.assertEqual([(s["server"], s["source"], s["source_kind"]) for s in servers],
+                         [("docs", str(self.volume / ".mcp.json"), "file"),
+                          ("finretail", "openclaw profile", "harness_profile")])
         self.assertEqual(attribute["status"], "ANSWERED")
 
     def test_a_server_whose_url_path_carries_a_key_is_never_asked(self):
@@ -224,7 +225,7 @@ class NoProfileTest(AgentRoot):
             declared, _, servers, attribute = self.probe(subject)
         self.assertIsNone(declared)
         self.assertEqual(set(server.seen_authorization), {None})
-        self.assertEqual([(s["server"], s["source"]) for s in servers], [("finretail", ".mcp.json")])
+        self.assertEqual([(s["server"], s["source"]) for s in servers], [("finretail", str(self.volume / ".mcp.json"))])
         self.assertEqual(attribute["status"], "ANSWERED")
 
     def test_without_an_agent_process_nothing_is_declared(self):

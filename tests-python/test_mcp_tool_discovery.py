@@ -10,6 +10,7 @@ mocked prober couldn't verify. Stdlib only, to match the scanner itself.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import threading
 import unittest
@@ -522,17 +523,101 @@ class RecordToolSchemaTest(unittest.TestCase):
             (entry,) = tool_schemas_from([("finretail", {"url": server.url})])
         self.assertEqual((entry["server"], entry["reachability"]), ("finretail", "reached"))
         self.assertEqual(entry["endpoints"], [server.url])
+        self.assertEqual(entry["source_kind"], "file")
+        self.assertTrue(entry["source"].endswith("/.mcp.json"))
         rate, branches = entry["tools"]
         self.assertEqual(rate, {
             "name": "getInterestRate",
+            "description": "The interest rate for a product.",
             "inputSchema": FINRETAIL_TOOLS[0]["inputSchema"],
             "annotations": FINRETAIL_TOOLS[0]["annotations"],
+            "schema_sha256": scanner.tool_schema_digest(
+                "The interest rate for a product.", FINRETAIL_TOOLS[0]["inputSchema"],
+                FINRETAIL_TOOLS[0]["annotations"]),
         })
-        self.assertEqual(branches, {"name": "listBranches"})  # declares no schema: none, and no omission mark
+        # declares no schema: none, and no omission mark
+        self.assertEqual(branches, {"name": "listBranches", "description": "Every branch.",
+                                    "schema_sha256": scanner.tool_schema_digest("Every branch.", None, None)})
 
         field = evidence_bundle.tool_schemas_attribute([entry], [])
         self.assertEqual((field["status"], field["tier"], field["authored_by"]), ("ANSWERED", "declared", "subject"))
         self.assertEqual(field["value"], [entry])
+
+    def test_the_digest_is_raildash_schema_hash_of_the_same_tool(self):
+        # DR-294: with nothing redacted, a copy's identity is the hash RailDash
+        # takes of the same tool seen in captured traffic (raildash
+        # tool_schemas.schema_hash), so the two can be matched.
+        tool = FINRETAIL_TOOLS[0]
+        canonical = json.dumps(
+            {"description": tool["description"], "input_schema": tool["inputSchema"],
+             "annotations": tool["annotations"]},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+        self.assertEqual(scanner.record_tool_schema(tool)["schema_sha256"],
+                         hashlib.sha256(canonical.encode()).hexdigest())
+
+    def test_a_copy_keeps_its_digest_when_the_budget_drops_its_schema(self):
+        schema = {"type": "object", "properties": {f"p{i}": {"type": "string", "description": "x" * 40}
+                                                   for i in range(60)}}
+        tools = [{"name": f"t{i:03d}", "description": f"tool {i}", "inputSchema": schema} for i in range(200)]
+        (server,) = scanner.cap_tool_schemas([scanner.tool_schema_server("big", "a.json", [], "reached", tools, False)])
+        last = server["tools"][-1]
+        self.assertEqual(last["schema_omitted"], "bundle_budget")
+        self.assertEqual(last["description_omitted"], "bundle_budget")
+        self.assertNotIn("description", last)
+        self.assertEqual(last["schema_sha256"], scanner.record_tool_schema(tools[-1])["schema_sha256"])
+
+    def test_a_description_past_the_per_tool_cap_is_marked(self):
+        tool = {"name": "chatty", "description": "y" * (scanner.TOOL_SCHEMA_BYTES + 1)}
+        record = scanner.record_tool_schema(tool)
+        self.assertNotIn("description", record)
+        self.assertEqual(record["description_omitted"], "per_tool_budget")
+        field = evidence_bundle.tool_schemas_attribute(
+            [scanner.tool_schema_server("s", "a.json", [], "reached", [tool], False)], [])
+        self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
+
+    def test_a_server_in_two_config_files_is_two_copies_with_their_origin(self):
+        # DR-294: ./.mcp.json and ~/.mcp.json both naming "finretail" are two
+        # sources; each keeps its own tools, nothing merged, and the home
+        # folder is `~`. skills_inventory still reads one tool per name.
+        import tempfile
+
+        other = [{**FINRETAIL_TOOLS[0], "description": "A different description."}]
+        with tempfile.TemporaryDirectory() as tmp, FakeMcpServer(FINRETAIL_TOOLS) as one, \
+                FakeMcpServer(other) as two:
+            home = Path(tmp) / "home" / "alice"
+            work = Path(tmp) / "work"
+            home.mkdir(parents=True)
+            work.mkdir()
+            (work / ".mcp.json").write_text(json.dumps({"mcpServers": {"finretail": {"url": one.url}}}))
+            (home / ".mcp.json").write_text(json.dumps({"mcpServers": {"finretail": {"url": two.url}}}))
+            schemas: list[dict] = []
+            skills = scanner.collect_skills([work / ".mcp.json", home / ".mcp.json"], {"HOME": str(home)},
+                                            schemas=schemas)
+            servers = scanner.cap_tool_schemas(schemas)
+        self.assertEqual([(s["server"], s["source"], s["source_kind"]) for s in servers],
+                         [("finretail", str(work / ".mcp.json"), "file"), ("finretail", "~/.mcp.json", "file")])
+        self.assertNotIn("alice", json.dumps(servers))
+        self.assertEqual([len(s["tools"]) for s in servers], [2, 1])
+        self.assertEqual(servers[1]["tools"][0]["description"], "A different description.")
+        self.assertNotEqual(servers[0]["tools"][0]["schema_sha256"], servers[1]["tools"][0]["schema_sha256"])
+        self.assertEqual(sorted(s["name"] for s in skills), ["getInterestRate", "listBranches"])
+        field = evidence_bundle.tool_schemas_attribute(servers, [])
+        self.assertEqual(field["status"], "ANSWERED")
+
+    def test_the_environment_server_is_its_own_source(self):
+        with FakeMcpServer(FINRETAIL_TOOLS) as server:
+            schemas: list[dict] = []
+            scanner.collect_skills([], {"AGENT_MCP_NAME": "finretail", "AGENT_MCP_URL": server.url}, schemas=schemas)
+        (entry,) = scanner.cap_tool_schemas(schemas)
+        self.assertEqual((entry["source"], entry["source_kind"]), ("environment", "environment"))
+
+    def test_config_origin_reads_home_as_tilde_only_on_a_whole_segment(self):
+        self.assertEqual(scanner.config_origin(Path("/home/al/.mcp.json"), "/home/al"), "~/.mcp.json")
+        self.assertEqual(scanner.config_origin(Path("/home/al/.mcp.json"), "/home/al/"), "~/.mcp.json")
+        self.assertEqual(scanner.config_origin(Path("/home/alice/.mcp.json"), "/home/al"), "/home/alice/.mcp.json")
+        self.assertEqual(scanner.config_origin(Path("/work/.mcp.json"), "/"), "/work/.mcp.json")
+        self.assertEqual(scanner.config_origin(Path("/work/.mcp.json"), None), "/work/.mcp.json")
 
     def test_a_key_in_a_default_is_redacted(self):
         tools = [{
@@ -597,7 +682,8 @@ class RecordToolSchemaTest(unittest.TestCase):
         big = {"type": "object", "description": "x" * (scanner.TOOL_SCHEMA_BYTES + 1)}
         with FakeMcpServer([{"name": "bulkImport", "inputSchema": big}, FINRETAIL_TOOLS[1]]) as server:
             (entry,) = tool_schemas_from([("bulk", {"url": server.url})])
-        self.assertEqual(entry["tools"][0], {"name": "bulkImport", "schema_omitted": "per_tool_budget"})
+        self.assertEqual(entry["tools"][0], {"name": "bulkImport", "schema_omitted": "per_tool_budget",
+                                             "schema_sha256": scanner.tool_schema_digest(None, big, None)})
         field = evidence_bundle.tool_schemas_attribute([entry], [])
         self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
         self.assertIn("bulk", field["note"])
