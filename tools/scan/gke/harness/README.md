@@ -171,3 +171,19 @@ entries beside the `.mcp.json` ones, `skills_inventory` as normalized skills
 
 A field the profile doesn't name is `BLIND` with `NOT_COLLECTED_BY_PACK`, and
 pod mode leaves the bundle's own value for it.
+
+## The MCP probe
+
+The MCP probe reads `mcp_servers_declared` on its own, before the bundle is
+built (`read_declared_mcp_servers`, RC-531), and asks each server the profile
+declares, so `tool_schemas` and `skills_inventory` list those servers' tools.
+Only that field is read, and its value isn't redacted: redaction hides a
+server's whole config when its name looks like a credential's
+(`secrets-manager`), which would leave the probe no URL. Each server keeps
+only what the probe uses (`url`, `command`, `args`, `type`, `transport`), so
+`headers` and `env` never reach it, and the probe judges each URL for a
+credential itself. That value is the probe's alone and never reaches the
+bundle. A hook that
+settles a list the harness loads to the exclusion of every other server says
+`exclusive` in its result, as Claude Code's does for `managed-mcp.json`, and
+only those servers are probed.

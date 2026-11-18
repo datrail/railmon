@@ -1231,7 +1231,16 @@ def collect_mcp_inventory(mcp_configs: list[Path], env: dict[str, str] | None = 
     return inventory
 
 
-def read_mcp_config(path: Path) -> list[dict[str, Any]]:
+def read_mcp_config(
+    path: Path,
+    *,
+    send_headers: bool = True,
+    schemas: list[dict[str, Any]] | None = None,
+    skip: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    """Skills for each server in an MCP config's mcpServers; a server named
+    in `skip` is left to whoever probes it instead (RC-531: the harness
+    profile's declaration of the same name)."""
     data = load_json_file(path)
     if not isinstance(data, dict):
         return []
@@ -1241,21 +1250,62 @@ def read_mcp_config(path: Path) -> list[dict[str, Any]]:
 
     skills: list[dict[str, Any]] = []
     for name, spec in servers.items():
-        if isinstance(spec, dict):
-            skills.extend(mcp_server_skills(str(name), spec, path.name))
+        if isinstance(spec, dict) and str(name) not in skip:
+            skills.extend(mcp_server_skills(str(name), spec, path.name, send_headers=send_headers, schemas=schemas))
     return skills
 
 
-def read_mcp_config_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
-    """Skills for the single env-declared MCP server, mirroring `read_mcp_config`."""
+# A query parameter whose name says it carries a credential (RC-531).
+CREDENTIAL_PARAM_RE = re.compile(r"key|token|secret|passw|auth|sig|session|credential|code", re.IGNORECASE)
+
+
+def url_carries_credential(url: str) -> bool:
+    """Whether an MCP server's URL holds something the sidecar must not
+    send (RC-531): userinfo, a query parameter named like a credential or
+    holding a key-shaped value, or a path segment that could be a key (as
+    redact_url judges it, or already `[redacted]`). Pod mode doesn't probe
+    such a URL: the agent's credential would go out in it, which the sidecar
+    never sends, so the server is reported as needing one. A harness
+    profile's URLs arrive whole too (read_declared_mcp_servers), so both
+    are judged the same way."""
+    try:
+        parts = urlsplit(url)
+        _ = parts.port
+    except ValueError:
+        return False  # the probe can't ask it either way; it reads as unreachable
+    if parts.username or parts.password:
+        return True
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if CREDENTIAL_PARAM_RE.search(key) or REDACTED_SEGMENT in value or is_secret_token(value) \
+                or looks_like_secret_segment(value):
+            return True
+    return any(
+        REDACTED_SEGMENT in segment or looks_like_secret_segment(segment)
+        for segment in parts.path.split("/") if segment
+    )
+
+
+def read_mcp_config_from_env(
+    env: dict[str, str], *, send_headers: bool = True, schemas: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Skills for the single env-declared MCP server, mirroring `read_mcp_config`.
+    `send_headers` False (pod mode) applies the same credential check to its
+    URL: in pod mode `env` is the agent's own environment."""
     name = env.get(ENV_MCP_NAME_KEY)
     url = env.get(ENV_MCP_URL_KEY)
     if not name or not url:
         return []
-    return mcp_server_skills(name, {"url": url}, "environment")
+    return mcp_server_skills(name, {"url": url}, "environment", send_headers=send_headers, schemas=schemas)
 
 
-def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> list[dict[str, Any]]:
+def mcp_server_skills(
+    name: str,
+    spec: dict[str, Any],
+    source_label: str,
+    *,
+    send_headers: bool = True,
+    schemas: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """One skill per tool a reachable MCP server declares.
 
     The scanner never asked a server what it exposes before this; it
@@ -1271,15 +1321,26 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
     from a server RailMon couldn't ask. A tool is `reached`; a server entry
     is why its tools aren't listed. `tools_truncated` marks the tools of a
     server whose list was cut at MCP_TOOLS_MAX or MCP_TOOLS_PAGES.
+
+    `send_headers` False (pod mode, RC-511) probes without the config's
+    `headers`: the sidecar never presents the agent's credential, and a
+    server that needs one answers 401 or 403, `auth_refused`. `schemas`, when
+    given, gets this server's `tool_schema_server` entry from the same probe.
     """
     endpoints = dedupe(
         redact_url(value) or UNPARSEABLE for value in collect_strings(spec) if value.startswith(("http://", "https://"))
     )
     url = spec.get("url")
     if isinstance(url, str) and url:
-        headers = spec.get("headers")
+        headers = spec.get("headers") if send_headers else None
         headers = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else None
-        tools, reachability, truncated = probe_mcp_server(url, headers)
+        if not send_headers and url_carries_credential(url):
+            # RC-531: a credential in the URL is still the agent's credential.
+            tools, reachability, truncated = None, "auth_refused", False
+        else:
+            tools, reachability, truncated = probe_mcp_server(url, headers)
+        if schemas is not None:
+            schemas.append(tool_schema_server(name, source_label, endpoints, reachability, tools, truncated))
         if tools is None:
             return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable", reachability)]
         result: list[dict[str, Any]] = []
@@ -1309,6 +1370,10 @@ def mcp_server_skills(name: str, spec: dict[str, Any], source_label: str) -> lis
 
     command = spec.get("command")
     reached = command_basename(command)
+    if schemas is not None:
+        schemas.append(tool_schema_server(
+            name, source_label, endpoints, "not_probed_stdio" if reached else "unreachable", None, False
+        ))
     if not reached:
         return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable", "unreachable")]
     return [
@@ -1497,7 +1562,14 @@ def collect_strings(value: Any) -> list[str]:
     return []
 
 
-def collect_skills(mcp_configs: list[Path], env: dict[str, str] | None = None) -> list[dict[str, Any]]:
+def collect_skills(
+    mcp_configs: list[Path],
+    env: dict[str, str] | None = None,
+    *,
+    send_headers: bool = True,
+    schemas: list[dict[str, Any]] | None = None,
+    declared: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Every MCP skill across every config path, collisions of one server's
     same-named tool merged (two servers' stay apart: `server`, DR-264).
 
@@ -1509,13 +1581,55 @@ def collect_skills(mcp_configs: list[Path], env: dict[str, str] | None = None) -
     `merge_skill_lists`'s union of `destination_endpoints`, the same merge the
     final registration payload already relies on for the analogous collision
     between mcp- and skills-file-derived skills.
+
+    `send_headers` and `schemas` as in `mcp_server_skills`: one probe per
+    server feeds both skills_inventory and tool_schemas.
+
+    `declared` (RC-531, pod mode) is the agent's harness profile's
+    mcp_servers_declared result (pod_mode.declared_mcp_servers). Its servers
+    are probed too, and a config file's server of the same name is left to
+    it, so each is asked once and the harness's own declaration wins. When it
+    is `exclusive` (Claude Code's managed-mcp.json), the harness loads those
+    servers and no others, so they are the only ones probed.
     """
+    profile_servers, label, exclusive = declared_servers(declared)
     skills: list[dict[str, Any]] = []
-    for path in mcp_configs:
-        if path.exists():
-            skills.extend(read_mcp_config(path))
-    skills.extend(read_mcp_config_from_env(env or {}))
+    if not exclusive:
+        for path in mcp_configs:
+            if path.exists():
+                skills.extend(read_mcp_config(path, send_headers=send_headers, schemas=schemas,
+                                              skip=frozenset(profile_servers)))
+        if (env or {}).get(ENV_MCP_NAME_KEY) not in profile_servers:  # else the profile's, probed below
+            skills.extend(read_mcp_config_from_env(env or {}, send_headers=send_headers, schemas=schemas))
+    for name, spec in profile_servers.items():
+        skills.extend(mcp_server_skills(name, spec, label, send_headers=send_headers, schemas=schemas))
     return merge_skill_lists(skills)
+
+
+def unread_mcp_config(declared: dict[str, Any] | None) -> dict[str, str] | None:
+    """Why the harness profile couldn't read the agent's MCP config, when it
+    couldn't (BLIND or FAILED), as {"reason", "note"}: tool_schemas with no
+    server is then BLIND with that reason, not ABSENT, since "no server" was
+    never established (RC-531, the design's failure-mode table)."""
+    if not declared or declared.get("status") not in ("BLIND", "FAILED"):
+        return None
+    reason = declared.get("reason") or "NO_SOURCE_ACCESS"
+    if reason in ("UNKNOWN_HARNESS", "NOT_COLLECTED_BY_PACK"):
+        return None
+    note = f"the {declared.get('harness') or 'harness'} profile couldn't read the MCP config"
+    return {"reason": reason, "note": note + (f": {declared['note']}" if declared.get("note") else "")}
+
+
+def declared_servers(declared: dict[str, Any] | None) -> tuple[dict[str, dict[str, Any]], str, bool]:
+    """A harness profile's mcp_servers_declared result as the servers to
+    probe ({name: spec}, only a value the profile found), the source label
+    their skills carry, and whether the harness loads those alone."""
+    if not declared or declared.get("status") not in ("ANSWERED", "PARTIAL"):
+        return {}, "", False
+    value = declared.get("value")
+    servers = {str(name): spec for name, spec in value.items() if isinstance(spec, dict)} \
+        if isinstance(value, dict) else {}
+    return servers, f"{declared.get('harness') or 'harness'} profile", bool(declared.get("exclusive"))
 
 
 # A skill's source_type, a closed set (DR-264, Eason 2026-10-29): an MCP
@@ -1560,10 +1674,11 @@ SKILL_SCHEMA_DEPTH = 16
 MCP_ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 
 
-def _redacted_json(value: Any, depth: int = 0) -> Any:
+def redact_json(value: Any, depth: int = 0) -> Any:
     """`value` with every string, keys included, through `redact_text`, or
     None past SKILL_SCHEMA_DEPTH or for a value JSON has no form for: a
-    schema's descriptions are operator text, like the tool's own."""
+    schema's descriptions, defaults and examples are operator text, like the
+    tool's own, and a key can end up in any of them (RC-511)."""
     if depth > SKILL_SCHEMA_DEPTH:
         return None
     if isinstance(value, str):
@@ -1573,12 +1688,12 @@ def _redacted_json(value: Any, depth: int = 0) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, list):
-        items = [_redacted_json(item, depth + 1) for item in value]
+        items = [redact_json(item, depth + 1) for item in value]
         return None if any(item is None and raw is not None for item, raw in zip(items, value)) else items
     if isinstance(value, dict):
         kept: dict[str, Any] = {}
         for key, item in value.items():
-            redacted = _redacted_json(item, depth + 1)
+            redacted = redact_json(item, depth + 1)
             if redacted is None and item is not None:
                 return None
             kept[redact_text(str(key))] = redacted
@@ -1597,7 +1712,7 @@ def tool_schema_fields(tool: dict[str, Any]) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     schema = tool.get("inputSchema")
     if schema is not None:
-        redacted = _redacted_json(schema) if isinstance(schema, dict) else None
+        redacted = redact_json(schema) if isinstance(schema, dict) else None
         if not isinstance(redacted, dict):
             fields["schema_omitted"] = "unrepresentable"
         elif len(json.dumps(redacted, separators=(",", ":"), sort_keys=True)) > SKILL_SCHEMA_BYTES:
@@ -1617,6 +1732,132 @@ def tool_schema_fields(tool: dict[str, Any]) -> dict[str, Any]:
         if kept:
             fields["annotations"] = kept
     return fields
+
+
+# tool_schemas (RC-511): every MCP tool's input schema, for Data GuardRail's
+# before-run rules. Unlike a skill's copy (tool_schema_fields), the schema
+# and annotations are kept whole, every string through redact_json, within
+# TOOL_SCHEMA_BYTES a tool (compact JSON, sorted keys, as skills' per-tool
+# cap) and TOOL_SCHEMAS_BYTES for the whole value as the bundle renders it:
+# pretty-printed (render_json's indent=2), each line indented to where the
+# value sits. A tool object sits at column TOOL_SCHEMA_TOOL_INDENT at its
+# deepest (a v2 bundle's agent scope; 12 in v1) and a server entry at
+# TOOL_SCHEMA_SERVER_INDENT. Every server entry and tool name counts, not
+# only the schemas, so the attribute can't push the bundle past RailDash's
+# and Rail Center's 1 MiB bound beside skills_inventory's own 256 KiB.
+TOOL_SCHEMA_BYTES = SKILL_SCHEMA_BYTES
+TOOL_SCHEMAS_BYTES = 256 * 1024
+TOOL_SCHEMA_SERVER_INDENT = 12
+TOOL_SCHEMA_TOOL_INDENT = 16
+
+
+def _compact_size(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), sort_keys=True))
+
+
+def _rendered_size(value: Any, indent: int) -> int:
+    """`value`'s bytes as render_json writes it at column `indent` of the
+    bundle: its pretty-printed lines, each with `indent` more spaces, plus
+    the comma and newline that separate it from the next item."""
+    rendered = json.dumps(value, indent=2, sort_keys=True)
+    return len(rendered) + indent * (rendered.count("\n") + 1) + 2
+
+
+def record_tool_schema(tool: Any) -> dict[str, Any] | None:
+    """One tools/list entry as tool_schemas keeps it, or None for an entry
+    with no name: `name`, the raw `inputSchema` and `annotations` with every
+    string redacted (redact_json). A schema that is not a JSON object, nests
+    past SKILL_SCHEMA_DEPTH or is past TOOL_SCHEMA_BYTES is left out, and
+    `schema_omitted` says why (the closed set skills_inventory uses);
+    annotations that would push the tool past the cap are left out too."""
+    if not isinstance(tool, dict):
+        return None
+    name = first_nonempty(str(tool.get("name") or ""))
+    if not name:
+        return None
+    record: dict[str, Any] = {"name": name}
+    schema = tool.get("inputSchema")
+    if schema is not None:
+        redacted = redact_json(schema) if isinstance(schema, dict) else None
+        if not isinstance(redacted, dict):
+            record["schema_omitted"] = "unrepresentable"
+        elif _compact_size(redacted) > TOOL_SCHEMA_BYTES:
+            record["schema_omitted"] = "per_tool_budget"
+        else:
+            record["inputSchema"] = redacted
+    annotations = tool.get("annotations")
+    if isinstance(annotations, dict) and annotations:
+        redacted_annotations = redact_json(annotations)
+        if isinstance(redacted_annotations, dict) \
+                and _compact_size({**record, "annotations": redacted_annotations}) <= TOOL_SCHEMA_BYTES:
+            record["annotations"] = redacted_annotations
+    return record
+
+
+def tool_schema_server(
+    name: str,
+    source_label: str,
+    endpoints: list[str],
+    reachability: str,
+    tools: list[Any] | None,
+    truncated: bool,
+) -> dict[str, Any]:
+    """One configured MCP server's entry in tool_schemas: how it answered
+    (MCP_REACHABILITY) and, when it was listed, each tool's
+    `record_tool_schema`. A server that needed a credential is
+    `auth_refused`, never retried with one."""
+    entry: dict[str, Any] = {
+        "server": name,
+        "source": source_label,
+        "endpoints": endpoints,
+        "reachability": reachability,
+        "tools": [record for record in map(record_tool_schema, tools or []) if record is not None],
+    }
+    if truncated:
+        entry["tools_truncated"] = True
+    return entry
+
+
+def cap_tool_schemas(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """tool_schemas' servers, one per name (a server read from two configs
+    keeps the entry that reached it, as merge_skill_lists does), sorted, and
+    within TOOL_SCHEMAS_BYTES as the bundle renders them (`_rendered_size`):
+    every server entry and tool counts, and past the budget a tool keeps its
+    name but its schema and annotations are left out, the schema as
+    `bundle_budget`, in order. Names alone are bounded by MCP_TOOLS_MAX a
+    server."""
+    kept: dict[str, dict[str, Any]] = {}
+    for server in servers:
+        current = kept.get(server["server"])
+        if current is None or MCP_REACHABILITY.index(server["reachability"]) < MCP_REACHABILITY.index(
+            current["reachability"]
+        ):
+            kept[server["server"]] = server
+    result = [kept[name] for name in sorted(kept)]
+    # Room for what every entry keeps whatever happens (the server entries,
+    # and each tool as it reads with its schema and annotations left out) is
+    # set aside first, so the tools past the budget still fit in it; then
+    # each schema, in order, takes what it adds over that.
+    def without_schema(tool: dict[str, Any]) -> dict[str, Any]:
+        stripped = {key: value for key, value in tool.items() if key not in ("inputSchema", "annotations")}
+        if "inputSchema" in tool:
+            stripped["schema_omitted"] = "bundle_budget"
+        return stripped
+
+    used = sum(_rendered_size({**server, "tools": []}, TOOL_SCHEMA_SERVER_INDENT) for server in result)
+    used += sum(_rendered_size(without_schema(tool), TOOL_SCHEMA_TOOL_INDENT)
+                for server in result for tool in server["tools"])
+    for server in result:
+        for index, tool in enumerate(server["tools"]):
+            if "inputSchema" not in tool and "annotations" not in tool:
+                continue
+            stripped = without_schema(tool)
+            extra = _rendered_size(tool, TOOL_SCHEMA_TOOL_INDENT) - _rendered_size(stripped, TOOL_SCHEMA_TOOL_INDENT)
+            if used + extra > TOOL_SCHEMAS_BYTES:
+                server["tools"][index] = stripped
+                continue
+            used += extra
+    return result
 
 
 def normalize_skill(value: Any, source_hint: str) -> dict[str, Any]:
@@ -2998,6 +3239,11 @@ def collect_identity(args: argparse.Namespace, context: dict[str, Any]) -> dict[
         # Overwritten with "registered" only once the POST has actually succeeded.
         "registration_status": "registration_failed" if args.register else "unregistered",
         "mcp_servers": [],
+        # None until build_registration_payload probes: tool_schemas is then
+        # BLIND rather than an empty list that reads as "no MCP config".
+        "tool_schemas": None,
+        # Why the harness profile couldn't read the MCP config, if it couldn't.
+        "tool_schemas_unread": None,
         "observed_reach": None,
         "observed_listeners": None,
         "observed_file_access": None,
@@ -3102,7 +3348,18 @@ def build_registration_payload(
             llm_model = container_config_models[-1]
             model_source = "container_openclaw_config"
     owner, owner_source = detect_owner(settings_env(context), args.owner, pod=is_pod_mode(context))
-    mcp_skills = collect_skills(mcp_paths, env)
+    # RC-511: a pod's sidecar probes without the agent's MCP headers, so it
+    # never presents the agent's credential. The tool schemas ride on
+    # identity, beside mcp_servers, for the bundle's tool_schemas: they are
+    # not a registration field.
+    # RC-531: in pod mode the servers the agent's harness profile declares
+    # (OpenClaw's openclaw.json, Claude Code's scopes) are probed too.
+    declared = _pod_mode().declared_mcp_servers(context) if is_pod_mode(context) else None
+    tool_schemas: list[dict[str, Any]] = []
+    mcp_skills = collect_skills(mcp_paths, env, send_headers=not is_pod_mode(context), schemas=tool_schemas,
+                                declared=declared)
+    identity["tool_schemas"] = cap_tool_schemas(tool_schemas)
+    identity["tool_schemas_unread"] = unread_mcp_config(declared)
     scanned_skills = collect_skills_from_files(skill_files)
     payload = {
         "type": args.agent_type,

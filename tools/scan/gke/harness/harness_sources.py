@@ -91,6 +91,53 @@ class PodSources:
         return _agent_process().list_in_root(*located)
 
 
+# What the MCP probe uses from a declared server's spec (RC-531): its
+# address or command. Everything else (headers, env, OAuth settings) is
+# dropped before the probe sees it.
+PROBE_SPEC_KEYS = ("url", "command", "args", "type", "transport")
+
+
+def read_declared_mcp_servers(context: dict[str, Any], config_paths: list[Path],
+                              known_profiles: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """The MCP servers the matched profile settles for mcp_servers_declared
+    (RC-531), for the MCP probe: None when no profile matches, else the
+    field's result (`status`, `value` as {name: spec}, `reason`, `note`, and
+    `exclusive` when the harness loads these servers and no others) and the
+    profile's `harness`.
+
+    Only that one field is read, so a scan doesn't copy the transcript
+    databases twice, and its value is not redacted: the reader's redaction
+    is for the bundle, and it hides a server's whole config when the
+    server's name looks like a credential's (secrets-manager, github-token),
+    so its URL would reach the probe as `[redacted]`. Each spec keeps only
+    PROBE_SPEC_KEYS instead, so headers and env never reach the probe, and
+    the probe judges the URL itself (url_carries_credential), as it does a
+    .mcp.json server's. This value never reaches the bundle: the bundle's
+    mcp_servers_declared is read_agent_harness's, redacted."""
+    subject = context.get("subject")
+    if not subject:
+        return None
+    harness_reader = reader()
+    agent = agent_view(subject)
+    profile = harness_reader.harness_reader_for(profiles() if known_profiles is None else known_profiles, agent)
+    spec = (profile or {}).get("fields", {}).get("mcp_servers_declared")
+    if spec is None:
+        return None
+    # read_harness_fields' own steps for one config field, without its
+    # redaction of the value.
+    ctx = harness_reader.Context(profile, harness_reader.with_derived(profile, agent),
+                                 PodSources(subject.get("root"), config_paths), harness_reader.loads_json, False)
+    ctx.config_sources = harness_reader._read_sources(ctx)
+    result = harness_reader._config_field(ctx, "mcp_servers_declared", spec, ctx.config_sources)
+    value = result.get("value")
+    if isinstance(value, dict):
+        result = {**result, "value": {
+            str(name): {key: server[key] for key in PROBE_SPEC_KEYS if key in server}
+            for name, server in value.items() if isinstance(server, dict)
+        }}
+    return {**result, "harness": profile["harness"]}
+
+
 def profiles() -> list[dict[str, Any]]:
     """The harness profiles shipped with the scanner (gke/harness/profiles)."""
     return reader().load_profiles()

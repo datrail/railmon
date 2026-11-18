@@ -313,6 +313,16 @@ def default_mcp_paths(config_paths: list[Path]) -> list[Path]:
     return list(dict.fromkeys(folder / ".mcp.json" for folder in folders))
 
 
+def declared_mcp_servers(context: dict[str, Any]) -> dict[str, Any] | None:
+    """The MCP servers the agent's harness profile declares, for the MCP
+    probe (RC-531): harness_sources.read_declared_mcp_servers for the agent
+    in `context`, or None with no agent process or no matching profile."""
+    if not context.get("subject"):
+        return None
+    return _harness_sources().read_declared_mcp_servers(
+        context, [Path(p) for p in context.get("config_paths") or []])
+
+
 def choice_warning(subject: dict[str, Any]) -> str | None:
     """A note when the agent's process was a guess: no candidate's root holds
     the config, or processes in more than one other container (counted by
