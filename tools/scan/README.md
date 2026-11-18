@@ -534,10 +534,11 @@ listening somewhere new:
   whether the kernel chose it, so a port the probe saw as `ephemeral` shows
   twice if it is still open at a reattach (already PARTIAL). Its process is
   the main thread's name, and so is the process of every AgentSight record
-  (the adapter reads it from `/proc/<pid>/comm`), so a socket bound or a
-  peer accepted in a named thread (Python from 3.14 names every thread)
-  keys as its process. Only when the process is gone before its record is
-  read does the record keep the thread's name;
+  when `railmon listen` follows a container (`RAIL_LISTEN_CONTAINER`, the
+  adapter reads `/proc/<pid>/comm`), so a socket bound or a peer accepted in
+  a named thread (Python from 3.14 names every thread) keys as its process.
+  A record keeps the thread's name when its process is gone before the
+  record is read, or when the probe runs in the agent's own namespace;
 - the PARTIAL note names the kind of gap, never a count, so a growing lost
   count is not drift on every scan. The counts are in the feature file.
 

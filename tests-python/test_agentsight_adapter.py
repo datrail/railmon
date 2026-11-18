@@ -308,7 +308,7 @@ class ListenerMappingTest(unittest.TestCase):
             instance = adapter.Adapter("listen", proc=tmp)
             out = records(adapt([summary("NET_LISTEN", 80, protocol="tcp", address="0.0.0.0")], "listen", instance))
             self.assertEqual(out[0]["comm"], "srv")
-            # Not cached: once the process can be read, its name is used.
+            # Read for every record: once the process can be read, its name is used.
             self.fake_proc(Path(tmp), 100, 100, b"python3")
             out = records(adapt([summary("NET_LISTEN", 81, protocol="tcp", address="0.0.0.0")], "listen", instance))
             self.assertEqual(out[0]["comm"], "python3")
