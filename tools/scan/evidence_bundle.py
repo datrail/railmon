@@ -122,6 +122,11 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 16 also: Claude Code's harness profile (RC-526), the same harness
 # fields as OpenClaw's, from its settings files, ~/.claude.json, .mcp.json,
 # its package or native install, its transcripts and CLAUDE.md.
+# Pack 16 also: for a pod agent no profile matches, the generic reader
+# (RC-520) fills the harness fields any harness may declare (.mcp.json,
+# AGENTS.md, *_MODEL and *_BASE_URL, model-like and permission-named keys),
+# and the rest are BLIND with UNKNOWN_HARNESS rather than ABSENT, with
+# tool_schemas BLIND, not ABSENT, when there is no MCP config.
 # Pack 16 also: tool_schemas keeps a copy per server and source with its
 # origin (source, source_kind), and each tool's description and
 # schema_sha256 (DR-294).
