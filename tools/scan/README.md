@@ -1189,17 +1189,39 @@ before: an `auth_refused` server's still reads `unreachable`.
 ### Tool schemas
 
 The same probe fills the bundle's `tool_schemas` (RC-511): one entry per
-configured MCP server, sorted by name, with its `source`, its redacted
-`endpoints`, its `reachability` (the values above) and its `tools`. Each tool
-keeps its `name`, its raw `inputSchema` and its `annotations`, every string in
+configured MCP server and source, sorted by server then source, with its
+redacted `endpoints`, its `reachability` (the values above) and its `tools`.
+A server read from two sources is two entries, each with the tools, schemas
+and descriptions that source's server gave, never merged (DR-294; a server
+read twice from the same source keeps the entry that reached it).
+`skills_inventory` still merges them into one skill per tool.
+
+Where an entry was read from is `source` and `source_kind`:
+
+| `source_kind` | `source` |
+| --- | --- |
+| `file` | the MCP config's path, the agent's `HOME` written `~` (`~/.mcp.json`); in pod mode, its path on the config volume |
+| `environment` | `environment` (`AGENT_MCP_NAME`/`AGENT_MCP_URL`) |
+| `harness_profile` | `<harness> profile`, the harness's own declaration (below) |
+
+Each tool keeps its `name`, its server's `description` (through
+`redact_text`), its raw `inputSchema` and its `annotations`, every string in
 them (keys, descriptions, defaults and examples) run through `redact_json`, so
-a key pasted into a default is `[redacted]`. A schema left out says why in
+a key pasted into a default is `[redacted]`. `schema_sha256` identifies the
+copy: SHA-256 of the redacted description, schema and annotations as the
+server sent them (a description with its whitespace, `{}` annotations kept),
+sorted-key compact JSON, as RailDash's `schema_hash` takes it from captured
+traffic, so with nothing redacted the two match. The `description` field
+itself is shown stripped. It is taken before any size cap, so a
+copy keeps it when its schema is left out; a copy's identity across scans is
+server, source, tool name and `schema_sha256`. A schema left out says why in
 `schema_omitted`, as in `skills_inventory`: past 8 KiB for one tool
 (`per_tool_budget`), past 256 KiB for the whole value as the bundle writes
 it, pretty-printed at its deepest indentation, with every server entry and
-tool name counted (`bundle_budget`; the tool keeps its name), or
-`unrepresentable`. Annotations that would take a tool past 8 KiB are left
-out. A server read from two configs keeps the entry that reached it.
+tool name counted (`bundle_budget`; the tool keeps its name and digest), or
+`unrepresentable`. A description left out says why in `description_omitted`
+(`per_tool_budget` or `bundle_budget`). Annotations that would take a tool
+past 8 KiB are left out.
 
 In pod mode the probe sends none of the agent's MCP `headers`, so the sidecar
 never presents the agent's credential, and a server that needs one is not
@@ -1225,7 +1247,7 @@ The status names the worst gap:
 | `ANSWERED` | every server was listed in full |
 | `PARTIAL` / `BLIND`, `PRIVATE_STORE` | a server answered 401 or 403 |
 | `PARTIAL` / `BLIND`, `NO_SOURCE_ACCESS` | a server didn't answer, or answered with something other than MCP |
-| `PARTIAL`, `SIZE_CAP_EXCEEDED` | a schema was left out for size, or a tool list was cut |
+| `PARTIAL`, `SIZE_CAP_EXCEEDED` | a schema or description was left out for size, or a tool list was cut |
 | `PARTIAL` / `BLIND`, `NOT_COLLECTED_BY_PACK` | a `command` server, which the scan never starts |
 | `BLIND`, the profile's reason | no server, and the harness profile couldn't read its MCP config (`PARSE_FAILED`, `NO_SOURCE_ACCESS`) |
 | `ABSENT` | no MCP server in the MCP config |
