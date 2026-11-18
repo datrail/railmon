@@ -21,7 +21,9 @@ Statuses, per field:
 * ABSENT: sources were read and none had it (`method` names them).
 * FAILED (PARSE_FAILED): no source had it and one could not be parsed.
 * BLIND (NO_SOURCE_ACCESS): no source could be read at all.
-* BLIND (UNKNOWN_HARNESS): no profile matched the agent.
+* BLIND (UNKNOWN_HARNESS): no profile matched the agent, and the generic
+  reader (generic.py, RC-520) couldn't fill the field from what any harness
+  may use.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import json
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
@@ -73,6 +76,9 @@ TRANSCRIPT_MAX_BYTES = 1_000_000
 TRANSCRIPT_MAX_FILES = 50
 MAX_JSON_DEPTH = 100
 PROFILES_DIR = Path(__file__).resolve().with_name("profiles")
+GENERIC_READER = Path(__file__).resolve().with_name("generic.py")
+# The name a result of the generic reader carries in place of a profile's.
+GENERIC_HARNESS = "generic"
 
 # Keys whose values are credentials or carry them (an MCP server's headers and
 # env, a provider's apiKey). Matched as whole names, case and separators
@@ -364,9 +370,8 @@ def with_derived(profile: dict[str, Any], agent: Agent) -> Agent:
 
 
 def harness_reader_for(profiles: Iterable[dict[str, Any]], agent: Agent) -> dict[str, Any] | None:
-    """The profile whose markers match the agent, or None (then the generic
-    reader runs, task 6; until it lands the harness fields are BLIND with
-    UNKNOWN_HARNESS). The command line decides first: of the profiles it
+    """The profile whose markers match the agent, or None (then
+    read_harness_fields runs the generic reader, generic.py). The command line decides first: of the profiles it
     shows any sign of, the one with the strongest (_command_line_evidence),
     so an OpenClaw agent whose prompt or note says "claude" stays OpenClaw
     and a Claude Code agent asked about OpenClaw stays Claude Code; on a tie,
@@ -932,14 +937,57 @@ def _transcript_field(ctx: Context, spec: dict[str, Any]) -> dict[str, Any]:
     return _result("ANSWERED", "tool_names", value=value, source=files, note=floor)
 
 
+def _generic_reader() -> Any:
+    """generic.py beside this file, loaded by path once, as a profile's hooks are."""
+    import importlib.util
+    import sys
+
+    name = "harness_generic_reader"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, GENERIC_READER)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {GENERIC_READER}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def _finish(results: dict[str, dict[str, Any]], harness: str,
+            redact_url: Callable[[str], str] | None) -> dict[str, dict[str, Any]]:
+    """Every value, and every string reported beside it, redacted, and each
+    result tagged with the harness (or reader) it came from."""
+    for field in HARNESS_FIELDS:
+        if "value" in results[field]:
+            results[field]["value"] = redact(results[field]["value"], redact_url)
+        # Every string reported beside the value too: file names are the
+        # agent's to choose.
+        for key in ("source", "method", "note"):
+            if key in results[field]:
+                results[field][key] = redact(results[field][key])
+        results[field]["harness"] = harness
+    return results
+
+
 def read_harness_fields(profile: dict[str, Any] | None, agent: Agent, sources: Sources, *,
                         collect_prompt: bool = False, loads: Callable[[str], Any] = loads_json,
-                        redact_url: Callable[[str], str] | None = None) -> dict[str, dict[str, Any]]:
-    """Every harness field for `agent`, read with `profile` (None: no profile
-    matched, so every field is BLIND with UNKNOWN_HARNESS). A field the
-    profile doesn't name is BLIND with NOT_COLLECTED_BY_PACK."""
+                        redact_url: Callable[[str], str] | None = None,
+                        config_paths: Iterable[str] = ()) -> dict[str, dict[str, Any]]:
+    """Every harness field for `agent`, read with `profile`. A field the
+    profile doesn't name is BLIND with NOT_COLLECTED_BY_PACK.
+
+    With no profile (none matched), the generic reader (generic.py) reads
+    what any harness may use: .mcp.json, AGENTS.md, *_MODEL and *_BASE_URL
+    variables, and model-like and permission-named keys in the top-level
+    *.json files under `config_paths` (the --config-path values); every
+    field it can't fill is BLIND with UNKNOWN_HARNESS."""
     if profile is None:
-        return unknown_harness_fields()
+        agent = with_derived({"harness": GENERIC_HARNESS}, agent)
+        results = _generic_reader().read_generic_config(
+            sys.modules[__name__], agent, sources, [str(p) for p in config_paths],
+            collect_prompt=collect_prompt, loads=loads)
+        return _finish(results, GENERIC_HARNESS, redact_url)
     agent = with_derived(profile, agent)
     ctx = Context(profile, agent, sources, loads, collect_prompt)
     results: dict[str, dict[str, Any]] = {}
@@ -958,15 +1006,7 @@ def read_harness_fields(profile: dict[str, Any] | None, agent: Agent, sources: S
     for field in HARNESS_FIELDS:
         results.setdefault(field, _result("BLIND", field, reason="NOT_COLLECTED_BY_PACK",
                                           note=f"the {profile['harness']} profile doesn't name this field"))
-        if "value" in results[field]:
-            results[field]["value"] = redact(results[field]["value"], redact_url)
-        # Every string reported beside the value too: file names are the
-        # agent's to choose.
-        for key in ("source", "method", "note"):
-            if key in results[field]:
-                results[field][key] = redact(results[field][key])
-        results[field]["harness"] = profile["harness"]
-    return results
+    return _finish(results, profile["harness"], redact_url)
 
 
 def to_attributes(results: dict[str, dict[str, Any]], builders: dict[str, Callable[..., dict[str, Any]]],
@@ -984,7 +1024,8 @@ def to_attributes(results: dict[str, dict[str, Any]], builders: dict[str, Callab
         authored_by = FIELD_AUTHORED_BY.get(field, "subject")
         harness = result.get("harness")
         source = result.get("source")
-        method = f"{harness} profile: {source if isinstance(source, str) else ', '.join(source or [])}" if harness else None
+        label = "generic reader" if harness == GENERIC_HARNESS else f"{harness} profile"
+        method = f"{label}: {source if isinstance(source, str) else ', '.join(source or [])}" if harness else None
         note = result.get("note")
         if status == "ANSWERED":
             attributes[field] = builders["answered"](result["value"], tier, authored_by=authored_by, method=method,

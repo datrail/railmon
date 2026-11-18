@@ -11,16 +11,17 @@ that harness keeps each field. Supporting a harness means writing its profile
 | `profiles/openclaw.json` (RC-516) | OpenClaw, as 2026.9.2 lays out its files | `profiles/openclaw.py`: the installed version, the model's provider and endpoint, exec approvals and transcripts from its SQLite databases |
 | `profiles/claude-code.json` (RC-526) | Claude Code, as 2.1.325 lays out and reads its files | `profiles/claude-code.py`: the version (npm package or native install), the model, provider and endpoint in Claude Code's own order (`--model`, `ANTHROPIC_MODEL`, `model`), MCP servers by scope (user, project `.mcp.json`, local, or `managed-mcp.json` alone), permission rules merged across settings files with an untrusted project's allow rules left out, the permission mode and hooks (by event and matcher only), and `tool_use` names from its JSONL transcripts |
 
-For an agent no profile matches, the harness fields
-come from the scanner's generic code until the generic reader (RC-520) lands.
+For an agent no profile matches, the generic reader (`generic.py`, RC-520)
+reads the fields that need no profile; see [The generic reader](#the-generic-reader).
 
 ## The reader
 
 - `harness_reader_for(profiles, agent)` picks the profile with the strongest
   sign on the agent's command line, else the first whose environment markers
   it sets, or None.
-- `read_harness_fields(profile, agent, sources)` reads each field. With no
-  profile, every field is `BLIND` with `UNKNOWN_HARNESS`.
+- `read_harness_fields(profile, agent, sources, config_paths=...)` reads each
+  field. With no profile, the generic reader reads them from what any
+  harness may use, under the `--config-path` values in `config_paths`.
 - `to_attributes(results, builders)` turns the results into bundle attributes.
 
 Where files come from is the caller's: a `Sources` object reads a path as the
@@ -41,7 +42,7 @@ Each field comes back as one of:
 | `BLIND`, `NO_SOURCE_ACCESS` | No source could be read |
 | `FAILED`, `PARSE_FAILED`, "hook … failed" | A hook raised (a malformed database, a full or read-only `/tmp`): that field only, never the scan |
 | `BLIND`, `NOT_COLLECTED_BY_PACK` | The profile doesn't name the field, or prompt text without the flag |
-| `BLIND`, `UNKNOWN_HARNESS` | No profile matched |
+| `BLIND`, `UNKNOWN_HARNESS` | No profile matched, and the generic reader couldn't fill the field |
 
 In pod mode the scanner's own `redact_url` is applied to any whole URL, which
 also masks a secret in a URL's path (a gateway's `/mcp/<key>/sse`).
@@ -88,6 +89,37 @@ the scanner's own functions: `mcp_servers_declared` as `read_mcp_inventory`'s
 entries beside the `.mcp.json` ones, `skills_inventory` as normalized skills
 (name and description from each `SKILL.md`'s frontmatter), and
 `declared_destinations` recomputed from the result.
+
+## The generic reader
+
+`generic.py`'s `read_generic_config` runs when no profile matches the agent.
+It reads only what any harness may use, and reports its results as
+`generic` (`generic reader: <source>` in the bundle's `method`):
+
+| Field | From |
+|---|---|
+| `mcp_servers_declared` | `.mcp.json` (`mcpServers`, or `servers`) in each `--config-path` folder, `$AGENT_CWD`, `~` and `/workdir`, the earlier winning on a name, and an `mcpServers` key in the top-level `*.json` under `--config-path`. `ABSENT` when an MCP config was read and names no server, `FAILED` when one of these files (an `.mcp.json` or a top-level `*.json`) couldn't be read or parsed, since it may hold the servers |
+| `system_prompt_present`, `system_prompt_text` | `AGENTS.md` in the same folders; its text only with `--collect-system-prompt` |
+| `model_name` | The agent's `*_MODEL` variables: the scanner's own first (`RAIL_LLM_MODEL`, `LLM_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `OPENCLAW_MODEL`), then any whose name has a model-service word (`LLM`, `AI`, `CHAT`, `AGENT`, a vendor), never an embedding or reranking model nor one like `AUTH_USER_MODEL`; else a model-like key (`model`, `modelName`, `defaultModel`, `model.primary`, ...) |
+| `inference_endpoint` | `*_BASE_URL` variables, the scanner's own first, then any whose name has a model-service word (`LLM`, `MODEL`, a vendor), never one like `APP_BASE_URL`; else a base-URL key beside a model key or under a model or provider key, redacted |
+| `llm_provider` | A provider key, else a `vendor/model` prefix, else the vendor a model or base-URL variable is named for (`GEMINI_MODEL`) |
+| `tool_allow_deny` | Permission-named keys (`permissions`, `allowedTools`, `tools.allow`, ...), by file and key path |
+| `approval_policy` | Approval-named keys (`approvalMode`, `autoApprove`, ...), by file and key path |
+
+Nothing under a credential-named key (`env`, `headers`, `auth`, `apiKey`, ...) is taken from them, since a value found there would be reported under a path that no longer names it. The top-level `*.json` are read like a profile's sources (64 KB, regular
+files only, at most 50); one that doesn't parse makes the fields it might
+have held `FAILED` with `PARSE_FAILED`. Every other field it can't fill is
+`BLIND` with `UNKNOWN_HARNESS`, never `ABSENT`: a harness without a profile
+may keep it anywhere. `harness_identity`, `tool_names` and `skills_inventory`
+always are, since only a profile knows the version, transcripts and skills.
+
+In pod mode its values are merged as a profile's are. Where it found no
+value, its account replaces a bundle account that only says "not found"
+(`ABSENT`, `BLIND` with `NOT_COLLECTED_BY_PACK`, or `GATEWAY_MANAGED` for an
+undeclared policy); a value the scanner observed itself, or a more specific
+failure, stands. `tool_schemas` is never `ABSENT` while the servers are
+unknown: `BLIND` with `UNKNOWN_HARNESS` when no MCP config was found, and
+`FAILED` with the config's own reason when one couldn't be read or parsed.
 
 ## A profile
 

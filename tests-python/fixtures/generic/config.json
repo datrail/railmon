@@ -1,0 +1,15 @@
+{
+  "name": "fixture-agent",
+  "llm": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "baseUrl": "https://llm-gateway.example.internal/v1",
+    "apiKey": "fixture-placeholder-not-a-key"
+  },
+  "tools": {
+    "allow": ["read_file", "getStockPrice"],
+    "deny": ["shell"]
+  },
+  "approvalMode": "on-request",
+  "telemetry": {"endpoint": "https://telemetry.example.internal/v1/events"}
+}

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "finretail": {
+      "type": "http",
+      "url": "http://finretail-mcp-server:23004/mcp",
+      "headers": {"Authorization": "Bearer fixture-placeholder-not-a-key"}
+    },
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/work"],
+      "env": {"FILES_TOKEN": "fixture-placeholder-not-a-key"}
+    }
+  }
+}

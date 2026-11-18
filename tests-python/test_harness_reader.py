@@ -658,10 +658,15 @@ class PodSourcesTest(Fixture):
         # no tools in the file, so no tool_allow_deny here, nor an ABSENT inference_endpoint.
         self.assertNotIn("tool_allow_deny", attributes)
         self.assertNotIn("inference_endpoint", attributes)
-        # No profile matches (none ships until tasks 4 and 5): the bundle's own values stand.
+        # No profile matches: the generic reader (RC-520) reads the volume's
+        # top-level *.json instead, and names itself, never a profile.
         other = dict(context, subject=dict(subject, cmdline="python3 agent.py"))
-        self.assertEqual(pod_mode.harness_attributes(other, BUILDERS, known_profiles=[profile]), {})
-        self.assertEqual(pod_mode.harness_attributes(context, BUILDERS, known_profiles=[]), {})
+        generic = pod_mode.harness_attributes(other, BUILDERS, known_profiles=[profile])
+        self.assertEqual(generic["model_name"]["value"], "toy-large")
+        self.assertEqual(generic["model_name"]["method"], f"generic reader: {self.volume / 'settings.json'} (model)")
+        self.assertEqual((generic["harness_identity"]["status"], generic["harness_identity"]["reason"]),
+                         ("BLIND", "UNKNOWN_HARNESS"))
+        # No agent process: nothing to read, so the bundle's own values stand.
         self.assertEqual(pod_mode.harness_attributes(dict(context, subject=None), BUILDERS, known_profiles=[profile]), {})
 
     def merged(self, existing, settings):
