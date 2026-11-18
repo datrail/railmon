@@ -99,9 +99,10 @@ def _namespace_sockets(proc: str, pid: int) -> dict[int, tuple[int, str, int]]:
     The comm is the agent's to set, any bytes but NUL, so it is read as
     bytes and decoded one character per byte, as listensnoop escapes it:
     the same name gives the same key, and no name can make the read fail
-    and drop the process's sockets. It is the main thread's name, where
-    listensnoop has the binding thread's; they differ only for a socket
-    bound in a thread named apart."""
+    and drop the process's sockets. It is the main thread's name, as the
+    AgentSight adapter names a listener or peer too; listensnoop has the
+    binding thread's, which differs for a socket bound in a thread named
+    apart (Python from 3.14 names every thread)."""
     owners: dict[int, tuple[int, str, int]] = {}
     namespace = os.readlink(f"{proc}/{pid}/ns/pid")
     for entry in os.listdir(proc):
@@ -539,7 +540,7 @@ def main() -> int:
         if agentsight:
             threading.Thread(target=watch_container, daemon=True,
                              args=(docker, args.container, pid, child, stop_probe)).start()
-            adapter = adapter_module.Adapter(mode)
+            adapter = adapter_module.Adapter(mode, proc=PROC)
             on_snapshot = adapter.note_listeners
             stream = adapter_module.adapt_stream(child.stdout, adapter)
         if agentsight and not args.snapshot_listeners:

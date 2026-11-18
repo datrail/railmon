@@ -533,8 +533,11 @@ listening somewhere new:
   one entry. Its port is a number, since the socket table does not say
   whether the kernel chose it, so a port the probe saw as `ephemeral` shows
   twice if it is still open at a reattach (already PARTIAL). Its process is
-  the main thread's name, so a socket bound in a thread named apart shows
-  twice too;
+  the main thread's name, and so is the process of every AgentSight record
+  (the adapter reads it from `/proc/<pid>/comm`), so a socket bound or a
+  peer accepted in a named thread (Python from 3.14 names every thread)
+  keys as its process. Only when the process is gone before its record is
+  read does the record keep the thread's name;
 - the PARTIAL note names the kind of gap, never a count, so a growing lost
   count is not drift on every scan. The counts are in the feature file.
 

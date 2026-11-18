@@ -276,6 +276,49 @@ class ListenerMappingTest(unittest.TestCase):
         self.assertEqual((out[0]["kind"], out[0]["addr"], out[0]["family"]), ("peer", "172.17.0.2", "ipv4"))
         self.assertEqual(scanner.peer_scope(scanner._peer_address(out[0]["peer"])), "public")
 
+    def fake_proc(self, root: Path, pid: int, tgid: int, comm: bytes) -> None:
+        (root / str(pid)).mkdir(parents=True, exist_ok=True)
+        (root / str(pid) / "status").write_bytes(b"Name:\tThread-1 (serve\nTgid:\t%d\nPid:\t%d\n" % (tgid, pid))
+        (root / str(tgid)).mkdir(parents=True, exist_ok=True)
+        (root / str(tgid) / "comm").write_bytes(comm + b"\n")
+        if tgid != pid:
+            (root / str(tgid) / "status").write_bytes(b"Tgid:\t%d\n" % tgid)
+
+    def test_a_peer_accepted_on_a_named_thread_is_named_for_its_process(self):
+        # Python from 3.14 names the OS thread after the threading.Thread, so
+        # AgentSight's comm on an accept in a worker is the thread's name.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fake_proc(Path(tmp), 100, 100, b"python3")
+            instance = adapter.Adapter("listen", proc=tmp)
+            out = records(adapt([summary("NET_LISTEN", 8443, protocol="tcp", address="0.0.0.0"),
+                                 summary("NET_ACCEPT", 8443, comm="Thread-1 (serve", protocol="tcp",
+                                         local_endpoint="172.17.0.2:8443", address="172.17.0.2",
+                                         peer="172.17.0.5")], "listen", instance))
+        self.assertEqual([(e["kind"], e["comm"]) for e in out], [("listen", "python3"), ("peer", "python3")])
+
+    def test_a_threads_id_is_named_for_its_thread_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fake_proc(Path(tmp), 101, 100, b"java")
+            out = records(adapt([summary("NET_LISTEN", 80, pid=101, comm="http-nio-80-Acc", protocol="tcp",
+                                         address="0.0.0.0")], "listen", adapter.Adapter("listen", proc=tmp)))
+        self.assertEqual(out[0]["comm"], "java")
+
+    def test_a_process_gone_before_its_record_keeps_the_records_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = adapter.Adapter("listen", proc=tmp)
+            out = records(adapt([summary("NET_LISTEN", 80, protocol="tcp", address="0.0.0.0")], "listen", instance))
+            self.assertEqual(out[0]["comm"], "srv")
+            # Not cached: once the process can be read, its name is used.
+            self.fake_proc(Path(tmp), 100, 100, b"python3")
+            out = records(adapt([summary("NET_LISTEN", 81, protocol="tcp", address="0.0.0.0")], "listen", instance))
+            self.assertEqual(out[0]["comm"], "python3")
+
+    def test_without_proc_the_records_name_stands(self):
+        out = records(adapt([summary("NET_ACCEPT", 8443, comm="Thread-1 (serve", protocol="tcp",
+                                     local_endpoint="172.17.0.2:8443", address="172.17.0.2",
+                                     peer="172.17.0.5")], "listen"))
+        self.assertEqual(out[0]["comm"], "Thread-1 (serve")
+
     def test_process_names_are_one_character_per_byte_as_listensnoop_writes_them(self):
         out = records(adapt([summary("NET_LISTEN", 80, protocol="tcp", address="0.0.0.0",
                                      comm="naïve")], "listen"))
