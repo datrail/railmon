@@ -51,6 +51,39 @@ python3 tools/scan/scan_agent_environment.py --mode pod \
   --register --center-url https://gke-scan.rail-system.svc
 ```
 
+## Reporting to gke-scan (RC-513)
+
+With `--register`, pod mode posts each bundle to gke-scan through
+`gke/reporter.py`, with a 30-second timeout (gke-scan's own post to Rail
+Center takes up to 15).
+
+| gke-scan answers | The sidecar |
+| --- | --- |
+| 2xx, accepted or `duplicate` | Done |
+| 429, 503 or another 5xx, or no answer (refused, timed out, TLS failure) | Retries 5 s later, doubling with ±20% jitter up to 5 minutes, never sooner than `Retry-After` (read up to an hour) |
+| 401, 403, 409, 413, 422, or anything else | Logs it and drops the bundle; the next scan sends its own |
+| Nothing, because the token file can't be read | Sends nothing, never anonymously, and drops the bundle |
+
+The first attempt is the scan's own, so its log line says what gke-scan
+answered. Retries run on one background thread, only with `--interval`; a
+single scan makes its one attempt. At most one bundle waits: a scan that
+finishes during the backoff replaces it and goes at its scheduled time, so
+Rail Center gets the newest view and gke-scan's backoff still holds. A retry
+that gets through stores the registration state as the scan would have.
+
+gke-scan serves a certificate from the chart's own CA. `--center-ca-file`
+(or `RAIL_CENTER_CA_FILE`) names that CA as a PEM file, and the post to
+`--center-url` trusts it beside the system store. Only that post does: the
+MCP and spec probes, RailDash and the metadata server keep the system store.
+The file is read on every post, so a rotated CA is picked up without a
+restart; one that can't be read fails the post before anything is sent.
+
+```bash
+python3 tools/scan/scan_agent_environment.py --mode pod --interval 3600 \
+  --register --center-url https://gke-scan.rail-system.svc \
+  --center-ca-file /etc/rail/gke-scan-ca.crt
+```
+
 ## The agent's own process (RC-509)
 
 With `shareProcessNamespace: true`, the sidecar reads the agent's own process

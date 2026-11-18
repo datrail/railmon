@@ -3631,12 +3631,50 @@ def auth_headers(mode: str | None = None, timeout: float = 15.0) -> dict[str, st
     return {"Authorization": f"Bearer {_gcp_identity_token(audience, timeout)}"}
 
 
+class RegistrationError(ScannerError):
+    """A registration POST that left the process and failed (RC-513).
+
+    `status` is the HTTP status answered, or None when nothing answered
+    (refused, timed out, TLS failure); `retry_after` is the raw Retry-After
+    header, if any. A ScannerError that is not one of these failed before a
+    request was sent (no credential, say). gke/reporter.py decides from these
+    whether pod mode retries the bundle."""
+
+    sent = True
+
+    def __init__(self, message: str, status: int | None = None, retry_after: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def registration_opener(ca_file: str | None = None) -> Any:
+    """The opener for the register POST: redirects refused, and with
+    `ca_file` (`--center-ca-file`, RC-513) that CA trusted beside the system
+    store. Only this opener uses it, and it only ever opens the register URL,
+    so the CA is trusted for the `--center-url` host alone: the MCP and spec
+    probes, RailDash and the metadata server keep the system store. The file
+    is read on every call, so a rotated CA is picked up like a rotated token."""
+    if not ca_file:
+        return _REGISTRATION_OPENER
+    import ssl
+    from urllib.request import HTTPSHandler
+
+    try:
+        context = ssl.create_default_context()
+        context.load_verify_locations(cafile=ca_file)
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        raise ScannerError(f"--center-ca-file/RAIL_CENTER_CA_FILE {ca_file}: {exc.__class__.__name__}") from None
+    return build_opener(_NoRedirect, HTTPSHandler(context=context))
+
+
 def post_registration(
     center_url: str,
     data: bytes,
     timeout: float = 15.0,
     auth_mode: str | None = None,
     agent_key: str | None = None,
+    ca_file: str | None = None,
 ) -> dict[str, Any]:
     """POST this scan's evidence bundle, as raw bytes, to rail-center's register route.
 
@@ -3652,7 +3690,10 @@ def post_registration(
     `agent_key` is a keyed v1 scan's key, sent as `?agent_key=` (a v1 bundle
     names none). The credential is `auth_headers`' (RAIL_AUTH_MODE), and a
     redirect is refused rather than followed, so it never reaches another host.
+    `ca_file` adds a CA for this host only (`registration_opener`). A failure
+    after the request was sent raises `RegistrationError`.
     """
+    opener = registration_opener(ca_file)
     req = Request(
         registration_url(center_url, agent_key),
         data=data,
@@ -3664,18 +3705,30 @@ def post_registration(
         method="POST",
     )
     try:
-        with _REGISTRATION_OPENER.open(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             body_text = resp.read().decode("utf-8", errors="replace")
             try:
                 body = json.loads(body_text) if body_text else None
             except json.JSONDecodeError as exc:
-                raise ScannerError(f"rail-center returned non-JSON response: {body_text[:200]}") from exc
+                raise RegistrationError(
+                    f"rail-center returned non-JSON response: {body_text[:200]}", status=resp.status
+                ) from exc
             return {"status": resp.status, "body": body}
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise ScannerError(f"rail-center registration failed: HTTP {exc.code}: {body}") from exc
+        raise RegistrationError(
+            f"rail-center registration failed: HTTP {exc.code}: {body}",
+            status=exc.code,
+            retry_after=exc.headers.get("Retry-After") if exc.headers is not None else None,
+        ) from exc
     except (URLError, TimeoutError, OSError) as exc:
-        raise ScannerError(f"rail-center registration failed: {exc}") from exc
+        raise RegistrationError(f"rail-center registration failed: {exc}") from exc
+
+
+def configured_center_ca_file(args: argparse.Namespace) -> str | None:
+    """RC-513: a CA to trust for `--center-url`'s host, beside the system store
+    (in pod mode, the chart's CA for gke-scan's certificate), or None."""
+    return first_nonempty(getattr(args, "center_ca_file", None), os.environ.get("RAIL_CENTER_CA_FILE"))
 
 
 def configured_center_url(args: argparse.Namespace) -> str:
@@ -3903,7 +3956,9 @@ def _register_v2_collection(
         return None, registered, True
     try:
         center_url = configured_center_url(args)
-        response = post_registration(center_url, data, auth_mode=args.auth_mode)
+        response = post_registration(
+            center_url, data, auth_mode=args.auth_mode, ca_file=configured_center_ca_file(args)
+        )
         by_key = registrations_by_agent_key(response)
         skipped = skipped_agent_keys(response)
     except ScannerError as exc:
@@ -4649,12 +4704,50 @@ def register_bundle(args: argparse.Namespace, data: bytes | None, payload: dict[
                     f"got {_printable(agent_key, 80)!r}"
                 )
         center_url = configured_center_url(args)
-        response = post_registration(center_url, data, auth_mode=args.auth_mode, agent_key=agent_key)
+        response = _post_bundle(args, center_url, data, payload, agent_key)
         store_registration(args, center_url, payload, response, registration_output_path(args), agent_key)
         return True
     except ScannerError as exc:
         print(f"agent-environment-scanner: {exc}", file=sys.stderr)
         return False
+
+
+def _post_bundle(
+    args: argparse.Namespace,
+    center_url: str,
+    data: bytes,
+    payload: dict[str, Any],
+    agent_key: str | None,
+) -> dict[str, Any]:
+    """POST a v1 bundle, the one attempt self and docker modes make.
+
+    RC-513: pod mode posts through gke/reporter.py instead, with a 30-second
+    timeout: 429, 5xx and no answer are retried in the background of an
+    `--interval` sidecar with backoff, keeping only the latest bundle, and
+    any other answer is final for that bundle. A retry that gets through
+    stores its registration state as this scan would have.
+    """
+    ca_file = configured_center_ca_file(args)
+    if args.mode != "pod":
+        return post_registration(center_url, data, auth_mode=args.auth_mode, agent_key=agent_key, ca_file=ca_file)
+    reporter = _gke("reporter")
+    state_path = registration_output_path(args)
+
+    def send() -> dict[str, Any]:
+        return post_registration(
+            center_url,
+            data,
+            timeout=reporter.POST_TIMEOUT_SECONDS,
+            auth_mode=args.auth_mode,
+            agent_key=agent_key,
+            ca_file=ca_file,
+        )
+
+    def on_success(response: dict[str, Any]) -> None:
+        store_registration(args, center_url, payload, response, state_path, agent_key)
+
+    background = configured_scan_interval(args) is not None
+    return reporter.reporter(ScannerError, background).report(send, on_success)
 
 
 def store_json(path: Path, value: dict[str, Any], compact: bool) -> None:
@@ -4777,6 +4870,12 @@ def make_parser() -> argparse.ArgumentParser:
         "locally and sent to RailDash) to its /v1/agents/register. The registration payload is no longer sent.",
     )
     parser.add_argument("--center-url", help="rail-center base URL or /v1/agents/register URL.")
+    parser.add_argument(
+        "--center-ca-file",
+        help="RC-513: a PEM CA to trust for --center-url's host, beside the system store (in pod mode, "
+        "the chart's CA for gke-scan). Nothing else the scan connects to trusts it. Also read from "
+        "RAIL_CENTER_CA_FILE.",
+    )
     parser.add_argument(
         "--auth-mode",
         choices=list(AUTH_MODES),

@@ -1019,6 +1019,12 @@ registration request does not follow redirects, so the credential cannot be
 carried to another host. These are the same variables, read the same way, as
 the collector's `--webhook` and `railmon forward`.
 
+`--center-ca-file` (or `RAIL_CENTER_CA_FILE`) trusts a PEM CA for the
+`--center-url` host, beside the system store, for a Rail Center (or, in pod
+mode, a gke-scan) whose certificate a private CA signed. No other connection
+the scan makes trusts it. In pod mode the post is also retried; see
+[gke/README.md](gke/README.md#reporting-to-gke-scan-rc-513).
+
 ## Local Machine Scan
 
 From the repository root:

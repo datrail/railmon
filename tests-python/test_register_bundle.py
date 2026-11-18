@@ -112,9 +112,10 @@ def v2_answer(keys: list[str], duplicate: bool = False) -> dict[str, Any]:
 
 class FakeServer:
     """A loopback HTTP server answering each POST from a queue, recording
-    path, headers and the exact body bytes."""
+    path, headers and the exact body bytes. An answer may carry a third
+    element, its extra headers (RC-513's Retry-After); `tls` serves HTTPS."""
 
-    def __init__(self, responses: list[tuple[int, dict[str, Any]]]):
+    def __init__(self, responses: list[tuple], tls: Any = None):
         server = self
         self.responses = list(responses)
         self.requests: list[dict[str, Any]] = []
@@ -131,16 +132,21 @@ class FakeServer:
                     "content_type": self.headers.get("Content-Type"),
                     "authorization": self.headers.get("Authorization"),
                 })
-                status, answer = server.responses.pop(0) if server.responses else (500, {"error": "exhausted"})
+                status, answer, *extra = server.responses.pop(0) if server.responses else (500, {"error": "exhausted"})
                 data = json.dumps(answer).encode()
                 self.send_response(status)
+                for name, value in (extra[0] if extra else {}).items():
+                    self.send_header(name, value)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        if tls is not None:
+            self.httpd.socket = tls.wrap_socket(self.httpd.socket, server_side=True)
+        scheme = "https" if tls is not None else "http"
+        self.url = f"{scheme}://127.0.0.1:{self.httpd.server_address[1]}"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
@@ -618,3 +624,372 @@ class RegistrationStateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- RC-513: the reporter retries safely and trusts gke-scan's certificate ---
+
+reporter_mod = scanner._gke("reporter")
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def wait_for(predicate, timeout: float = 5.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+class ReporterTest(unittest.TestCase):
+    """gke/reporter.py against a local fake gke-scan, for every answer it can give."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.logs: list[str] = []
+        self.reporter = reporter_mod.Reporter(
+            scanner.ScannerError, clock=self.clock, rand=lambda: 0.5, log=self.logs.append
+        )
+        self.addCleanup(self.reporter.close)
+        self.stored: list[dict[str, Any]] = []
+        env = mock.patch.dict(os.environ, clean_env(), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+
+    def server(self, responses):
+        server = FakeServer(responses)
+        self.addCleanup(server.close)
+        return server
+
+    def sender(self, server: FakeServer, data: bytes):
+        def send():
+            return scanner.post_registration(server.url, data, timeout=reporter_mod.POST_TIMEOUT_SECONDS)
+        return send
+
+    def report(self, server: FakeServer, data: bytes = b'{"bundle":"a"}'):
+        return self.reporter.report(self.sender(server, data), self.stored.append)
+
+    def advance(self, seconds: float) -> None:
+        self.clock.now += seconds
+        self.reporter.wake()
+
+    def test_2xx_is_accepted_once(self):
+        server = self.server([(201, v1_answer())])
+        response = self.report(server)
+        self.assertEqual(response["status"], 201)
+        self.assertFalse(response["body"]["duplicate"])
+        self.assertFalse(self.reporter.waiting)
+        self.assertEqual(len(server.requests), 1)
+
+    def test_a_duplicate_is_accepted_and_not_resent(self):
+        server = self.server([(200, v1_answer(duplicate=True))])
+        response = self.report(server)
+        self.assertTrue(response["body"]["duplicate"])
+        self.assertFalse(self.reporter.waiting)
+        self.advance(600)
+        self.assertEqual(len(server.requests), 1)
+
+    def test_a_refused_token_or_bundle_is_final(self):
+        for status in (401, 403, 409, 413, 422):
+            with self.subTest(status=status):
+                server = self.server([(status, {"error": "no"}), (201, v1_answer())])
+                with self.assertRaises(scanner.ScannerError) as raised:
+                    self.report(server)
+                self.assertIn(f"HTTP {status}", str(raised.exception))
+                self.assertIn("not resent", str(raised.exception))
+                self.assertFalse(self.reporter.waiting)
+                self.advance(600)
+                self.assertFalse(wait_for(lambda: len(server.requests) > 1, timeout=0.3))
+
+    def test_429_honors_retry_after(self):
+        server = self.server([(429, {"error": "slow down"}, {"Retry-After": "120"}), (201, v1_answer())])
+        data = b'{"bundle":"a"}'
+        with self.assertRaises(scanner.ScannerError) as raised:
+            self.report(server, data)
+        self.assertIn("retrying in 120s", str(raised.exception))
+        self.assertAlmostEqual(self.reporter.next_retry_in(), 120.0)
+        self.advance(119)
+        self.assertFalse(wait_for(lambda: len(server.requests) > 1, timeout=0.3))
+        self.advance(1)
+        self.assertTrue(wait_for(lambda: len(server.requests) == 2))
+        self.assertEqual(server.requests[1]["body"], data)
+        self.assertTrue(wait_for(lambda: len(self.stored) == 1))
+        self.assertEqual(self.stored[0]["status"], 201)
+        self.assertFalse(self.reporter.waiting)
+
+    def test_a_short_retry_after_never_shortens_the_backoff(self):
+        server = self.server([(429, {}, {"Retry-After": "1"})])
+        with self.assertRaises(scanner.ScannerError):
+            self.report(server)
+        self.assertAlmostEqual(self.reporter.next_retry_in(), 5.0)
+
+    def test_503_is_retried_after_5_seconds(self):
+        server = self.server([(503, {"error": "rail center unreachable"}), (201, v1_answer())])
+        with self.assertRaises(scanner.ScannerError) as raised:
+            self.report(server)
+        self.assertIn("HTTP 503, retrying in 5s", str(raised.exception))
+        self.advance(4.9)
+        self.assertFalse(wait_for(lambda: len(server.requests) > 1, timeout=0.3))
+        self.advance(0.1)
+        self.assertTrue(wait_for(lambda: len(self.stored) == 1))
+        self.assertEqual(len(server.requests), 2)
+
+    def test_500_backs_off_doubling(self):
+        server = self.server([(500, {}), (500, {}), (502, {}), (201, v1_answer())])
+        with self.assertRaises(scanner.ScannerError):
+            self.report(server)
+        for attempt, delay in ((2, 5.0), (3, 10.0), (4, 20.0)):
+            self.assertAlmostEqual(self.reporter.next_retry_in(), delay)
+            self.advance(delay)
+            self.assertTrue(wait_for(lambda: len(server.requests) == attempt))
+            wait_for(lambda: self.reporter.next_retry_in() != 0.0, timeout=0.5)
+        self.assertTrue(wait_for(lambda: len(self.stored) == 1))
+        self.assertFalse(self.reporter.waiting)
+
+    def test_no_answer_is_retried(self):
+        import socket
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        dead = mock.Mock(url=f"http://127.0.0.1:{port}")
+        with self.assertRaises(scanner.ScannerError) as raised:
+            self.reporter.report(self.sender(dead, b"{}"), self.stored.append)
+        self.assertIn("no answer, retrying in 5s", str(raised.exception))
+        self.assertTrue(self.reporter.waiting)
+
+    def test_only_the_latest_bundle_is_kept(self):
+        server = self.server([(503, {}), (201, v1_answer())])
+        with self.assertRaises(scanner.ScannerError):
+            self.report(server, b'{"bundle":"old"}')
+        with self.assertRaises(scanner.ScannerError) as raised:
+            self.report(server, b'{"bundle":"new"}')
+        self.assertIn("queued", str(raised.exception))
+        # Queued behind the backoff, not sent early.
+        self.assertEqual(len(server.requests), 1)
+        self.advance(5)
+        self.assertTrue(wait_for(lambda: len(self.stored) == 1))
+        self.assertEqual([r["body"] for r in server.requests], [b'{"bundle":"old"}', b'{"bundle":"new"}'])
+        self.advance(600)
+        self.assertFalse(wait_for(lambda: len(server.requests) > 2, timeout=0.3))
+
+    def test_a_non_ascii_digit_retry_after_falls_back_to_the_backoff(self):
+        server = self.server([(503, {}, {"Retry-After": "²"}), (503, {}, {"Retry-After": "²"}), (201, v1_answer())])
+        with self.assertRaises(scanner.ScannerError) as raised:
+            self.report(server)
+        self.assertIn("HTTP 503, retrying in 5s", str(raised.exception))
+        self.advance(5)
+        self.assertTrue(wait_for(lambda: len(server.requests) == 2))
+        wait_for(lambda: self.reporter.next_retry_in() != 0.0, timeout=0.5)
+        self.assertAlmostEqual(self.reporter.next_retry_in(), 10.0)
+        self.advance(10)
+        self.assertTrue(wait_for(lambda: len(self.stored) == 1))
+        self.assertFalse(self.reporter.waiting)
+
+    def test_an_unexpected_error_in_the_retry_thread_does_not_stop_it(self):
+        server = self.server([(503, {}), (503, {}), (201, v1_answer())])
+        failed_once: list[str] = []
+
+        def log(message: str) -> None:
+            if "retry failed" in message and not failed_once:
+                failed_once.append(message)
+                raise RuntimeError("log broke")
+            self.logs.append(message)
+
+        self.reporter._log = log
+        with self.assertRaises(scanner.ScannerError):
+            self.report(server)
+        self.advance(5)
+        self.assertTrue(wait_for(lambda: any("unexpected error" in m for m in self.logs)))
+        self.assertTrue(self.reporter.waiting)
+        # The failed retry counted once, the error once more: 5 s doubled twice.
+        self.assertAlmostEqual(self.reporter.next_retry_in(), 20.0)
+        self.advance(20)
+        self.assertTrue(wait_for(lambda: len(self.stored) == 1))
+        self.assertEqual(len(server.requests), 3)
+        self.assertFalse(self.reporter.waiting)
+
+    def test_a_single_scan_does_not_retry(self):
+        single = reporter_mod.Reporter(scanner.ScannerError, background=False, clock=self.clock)
+        self.addCleanup(single.close)
+        server = self.server([(503, {})])
+        with self.assertRaises(scanner.ScannerError) as raised:
+            single.report(self.sender(server, b"{}"))
+        self.assertIn("not retried by a single scan", str(raised.exception))
+        self.assertFalse(single.waiting)
+
+    def test_a_missing_token_is_not_sent_or_retried(self):
+        server = self.server([(201, v1_answer())])
+        os.environ.update(RAIL_AUTH_MODE="bearer", RAIL_AUTH_TOKEN_FILE="/nonexistent/rail/token")
+
+        def send():
+            return scanner.post_registration(server.url, b"{}")
+
+        with self.assertRaises(scanner.ScannerError) as raised:
+            self.reporter.report(send)
+        self.assertIn("not sent, not retried", str(raised.exception))
+        self.assertFalse(self.reporter.waiting)
+        self.assertEqual(server.requests, [])
+
+
+class BackoffTest(unittest.TestCase):
+    def test_the_delay_doubles_from_5_seconds_to_5_minutes(self):
+        delays = [reporter_mod.backoff_delay(n, lambda: 0.5) for n in range(1, 10)]
+        self.assertEqual(delays, [5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0, 300.0])
+
+    def test_jitter_stays_within_20_percent_and_the_cap(self):
+        self.assertAlmostEqual(reporter_mod.backoff_delay(1, lambda: 0.0), 4.0)
+        self.assertAlmostEqual(reporter_mod.backoff_delay(1, lambda: 1.0), 6.0)
+        self.assertEqual(reporter_mod.backoff_delay(20, lambda: 1.0), 300.0)
+
+    def test_retry_after_is_read_as_seconds_or_a_date(self):
+        self.assertEqual(reporter_mod.parse_retry_after("120"), 120.0)
+        import calendar
+
+        midnight = float(calendar.timegm((2026, 11, 18, 0, 0, 0)))
+        self.assertEqual(reporter_mod.parse_retry_after("Wed, 18 Nov 2026 00:02:00 GMT", now=midnight), 120.0)
+        self.assertEqual(reporter_mod.parse_retry_after("Wed, 18 Nov 2026 00:02:00 GMT", now=midnight + 600), 0.0)
+        self.assertEqual(reporter_mod.parse_retry_after("999999"), reporter_mod.RETRY_AFTER_MAX_SECONDS)
+        self.assertIsNone(reporter_mod.parse_retry_after("soon"))
+        self.assertIsNone(reporter_mod.parse_retry_after(None))
+        # isdigit() is true for these; float() refuses them.
+        for value in ("²", "١٢٠", "12³"):
+            with self.subTest(value=value):
+                self.assertIsNone(reporter_mod.parse_retry_after(value))
+
+    def test_which_answers_are_retried(self):
+        for status in (429, 500, 502, 503, 504, None):
+            self.assertTrue(reporter_mod.is_retryable(status), status)
+        for status in (200, 301, 400, 401, 403, 404, 409, 413, 422):
+            self.assertFalse(reporter_mod.is_retryable(status), status)
+
+
+class PodModePostTest(unittest.TestCase):
+    """register_bundle in pod mode goes through the reporter, with a 30 s timeout."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        env = mock.patch.dict(os.environ, clean_env(), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        reset = mock.patch.object(reporter_mod, "_REPORTER", None)
+        reset.start()
+        self.addCleanup(reset.stop)
+
+    def args(self, mode: str, url: str, *extra: str) -> argparse.Namespace:
+        return scanner.make_parser().parse_args(
+            ["--mode", mode, "--register", "--center-url", url,
+             "--registration-output", f"{self.tmp}/registration.json", *extra])
+
+    def test_pod_mode_posts_with_a_30_second_timeout(self):
+        self.assertEqual(reporter_mod.POST_TIMEOUT_SECONDS, 30.0)
+        with mock.patch.object(scanner, "post_registration", return_value={"status": 201, "body": v1_answer()}) as post:
+            scanner._post_bundle(self.args("pod", "http://gke-scan"), "http://gke-scan", b"{}", {}, None)
+        self.assertEqual(post.call_args.kwargs["timeout"], 30.0)
+
+    def test_self_mode_keeps_its_one_attempt(self):
+        with mock.patch.object(scanner, "post_registration", return_value={"status": 201, "body": v1_answer()}) as post:
+            scanner._post_bundle(self.args("self", "http://rc"), "http://rc", b"{}", {}, None)
+        self.assertNotIn("timeout", post.call_args.kwargs)
+        self.assertIsNone(reporter_mod._REPORTER)
+
+    def test_an_interval_sidecar_retries_and_stores_the_state(self):
+        server = FakeServer([(503, {}), (201, v1_answer(agent_id="a-retried"))])
+        self.addCleanup(server.close)
+        args = self.args("pod", server.url, "--interval", "3600")
+        clock = FakeClock()
+        reporter = reporter_mod.Reporter(scanner.ScannerError, clock=clock, rand=lambda: 0.5, log=lambda m: None)
+        self.addCleanup(reporter.close)
+        reporter_mod._REPORTER = reporter
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(scanner.register_bundle(args, b'{"bundle":"x"}', {}))
+            clock.now += 5
+            reporter.wake()
+            self.assertTrue(wait_for(lambda: Path(self.tmp, "registration.json").exists()))
+        state = json.loads(Path(self.tmp, "registration.json").read_text())
+        self.assertEqual(state["agent_id"], "a-retried")
+        self.assertNotIn(TOKEN, json.dumps(state))
+
+
+class CenterCaTest(unittest.TestCase):
+    """--center-ca-file: a self-signed CA is trusted for --center-url only."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        import ssl
+
+        if shutil.which("openssl") is None:
+            raise unittest.SkipTest("openssl is needed to make a test CA")
+        cls.dir = tempfile.mkdtemp()
+        d = Path(cls.dir)
+        # Key identifiers too: Python 3.13's default context checks X.509 strictly.
+        (d / "server.ext").write_text(
+            "subjectAltName=IP:127.0.0.1,DNS:localhost\nbasicConstraints=critical,CA:FALSE\n"
+            "keyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
+            "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n")
+        (d / "ca.ext").write_text(
+            "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
+            "subjectKeyIdentifier=hash\n")
+        for cmd in (
+            ["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.csr",
+             "-subj", "/CN=railmon-test-ca"],
+            ["openssl", "x509", "-req", "-in", "ca.csr", "-signkey", "ca.key", "-out", "ca.crt", "-days", "2",
+             "-extfile", "ca.ext"],
+            ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "server.key", "-out", "server.csr",
+             "-subj", "/CN=127.0.0.1"],
+            ["openssl", "x509", "-req", "-in", "server.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial",
+             "-out", "server.crt", "-days", "2", "-extfile", "server.ext"],
+        ):
+            subprocess.run(cmd, cwd=d, check=True, capture_output=True)
+        cls.ca = str(d / "ca.crt")
+        cls.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        cls.tls.load_cert_chain(d / "server.crt", d / "server.key")
+
+    @classmethod
+    def tearDownClass(cls):
+        __import__("shutil").rmtree(cls.dir, ignore_errors=True)
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, clean_env(), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.server = FakeServer([(201, v1_answer())], tls=self.tls)
+        self.addCleanup(self.server.close)
+
+    def test_the_post_succeeds_with_the_ca(self):
+        response = scanner.post_registration(self.server.url, b"{}", ca_file=self.ca)
+        self.assertEqual(response["status"], 201)
+
+    def test_the_variable_sets_it_too(self):
+        os.environ["RAIL_CENTER_CA_FILE"] = self.ca
+        args = scanner.make_parser().parse_args(["--register", "--center-url", self.server.url])
+        self.assertEqual(scanner.configured_center_ca_file(args), self.ca)
+
+    def test_the_post_fails_without_it_and_is_retryable(self):
+        with self.assertRaises(scanner.RegistrationError) as raised:
+            scanner.post_registration(self.server.url, b"{}")
+        self.assertIsNone(raised.exception.status)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", str(raised.exception))
+        self.assertEqual(self.server.requests, [])
+
+    def test_other_connections_keep_the_system_store(self):
+        scanner.post_registration(self.server.url, b"{}", ca_file=self.ca)
+        with self.assertRaises(scanner.URLError):
+            scanner.urlopen(self.server.url, timeout=5)
+
+    def test_an_unreadable_ca_is_refused_before_sending(self):
+        with self.assertRaises(scanner.ScannerError) as raised:
+            scanner.post_registration(self.server.url, b"{}", ca_file="/nonexistent/ca.crt")
+        self.assertNotIsInstance(raised.exception, scanner.RegistrationError)
+        self.assertEqual(self.server.requests, [])
