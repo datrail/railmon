@@ -402,7 +402,10 @@ Data GuardRail's before-run rules, so a pack-15 baseline is
 `CONTRACT_MISMATCH` until a pack-16 ASP is locked (see
 [Tool schemas](#tool-schemas)). In pod mode the probe no longer sends the
 agent's MCP `headers`, so a server that needs them is `auth_refused` in
-`skills_inventory` too. Self and docker scans send them as before.
+`skills_inventory` too. Self and docker scans send them as before. The same
+pack adds `http_operations` (RC-512), the operations in each HTTP
+destination's public API spec, probed by the pod-mode sidecar only (see
+[`gke/README.md`](gke/README.md#http-operations-rc-512)).
 
 ## RailDash delivery
 
@@ -1223,6 +1226,42 @@ tool name counted (`bundle_budget`; the tool keeps its name and digest), or
 (`per_tool_budget` or `bundle_budget`). Annotations that would take a tool
 past 8 KiB are left out.
 
+The server's and each tool's name go through `redact_text`, as in
+`skills_inventory`, so the two attributes name a server alike and a
+key-shaped name is `[redacted]`. Besides key shapes, an HTTP auth scheme's
+credential in any text (`Bearer …`, `Basic …`; the scheme is kept) is
+`[redacted]` when it is shaped like one (a digit, a lowercase letter followed
+by an uppercase one, `=` padding, or a JWT's three parts), so a description's
+own words after the scheme word ("token obtained from", "Basic information
+about") are kept. Names count as well as shapes (`password`, `pwd`, `api_key`,
+`token`, `authorization`, `auth`, `cookie`, `session`, `passphrase`, `jwt`,
+`signature`; not `author`, nor a budget like `max_tokens`): under a property so
+named, every string and number in its `default`, `example(s)`, `const` and
+`enum` is `[redacted]`; in sample data, any value under a key so named is,
+whatever its type (an example object's `"password"`, a `"passwords"` list);
+and elsewhere a non-object value under such a key is. A URL carrying a
+credential, of any scheme, loses it through `redact_url`
+(`postgres://u:p@db/app` becomes `postgres://db/app`), checked with the port
+set aside so a placeholder port (`PORT`, `${DB_PORT}`) can't hide one; a URL
+that still can't be redacted is `[redacted]` whole. Types, formats and
+descriptions are kept. The redaction runs in time linear in its input, so a
+hostile server can't stall the scan past its deadline, and in
+`skills_inventory` a schema more than twice its cap as written is left out
+before it is redacted (`tool_schemas` redacts it whole first, since
+`schema_sha256` is taken before any cap).
+
+What a server's answers may cost in memory is bounded too, by JSON elements
+as well as bytes, since a body of tiny elements (`[{},{},...]`) parses to many
+times its size: a response is at most 4 MiB (`MCP_RESPONSE_MAX_BYTES`) and
+200,000 elements, counted from its bytes before parsing, a server at most
+300,000 across its pages and a scan at most 600,000 across every server. A
+response past one isn't parsed: a first page makes the server `unreachable`, a
+later one cuts its list (`tools_truncated`). An MCP call follows no redirect,
+whose body urllib would otherwise read in full first, and has its 3 seconds in
+all, body included, so a server that drips its answer can't hold the probe.
+Only one JSON body is parsed at a time, and an API spec is cut at 500,000 elements (`PARTIAL`,
+`SIZE_CAP_EXCEEDED`), so the sidecar's peak stays well inside its 256 Mi.
+
 In pod mode the probe sends none of the agent's MCP `headers`, so the sidecar
 never presents the agent's credential, and a server that needs one is not
 public. A URL that carries a credential itself (userinfo, a query parameter
@@ -1255,6 +1294,16 @@ The status names the worst gap:
 It's `BLIND` when no server could be listed at all, and `PARTIAL` when some
 could. The `note` names every server affected. The schemas aren't a
 registration field: they reach Rail Center in the bundle only.
+
+### HTTP operations and the probe pool
+
+The pod-mode sidecar also records each HTTP destination's public API spec
+operations in `http_operations`, and runs its MCP and spec probes in a pool
+with a scan deadline (RC-512). Both run only in pod mode, so they're described
+with the rest of the sidecar in [`gke/README.md`](gke/README.md#http-operations-rc-512).
+A self or docker scan reports `http_operations` as `BLIND`,
+`NOT_COLLECTED_BY_PACK`, and probes its MCP servers one after another, with no
+deadline.
 
 Pass custom paths with:
 

@@ -42,6 +42,8 @@ test-python:
 		tools/scan/container_ref.py \
 		tools/scan/gke/pod_mode.py \
 		tools/scan/gke/agent_process.py \
+		tools/scan/gke/spec_probe.py \
+		tools/scan/gke/probe_pool.py \
 		tools/scan/gke/harness/harness_sources.py \
 		tools/scan/gke/harness/reader.py \
 		tools/scan/gke/harness/generic.py \

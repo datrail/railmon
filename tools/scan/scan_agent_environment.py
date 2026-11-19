@@ -27,6 +27,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -682,6 +683,35 @@ def _pod_mode() -> Any:
     return _gke("pod_mode")
 
 
+class _ThisModule:
+    """This module's globals, read live, as the scanner a gke module is handed
+    by `register`: the scanner may be loaded by path with no sys.modules entry
+    (as the tests load it), and a patched global is seen as patched."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+_THIS_MODULE = _ThisModule()
+
+
+def _spec_probe() -> Any:
+    """The API spec prober (RC-512), pod mode's http_operations."""
+    module = _gke("spec_probe")
+    module.register(_THIS_MODULE)
+    return module
+
+
+def _probe_pool() -> Any:
+    """Pod mode's probe stage: the probe pool and the scan deadline (RC-512)."""
+    module = _gke("probe_pool")
+    module.register(_THIS_MODULE)
+    return module
+
+
 def _agent_process() -> Any:
     """The agent's own process, read through the pod's shared process
     namespace (RC-509)."""
@@ -1326,6 +1356,7 @@ def mcp_server_skills(
     send_headers: bool = True,
     schemas: list[dict[str, Any]] | None = None,
     origin: tuple[str, str] | None = None,
+    probe: Callable[..., tuple[Any, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     """One skill per tool a reachable MCP server declares.
 
@@ -1348,7 +1379,9 @@ def mcp_server_skills(
     server that needs one answers 401 or 403, `auth_refused`. `schemas`, when
     given, gets this server's `tool_schema_server` entry from the same probe,
     under `origin` (its source and TOOL_SCHEMA_SOURCE_KINDS kind, DR-294;
-    `source_label` as a file when not given).
+    `source_label` as a file when not given). `probe` (RC-512) asks the
+    server in place of `probe_mcp_server`: pod mode's ProbePool
+    (gke/probe_pool.py), which runs the scan's probes four at a time.
     """
     schema_source, schema_kind = origin or (str(source_label), "file")
     endpoints = dedupe(
@@ -1356,16 +1389,21 @@ def mcp_server_skills(
     )
     url = spec.get("url")
     if isinstance(url, str) and url:
-        headers = spec.get("headers") if send_headers else None
-        headers = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else None
-        if not send_headers and url_carries_credential(url):
+        request = mcp_probe_request(spec, send_headers=send_headers)
+        deadline_exceeded = False
+        if request is None:
             # RC-531: a credential in the URL is still the agent's credential.
             tools, reachability, truncated = None, "auth_refused", False
         else:
-            tools, reachability, truncated = probe_mcp_server(url, headers)
+            # RC-512: `probe` is the scan's probe pool in pod mode, which
+            # answers a probe still running at the scan's deadline as
+            # unreachable, with a fourth element saying so.
+            result = (probe or probe_mcp_server)(*request)
+            tools, reachability, truncated = result[:3]
+            deadline_exceeded = len(result) > 3 and bool(result[3])
         if schemas is not None:
             schemas.append(tool_schema_server(name, schema_source, endpoints, reachability, tools, truncated,
-                                              source_kind=schema_kind))
+                                              source_kind=schema_kind, deadline_exceeded=deadline_exceeded))
         if tools is None:
             return [unreachable_mcp_skill(name, source_label, endpoints, "unreachable", reachability)]
         result: list[dict[str, Any]] = []
@@ -1415,6 +1453,22 @@ def mcp_server_skills(
     ]
 
 
+def mcp_probe_request(spec: dict[str, Any], *, send_headers: bool = True) -> tuple[str, dict[str, str] | None] | None:
+    """What `mcp_server_skills` would send to an MCP server: its URL and the
+    headers it carries, or None when it would ask nothing (no URL, or in pod
+    mode a URL that carries the agent's credential, RC-531). The probe pool
+    (RC-512) starts a server's probe from this, so it asks exactly what the
+    sequential probe would."""
+    url = spec.get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    if not send_headers and url_carries_credential(url):
+        return None
+    headers = spec.get("headers") if send_headers else None
+    headers = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else None
+    return url, headers
+
+
 def unreachable_mcp_skill(
     name: str, source_label: str, endpoints: list[str], reason: str, reachability: str
 ) -> dict[str, Any]:
@@ -1429,6 +1483,7 @@ def unreachable_mcp_skill(
     }
 
 
+# One JSON-RPC call, connection to last byte of the body.
 MCP_PROBE_TIMEOUT_SECONDS = 3.0
 MCP_PROTOCOL_VERSION = "2025-06-18"
 # How far tools/list's pagination is followed (DR-293). Past either bound the
@@ -1437,6 +1492,45 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 # (MAX_PAYLOAD_LIST_ITEMS, 200): one server can't usefully declare more.
 MCP_TOOLS_PAGES = 20
 MCP_TOOLS_MAX = 200
+# What a server's answers may cost the sidecar (256 Mi), rail review of RC-512.
+# Bytes alone don't bound memory: a body of tiny elements (`[{},{},...]`)
+# parses to many times its size (8 MiB of them is about 400 MB of objects).
+# So every response is also held to a count of JSON elements, taken from its
+# bytes before parsing (json_element_count), per response, per server across
+# its pages, and per scan across every server, whose results are all kept
+# until the bundle is built. A response past any of them is not parsed: the
+# first page so cut makes the server unreachable, a later one cuts its list
+# (tools_truncated). Only one JSON body is parsed at a time
+# (_JSON_PARSE_LOCK): parsing holds the GIL anyway, so the pool loses no
+# speed, and the peak is one parse, not four.
+MCP_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
+MCP_RESPONSE_MAX_ELEMENTS = 200_000
+MCP_SERVER_MAX_ELEMENTS = 300_000
+MCP_SCAN_MAX_ELEMENTS = 600_000
+_JSON_PARSE_LOCK = threading.Lock()
+
+
+def json_element_count(body: bytes) -> int:
+    """An upper bound on the JSON elements `body` parses to: its `{`, `[`
+    and `,` bytes, counted in C. A string holding them counts too, so this
+    never undercounts what the parser builds."""
+    return body.count(b"{") + body.count(b"[") + body.count(b",")
+
+
+class JsonElementBudget:
+    """A count of JSON elements left to parse, shared between threads."""
+
+    def __init__(self, limit: int) -> None:
+        self.remaining = limit
+        self._lock = threading.Lock()
+
+    def take(self, count: int) -> bool:
+        with self._lock:
+            if count > self.remaining:
+                self.remaining = 0  # spent: what follows from the same source is not parsed either
+                return False
+            self.remaining -= count
+            return True
 
 
 def probe_mcp_tools(
@@ -1448,7 +1542,8 @@ def probe_mcp_tools(
 
 
 def probe_mcp_server(
-    url: str, headers: dict[str, str] | None, timeout: float = MCP_PROBE_TIMEOUT_SECONDS
+    url: str, headers: dict[str, str] | None, timeout: float = MCP_PROBE_TIMEOUT_SECONDS,
+    *, scan_budget: JsonElementBudget | None = None,
 ) -> tuple[list[dict[str, Any]] | None, str, bool]:
     """The tools a live MCP server declares, how it answered, and whether
     the list was cut short: `(tools, reachability, truncated)`.
@@ -1471,9 +1566,16 @@ def probe_mcp_server(
     `"url": "file:///etc/shadow"` would otherwise make the scanner read it and
     try to parse it as a tools/list response, which is a local file read this
     function must never become.
+
+    Every response is held to MCP_RESPONSE_MAX_BYTES and to JSON element
+    budgets: its own, this server's (MCP_SERVER_MAX_ELEMENTS across its
+    pages) and, when given, the scan's (`scan_budget`, shared by every
+    server the pool asks), so no server can make the sidecar build more
+    objects than those bound.
     """
     if not url.startswith(("http://", "https://")):
         return None, "unreachable", False
+    budgets = tuple(budget for budget in (JsonElementBudget(MCP_SERVER_MAX_ELEMENTS), scan_budget) if budget)
     base_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -1493,6 +1595,7 @@ def probe_mcp_server(
         },
         base_headers,
         timeout,
+        budgets,
     )
     if init_result is None:
         return None, mcp_failure_reachability(status), False
@@ -1507,7 +1610,8 @@ def probe_mcp_server(
     for page in range(MCP_TOOLS_PAGES):
         params = {"cursor": cursor} if cursor is not None else {}
         list_result, _, status = mcp_rpc_call(
-            url, {"jsonrpc": "2.0", "id": 2 + page, "method": "tools/list", "params": params}, call_headers, timeout
+            url, {"jsonrpc": "2.0", "id": 2 + page, "method": "tools/list", "params": params}, call_headers, timeout,
+            budgets,
         )
         page_tools = list_result.get("tools") if list_result is not None else None
         if not isinstance(page_tools, list):
@@ -1528,23 +1632,45 @@ def mcp_failure_reachability(status: int | None) -> str:
 
 
 def mcp_rpc_call(
-    url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
+    url: str, body: dict[str, Any], headers: dict[str, str], timeout: float,
+    budgets: tuple[JsonElementBudget, ...] = (),
 ) -> tuple[dict[str, Any] | None, Any, int | None]:
     """One JSON-RPC round trip to an MCP endpoint.
 
     Returns the response's `result` object, its headers and its HTTP status,
     or `(None, {}, status)` on any failure: refused connection, timeout (no
     status), a non-2xx status, a body that isn't JSON or SSE-framed JSON, or
-    a response with no `result`.
+    a response with no `result`; and a body past MCP_RESPONSE_MAX_BYTES,
+    past MCP_RESPONSE_MAX_ELEMENTS, or past what is left of any of
+    `budgets`, which is never parsed.
     """
     req = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    started = time.monotonic()
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        # _MCP_OPENER follows no redirect: urllib reads a 3xx's whole body
+        # before following it, past every bound below (rail review of RC-512),
+        # and a POST it redirects becomes a GET with no body, which no MCP
+        # server answers. A redirect is the HTTPError below, its body unread.
+        with _MCP_OPENER.open(req, timeout=timeout) as resp:
             content_type = resp.headers.get("Content-Type", "")
-            raw = resp.read().decode("utf-8", errors="replace")
             response_headers = resp.headers
             status = resp.status
+            # `timeout` bounds the whole call, body included, not each read
+            # alone: a server that drips its answer can't hold the probe past it.
+            chunks: list[bytes] = []
+            size = 0
+            while size <= MCP_RESPONSE_MAX_BYTES:
+                if time.monotonic() - started > timeout:
+                    return None, {}, None
+                chunk = resp.read1(min(64 * 1024, MCP_RESPONSE_MAX_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            body = b"".join(chunks)
+            del chunks
     except HTTPError as exc:
+        exc.close()  # a 3xx or an error status: its body is never read
         return None, {}, exc.code
     except (URLError, TimeoutError, OSError, ValueError, http.client.HTTPException):
         # HTTPException: a garbage status line, a truncated body or a bad
@@ -1552,7 +1678,14 @@ def mcp_rpc_call(
         # the scan.
         return None, {}, None
 
-    payload = parse_mcp_body(raw, content_type)
+    if len(body) > MCP_RESPONSE_MAX_BYTES:
+        return None, {}, status  # not read on, and not parsed
+    elements = json_element_count(body)
+    if elements > MCP_RESPONSE_MAX_ELEMENTS or not all(budget.take(elements) for budget in budgets):
+        return None, {}, status
+    with _JSON_PARSE_LOCK:
+        payload = parse_mcp_body(body.decode("utf-8", errors="replace"), content_type)
+    del body
     if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
         return None, {}, status
     return payload["result"], response_headers, status
@@ -1595,6 +1728,7 @@ def collect_skills(
     send_headers: bool = True,
     schemas: list[dict[str, Any]] | None = None,
     declared: dict[str, Any] | None = None,
+    probe: Callable[..., tuple[Any, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     """Every MCP skill across every config path, collisions of one server's
     same-named tool merged (two servers' stay apart: `server`, DR-264).
@@ -1616,21 +1750,45 @@ def collect_skills(
     are probed too, and a config file's server of the same name is left to
     it, so each is asked once and the harness's own declaration wins. When it
     is `exclusive` (Claude Code's managed-mcp.json), the harness loads those
-    servers and no others, so they are the only ones probed.
+    servers and no others, so they are the only ones probed. The servers, in
+    order, are `mcp_probe_plan`'s; `probe` as in `mcp_server_skills`.
     """
-    profile_servers, label, exclusive = declared_servers(declared)
     skills: list[dict[str, Any]] = []
+    for name, spec, source_label, origin in mcp_probe_plan(mcp_configs, env, declared):
+        skills.extend(mcp_server_skills(name, spec, source_label, send_headers=send_headers, schemas=schemas,
+                                        origin=origin, probe=probe))
+    return merge_skill_lists(skills)
+
+
+def mcp_probe_plan(
+    mcp_configs: list[Path], env: dict[str, str] | None = None, declared: dict[str, Any] | None = None
+) -> list[tuple[str, dict[str, Any], str, tuple[str, str]]]:
+    """Every MCP server `collect_skills` asks, in its order, as (name, spec,
+    source label, origin), the origin being tool_schemas' source and its
+    kind (DR-294: the file as `config_origin` names it, with HOME as `~`;
+    `environment`; or the harness profile): each config file's mcpServers, then AGENT_MCP_NAME and
+    AGENT_MCP_URL, then the harness profile's servers (RC-531), a file's or
+    the environment's server of a profile server's name left to the profile,
+    and only the profile's when it is exclusive. The probe pool and the spec
+    prober (RC-512) read the same list, so all three ask the same servers."""
+    profile_servers, label, exclusive = declared_servers(declared)
+    plan: list[tuple[str, dict[str, Any], str, tuple[str, str]]] = []
+    home = (env or {}).get("HOME")
     if not exclusive:
         for path in mcp_configs:
-            if path.exists():
-                skills.extend(read_mcp_config(path, send_headers=send_headers, schemas=schemas,
-                                              skip=frozenset(profile_servers), home=(env or {}).get("HOME")))
-        if (env or {}).get(ENV_MCP_NAME_KEY) not in profile_servers:  # else the profile's, probed below
-            skills.extend(read_mcp_config_from_env(env or {}, send_headers=send_headers, schemas=schemas))
-    for name, spec in profile_servers.items():
-        skills.extend(mcp_server_skills(name, spec, label, send_headers=send_headers, schemas=schemas,
-                                        origin=(label, "harness_profile")))
-    return merge_skill_lists(skills)
+            if not path.exists():
+                continue
+            data = load_json_file(path)
+            servers = data.get("mcpServers") if isinstance(data, dict) else None
+            if isinstance(servers, dict):
+                origin = (config_origin(path, home), "file")
+                plan.extend((str(name), spec, path.name, origin) for name, spec in servers.items()
+                            if isinstance(spec, dict) and str(name) not in profile_servers)
+        name, url = (env or {}).get(ENV_MCP_NAME_KEY), (env or {}).get(ENV_MCP_URL_KEY)
+        if name and url and name not in profile_servers:  # else the profile's, below
+            plan.append((name, {"url": url}, "environment", ("environment", "environment")))
+    plan.extend((name, spec, label, (label, "harness_profile")) for name, spec in profile_servers.items())
+    return plan
 
 
 def unread_mcp_config(declared: dict[str, Any] | None) -> dict[str, str] | None:
@@ -1701,31 +1859,170 @@ SKILL_SCHEMA_DEPTH = 16
 MCP_ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 
 
-def redact_json(value: Any, depth: int = 0) -> Any:
-    """`value` with every string, keys included, through `redact_text`, or
-    None past SKILL_SCHEMA_DEPTH or for a value JSON has no form for: a
+# The JSON Schema keywords that hold sample or fixed values, not schema: under
+# a property named like a credential, every string in them is concealed.
+SCHEMA_VALUE_KEYWORDS = frozenset({"default", "example", "examples", "const", "enum", "x-example"})
+# A URL inside free text, any scheme (postgres://, redis://, https://). The
+# scheme starts only where a scheme character doesn't precede it and is at
+# most 32 characters, so a long run of letters with no :// costs one pass, not
+# one pass per starting position (rail review: an unbounded scheme made a few
+# hundred KB of letters take minutes, before any size check).
+EMBEDDED_URL_RE = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,31}://[^\s\"'<>`]+")
+
+
+# A port kept as written after redaction: a number, or a placeholder such as
+# PORT or ${DB_PORT}. Anything else in the port's place is dropped.
+URL_PORT_KEPT_RE = re.compile(r"[0-9]{1,5}|\$?\{?[A-Za-z_][A-Za-z0-9_]{0,63}\}?")
+
+
+def _redact_embedded_url(match: re.Match[str]) -> str:
+    """A URL in schema text, with its credential removed if it carries one.
+    The check runs with the port set aside: url_carries_credential reads a
+    URL whose port doesn't parse (`PORT`, `${DB_PORT}`, 99999) as carrying
+    nothing, so a placeholder port must not hide a password. Userinfo
+    always counts. A URL that still can't be redacted is concealed whole."""
+    url = match.group(0)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return REDACTED_SEGMENT
+    userinfo, _, hostport = parts.netloc.rpartition("@")
+    host, port = hostport, ""
+    if not hostport.endswith("]") and ":" in hostport:
+        host, _, port = hostport.rpartition(":")
+    portless = urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+    if not userinfo and "@" not in parts.netloc and not url_carries_credential(portless):
+        return url
+    cleaned = redact_url(portless)
+    try:
+        cleaned_parts = urlsplit(cleaned) if cleaned and cleaned != UNPARSEABLE else None
+    except ValueError:
+        cleaned_parts = None
+    if cleaned_parts is None or not cleaned_parts.netloc:
+        return REDACTED_SEGMENT
+    netloc = cleaned_parts.netloc + (f":{port}" if port and URL_PORT_KEPT_RE.fullmatch(port) else "")
+    return urlunsplit((cleaned_parts.scheme, netloc, cleaned_parts.path, cleaned_parts.query, cleaned_parts.fragment))
+
+
+# What names a credential in a tool's arguments, beyond the environment's
+# SECRET_MARKERS: HTTP auth (an Authorization header, a cookie, a session),
+# passphrases and passcodes, and signed tokens. AUTH counts unless it begins
+# "author" that isn't "authori(zation|ty)", so an `author` or `authors`
+# argument isn't one. Kept apart from SECRET_MARKERS, which also decides how
+# the agent's environment variables are classified.
+SCHEMA_SECRET_MARKERS = (*SECRET_MARKERS, "COOKIE", "BEARER", "PASSPHRASE", "PASSCODE", "SESSION", "JWT",
+                         "SIGNATURE")
+SCHEMA_AUTH_MARKER_RE = re.compile(r"AUTH(?!OR(?!I))")
+# An HTTP auth scheme and its credential in free text (`Bearer abc…`,
+# `Basic dXNlcjpwYXNz`), which no vendor key shape matches: the scheme is
+# kept and the credential redacted. Only a value shaped like a credential
+# (credential_shaped) counts, so a description's own words after the scheme
+# word ("token obtained from", "Basic information about") are kept.
+AUTH_SCHEME_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(Bearer|Basic|Digest|Token|Negotiate|Bot)(\s{1,8})([A-Za-z0-9._~+/=:-]{8,})", re.IGNORECASE)
+CREDENTIAL_SHAPE_RE = re.compile(r"[0-9]|[a-z][A-Z]|=$|^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+
+def credential_shaped(value: str) -> bool:
+    """Whether the word after an HTTP auth scheme looks like a credential
+    rather than prose: it holds a digit, a lowercase letter followed by an
+    uppercase one (base64 and random tokens do; "information" and
+    "Information" don't), base64's `=` padding, or a JWT's three
+    dot-separated parts. A credential of lowercase letters alone is missed,
+    which is rare; a description's every word redacted was not (rail review
+    of RC-512)."""
+    return bool(CREDENTIAL_SHAPE_RE.search(value))
+
+
+def schema_name_looks_secret(name: str) -> bool:
+    """Whether a schema's property or an example's key names a credential:
+    SCHEMA_SECRET_MARKERS and AUTH (authorization, auth, x-auth-token,
+    oauth), without looks_secret's environment exemptions (PWD there is the
+    working directory; in a tool's arguments `pwd` is a password), except
+    that a token budget (max_tokens) is no credential."""
+    upper = name.upper()
+    if TOKEN_BUDGET_RE.fullmatch(upper) and not looks_secret(upper[: -len("_TOKENS")]):
+        return False
+    return any(marker in upper for marker in SCHEMA_SECRET_MARKERS) or bool(SCHEMA_AUTH_MARKER_RE.search(upper))
+
+
+def redact_schema_text(value: str) -> str:
+    """`redact_text`, then every URL in the text that carries a credential
+    (userinfo, a credential-named or key-shaped query value, a key-shaped path
+    segment: `url_carries_credential`) through `redact_url`, whatever its
+    scheme: `postgres://u:p@h/db` becomes `postgres://h/db`; and an HTTP auth
+    scheme's credential (`Bearer …`, `Basic …`) redacted, the scheme kept."""
+    text = AUTH_SCHEME_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{REDACTED_SEGMENT}"
+        if credential_shaped(match.group(3)) else match.group(0),
+        redact_text(value))
+    return EMBEDDED_URL_RE.sub(_redact_embedded_url, text)
+
+
+def redact_json(value: Any, depth: int = 0, *, secret: bool = False, conceal: bool = False,
+                data: bool = False) -> Any:
+    """`value` with every string, keys included, through `redact_schema_text`,
+    or None past SKILL_SCHEMA_DEPTH or for a value JSON has no form for: a
     schema's descriptions, defaults and examples are operator text, like the
-    tool's own, and a key can end up in any of them (RC-511)."""
+    tool's own, and a key can end up in any of them (RC-511).
+
+    A shape match alone misses a plain password, so names count too
+    (`schema_name_looks_secret`: password, pwd, api_key, token, ...):
+    - under a property so named, every string and number in its default,
+      example(s), const and enum is concealed;
+    - inside sample data (anything under those keywords: `data`), every
+      value under a key so named is concealed, whatever its type, so an
+      example object's `"password": "hunter2"`, `"passwords": [...]` or
+      `"password": {"value": ...}` never reaches the bundle;
+    - anywhere else, a value under such a key that isn't an object (a
+      schema is one) is data and concealed: a string, a list, a number.
+    The schema's own structure (types, formats, descriptions) is kept, and
+    booleans and nulls stay as they are."""
     if depth > SKILL_SCHEMA_DEPTH:
         return None
     if isinstance(value, str):
-        return redact_text(value)
-    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return REDACTED_SEGMENT if conceal else redact_schema_text(value)
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)) and conceal:
+        return REDACTED_SEGMENT
+    if isinstance(value, int):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, list):
-        items = [redact_json(item, depth + 1) for item in value]
+        items = [redact_json(item, depth + 1, secret=secret, conceal=conceal, data=data) for item in value]
         return None if any(item is None and raw is not None for item, raw in zip(items, value)) else items
     if isinstance(value, dict):
         kept: dict[str, Any] = {}
         for key, item in value.items():
-            redacted = redact_json(item, depth + 1)
+            name = str(key)
+            named_secret = schema_name_looks_secret(name)
+            keyword = not data and name in SCHEMA_VALUE_KEYWORDS
+            redacted = redact_json(
+                item, depth + 1,
+                secret=secret or named_secret,
+                conceal=conceal or (secret and keyword)
+                or (named_secret and (data or not isinstance(item, dict))),
+                data=data or keyword,
+            )
             if redacted is None and item is not None:
                 return None
-            kept[redact_text(str(key))] = redacted
+            kept[redact_schema_text(name)] = redacted
         return kept
     return None
+
+
+def _too_large_to_redact(value: Any, budget: int) -> bool:
+    """Whether `value` is so far past `budget` as written that redacting it
+    first would be wasted work an MCP server chooses the size of (rail
+    review): past twice the budget, which redaction can't shrink it back
+    under in practice. A value json can't write is left to redact_json,
+    which bounds its depth and calls it unrepresentable."""
+    try:
+        return len(json.dumps(value, separators=(",", ":"), default=str)) > 2 * budget
+    except (TypeError, ValueError, RecursionError):
+        return False
 
 
 def tool_schema_fields(tool: dict[str, Any]) -> dict[str, Any]:
@@ -1738,7 +2035,9 @@ def tool_schema_fields(tool: dict[str, Any]) -> dict[str, Any]:
     a tool that declares none; one already left out stays so."""
     fields: dict[str, Any] = {}
     schema = tool.get("inputSchema")
-    if schema is not None:
+    if schema is not None and _too_large_to_redact(schema, SKILL_SCHEMA_BYTES):
+        fields["schema_omitted"] = "per_tool_budget"
+    elif schema is not None:
         redacted = redact_json(schema) if isinstance(schema, dict) else None
         if not isinstance(redacted, dict):
             fields["schema_omitted"] = "unrepresentable"
@@ -1754,7 +2053,8 @@ def tool_schema_fields(tool: dict[str, Any]) -> dict[str, Any]:
             hint: annotations[hint] for hint in MCP_ANNOTATION_HINTS if isinstance(annotations.get(hint), bool)
         }
         title = annotations.get("title")
-        if isinstance(title, str) and first_nonempty(redact_text(title)):
+        title = title[:1024] if isinstance(title, str) else None  # cut before redacting; 255 are kept
+        if title and first_nonempty(redact_text(title)):
             kept["title"] = first_nonempty(redact_text(title))[:255]
         if kept:
             fields["annotations"] = kept
@@ -1825,7 +2125,9 @@ def record_tool_schema(tool: Any) -> dict[str, Any] | None:
     the tool past the cap are left out too."""
     if not isinstance(tool, dict):
         return None
-    name = first_nonempty(str(tool.get("name") or ""))
+    # Through redact_text, as normalize_skill does skills_inventory's names:
+    # a key-shaped tool name never reaches the bundle.
+    name = first_nonempty(redact_text(str(tool.get("name") or "")))
     if not name:
         return None
     # What RailDash would hash (tool_schema_digest), redacted: a string
@@ -1868,17 +2170,21 @@ def tool_schema_server(
     truncated: bool,
     *,
     source_kind: str = "file",
+    deadline_exceeded: bool = False,
 ) -> dict[str, Any]:
     """One configured MCP server's entry in tool_schemas, as read from one
     source (DR-294): where (`source`, `source_kind`), how it answered
     (MCP_REACHABILITY) and, when it was listed, each tool's
     `record_tool_schema`. A server that needed a credential is
-    `auth_refused`, never retried with one."""
+    `auth_refused`, never retried with one. One still unanswered at the
+    scan's deadline (RC-512) is `unreachable` with `deadline_exceeded`."""
     if source_kind not in TOOL_SCHEMA_SOURCE_KINDS:
         raise ValueError(f"unknown tool_schemas source kind {source_kind!r}")
     entry: dict[str, Any] = {
-        "server": name,
-        "source": source_label,
+        # The config's key and origin, through redact_text as skills_inventory's
+        # `server` is, so the two attributes name a server the same way.
+        "server": first_nonempty(redact_text(name)) or REDACTED_SEGMENT,
+        "source": first_nonempty(redact_text(source_label)) or source_label,
         "source_kind": source_kind,
         "endpoints": endpoints,
         "reachability": reachability,
@@ -1886,6 +2192,8 @@ def tool_schema_server(
     }
     if truncated:
         entry["tools_truncated"] = True
+    if deadline_exceeded:
+        entry["deadline_exceeded"] = True
     return entry
 
 
@@ -3336,6 +3644,7 @@ def drop_none(value: Any) -> Any:
 
 def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Inspect the environment once and return (context, payload, identity)."""
+    started = time.monotonic()
     if args.mode == "docker":
         if not args.container:
             raise ScannerError("--container is required with --mode docker")
@@ -3366,6 +3675,9 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
             redact_cmdline,
             container_id_from_cgroup,
         )
+        # RC-512: the whole scan has SCAN_DEADLINE_SECONDS from here; the
+        # probe stage (gke/probe_pool.py) waits for no probe past it.
+        context["probe_deadline"] = started + _probe_pool().SCAN_DEADLINE_SECONDS
     else:
         context = collect_self_context()
     identity = collect_identity(args, context)
@@ -3432,8 +3744,16 @@ def build_registration_payload(
     # (OpenClaw's openclaw.json, Claude Code's scopes) are probed too.
     declared = _pod_mode().declared_mcp_servers(context) if is_pod_mode(context) else None
     tool_schemas: list[dict[str, Any]] = []
-    mcp_skills = collect_skills(mcp_paths, env, send_headers=not is_pod_mode(context), schemas=tool_schemas,
-                                declared=declared)
+    if is_pod_mode(context):
+        # RC-512: the same servers' origins are asked for their API specs
+        # (http_operations), and every probe runs in one pool of four with
+        # the scan's deadline; a probe still out at the deadline is BLIND.
+        # The spec results ride on the pod's context, for pod mode's own
+        # http_operations attribute (gke/pod_mode.py).
+        mcp_skills, context["http_operations"], context["http_operations_servers"] = _probe_pool().run_pod_probes(
+            mcp_paths, env, declared, tool_schemas, context.get("probe_deadline"))
+    else:
+        mcp_skills = collect_skills(mcp_paths, env, send_headers=True, schemas=tool_schemas)
     identity["tool_schemas"] = cap_tool_schemas(tool_schemas)
     identity["tool_schemas_unread"] = unread_mcp_config(declared)
     scanned_skills = collect_skills_from_files(skill_files)
@@ -3519,6 +3839,9 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 _REGISTRATION_OPENER = build_opener(_NoRedirect)
+# The MCP probe's: no redirect followed, since urllib reads a 3xx's whole body
+# before following it (mcp_rpc_call).
+_MCP_OPENER = build_opener(_NoRedirect)
 # The metadata server is link-local: never through an HTTP proxy, which would
 # see the minted identity token in clear.
 _METADATA_OPENER = build_opener(ProxyHandler({}), _NoRedirect)
