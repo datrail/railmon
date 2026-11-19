@@ -174,5 +174,6 @@ def read_agent_harness(context: dict[str, Any], config_paths: list[Path],
     agent = agent_view(subject)
     profile = harness_reader.harness_reader_for(profiles() if known_profiles is None else known_profiles, agent)
     results = harness_reader.read_harness_fields(profile, agent, PodSources(subject.get("root"), config_paths),
-                                                 redact_url=redact_url, config_paths=[str(p) for p in config_paths])
+                                                 redact_url=redact_url, config_paths=[str(p) for p in config_paths],
+                                                 collect_prompt=bool(context.get("collect_system_prompt")))
     return (profile or {}).get("harness", harness_reader.GENERIC_HARNESS), results

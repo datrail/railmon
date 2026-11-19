@@ -1,0 +1,13 @@
+{{- include "railmon-gke.required" . -}}
+# The one sidecar spec, read by the webhook. A manifest that adds the sidecar
+# by hand copies sidecar.json from here (README.md, "Without the webhook").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rail-scan-sidecar-spec
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+data:
+  sidecar.json: |
+    {{- include "railmon-gke.sidecarSpec" . | fromYaml | toPrettyJson | nindent 4 }}

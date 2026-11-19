@@ -3678,6 +3678,9 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         # RC-512: the whole scan has SCAN_DEADLINE_SECONDS from here; the
         # probe stage (gke/sidecar/probe_pool.py) waits for no probe past it.
         context["probe_deadline"] = started + _probe_pool().SCAN_DEADLINE_SECONDS
+        # RC-518: the system prompt's text goes in the bundle only when asked;
+        # without it, system_prompt_present says which files exist.
+        context["collect_system_prompt"] = collect_system_prompt(args)
     else:
         context = collect_self_context()
     identity = collect_identity(args, context)
@@ -4830,6 +4833,13 @@ def wait_for_raildash(
         sleep(RAILDASH_START_POLL_SECONDS)
 
 
+def collect_system_prompt(args: argparse.Namespace) -> bool:
+    """--collect-system-prompt, or RAIL_COLLECT_SYSTEM_PROMPT set to 1, true or yes."""
+    if getattr(args, "collect_system_prompt", False):
+        return True
+    return (os.environ.get("RAIL_COLLECT_SYSTEM_PROMPT") or "").strip().lower() in ("1", "true", "yes")
+
+
 def registration_output_path(args: argparse.Namespace) -> Path:
     configured = first_nonempty(
         args.registration_output,
@@ -5172,6 +5182,13 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--feature-output",
         help=f"Write the feature file here. Defaults to {DEFAULT_FEATURE_OUTPUT}.",
+    )
+    parser.add_argument(
+        "--collect-system-prompt",
+        action="store_true",
+        help="Pod mode: put the text of the agent's system prompt files in the bundle (system_prompt_text), "
+        "each bounded in size. Without it only which files exist is reported (system_prompt_present). "
+        "RAIL_COLLECT_SYSTEM_PROMPT=1, true or yes also works.",
     )
     parser.add_argument(
         "--no-feature-file",

@@ -1,0 +1,127 @@
+{{- /*
+The chart's CA, and everything that needs it in one file, since Helm can't
+share a generated value between template files: gke-scan's and the webhook's
+certificates, the webhook configuration's caBundle, and the CA ConfigMap each
+enrolled namespace's sidecars trust gke-scan with.
+
+The CA is, in order: `tls.ca` from the values, when given; else read back
+from its Secret when it exists; else a new one. Either of the first two keeps
+it across renders, so sidecars already running keep trusting gke-scan's new
+certificate (the reporter reads the CA file on every post) and the API server
+keeps trusting the webhook's. `helm template` and Argo CD can't read the
+cluster, so without `tls.ca` they make a new CA each time. The certificates
+are signed again on every render either way; gke-scan and the webhook load
+them again when their Secret changes (tools/scan/gke/tls_reload.py).
+*/ -}}
+{{- $ns := .Release.Namespace -}}
+{{- $ca := dict -}}
+{{- $given := .Values.tls.ca | default dict -}}
+{{- if or $given.cert $given.key -}}
+{{- if not (and $given.cert $given.key) -}}
+{{- fail "tls.ca needs both cert and key (PEM), or neither" -}}
+{{- end -}}
+{{- $ca = buildCustomCert ($given.cert | b64enc) ($given.key | b64enc) -}}
+{{- else -}}
+{{- $existing := lookup "v1" "Secret" $ns "rail-scan-ca" -}}
+{{- if and $existing (index ($existing.data | default dict) "tls.crt") (index ($existing.data | default dict) "tls.key") -}}
+{{- $ca = buildCustomCert (index $existing.data "tls.crt") (index $existing.data "tls.key") -}}
+{{- else -}}
+{{- $ca = genCA "railmon-gke-ca" (int .Values.tls.caDays) -}}
+{{- end -}}
+{{- end -}}
+{{- $gkeScanNames := list "gke-scan" (printf "gke-scan.%s" $ns) (printf "gke-scan.%s.svc" $ns) (printf "gke-scan.%s.svc.cluster.local" $ns) -}}
+{{- $gkeScanCert := genSignedCert (printf "gke-scan.%s.svc" $ns) nil $gkeScanNames (int .Values.tls.certDays) $ca -}}
+{{- $webhookNames := list "rail-scan-webhook" (printf "rail-scan-webhook.%s" $ns) (printf "rail-scan-webhook.%s.svc" $ns) (printf "rail-scan-webhook.%s.svc.cluster.local" $ns) -}}
+{{- $webhookCert := genSignedCert (printf "rail-scan-webhook.%s.svc" $ns) nil $webhookNames (int .Values.tls.certDays) $ca -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rail-scan-ca
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+  annotations:
+    # The CA outlives an uninstall, so a reinstall keeps it.
+    helm.sh/resource-policy: keep
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $ca.Cert | b64enc }}
+  tls.key: {{ $ca.Key | b64enc }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gke-scan-tls
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $gkeScanCert.Cert | b64enc }}
+  tls.key: {{ $gkeScanCert.Key | b64enc }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rail-scan-webhook-tls
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $webhookCert.Cert | b64enc }}
+  tls.key: {{ $webhookCert.Key | b64enc }}
+{{- range .Values.enrolledNamespaces }}
+---
+# What the sidecar trusts gke-scan's certificate with (RAIL_CENTER_CA_FILE).
+# The CA's certificate only; its key stays in {{ $ns }}.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rail-scan-ca
+  namespace: {{ . }}
+  labels:
+    {{- include "railmon-gke.labels" $ | nindent 4 }}
+data:
+  ca.crt: |
+    {{- $ca.Cert | nindent 4 }}
+{{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: rail-scan-sidecar
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+webhooks:
+  - name: scan-sidecar.rail.datrail.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # Fail open: with the webhook down or slow, pods start without a sidecar
+    # and gke-scan's view still covers them.
+    failurePolicy: Ignore
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    matchPolicy: Equivalent
+    reinvocationPolicy: Never
+    clientConfig:
+      caBundle: {{ $ca.Cert | b64enc }}
+      service:
+        name: rail-scan-webhook
+        namespace: {{ $ns }}
+        path: /mutate
+        port: 443
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+            {{- toYaml .Values.enrolledNamespaces | nindent 12 }}
+    objectSelector:
+      matchLabels:
+        rail.datrail.io/scan: "true"

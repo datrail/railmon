@@ -1,0 +1,121 @@
+{{- $ns := .Release.Namespace -}}
+# The admission webhook (tools/scan/gke/webhook/). It calls nothing and holds
+# no credential: no Kubernetes API token is mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rail-scan-webhook
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rail-scan-webhook
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: rail-scan-webhook
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.webhook.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rail-scan-webhook
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rail-scan-webhook
+        {{- include "railmon-gke.labels" . | nindent 8 }}
+      annotations:
+        # The webhook reads the spec once at start: restart it when it changes.
+        checksum/sidecar-spec: {{ include "railmon-gke.sidecarSpec" . | sha256sum }}
+    spec:
+      serviceAccountName: rail-scan-webhook
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: rail-scan-webhook
+      containers:
+        - name: webhook
+          image: {{ include "railmon-gke.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["scan-webhook"]
+          env:
+            - name: RAIL_SCAN_SIDECAR_SPEC
+              value: /etc/rail/sidecar/sidecar.json
+            - name: RAIL_WEBHOOK_TLS_CERT_FILE
+              value: /etc/rail/tls/tls.crt
+            - name: RAIL_WEBHOOK_TLS_KEY_FILE
+              value: /etc/rail/tls/tls.key
+            - name: RAIL_WEBHOOK_LISTEN
+              value: {{ printf "0.0.0.0:%d" (int .Values.webhook.port) | quote }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.webhook.port }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+          securityContext:
+            {{- include "railmon-gke.containerSecurity" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.webhook.resources | nindent 12 }}
+          volumeMounts:
+            - name: sidecar-spec
+              mountPath: /etc/rail/sidecar
+              readOnly: true
+            - name: tls
+              mountPath: /etc/rail/tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: sidecar-spec
+          configMap:
+            name: rail-scan-sidecar-spec
+        - name: tls
+          secret:
+            secretName: rail-scan-webhook-tls
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rail-scan-webhook
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: rail-scan-webhook
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rail-scan-webhook
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rail-scan-webhook

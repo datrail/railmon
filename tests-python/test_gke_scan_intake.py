@@ -852,6 +852,21 @@ class TLSTest(unittest.TestCase):
                           data=bundle_bytes(), method="POST", headers={"Authorization": f"Bearer {SIDECAR_TOKEN}"})
             with urlopen(req, timeout=10, context=context) as resp:
                 self.assertEqual(resp.status, 200)
+
+            # The chart signs a new certificate on every render; sidecars
+            # trusting the new CA reach the running intake without a restart.
+            renewed = Path(folder.name) / "renewed"
+            renewed.mkdir()
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                            "-subj", "/CN=gke-scan.rail-system.svc", "-addext", "subjectAltName=IP:127.0.0.1",
+                            "-keyout", str(renewed / "tls.key"), "-out", str(renewed / "tls.crt")],
+                           check=True, capture_output=True)
+            shutil.copy(renewed / "tls.key", key)
+            shutil.copy(renewed / "tls.crt", cert)
+            req = Request(f"https://127.0.0.1:{server.server_address[1]}{intake.REGISTER_PATH}",
+                          data=bundle_bytes(), method="POST", headers={"Authorization": f"Bearer {SIDECAR_TOKEN}"})
+            with urlopen(req, timeout=10, context=ssl.create_default_context(cafile=str(renewed / "tls.crt"))) as resp:
+                self.assertIn(resp.status, (200, 409))
         self.assertEqual(center.requests[0]["body"], bundle_bytes())
 
 

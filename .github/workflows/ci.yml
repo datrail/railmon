@@ -285,3 +285,100 @@ jobs:
             railmon:ci /tests/multi_agent_drift_acceptance.py \
             --raildash http://raildash:8000 --token="$token" \
             || { docker logs raildash; exit 1; }
+
+  # RC-518: the slim scan-sidecar image (Dockerfile.scan-sidecar), on both
+  # architectures, each built and tested natively on its own runner: the image
+  # has no Rust and nothing downloaded, so arm64 costs one runner, not QEMU.
+  # The container test runs a pod-mode scan as the webhook runs it: read-only
+  # root, no capabilities, the agent's UID and its PID namespace.
+  scan-sidecar:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Its own cache scope per architecture, which container-release.yml
+      # reuses for the published image.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.scan-sidecar
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          load: true
+          tags: scan-sidecar:ci
+          cache-from: type=gha,scope=scan-sidecar-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=scan-sidecar-${{ matrix.arch }}
+
+      - name: Pod-mode scan in the image, read-only and unprivileged
+        run: python3 tests/scan_sidecar_acceptance.py --image scan-sidecar:ci
+
+      - name: Image size
+        run: |
+          docker image inspect scan-sidecar:ci --format 'image size: {{.Size}} bytes'
+
+  # RC-518: the chart renders and lints, and the webhook's patch tests run
+  # again against the sidecar spec the chart really renders, not only the
+  # tests' own copy of it.
+  chart:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.15"
+
+      - name: Lint and render
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/railmon-gke -f deploy/helm/railmon-gke/ci/test-values.yaml
+          helm template railmon-gke deploy/helm/railmon-gke -n rail-system \
+            -f deploy/helm/railmon-gke/ci/test-values.yaml > "$RUNNER_TEMP/railmon-gke.yaml"
+          # Without its required values the chart refuses to render.
+          if helm template railmon-gke deploy/helm/railmon-gke -n rail-system > /dev/null 2>&1; then
+            echo "::error::the chart rendered without clusterName, gkeScan.centerUrl and enrolledNamespaces"
+            exit 1
+          fi
+
+      # A render that can't read the cluster (helm template, Argo CD) keeps the
+      # webhook's caBundle across renders when it is given tls.ca.
+      - name: tls.ca keeps the CA across renders
+        run: |
+          set -euo pipefail
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=ci-ca \
+            -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+            -keyout "$RUNNER_TEMP/ca.key" -out "$RUNNER_TEMP/ca.crt" 2> /dev/null
+          for n in 1 2; do
+            helm template railmon-gke deploy/helm/railmon-gke -n rail-system \
+              -f deploy/helm/railmon-gke/ci/test-values.yaml \
+              --set-file tls.ca.cert="$RUNNER_TEMP/ca.crt" --set-file tls.ca.key="$RUNNER_TEMP/ca.key" \
+              | grep 'caBundle:' > "$RUNNER_TEMP/bundle-$n"
+          done
+          cmp "$RUNNER_TEMP/bundle-1" "$RUNNER_TEMP/bundle-2"
+          diff <(awk '{print $2}' "$RUNNER_TEMP/bundle-1" | base64 -d) "$RUNNER_TEMP/ca.crt"
+          # Half a CA is refused.
+          if helm template railmon-gke deploy/helm/railmon-gke -n rail-system \
+              -f deploy/helm/railmon-gke/ci/test-values.yaml --set-file tls.ca.cert="$RUNNER_TEMP/ca.crt" > /dev/null 2>&1; then
+            echo "::error::the chart rendered with tls.ca.cert but no tls.ca.key"
+            exit 1
+          fi
+
+      - name: The webhook's tests, against the rendered sidecar spec
+        run: |
+          set -euo pipefail
+          python3 tests/extract_sidecar_spec.py "$RUNNER_TEMP/railmon-gke.yaml" > "$RUNNER_TEMP/sidecar.json"
+          RAILMON_SIDECAR_SPEC="$RUNNER_TEMP/sidecar.json" python3 -m unittest tests-python/test_scan_webhook.py

@@ -1,0 +1,19 @@
+# Values for CI's `helm lint` and `helm template` (.github/workflows/ci.yml),
+# and an example of what an install sets. The addresses are placeholders.
+clusterName: gke-test
+enrolledNamespaces: [gke-test]
+image:
+  tag: ci
+gkeScan:
+  centerUrl: https://rail-center.example.com
+  gcpServiceAccount: gke-scan@example-project.iam.gserviceaccount.com
+networkPolicy:
+  railCenterCidrs: [203.0.113.10/32]
+  kubeApiCidrs: [172.16.0.2/32]
+  specTargets:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-test
+      ports:
+        - {protocol: TCP, port: 23004}
