@@ -148,7 +148,7 @@ def read_declared_mcp_servers(context: dict[str, Any], config_paths: list[Path],
 
 
 def profiles() -> list[dict[str, Any]]:
-    """The harness profiles shipped with the scanner (gke/harness/profiles)."""
+    """The harness profiles shipped with the scanner (gke/sidecar/harness/profiles)."""
     return reader().load_profiles()
 
 

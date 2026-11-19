@@ -109,7 +109,7 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # annotations, redacted and capped, and in pod mode the MCP probe drops the
 # agent's MCP headers, so a server that needs them is auth_refused.
 # Pack 16 adds http_operations (RC-512): in pod mode, each MCP server's
-# origin's public API spec operations (tools/scan/gke/spec_probe.py);
+# origin's public API spec operations (tools/scan/gke/sidecar/spec_probe.py);
 # elsewhere BLIND, NOT_COLLECTED_BY_PACK.
 # Pack 16 fills a pod's harness fields from the harness's own files when a
 # harness profile matches the agent (RC-516: OpenClaw's, the first to ship):
@@ -1646,13 +1646,13 @@ def build_evidence_bundle(
     attributes["tool_schemas"] = tool_schemas_attribute(identity.get("tool_schemas"), scanned_roots,
                                                         unread=identity.get("tool_schemas_unread"))
     # Only the pod-mode sidecar probes API specs (RC-512): pod mode puts its
-    # own http_operations in place of this (tools/scan/gke/spec_probe.py).
+    # own http_operations in place of this (tools/scan/gke/sidecar/spec_probe.py).
     attributes["http_operations"] = _blind("NOT_COLLECTED_BY_PACK", "declared",
                                            note="API specs are probed by the pod-mode sidecar only")
 
     attributes.update(registration_attributes(payload))
     # A scan mode that reads some attributes its own way fills them last
-    # (pod mode's are in tools/scan/gke/).
+    # (pod mode's are in tools/scan/gke/sidecar/).
     attributes.update(scanner.mode_attributes(context, payload, _answered, _blind, existing=dict(attributes),
                                               absent=_absent, failed=_failed, partial=_partial))
 

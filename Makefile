@@ -39,18 +39,22 @@ test-python:
 		tools/scan/evidence_bundle.py \
 		tools/scan/compose_evidence_bundle_v2.py \
 		tools/scan/egress_containment.py \
-		tools/scan/gke/reporter.py \
+		tools/scan/gke/sidecar/reporter.py \
 		tools/scan/container_ref.py \
-		tools/scan/gke/pod_mode.py \
-		tools/scan/gke/agent_process.py \
-		tools/scan/gke/spec_probe.py \
-		tools/scan/gke/probe_pool.py \
-		tools/scan/gke/harness/harness_sources.py \
-		tools/scan/gke/harness/reader.py \
-		tools/scan/gke/harness/generic.py \
-		tools/scan/gke/harness/profiles/openclaw.py \
-		tools/scan/gke/harness/profiles/claude-code.py \
-		tools/scan/gke/watcher.py \
+		tools/scan/gke/sidecar/pod_mode.py \
+		tools/scan/gke/sidecar/agent_process.py \
+		tools/scan/gke/sidecar/spec_probe.py \
+		tools/scan/gke/sidecar/probe_pool.py \
+		tools/scan/gke/sidecar/harness/harness_sources.py \
+		tools/scan/gke/sidecar/harness/reader.py \
+		tools/scan/gke/sidecar/harness/generic.py \
+		tools/scan/gke/sidecar/harness/profiles/openclaw.py \
+		tools/scan/gke/sidecar/harness/profiles/claude-code.py \
+		tools/scan/gke/sidecar/watcher.py \
+		tools/scan/gke/central_service/gke_scan.py \
+		tools/scan/gke/central_service/intake.py \
+		tools/scan/gke/central_service/kube.py \
+		tools/scan/gke/central_service/workload.py \
 		tools/listen/follow_container.py \
 		tools/listen/agentsight_adapter.py \
 		tools/listen/preflight.py \
@@ -66,6 +70,7 @@ test-python:
 		python/asp_spelling/asp_redaction.py
 	sh -n tools/local-demo/run_local_demo.sh
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh scan --help >/dev/null
+	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh gke-scan --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh forward --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh openshell --help >/dev/null

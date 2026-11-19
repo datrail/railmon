@@ -1,7 +1,7 @@
 """RC-509: pod mode reads the agent's own process, not the sidecar's.
 
 With a shared process namespace the sidecar finds the agent's main process
-(tools/scan/gke/agent_process.py) and reads its environment, user, command
+(tools/scan/gke/sidecar/agent_process.py) and reads its environment, user, command
 line, runtimes and /etc/os-release through /proc/<pid>. These tests build a
 fake /proc tree: per-process folders whose `root` links to a folder standing
 in for that container's filesystem.
@@ -36,10 +36,10 @@ def _load(name: str, path: Path):
 
 scanner = _load("scan_agent_environment", SCANNER_DIR / "scan_agent_environment.py")
 evidence_bundle = _load("evidence_bundle", SCANNER_DIR / "evidence_bundle.py")
-agent_process = scanner._agent_process()   # tools/scan/gke/agent_process.py
+agent_process = scanner._agent_process()   # tools/scan/gke/sidecar/agent_process.py
 harness_sources = _load("gke_harness_sources_for_agent_process_test",
-                        SCANNER_DIR / "gke" / "harness" / "harness_sources.py")
-pod_mode = scanner._pod_mode()             # tools/scan/gke/pod_mode.py
+                        SCANNER_DIR / "gke" / "sidecar" / "harness" / "harness_sources.py")
+pod_mode = scanner._pod_mode()             # tools/scan/gke/sidecar/pod_mode.py
 
 _PATCHED = {"scan_agent_environment": scanner, "evidence_bundle": evidence_bundle}
 _saved: dict[str, Any] = {}

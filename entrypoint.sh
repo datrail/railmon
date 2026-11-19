@@ -57,6 +57,12 @@ case "$command_name" in
     scan|agent-environment-scanner)
         exec python3 "$root/tools/scan/scan_agent_environment.py" "$@"
         ;;
+    gke-scan)
+        # The central GKE service, one per cluster in rail-system (RC-515):
+        # relays each scan sidecar's bundle to Rail Center after checking the
+        # pod that sent it. tools/scan/gke/central_service/README.md.
+        exec python3 "$root/tools/scan/gke/central_service/gke_scan.py" "$@"
+        ;;
     skills|skills-scanner)
         exec python3 "$root/tools/skills/skill_scanner.py" "$@"
         ;;
@@ -186,6 +192,7 @@ Usage: railmon COMMAND [ARGS...]
 Commands:
   collect    capture agent traffic and forward interactions   (default)
   scan       inspect and optionally register an agent
+  gke-scan   the central GKE service: relays scan sidecars' bundles
   skills     inventory OpenClaw/NemoClaw SKILL.md files
   forward    send captured interactions on to Rail Center
   listen     report sockets the agent opens to accept traffic (AgentSight)
