@@ -90,6 +90,14 @@ class PodSources:
             return None
         return _agent_process().list_in_root(*located)
 
+    def mtime(self, path: str) -> float | None:
+        """A regular file's modification time, with the same guards as a read
+        (RC-530: the newest transcripts are read first)."""
+        located = self._locate(path)
+        if located is None:
+            return None
+        return _agent_process().mtime_in_root(*located)
+
     def digest(self, path: str, max_bytes: int) -> tuple[str, int] | None:
         """The SHA-256 of a regular file's first `max_bytes` and how many
         bytes that was, read a chunk at a time with the same guards (the

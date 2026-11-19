@@ -133,7 +133,11 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 16 also: tool_schemas keeps a copy per server and source with its
 # origin (source, source_kind), and each tool's description and
 # schema_sha256 (DR-294).
-RULE_PACK_VERSION = 16
+# Pack 17 (RC-530): tool_names reads OpenClaw 2026.10.8's event_zstd events,
+# which pack 16 counted as unparsed, and past TRANSCRIPT_MAX_FILES reads the
+# newest transcripts and is PARTIAL with SIZE_CAP_EXCEEDED, where pack 16 was
+# ANSWERED from an arbitrary 50.
+RULE_PACK_VERSION = 17
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an

@@ -1307,6 +1307,14 @@ The pod-mode sidecar also records each HTTP destination's public API spec
 operations in `http_operations`, and runs its MCP and spec probes in a pool
 with a scan deadline (RC-512). Both run only in pod mode, so they're described
 with the rest of the sidecar in [`gke/sidecar/README.md`](gke/sidecar/README.md#http-operations-rc-512).
+
+Rule pack 17 (RC-530) changes pod mode's `tool_names`, so a pack-16 baseline
+is `CONTRACT_MISMATCH` until a pack-17 ASP is locked. OpenClaw's profile reads
+the events OpenClaw 2026.10.8 compresses into `event_zstd`, which pack 16
+counted as unparsed, and past `TRANSCRIPT_MAX_FILES` (50) the shared reader
+and Claude Code's profile read the newest transcripts and report `PARTIAL`
+with `SIZE_CAP_EXCEEDED`, where pack 16 was `ANSWERED` from an arbitrary 50
+(see [gke/sidecar/harness/README.md](gke/sidecar/harness/README.md)).
 A self or docker scan reports `http_operations` as `BLIND`,
 `NOT_COLLECTED_BY_PACK`, and probes its MCP servers one after another, with no
 deadline.

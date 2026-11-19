@@ -315,20 +315,28 @@ def _project_folder(ctx: Any) -> str | None:
     return re.sub(r"[^A-Za-z0-9]", "-", project.rstrip("/") or "/") if project else None
 
 
-def _transcript_files(ctx: Any, reader: Any) -> list[tuple[str, str]]:
-    """(the path reported, the path read) of each transcript, the agent's own
-    project first, at most TRANSCRIPT_MAX_FILES. A project folder's name is
-    a working directory's path (the agent's own, or another project it ran
+def _transcript_files(ctx: Any, reader: Any) -> tuple[list[tuple[str, str]], str | None]:
+    """(the path reported, the path read) of the transcripts to read, and a
+    note when the file cap left some unread (RC-530). Every session and
+    subagent transcript is listed, the agent's own project first, up to
+    TRANSCRIPT_MAX_CANDIDATES; past TRANSCRIPT_MAX_FILES, the newest are
+    read (reader.newest_first), since Claude Code names them by UUID and
+    name order would pick arbitrary ones. A project folder's name is a
+    working directory's path (the agent's own, or another project it ran
     in), so it is never reported, like the working directory itself: the
     agent's own is reported as <$CLAUDE_PROJECT>, any other as <project N>."""
     base = ctx.agent.expand("$CLAUDE_DIR/projects")
     folders = ctx.sources.list_dir(base) if base else None
     if not folders:
-        return []
+        return [], None
     own = _project_folder(ctx)
     files: list[tuple[str, str]] = []
     others = 0
+    limit = reader.TRANSCRIPT_MAX_CANDIDATES
+    more = False
     for folder in sorted(folders, key=lambda name: (name != own, name)):
+        if more:
+            break
         if folder == own:
             shown_folder = "<$CLAUDE_PROJECT>"
         else:
@@ -336,17 +344,22 @@ def _transcript_files(ctx: Any, reader: Any) -> list[tuple[str, str]]:
             shown_folder = f"<project {others}>"
         names = ctx.sources.list_dir(f"{base}/{folder}") or []
         for name in names:
-            if len(files) >= reader.TRANSCRIPT_MAX_FILES:
-                return files
+            if len(files) >= limit:
+                more = True
+                break
             if name.endswith(".jsonl"):
                 files.append((f"$CLAUDE_DIR/projects/{shown_folder}/{name}", f"{base}/{folder}/{name}"))
                 continue
             # A session's subagents keep their own transcripts beside it.
             for sub in ctx.sources.list_dir(f"{base}/{folder}/{name}/subagents") or []:
-                if sub.endswith(".jsonl") and len(files) < reader.TRANSCRIPT_MAX_FILES:
-                    files.append((f"$CLAUDE_DIR/projects/{shown_folder}/{name}/subagents/{sub}",
-                                  f"{base}/{folder}/{name}/subagents/{sub}"))
-    return files
+                if not sub.endswith(".jsonl"):
+                    continue
+                if len(files) >= limit:
+                    more = True
+                    break
+                files.append((f"$CLAUDE_DIR/projects/{shown_folder}/{name}/subagents/{sub}",
+                              f"{base}/{folder}/{name}/subagents/{sub}"))
+    return reader.newest_first(ctx.sources, files, lambda item: item[1], more)
 
 
 def _tool_names(entry: Any) -> list[str]:
@@ -513,7 +526,8 @@ def register(reader: Any) -> None:
         read: list[str] = []
         capped: list[str] = []
         bad_lines = 0
-        for shown, path in _transcript_files(ctx, reader):
+        chosen, file_note = _transcript_files(ctx, reader)
+        for shown, path in chosen:
             text, cut = reader._read_capped(ctx, path, reader.TRANSCRIPT_MAX_BYTES)
             if text is None:
                 continue
@@ -535,16 +549,21 @@ def register(reader: Any) -> None:
             return ctx.result("BLIND", field, reason="NO_SOURCE_ACCESS", note="claude-code: no transcript could be read")
         # The bundle's shape: the names, sorted; a floor, not a count.
         value = sorted(counts)
-        if not value:
+        notes = [n for n in (file_note,
+                             f"read up to {reader.TRANSCRIPT_MAX_BYTES} bytes of {', '.join(capped)}" if capped else None,
+                             f"{bad_lines} transcript line(s) could not be parsed" if bad_lines else None) if n]
+        source = read if len(read) > 1 else read[0]
+        if not value and not file_note:
             if bad_lines:
                 return ctx.result("FAILED", field, reason="PARSE_FAILED",
                                   note=f"{bad_lines} transcript line(s) could not be parsed")
             return ctx.result("ABSENT", field, method=f"claude-code: no tool calls in {len(read)} transcript(s)")
-        source = read if len(read) > 1 else read[0]
-        if capped:
+        if file_note or capped:
+            # Transcripts left unread (RC-530), or one cut short: a floor, and
+            # none found isn't "none" (an empty floor, not ABSENT).
             return ctx.result("PARTIAL", field, value=value, reason="SIZE_CAP_EXCEEDED", source=source,
-                              note=f"{FLOOR}; read up to {reader.TRANSCRIPT_MAX_BYTES} bytes of {', '.join(capped)}")
+                              note=f"{FLOOR}; " + "; ".join(notes))
         if bad_lines:
             return ctx.result("PARTIAL", field, value=value, reason="PARSE_FAILED", source=source,
-                              note=f"{FLOOR}; {bad_lines} transcript line(s) could not be parsed")
+                              note=f"{FLOOR}; " + "; ".join(notes))
         return ctx.result("ANSWERED", field, value=value, source=source, note=FLOOR)

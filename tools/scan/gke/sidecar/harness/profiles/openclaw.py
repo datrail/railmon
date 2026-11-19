@@ -11,7 +11,14 @@ NemoClaw's sandbox-base image, set up with rail-center's agent-setup.sh):
   the exec policy. Its summary columns only; raw_json is never selected, since
   its socket entry can carry the approvals socket's token.
 * <state>/agents/<id>/agent/openclaw-agent.sqlite, table transcript_events:
-  each assistant message's toolCall parts name the tools it called.
+  each assistant message's toolCall parts name the tools it called. From
+  OpenClaw 2026.10.8, an event of 1 KB or more is stored compressed in
+  event_zstd (one zstd frame) with event_json NULL (RC-530). It is
+  decompressed with the standard library's compression.zstd (Python 3.14+;
+  the images and CI run 3.15); where that is missing, such an event is
+  counted as unparsed. One event may decompress to at most 4 MB, and a
+  database's events to 64 MB within DB_SECONDS in all, so a crafted frame
+  can't exhaust the scanner.
 
 Both databases are in WAL mode, so each is copied with its -wal into a
 temporary folder and read there: the live files are never opened, and the
@@ -50,6 +57,8 @@ DB_MAX_VALUE = 1_000_000   # bytes in any one value SQLite will build
 DB_MAX_ROWS = 200_000      # rows read from one query
 DB_MAX_READ = 64_000_000   # bytes of values read from one query, in all
 APPROVAL_TEXT_MAX = 64     # an approvals summary column is a short word or a count
+EVENT_MAX_DECOMPRESSED = 4_000_000  # bytes one event_zstd frame may decompress to (RC-530)
+DB_MAX_DECOMPRESSED = 64_000_000    # bytes one database's event_zstd frames may decompress to, in all
 APPROVAL_COLUMNS = ("default_security", "default_ask", "default_ask_fallback", "auto_allow_skills",
                     "allowlist_count", "agent_count")
 VENDORS = (("googleapis.com", "google"), ("openai.com", "openai"), ("anthropic.com", "anthropic"),
@@ -128,34 +137,135 @@ def _open(copy: Path, table: str) -> sqlite3.Connection:
     return db
 
 
-def _query_each(copy: Path, table: str, column: str) -> tuple[list[Any], bool, int]:
-    """`column` of every row of `table`, each fetched on its own, so one value
-    over DB_MAX_VALUE (an event holding a screenshot) fails only that row:
-    (the values, whether the budget cut them short, how many rows were too
-    large to read). Rows are read up to DB_MAX_ROWS and DB_MAX_READ bytes,
-    within one DB_SECONDS deadline. Raises sqlite3.Error for anything else."""
+def _query_each(copy: Path, table: str, columns: tuple[str, ...]) -> tuple[list[tuple[Any, ...]], bool, int]:
+    """`columns` of every row of `table`, each row fetched on its own, so one
+    value over DB_MAX_VALUE (an event holding a screenshot) fails only that
+    row: (the rows, whether the budget cut them short, how many rows were too
+    large to read). A column the table doesn't have is None in every row, so
+    one query reads OpenClaw before and after event_zstd (RC-530). Rows are
+    read up to DB_MAX_ROWS and DB_MAX_READ bytes, within one DB_SECONDS
+    deadline. Raises sqlite3.Error for anything else."""
     db = _open(copy, table)
     try:
-        values: list[Any] = []
+        present = {row[1] for row in db.execute(f'pragma table_info("{table}")')}
+        wanted = [c for c in columns if c in present]
+        if not wanted:
+            raise sqlite3.DatabaseError(f"{table} has none of {', '.join(columns)}")
+        select = ", ".join(f'"{c}"' for c in wanted)
+        rows: list[tuple[Any, ...]] = []
         too_big, read, cut = 0, 0, False
         rowids = db.execute(f'select rowid from "{table}" order by rowid limit ?', (DB_MAX_ROWS + 1,)).fetchall()
         if len(rowids) > DB_MAX_ROWS:
             rowids, cut = rowids[:DB_MAX_ROWS], True
         for (rowid,) in rowids:
             try:
-                row = db.execute(f'select "{column}" from "{table}" where rowid = ?', (rowid,)).fetchone()
+                row = db.execute(f'select {select} from "{table}" where rowid = ?', (rowid,)).fetchone()
             except sqlite3.DataError:  # larger than DB_MAX_VALUE: not read, and counted
                 too_big += 1
                 continue
             if row is None:
                 continue
-            read += len(row[0]) if isinstance(row[0], (str, bytes)) else 8
+            read += sum(len(v) if isinstance(v, (str, bytes)) else 8 for v in row)
             if read > DB_MAX_READ:
-                return values, True, too_big
-            values.append(row[0])
-        return values, cut, too_big
+                return rows, True, too_big
+            by_name = dict(zip(wanted, row))
+            rows.append(tuple(by_name.get(c) for c in columns))
+        return rows, cut, too_big
     finally:
         db.close()
+
+
+class EventTooLarge(Exception):
+    """An event_zstd frame that decompresses past EVENT_MAX_DECOMPRESSED."""
+
+
+def _zstd_module() -> Any:
+    """The standard library's compression.zstd (Python 3.14+), or None."""
+    try:
+        from compression import zstd  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    return zstd
+
+
+def zstd_decompress(data: bytes, limit: int) -> bytes:
+    """One whole zstd frame, decompressed to at most `limit` bytes: never more
+    is produced, whatever size the frame claims. Raises LookupError when this
+    Python has no zstd, EventTooLarge past `limit`, and ValueError for
+    anything that isn't one whole valid frame. Tests replace this."""
+    module = _zstd_module()
+    if module is None:
+        raise LookupError("this Python has no compression.zstd (3.14+)")
+    decompressor = module.ZstdDecompressor()
+    try:
+        out = decompressor.decompress(data, max_length=limit + 1)
+    except (getattr(module, "ZstdError", ValueError), ValueError, TypeError, EOFError) as exc:
+        raise ValueError(f"not a valid zstd frame: {exc}") from None
+    if len(out) > limit:
+        raise EventTooLarge(limit)
+    if not decompressor.eof or decompressor.unused_data:
+        raise ValueError("not one whole zstd frame")
+    return out
+
+
+SKIPPED = object()  # a compressed event _Decoder couldn't read, already counted
+
+
+class _Decoder:
+    """Turns a transcript_events row into its event text, keeping count of
+    what it couldn't (RC-530). event_json as stored; else event_zstd,
+    decompressed within one database's budget: DB_MAX_DECOMPRESSED bytes and
+    DB_SECONDS in all, EVENT_MAX_DECOMPRESSED for any one event."""
+
+    def __init__(self) -> None:
+        self.deadline = time.monotonic() + DB_SECONDS
+        self.decompressed = 0
+        self.no_zstd = self.too_large = self.invalid = self.over_budget = 0
+
+    def text(self, event_json: Any, event_zstd: Any) -> Any:
+        """The event to parse; SKIPPED for a compressed one it couldn't read.
+        A row with neither column is returned as None, which fails to parse
+        and counts as unparsed, as before event_zstd."""
+        if event_json is not None or event_zstd is None:
+            return event_json
+        if not isinstance(event_zstd, bytes):
+            self.invalid += 1
+            return SKIPPED
+        if self.decompressed > DB_MAX_DECOMPRESSED or time.monotonic() > self.deadline:
+            self.over_budget += 1
+            return SKIPPED
+        try:
+            raw = zstd_decompress(event_zstd, EVENT_MAX_DECOMPRESSED)
+        except LookupError:
+            self.no_zstd += 1
+            return SKIPPED
+        except EventTooLarge:
+            self.too_large += 1
+            return SKIPPED
+        except ValueError:
+            self.invalid += 1
+            return SKIPPED
+        self.decompressed += len(raw)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            self.invalid += 1
+            return SKIPPED
+
+    def problems(self, shown: str) -> list[str]:
+        out = []
+        if self.no_zstd:
+            out.append(f"{shown}: {self.no_zstd} compressed event(s) not read: this Python has no "
+                       "compression.zstd (3.14+)")
+        if self.too_large:
+            out.append(f"{shown}: {self.too_large} compressed event(s) larger than {EVENT_MAX_DECOMPRESSED} "
+                       "bytes decompressed not read")
+        if self.invalid:
+            out.append(f"{shown}: {self.invalid} compressed event(s) could not be decompressed")
+        if self.over_budget:
+            out.append(f"{shown}: decompressed up to {DB_MAX_DECOMPRESSED} bytes or {DB_SECONDS:g} seconds; "
+                       f"{self.over_budget} compressed event(s) not read")
+        return out
 
 
 def _query(copy: Path, table: str, sql: str) -> tuple[list[tuple[Any, ...]], bool]:
@@ -345,7 +455,7 @@ def register(reader: Any) -> None:
                             capped = capped or "larger than" in why
                         continue
                     try:
-                        events, cut, too_big = _query_each(copy, "transcript_events", "event_json")
+                        events, cut, too_big = _query_each(copy, "transcript_events", ("event_json", "event_zstd"))
                     except sqlite3.Error as exc:
                         problems.append(f"{shown_base}: {exc}")
                         continue
@@ -358,7 +468,11 @@ def register(reader: Any) -> None:
                 if too_big:
                     problems.append(f"{shown_base}: {too_big} event(s) larger than {DB_MAX_VALUE} bytes not read")
                 bad_events += too_big
-                for event_json in events:
+                decoder = _Decoder()
+                for stored_json, stored_zstd in events:
+                    event_json = decoder.text(stored_json, stored_zstd)
+                    if event_json is SKIPPED:
+                        continue
                     try:
                         message = (ctx.loads(event_json) or {}).get("message") or {}
                     except (ValueError, TypeError, AttributeError):
@@ -373,6 +487,13 @@ def register(reader: Any) -> None:
                         # Names only: never a call's arguments or result.
                         if isinstance(part, dict) and part.get("type") == "toolCall" and isinstance(part.get("name"), str):
                             counts[part["name"]] = counts.get(part["name"], 0) + 1
+                # A compressed event that couldn't be read counts as unparsed,
+                # as an event over DB_MAX_VALUE does; one left unread by the
+                # decompression budget makes the result a floor, as the row
+                # budget does (RC-530).
+                problems.extend(decoder.problems(shown_base))
+                bad_events += decoder.no_zstd + decoder.too_large + decoder.invalid
+                capped = capped or bool(decoder.over_budget)
             if read or problems:
                 break
         if not read:
