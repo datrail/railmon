@@ -200,6 +200,15 @@ unknown: `BLIND` with `UNKNOWN_HARNESS` when no MCP config was found, and
   skill), and transcripts (JSON lines, `tool_name` a key path in each line;
   or `{"hook": "name"}`). `tool_names` is the bundle's shape: the names,
   sorted, a floor rather than a count.
+- **`watch`** (optional, pod mode's watcher, RC-523): `content`, more paths
+  hashed by content beside the `sources`, prompt files and skills, which
+  always are (a last part may be a pattern); `list`, folders hashed by file
+  list only, for transcripts that grow on every turn; and `wait_for`, what
+  must exist before the first scan, for up to `wait_seconds`. A `wait_for`
+  item may be a list of alternatives, the first whose variables are set
+  being used. OpenClaw waits for `openclaw.json` and `agents/main/`; a
+  profile with no `wait_for` is scanned as soon as its process is found. See
+  [the watcher](../README.md#rescans-shutdown-and-health-rc-523).
 
 A field the profile doesn't name is `BLIND` with `NOT_COLLECTED_BY_PACK`, and
 pod mode leaves the bundle's own value for it.

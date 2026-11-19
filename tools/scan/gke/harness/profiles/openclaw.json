@@ -1,7 +1,7 @@
 {
   "harness": "openclaw",
   "markers": {
-    "commands": ["openclaw"],
+    "commands": ["openclaw", "openclaw-gateway"],
     "packages": ["openclaw"],
     "env": ["OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_HOME"]
   },
@@ -55,5 +55,18 @@
       "$OPENCLAW_DIR/workspace/skills"
     ],
     "transcripts": {"hook": "openclaw_transcripts"}
+  },
+  "watch": {
+    "content": [
+      "$OPENCLAW_DIR/*.json",
+      "$OPENCLAW_DIR/state/openclaw.sqlite",
+      "$OPENCLAW_DIR/state/openclaw.sqlite-wal"
+    ],
+    "list": ["$OPENCLAW_DIR/agents"],
+    "wait_for": [
+      ["$OPENCLAW_CONFIG_PATH", "$OPENCLAW_DIR/openclaw.json"],
+      "$OPENCLAW_DIR/agents/main"
+    ],
+    "wait_seconds": 300
   }
 }

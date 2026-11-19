@@ -90,6 +90,15 @@ class PodSources:
             return None
         return _agent_process().list_in_root(*located)
 
+    def digest(self, path: str, max_bytes: int) -> tuple[str, int] | None:
+        """The SHA-256 of a regular file's first `max_bytes` and how many
+        bytes that was, read a chunk at a time with the same guards (the
+        watcher, RC-523)."""
+        located = self._locate(path)
+        if located is None:
+            return None
+        return _agent_process().digest_in_root(located[0], located[1], max_bytes)
+
 
 # What the MCP probe uses from a declared server's spec (RC-531): its
 # address or command. Everything else (headers, env, OAuth settings) is
