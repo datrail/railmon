@@ -39,6 +39,7 @@ test-python:
 		tools/scan/evidence_bundle.py \
 		tools/scan/compose_evidence_bundle_v2.py \
 		tools/scan/egress_containment.py \
+		tools/scan/gke/reporter.py \
 		tools/scan/container_ref.py \
 		tools/scan/gke/pod_mode.py \
 		tools/scan/gke/agent_process.py \
