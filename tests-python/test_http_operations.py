@@ -38,7 +38,7 @@ _evidence_spec.loader.exec_module(evidence_bundle)
 
 KEY = "sk-live-" + "a1B2c3D4" * 4
 
-# The pod-mode modules the moved code lives in (tools/scan/gke/), loaded the
+# The pod-mode modules the moved code lives in (tools/scan/gke/sidecar/), loaded the
 # way the scanner loads them, so they use this file's scanner.
 spec_probe = scanner._spec_probe()
 probe_pool = scanner._probe_pool()

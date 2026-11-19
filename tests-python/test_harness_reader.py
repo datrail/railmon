@@ -1,8 +1,8 @@
 """RC-510: the shared harness reader reads any harness's fields from its profile.
 
-The reader (tools/scan/gke/harness/reader.py) is tested with a made-up harness,
+The reader (tools/scan/gke/sidecar/harness/reader.py) is tested with a made-up harness,
 "toyagent", and local files; no real harness's profile is involved (those are
-tasks 4 and 5). The pod-mode side (tools/scan/gke/harness/harness_sources.py) is
+tasks 4 and 5). The pod-mode side (tools/scan/gke/sidecar/harness/harness_sources.py) is
 tested against a folder standing in for the agent's root and one for the
 config volume.
 """
@@ -33,9 +33,9 @@ def load(name: str, path: Path):
 
 
 sys.path.insert(0, str(SCAN))
-reader = load("harness_reader", SCAN / "gke" / "harness" / "reader.py")
-harness_sources = load("gke_harness_sources", SCAN / "gke" / "harness" / "harness_sources.py")
-pod_mode = load("gke_pod_mode", SCAN / "gke" / "pod_mode.py")
+reader = load("harness_reader", SCAN / "gke" / "sidecar" / "harness" / "reader.py")
+harness_sources = load("gke_harness_sources", SCAN / "gke" / "sidecar" / "harness" / "harness_sources.py")
+pod_mode = load("gke_pod_mode", SCAN / "gke" / "sidecar" / "pod_mode.py")
 import evidence_bundle  # noqa: E402
 import scan_agent_environment as scanner  # noqa: E402
 

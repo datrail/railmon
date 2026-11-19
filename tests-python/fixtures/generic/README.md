@@ -3,7 +3,7 @@
 The config folder of an agent on a harness no profile knows: a made-up
 `plainagent`, run as `python3 -m plainagent serve`, so neither OpenClaw's nor
 Claude Code's markers match it and the generic reader
-(`tools/scan/gke/harness/generic.py`) reads it. Written by hand, in the
+(`tools/scan/gke/sidecar/harness/generic.py`) reads it. Written by hand, in the
 shapes any harness may use; the key is a placeholder.
 
 | File | Laid out as | What it is |

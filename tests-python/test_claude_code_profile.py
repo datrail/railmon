@@ -1,6 +1,6 @@
 """RC-526: Claude Code's harness profile fills the harness fields.
 
-The shipped profile (tools/scan/gke/harness/profiles/claude-code.json and its
+The shipped profile (tools/scan/gke/sidecar/harness/profiles/claude-code.json and its
 hooks, claude-code.py), loaded as production loads it, read against an agent
 laid out from fixtures Claude Code 2.1.325 wrote itself
 (fixtures/claude-code/README.md).
@@ -42,8 +42,8 @@ def load_private(name: str, path: Path):
     return module
 
 
-reader = load("harness_reader", SCAN / "gke" / "harness" / "reader.py")
-pod_mode = load("gke_pod_mode", SCAN / "gke" / "pod_mode.py")
+reader = load("harness_reader", SCAN / "gke" / "sidecar" / "harness" / "reader.py")
+pod_mode = load("gke_pod_mode", SCAN / "gke" / "sidecar" / "pod_mode.py")
 scanner = load_private("claude_code_profile_test_scanner", SCAN / "scan_agent_environment.py")
 evidence_bundle = load_private("claude_code_profile_test_bundle", SCAN / "evidence_bundle.py")
 

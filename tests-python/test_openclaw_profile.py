@@ -1,6 +1,6 @@
 """RC-516: OpenClaw's harness profile fills the harness fields.
 
-The shipped profile (tools/scan/gke/harness/profiles/openclaw.json and its
+The shipped profile (tools/scan/gke/sidecar/harness/profiles/openclaw.json and its
 hooks, openclaw.py), loaded as production loads it, read against an agent laid
 out from fixtures OpenClaw 2026.9.2 wrote itself (fixtures/openclaw/README.md).
 """
@@ -34,9 +34,9 @@ def load(name: str, path: Path):
 
 
 sys.path.insert(0, str(SCAN))
-reader = load("harness_reader", SCAN / "gke" / "harness" / "reader.py")
-harness_sources = load("gke_harness_sources", SCAN / "gke" / "harness" / "harness_sources.py")
-pod_mode = load("gke_pod_mode", SCAN / "gke" / "pod_mode.py")
+reader = load("harness_reader", SCAN / "gke" / "sidecar" / "harness" / "reader.py")
+harness_sources = load("gke_harness_sources", SCAN / "gke" / "sidecar" / "harness" / "harness_sources.py")
+pod_mode = load("gke_pod_mode", SCAN / "gke" / "sidecar" / "pod_mode.py")
 import evidence_bundle  # noqa: E402
 import scan_agent_environment as scanner  # noqa: E402
 

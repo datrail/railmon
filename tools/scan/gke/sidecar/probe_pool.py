@@ -1,14 +1,14 @@
 """The probe pool and the scan deadline (RC-512, with the former RC-517).
 
 Pod mode's probe stage: after the harness reader has settled the agent's MCP
-servers, every MCP probe and every API spec probe (gke/spec_probe.py) runs in
+servers, every MCP probe and every API spec probe (gke/sidecar/spec_probe.py) runs in
 one ProbePool, four at a time, and the whole scan gets SCAN_DEADLINE_SECONDS
 from its start. A probe still out at the deadline is BLIND for its server
 alone, and the rest of the bundle is built and sent as usual.
 
 Self and docker scans still probe their MCP servers one after another, with
 no deadline, so this lives with the rest of the sidecar. Like the other
-modules in tools/scan/gke/, it imports nothing of railmon's: the scanner
+modules in tools/scan/gke/sidecar/, it imports nothing of railmon's: the scanner
 hands itself over with `register`, and the MCP probe itself (and its memory
 bounds) stays in the scanner, which every mode shares.
 """
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 _s: Any = None  # the scanner module (scan_agent_environment), set by register
-_spec: Any = None  # gke/spec_probe.py, as the scanner loads it
+_spec: Any = None  # gke/sidecar/spec_probe.py, as the scanner loads it
 
 
 def register(scanner: Any) -> None:

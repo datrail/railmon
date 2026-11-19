@@ -1,6 +1,6 @@
 """RC-520: any other harness gets the fields that need no profile.
 
-The generic reader (tools/scan/gke/harness/generic.py), which the shared
+The generic reader (tools/scan/gke/sidecar/harness/generic.py), which the shared
 reader runs when no profile matches the agent, read against the config folder
 of a made-up harness no profile knows (fixtures/generic/README.md): through
 the reader with local files, through pod mode's harness attributes, and in a
@@ -45,8 +45,8 @@ def load_private(name: str, path: Path):
     return module
 
 
-reader = load("harness_reader", SCAN / "gke" / "harness" / "reader.py")
-pod_mode = load("gke_pod_mode", SCAN / "gke" / "pod_mode.py")
+reader = load("harness_reader", SCAN / "gke" / "sidecar" / "harness" / "reader.py")
+pod_mode = load("gke_pod_mode", SCAN / "gke" / "sidecar" / "pod_mode.py")
 scanner = load_private("generic_reader_test_scanner", SCAN / "scan_agent_environment.py")
 evidence_bundle = load_private("generic_reader_test_bundle", SCAN / "evidence_bundle.py")
 
