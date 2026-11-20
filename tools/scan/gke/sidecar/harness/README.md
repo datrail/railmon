@@ -8,7 +8,7 @@ that harness keeps each field. Supporting a harness means writing its profile
 
 | Profile | Harness | Hooks |
 |---|---|---|
-| `profiles/openclaw.json` (RC-516) | OpenClaw, as 2026.9.2 lays out its files | `profiles/openclaw.py`: the installed version, the model's provider and endpoint, exec approvals and transcripts from its SQLite databases |
+| `profiles/openclaw.json` (RC-516) | OpenClaw, as 2026.9.2 lays out its files | `profiles/openclaw.py`: the installed version, the model's provider and endpoint, exec approvals and transcripts from its SQLite databases, including the events 2026.10.8 compresses into `event_zstd` (RC-530) |
 | `profiles/claude-code.json` (RC-526) | Claude Code, as 2.1.325 lays out and reads its files | `profiles/claude-code.py`: the version (npm package or native install), the model, provider and endpoint in Claude Code's own order (`--model`, `ANTHROPIC_MODEL`, `model`), MCP servers by scope (user, project `.mcp.json`, local, or `managed-mcp.json` alone), permission rules merged across settings files with an untrusted project's allow rules left out, the permission mode and hooks (by event and matcher only), and `tool_use` names from its JSONL transcripts |
 
 For an agent no profile matches, the generic reader (`generic.py`, RC-520)
@@ -38,7 +38,7 @@ Each field comes back as one of:
 | `BLIND`, `GATEWAY_MANAGED` | `tool_allow_deny` or `approval_policy` not set: an undeclared policy is never evidence of restriction (as the bundle already reports it) |
 | `FAILED`, `PARSE_FAILED` | None had it and one could not be parsed |
 | `FAILED`, `SIZE_CAP_EXCEEDED` | None had it and one was larger than the cap, so it was not read |
-| `PARTIAL`, `PARSE_FAILED` or `SIZE_CAP_EXCEEDED` | Tool names read, with some transcript lines unparsed, or a transcript read only up to its cap (whole lines only) |
+| `PARTIAL`, `PARSE_FAILED` or `SIZE_CAP_EXCEEDED` | Tool names read, with some transcript lines unparsed, or a transcript read only up to its cap (whole lines only), or more transcripts than `TRANSCRIPT_MAX_FILES` (the note says how many were read). With transcripts left unread, none found is an empty floor, not `ABSENT` |
 | `BLIND`, `NO_SOURCE_ACCESS` | No source could be read |
 | `FAILED`, `PARSE_FAILED`, "hook … failed" | A hook raised (a malformed database, a full or read-only `/tmp`): that field only, never the scan |
 | `BLIND`, `NOT_COLLECTED_BY_PACK` | The profile doesn't name the field, or prompt text without the flag |
@@ -199,7 +199,15 @@ unknown: `BLIND` with `UNKNOWN_HARNESS` when no MCP config was found, and
   prompt collection on), skills folders (a subfolder holding `SKILL.md` is a
   skill), and transcripts (JSON lines, `tool_name` a key path in each line;
   or `{"hook": "name"}`). `tool_names` is the bundle's shape: the names,
-  sorted, a floor rather than a count.
+  sorted, a floor rather than a count. At most `TRANSCRIPT_MAX_FILES` (50)
+  transcripts are read, 1 MB each; past that, the newest by modification
+  time (`newest_first`, RC-530), since a harness may name them by UUID.
+  Every transcript is listed first, up to 5,000. A `Sources` without
+  `mtime` gets name order, and the note says so. Claude Code's profile uses
+  the same selection, its subagent transcripts counted with its sessions.
+  The cap stays at 50: with the newest read first and the note saying how
+  many weren't, it keeps a scan's reads bounded at 50 MB, to revisit with
+  the overhead benchmark (RC-525).
 - **`watch`** (optional, pod mode's watcher, RC-523): `content`, more paths
   hashed by content beside the `sources`, prompt files and skills, which
   always are (a last part may be a pattern); `list`, folders hashed by file

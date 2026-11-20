@@ -253,6 +253,22 @@ def digest_in_root(root: Path, path: str, max_bytes: int, same_device: bool = Tr
         os.close(fd)
 
 
+def mtime_in_root(root: Path, path: str, same_device: bool = True,
+                  refuse: tuple[str, ...] = ()) -> float | None:
+    """A regular file's modification time inside the agent's root, resolved
+    and opened as read_bytes_in_root opens it (RC-530: the newest
+    transcripts are read first). None when it can't be read there."""
+    walked = _walk_in_root(root, path, open_file=True, same_device=same_device, refuse=refuse)
+    if walked is None or walked[1] is None:
+        return None
+    try:
+        return os.fstat(walked[1]).st_mtime
+    except OSError:
+        return None
+    finally:
+        os.close(walked[1])
+
+
 def read_in_root(root: Path, path: str, max_bytes: int = SMALL_FILE_MAX_BYTES,
                  same_device: bool = True, refuse: tuple[str, ...] = ()) -> str | None:
     """A regular file's text inside the agent's root (read_bytes_in_root)."""

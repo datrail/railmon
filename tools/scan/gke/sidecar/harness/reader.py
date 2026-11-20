@@ -74,6 +74,9 @@ CWD_NAME = "AGENT_CWD"
 PROMPT_TEXT_MAX_CHARS = 16_000
 TRANSCRIPT_MAX_BYTES = 1_000_000
 TRANSCRIPT_MAX_FILES = 50
+# Transcripts listed when choosing which TRANSCRIPT_MAX_FILES to read: each
+# past the file cap costs a stat, for its modification time (RC-530).
+TRANSCRIPT_MAX_CANDIDATES = 5000
 MAX_JSON_DEPTH = 100
 PROFILES_DIR = Path(__file__).resolve().with_name("profiles")
 GENERIC_READER = Path(__file__).resolve().with_name("generic.py")
@@ -134,6 +137,10 @@ class Sources(Protocol):
 
     def list_dir(self, path: str) -> list[str] | None: ...
 
+    # Optional: a regular file's modification time, or None. A Sources
+    # without it gets transcripts read in name order (newest_first).
+    # def mtime(self, path: str) -> float | None: ...
+
 
 class LocalSources:
     """This machine's files, optionally under `root`: regular files only,
@@ -175,6 +182,19 @@ class LocalSources:
             return sorted(os.listdir(self._path(path)))
         except OSError:
             return None
+
+    def mtime(self, path: str) -> float | None:
+        try:
+            fd = os.open(self._path(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+            return info.st_mtime if stat.S_ISREG(info.st_mode) else None
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
 
 
 class Agent:
@@ -884,6 +904,34 @@ def _skills_field(ctx: Context, spec: list[str]) -> dict[str, Any]:
     return _result("BLIND", "skills_inventory", reason="NO_SOURCE_ACCESS", note=f"{ctx.harness}: no skills folder could be read")
 
 
+def newest_first(sources: Any, candidates: list[Any], path_of: Callable[[Any], str],
+                 more: bool = False) -> tuple[list[Any], str | None]:
+    """At most TRANSCRIPT_MAX_FILES of `candidates` (transcripts, in the
+    order they were listed), and a note when that left some unread (RC-530).
+
+    Past the cap, the newest by modification time are kept, when `sources`
+    can give one (Sources.mtime), so the cap keeps recent activity: Claude
+    Code names its transcripts by UUID, so name order is arbitrary. A file
+    whose time can't be read sorts as the oldest. Without modification times
+    the first in listed order are kept, and the note says so. `more` means
+    listing stopped at TRANSCRIPT_MAX_CANDIDATES with more left."""
+    total = f"{'more than ' if more else ''}{len(candidates)}"
+    if len(candidates) <= TRANSCRIPT_MAX_FILES and not more:
+        return list(candidates), None
+    mtime = getattr(sources, "mtime", None)
+    if not callable(mtime):
+        return (list(candidates[:TRANSCRIPT_MAX_FILES]),
+                f"read the first {TRANSCRIPT_MAX_FILES} of {total} transcripts, in name order "
+                f"(no modification times; TRANSCRIPT_MAX_FILES)")
+    stamped = []
+    for index, candidate in enumerate(candidates):
+        when = mtime(path_of(candidate))
+        stamped.append((when if isinstance(when, (int, float)) else float("-inf"), index, candidate))
+    stamped.sort(key=lambda item: (-item[0], item[1]))
+    chosen = [candidate for _, _, candidate in stamped[:TRANSCRIPT_MAX_FILES]]
+    return chosen, f"read the {len(chosen)} newest of {total} transcripts (TRANSCRIPT_MAX_FILES)"
+
+
 def _transcript_field(ctx: Context, spec: dict[str, Any]) -> dict[str, Any]:
     if "hook" in spec:
         return _run_hook(ctx, "tool_names", spec)
@@ -893,47 +941,62 @@ def _transcript_field(ctx: Context, spec: dict[str, Any]) -> dict[str, Any]:
     files: list[str] = []
     capped: list[str] = []
     bad_lines = 0
+    # Every transcript first (names only), then at most TRANSCRIPT_MAX_FILES
+    # of them, the newest first (newest_first): a cap that leaves some unread
+    # says so, as the byte cap does (RC-530).
+    candidates: list[tuple[str, str]] = []
+    more = False
     for raw in spec.get("folders", []):
         folder = ctx.agent.expand(raw)
         names = ctx.sources.list_dir(folder) if folder else None
         for name in names or []:
-            if len(files) >= TRANSCRIPT_MAX_FILES or not fnmatch.fnmatch(name, spec.get("files", "*.jsonl")):
+            if not fnmatch.fnmatch(name, spec.get("files", "*.jsonl")):
                 continue
-            path = f"{folder.rstrip('/')}/{name}"
-            text, cut = _read_capped(ctx, path, TRANSCRIPT_MAX_BYTES)
-            if text is None:
+            if len(candidates) >= TRANSCRIPT_MAX_CANDIDATES:
+                more = True
+                break
+            candidates.append((f"{raw.rstrip('/')}/{name}", f"{folder.rstrip('/')}/{name}"))
+    chosen, file_note = newest_first(ctx.sources, candidates, lambda item: item[1], more)
+    for shown, path in chosen:
+        text, cut = _read_capped(ctx, path, TRANSCRIPT_MAX_BYTES)
+        if text is None:
+            continue
+        if cut:
+            # Count the whole lines read; the one the cap cut is not a bad line.
+            text = text.rpartition("\n")[0]
+            capped.append(shown)
+        files.append(shown)
+        for line in text.splitlines():
+            if not line.strip():
                 continue
-            if cut:
-                # Count the whole lines read; the one the cap cut is not a bad line.
-                text = text.rpartition("\n")[0]
-                capped.append(f"{raw.rstrip('/')}/{name}")
-            files.append(f"{raw.rstrip('/')}/{name}")
-            for line in text.splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    event = ctx.loads(line)
-                except ValueError:
-                    bad_lines += 1
-                    continue
-                names_found = get_path(event, spec["tool_name"])
-                for tool in names_found if isinstance(names_found, list) else [names_found]:
-                    if isinstance(tool, str) and tool:
-                        counts[tool] = counts.get(tool, 0) + 1
+            try:
+                event = ctx.loads(line)
+            except ValueError:
+                bad_lines += 1
+                continue
+            names_found = get_path(event, spec["tool_name"])
+            for tool in names_found if isinstance(names_found, list) else [names_found]:
+                if isinstance(tool, str) and tool:
+                    counts[tool] = counts.get(tool, 0) + 1
     if not files:
         return _result("BLIND", "tool_names", reason="NO_SOURCE_ACCESS", note=f"{ctx.harness}: no transcript could be read")
-    if not counts:
-        return _result("ABSENT", "tool_names", method=f"{ctx.harness}: no tool calls in {len(files)} transcript(s)")
     # The bundle's shape (evidence_bundle.py, compose_evidence_bundle_v2.py):
     # the names, sorted; a floor, not a count.
     value = sorted(counts)
     floor = "floor, not a count: tools not called in the transcripts read are absent here"
-    if capped:
+    notes = [n for n in (file_note,
+                         f"read up to {TRANSCRIPT_MAX_BYTES} bytes of {', '.join(capped)}" if capped else None,
+                         f"{bad_lines} transcript line(s) could not be parsed" if bad_lines else None) if n]
+    if not value and not file_note:
+        return _result("ABSENT", "tool_names", method=f"{ctx.harness}: no tool calls in {len(files)} transcript(s)")
+    if file_note or capped:
+        # Some transcripts, or some of one, weren't read: what was found is a
+        # floor, and none found isn't "none" (an empty floor, not ABSENT).
         return _result("PARTIAL", "tool_names", value=value, reason="SIZE_CAP_EXCEEDED", source=files,
-                       note=f"{floor}; read up to {TRANSCRIPT_MAX_BYTES} bytes of {', '.join(capped)}")
+                       note=f"{floor}; " + "; ".join(notes))
     if bad_lines:
         return _result("PARTIAL", "tool_names", value=value, reason="PARSE_FAILED", source=files,
-                       note=f"{floor}; {bad_lines} transcript line(s) could not be parsed")
+                       note=f"{floor}; " + "; ".join(notes))
     return _result("ANSWERED", "tool_names", value=value, source=files, note=floor)
 
 
