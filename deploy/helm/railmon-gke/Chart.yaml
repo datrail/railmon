@@ -1,0 +1,11 @@
+apiVersion: v2
+name: railmon-gke
+description: >-
+  RailMon on GKE: gke-scan in rail-system, the admission webhook that adds the
+  scan sidecar to pods labeled rail.datrail.io/scan=true, and the
+  NetworkPolicies that keep agent pods inside the cluster (RC-518).
+type: application
+version: 0.1.0
+# The scan-sidecar image tag the chart pins when image.tag is empty.
+appVersion: "0.1.0"
+kubeVersion: ">=1.29.0-0"

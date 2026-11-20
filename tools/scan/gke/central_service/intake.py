@@ -45,15 +45,16 @@ The pod check reads the pod from the Kubernetes API on each post. The cluster
 reader (gke-scan's watch of labeled pods, a later task) can answer it from
 memory instead, through the same `get_pod`.
 
-Like the sidecar's modules, this one imports nothing of railmon's: the entry
-point (gke_scan.py) hands it the Kubernetes client and the relay.
+Like the sidecar's modules, this one imports nothing of railmon's but two
+standard-library helpers loaded by path, workload.py beside it and
+tls_reload.py (its certificate, shared with the webhook): the entry point
+(gke_scan.py) hands it the Kubernetes client and the relay.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
-import ssl
 import sys
 import threading
 import time
@@ -88,6 +89,18 @@ def _workload() -> ModuleType:
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules["gke_scan_workload"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def _tls_reload() -> ModuleType:
+    """tls_reload.py, shared with the webhook (tools/scan/gke/), loaded by path once."""
+    module = sys.modules.get("gke_tls_reload")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("gke_tls_reload", Path(__file__).parent.parent / "tls_reload.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["gke_tls_reload"] = module
         spec.loader.exec_module(module)
     return module
 
@@ -357,19 +370,25 @@ class IntakeHandler(BaseHTTPRequestHandler):
 
 class IntakeServer(ThreadingHTTPServer):
     """The intake's HTTPS server: a thread per request, TLS from the chart's
-    certificate. `ssl_context` None serves plain HTTP, for tests only."""
+    certificate. `tls` None serves plain HTTP, for tests only."""
 
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], intake: Intake, ssl_context: ssl.SSLContext | None):
+    def __init__(self, address: tuple[str, int], intake: Intake, tls: Any | None):
         super().__init__(address, IntakeHandler)
         self.intake = intake
-        if ssl_context is not None:
-            # The handshake runs on the first read, in the request's own
-            # thread under its read timeout, so a client that stalls in it
-            # can't hold up the accept loop.
-            self.socket = ssl_context.wrap_socket(self.socket, server_side=True, do_handshake_on_connect=False)
+        self.tls = tls
+
+    def get_request(self) -> tuple[Any, Any]:
+        conn, address = self.socket.accept()
+        if self.tls is not None:
+            # Each connection gets the certificate the Secret holds now
+            # (tls_reload.py), with its handshake deferred to the request's
+            # own thread, under its read timeout, so a client that stalls
+            # in it can't hold up the accept loop.
+            conn = _tls_reload().wrap_accepted(conn, self.tls)
+        return conn, address
 
     def drain(self, grace: float = SHUTDOWN_GRACE_SECONDS, clock: Callable[[], float] = time.monotonic,
               sleep: Callable[[float], None] = time.sleep) -> int:
@@ -380,8 +399,7 @@ class IntakeServer(ThreadingHTTPServer):
         return self.intake.in_flight()
 
 
-def server_tls_context(cert_file: str, key_file: str) -> ssl.SSLContext:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(cert_file, key_file)
-    return context
+def server_tls_context(cert_file: str, key_file: str) -> Any:
+    """The intake's certificate, followed as its Secret is renewed. Raises
+    when the files won't load at start."""
+    return _tls_reload().ReloadingContext(cert_file, key_file, log=lambda line: log(line))

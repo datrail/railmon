@@ -1,0 +1,122 @@
+{{- $ns := .Release.Namespace -}}
+{{- $np := .Values.networkPolicy -}}
+{{- if $np.agentEgress.enabled }}
+{{- range .Values.enrolledNamespaces }}
+---
+# Agent pods reach gke-scan and DNS. The sidecar shares the agent's network,
+# so this is the agent's egress too: it never needs Rail Center's address.
+# Selecting the pods for egress denies them anything else no other policy
+# allows (values.yaml, networkPolicy.agentEgress).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rail-scan-agent-egress
+  namespace: {{ . }}
+  labels:
+    {{- include "railmon-gke.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      rail.datrail.io/scan: "true"
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gke-scan
+      ports:
+        - {protocol: TCP, port: {{ $.Values.gkeScan.port }}}
+    {{- include "railmon-gke.dnsEgress" $ | nindent 4 }}
+    {{- with $np.agentEgress.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- if $np.railSystem.enabled }}
+{{- if not $np.railCenterCidrs }}
+{{- fail "networkPolicy.railCenterCidrs is required with networkPolicy.railSystem.enabled: gke-scan's egress to Rail Center" }}
+{{- end }}
+{{- if not $np.kubeApiCidrs }}
+{{- fail "networkPolicy.kubeApiCidrs is required with networkPolicy.railSystem.enabled: gke-scan's egress to the Kubernetes API (kubectl get endpoints kubernetes -n default)" }}
+{{- end }}
+---
+# gke-scan accepts only labeled pods from enrolled namespaces, on its port,
+# and reaches only Rail Center, the Kubernetes API, DNS, the metadata server
+# (its Google identity) and the spec targets. Its path out of the cluster
+# (Cloud NAT on private nodes) is the only one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gke-scan
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gke-scan
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  {{- toYaml .Values.enrolledNamespaces | nindent 18 }}
+          podSelector:
+            matchLabels:
+              rail.datrail.io/scan: "true"
+      ports:
+        - {protocol: TCP, port: {{ .Values.gkeScan.port }}}
+  egress:
+    - to:
+        {{- range $np.railCenterCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: {{ $np.railCenterPort }}}
+    - to:
+        {{- range $np.kubeApiCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        {{- range $np.kubeApiPorts }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
+    {{- range $np.metadataServer }}
+    - to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+      ports:
+        - {protocol: TCP, port: {{ .port }}}
+    {{- end }}
+    {{- include "railmon-gke.dnsEgress" . | nindent 4 }}
+    {{- with $np.specTargets }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+---
+# The webhook: the API server calls it, from addresses no pod or namespace
+# selector can name, so its port is open to any source. It calls nothing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rail-scan-webhook
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rail-scan-webhook
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: {{ .Values.webhook.port }}}
+  egress: []
+{{- end }}

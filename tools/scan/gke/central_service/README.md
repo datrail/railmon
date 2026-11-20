@@ -149,7 +149,7 @@ With `RAIL_AUTH_MODE=gcp` and `RAIL_AUTH_AUDIENCE` set to Rail Center's URL.
 |---|---|---|
 | `--cluster-name` | `RAIL_CLUSTER_NAME` | required: the `host_id` the cluster's sidecars report under |
 | `--center-url` | `RAIL_CENTER_URL` | required |
-| `--tls-cert-file`, `--tls-key-file` | `RAIL_INTAKE_TLS_CERT_FILE`, `RAIL_INTAKE_TLS_KEY_FILE` | required: the intake's certificate from the chart's CA |
+| `--tls-cert-file`, `--tls-key-file` | `RAIL_INTAKE_TLS_CERT_FILE`, `RAIL_INTAKE_TLS_KEY_FILE` | required: the intake's certificate from the chart's CA, loaded again when its Secret changes ([`tls_reload.py`](../tls_reload.py)) |
 | `--listen` | `RAIL_INTAKE_LISTEN` | `0.0.0.0:8443` |
 | `--audience` | `RAIL_INTAKE_AUDIENCE` | `gke-scan` |
 | `--kube-api-url`, `--kube-token-file`, `--kube-ca-file` | | the in-cluster API and gke-scan's service account, where Kubernetes mounts them |
@@ -172,8 +172,8 @@ Grant the `rollouts` rule even where Argo isn't installed. The API server
 checks permission before it looks for the resource, so without the rule
 every read is refused (403) rather than not found (404), and every
 sidecar's post is answered 503 until it's granted. The log line names the
-read that was refused. The chart's RBAC,
-Service and NetworkPolicy are in the gke-scan design.
+read that was refused. The [`railmon-gke` chart](../../../../deploy/helm/railmon-gke/README.md)
+grants exactly this, and runs gke-scan with its Service and NetworkPolicy (RC-518).
 
 ## Tests
 

@@ -1,0 +1,71 @@
+# The slim scan-sidecar image (RC-518): Python and tools/scan, nothing else.
+#
+# It runs `railmon scan --mode pod` beside an agent in its pod
+# (tools/scan/gke/sidecar/), and, from the same image, the chart's other two
+# GKE parts: gke-scan (tools/scan/gke/central_service/) and the admission
+# webhook that adds the sidecar to labeled pods (tools/scan/gke/webhook/). All
+# three are standard-library Python under tools/scan, so one image and one
+# pinned tag cover the chart.
+#
+# What the main image carries and this one doesn't: the Rust collector,
+# AgentSight, the Docker CLI, OpenShell, curl and openssl. A compromised
+# sidecar can read what the agent's UID can read in the pod, so what it can
+# run should be as little as possible (the sidecar design's threat model).
+#
+# It runs with a read-only root filesystem, no added capabilities and as any
+# UID: the webhook runs it as the agent's UID, which the image can't know. So
+# nothing here is written after build, nothing needs a home folder, and every
+# file the scan writes goes to /tmp (an emptyDir in the pod). CI runs a
+# pod-mode scan in it that way (tests/scan_sidecar_acceptance.py).
+#
+# python:3.15-slim, the same as the main image and CI's setup-python, so the
+# scanner runs on the Python it is tested on.
+FROM python:3.15-slim
+
+# No pip, setuptools or ensurepip at runtime: the scanner is standard-library
+# only and nothing in the pod installs anything.
+RUN python3 -m pip uninstall -y pip setuptools wheel >/dev/null 2>&1 || true; \
+    rm -rf /usr/local/lib/python3*/ensurepip /usr/local/bin/pip* /root/.cache
+
+# No openssl command: Debian 13's ca-certificates pulls in the openssl
+# package. Only its programs go; the package stays installed, since it also
+# owns /usr/lib/ssl/cert.pem, /usr/lib/ssl/certs and openssl.cnf, which are
+# where Python's ssl finds the system CA store (gke-scan's calls to Rail
+# Center, the scanner's HTTPS probes). libssl stays too.
+RUN rm -f /usr/bin/openssl /usr/bin/c_rehash \
+    && rm -rf /usr/lib/ssl/misc
+
+# Only what the scanner reads: tools/scan, the evidence-bundle schemas it loads
+# at import (tools/scan/evidence_bundle.py), and the URL redaction rule it
+# loads by path from python/asp_spelling (tools/scan/scan_agent_environment.py).
+# The paths keep the checkout's layout, which is how the scanner finds them.
+COPY tools/scan/ /opt/railmon/tools/scan/
+COPY schemas/evidence-bundle-v1.schema.json schemas/evidence-bundle-v2.schema.json /opt/railmon/schemas/
+COPY python/asp_spelling/asp_redaction.py /opt/railmon/python/asp_spelling/asp_redaction.py
+COPY tools/scan/gke/sidecar/railmon-sidecar.sh /usr/local/bin/railmon
+
+# Bytecode is compiled here, by this image's interpreter, because the root
+# filesystem is read-only in the pod and Python would otherwise recompile every
+# module on every start. World-readable, since the UID is the agent's.
+RUN python3 -m compileall -q /opt/railmon \
+    && chmod -R a+rX /opt/railmon \
+    && chmod 0755 /usr/local/bin/railmon \
+    && rm -f /opt/railmon/tools/scan/gke/sidecar/railmon-sidecar.sh
+
+# A UID with no account, for a run by hand; in a pod the webhook sets the
+# agent's UID and GID. HOME and the working directory are /tmp, the pod's
+# emptyDir, so a stray relative path (.rail/railmon/...) lands somewhere
+# writable rather than failing on the read-only root.
+USER 65532:65532
+WORKDIR /tmp
+ENV RAILMON_ROOT=/opt/railmon \
+    HOME=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    RAIL_EVIDENCE_BUNDLE_OUTPUT=/tmp/evidence-bundle.json \
+    RAIL_REGISTRATION_OUTPUT=/tmp/registration.json \
+    RAIL_FEATURE_OUTPUT=/tmp/features.json \
+    RAIL_HEALTH_FILE=/tmp/railmon-health.json
+
+ENTRYPOINT ["/usr/local/bin/railmon"]
+CMD ["help"]

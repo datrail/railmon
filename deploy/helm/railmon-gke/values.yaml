@@ -1,0 +1,166 @@
+# Install into rail-system, one release per cluster:
+#
+#   helm install railmon-gke deploy/helm/railmon-gke -n rail-system --create-namespace \
+#     --set clusterName=gke-test \
+#     --set gkeScan.centerUrl=https://rail-center.example.com \
+#     --set 'enrolledNamespaces={gke-test}' ...
+#
+# See README.md for what each part does.
+
+# This cluster's name: the host_id every sidecar reports under, and the one
+# gke-scan checks bundles against. Required.
+clusterName: ""
+
+# The namespaces whose labeled pods get the sidecar. Each gets the CA
+# ConfigMap the sidecar trusts gke-scan with, gke-scan's read access, and
+# the agent pods' egress NetworkPolicy. The webhook ignores every other
+# namespace.
+enrolledNamespaces: []
+
+# The scan-sidecar image (Dockerfile.scan-sidecar), for the sidecar, the
+# webhook and gke-scan alike. Pin a tag; upgrading the sidecar means changing
+# it and restarting the agent pods.
+image:
+  repository: us-docker.pkg.dev/datrail/railmon/scan-sidecar
+  # Empty: the chart's appVersion.
+  tag: ""
+  # Prefer a digest in production: sha256:...
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The scan sidecar, as the webhook adds it. This is the one sidecar spec: the
+# chart renders it into the rail-scan-sidecar-spec ConfigMap, the webhook
+# fills in the per-pod parts, and a manifest that adds it by hand copies it.
+sidecar:
+  containerName: rail-scan
+  # The agent's config home, on a volume of the agent's container; the
+  # webhook mounts that volume read-only at the same path. A pod can name
+  # another with the rail.datrail.io/scan-config-path annotation.
+  configPath: /root/.openclaw
+  # Used only when neither the agent container's nor the pod's
+  # securityContext gives runAsUser/runAsGroup, and the pod has no
+  # rail.datrail.io/scan-run-as-user annotation. Empty: the sidecar runs as
+  # the image's UID 65532 and can't read the agent's process (the webhook
+  # warns). The sidecar must run as the agent's UID and GID to read it.
+  runAsUser: null
+  runAsGroup: null
+  # An init container with restartPolicy Always (Kubernetes 1.29+), so a
+  # Job's pod still completes and the sidecar stops after the agent. false:
+  # a regular second container.
+  nativeSidecar: true
+  intervalSeconds: 3600
+  # To be confirmed by the overhead benchmark (RC-525). Explicit, since
+  # Autopilot gives a container with none 500m CPU and 2Gi.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+      ephemeral-storage: 64Mi
+    limits:
+      memory: 256Mi
+      ephemeral-storage: 64Mi
+  # Put the text of the agent's system prompt files in the bundle
+  # (system_prompt_text). Off: only which files exist (system_prompt_present).
+  collectSystemPrompt: false
+  # The emptyDir at /tmp: the health file and the bundle.
+  tmpSizeLimit: 64Mi
+  # Extra environment variables for the sidecar, as a list of EnvVar.
+  extraEnv: []
+
+gkeScan:
+  # Rail Center's URL, where gke-scan relays bundles. Required.
+  centerUrl: ""
+  # RAIL_AUTH_MODE for the relay: gcp, gke-scan's Google identity through
+  # Workload Identity, minted for authAudience (default: centerUrl).
+  authMode: gcp
+  authAudience: ""
+  # The Google service account gke-scan's Kubernetes service account is bound
+  # to through Workload Identity.
+  gcpServiceAccount: ""
+  # The audience sidecar tokens carry.
+  audience: gke-scan
+  port: 8443
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+webhook:
+  replicas: 2
+  # On a private GKE Standard cluster, the control plane reaches nodes only on
+  # 443 and 10250 unless a firewall rule allows more: add one for this port
+  # from the control plane's range, or set it to 10250.
+  port: 9443
+  timeoutSeconds: 5
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+networkPolicy:
+  # Agent pods (rail.datrail.io/scan=true in enrolled namespaces) may reach
+  # gke-scan and DNS. A NetworkPolicy that selects a pod for egress denies the
+  # pod every other destination, unless another policy allows it: the agent's
+  # own MCP servers, model endpoint and other destinations need a policy of
+  # their own.
+  agentEgress:
+    enabled: true
+    # More of the agent's own destinations (its MCP servers, its model
+    # endpoint, an egress proxy), as NetworkPolicyEgressRule items, added to
+    # the same policy in every enrolled namespace. Policies of the
+    # namespace's own work as well: NetworkPolicies add up.
+    extraEgress: []
+  # gke-scan accepts only labeled pods from enrolled namespaces, and reaches
+  # only Rail Center, the Kubernetes API, DNS, the metadata server and the
+  # spec targets. The webhook accepts the API server and reaches nothing.
+  railSystem:
+    enabled: true
+  dns:
+    # NodeLocal DNSCache. A policy that allows only the kube-dns pods blocks
+    # DNS on a cluster that has it.
+    nodeLocalCidrs:
+      - 169.254.20.10/32
+    kubeDnsNamespace: kube-system
+    kubeDnsPodLabels:
+      k8s-app: kube-dns
+  # Rail Center's addresses for gke-scan's egress, as CIDRs (a NetworkPolicy
+  # can't match a hostname). Required with railSystem.enabled.
+  railCenterCidrs: []
+  railCenterPort: 443
+  # The Kubernetes API server's endpoint addresses, as CIDRs: on GKE, the
+  # control plane's endpoint (kubectl get endpoints kubernetes -n default).
+  # Required with railSystem.enabled.
+  kubeApiCidrs: []
+  kubeApiPorts: [443]
+  # The GKE metadata server, for gke-scan's Google ID token under Workload
+  # Identity: 169.254.169.254:80, and 169.254.169.252:988 on Dataplane V2.
+  metadataServer:
+    - cidr: 169.254.169.254/32
+      port: 80
+    - cidr: 169.254.169.252/32
+      port: 988
+  # What gke-scan probes for API specs, as NetworkPolicyEgressRule items
+  # (to and ports), added to its egress as they are.
+  specTargets: []
+
+tls:
+  # Days the chart's CA and the certificates it signs are valid. The CA is
+  # kept across upgrades (looked up from its Secret); the certificates are
+  # signed again on each.
+  caDays: 3650
+  certDays: 825
+  # A CA of your own, PEM, for a render that can't read the cluster
+  # (`helm template`, Argo CD, Flux's post-renderers): without it such a
+  # render makes a new CA every time, and the running webhook and gke-scan
+  # stop being trusted until they reload. Set both or neither; the chart
+  # signs its certificates with it and keeps it in the rail-scan-ca Secret.
+  # Keep the key out of plain values files (a secrets plugin, or --set-file).
+  ca:
+    cert: ""
+    key: ""

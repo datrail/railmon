@@ -1,0 +1,162 @@
+{{- $ns := .Release.Namespace -}}
+# gke-scan, the central service (tools/scan/gke/central_service/): so far, the
+# sidecar intake and relay (RC-515). Its RBAC is what that README lists.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gke-scan
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+  {{- with .Values.gkeScan.gcpServiceAccount }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ . | quote }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gke-scan
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: gke-scan
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+spec:
+  # One replica: the intake's one-bundle-per-pod check is in memory.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gke-scan
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gke-scan
+        {{- include "railmon-gke.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: gke-scan
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # SIGTERM gives relays in flight 10 seconds.
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: gke-scan
+          image: {{ include "railmon-gke.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["gke-scan"]
+          env:
+            - name: RAIL_CLUSTER_NAME
+              value: {{ .Values.clusterName | quote }}
+            - name: RAIL_CENTER_URL
+              value: {{ .Values.gkeScan.centerUrl | quote }}
+            - name: RAIL_AUTH_MODE
+              value: {{ .Values.gkeScan.authMode | quote }}
+            - name: RAIL_AUTH_AUDIENCE
+              value: {{ .Values.gkeScan.authAudience | default .Values.gkeScan.centerUrl | quote }}
+            - name: RAIL_INTAKE_TLS_CERT_FILE
+              value: /etc/rail/intake/tls.crt
+            - name: RAIL_INTAKE_TLS_KEY_FILE
+              value: /etc/rail/intake/tls.key
+            - name: RAIL_INTAKE_LISTEN
+              value: {{ printf "0.0.0.0:%d" (int .Values.gkeScan.port) | quote }}
+            - name: RAIL_INTAKE_AUDIENCE
+              value: {{ .Values.gkeScan.audience | quote }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.gkeScan.port }}
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 10
+          securityContext:
+            {{- include "railmon-gke.containerSecurity" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.gkeScan.resources | nindent 12 }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/rail/intake
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tls
+          secret:
+            secretName: gke-scan-tls
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gke-scan
+  namespace: {{ $ns }}
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: gke-scan
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+---
+# TokenReview, to check each sidecar's token.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rail-gke-scan-auth-delegator
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: gke-scan
+    namespace: {{ $ns }}
+---
+# Read access to a pod and the owners it names, bound in enrolled namespaces
+# only. rollouts.argoproj.io even without Argo: without it every read is 403,
+# not 404, and every post is answered 503.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rail-gke-scan-workload-reader
+  labels:
+    {{- include "railmon-gke.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["rollouts"]
+    verbs: ["get"]
+{{- range .Values.enrolledNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rail-gke-scan-workload-reader
+  namespace: {{ . }}
+  labels:
+    {{- include "railmon-gke.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rail-gke-scan-workload-reader
+subjects:
+  - kind: ServiceAccount
+    name: gke-scan
+    namespace: {{ $ns }}
+{{- end }}

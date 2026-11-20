@@ -231,6 +231,12 @@ specific to pods; `harness/harness_sources.py` is pod mode's side of it:
   process, and `$AGENT_CWD` from its working directory (`/proc/<pid>/cwd`).
   Environment values and the working directory are used to find files only.
 
+`system_prompt_text` holds the prompt files' text only with
+`--collect-system-prompt` (or `RAIL_COLLECT_SYSTEM_PROMPT` set to 1, true or
+yes; the chart's `sidecar.collectSystemPrompt`). Without it the field is
+`BLIND` with `NOT_COLLECTED_BY_PACK`, and `system_prompt_present` still says
+which files exist (RC-518).
+
 Pod mode replaces a harness field only with a value a matching profile
 found. OpenClaw's profile (RC-516) and Claude Code's (RC-526) ship. For an
 agent no profile matches, the generic reader (`harness/generic.py`, RC-520)
