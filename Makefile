@@ -1,4 +1,4 @@
-.PHONY: build test test-rust test-python fmt clippy docker demo clean fetch-agentsight build-ebpf
+.PHONY: build test test-rust test-python fmt clippy docker scan-sidecar demo clean fetch-agentsight build-ebpf
 
 # The AgentSight release the image pins (DR-204), read from the Dockerfile's
 # ARGs so a bump there is the only edit. Overriding AGENTSIGHT_URL to fetch
@@ -39,18 +39,26 @@ test-python:
 		tools/scan/evidence_bundle.py \
 		tools/scan/compose_evidence_bundle_v2.py \
 		tools/scan/egress_containment.py \
-		tools/scan/gke/reporter.py \
+		tools/scan/gke/sidecar/reporter.py \
 		tools/scan/container_ref.py \
-		tools/scan/gke/pod_mode.py \
-		tools/scan/gke/agent_process.py \
-		tools/scan/gke/spec_probe.py \
-		tools/scan/gke/probe_pool.py \
-		tools/scan/gke/harness/harness_sources.py \
-		tools/scan/gke/harness/reader.py \
-		tools/scan/gke/harness/generic.py \
-		tools/scan/gke/harness/profiles/openclaw.py \
-		tools/scan/gke/harness/profiles/claude-code.py \
-		tools/scan/gke/watcher.py \
+		tools/scan/gke/sidecar/pod_mode.py \
+		tools/scan/gke/sidecar/agent_process.py \
+		tools/scan/gke/sidecar/spec_probe.py \
+		tools/scan/gke/sidecar/probe_pool.py \
+		tools/scan/gke/sidecar/harness/harness_sources.py \
+		tools/scan/gke/sidecar/harness/reader.py \
+		tools/scan/gke/sidecar/harness/generic.py \
+		tools/scan/gke/sidecar/harness/profiles/openclaw.py \
+		tools/scan/gke/sidecar/harness/profiles/claude-code.py \
+		tools/scan/gke/sidecar/watcher.py \
+		tools/scan/gke/central_service/gke_scan.py \
+		tools/scan/gke/central_service/intake.py \
+		tools/scan/gke/central_service/kube.py \
+		tools/scan/gke/central_service/workload.py \
+		tools/scan/gke/webhook/patch.py \
+		tools/scan/gke/webhook/scan_webhook.py \
+		tests/scan_sidecar_acceptance.py \
+		tests/extract_sidecar_spec.py \
 		tools/listen/follow_container.py \
 		tools/listen/agentsight_adapter.py \
 		tools/listen/preflight.py \
@@ -65,7 +73,11 @@ test-python:
 		python/asp_spelling/asp_normalize.py \
 		python/asp_spelling/asp_redaction.py
 	sh -n tools/local-demo/run_local_demo.sh
+	sh -n tools/scan/gke/sidecar/railmon-sidecar.sh
+	RAILMON_ROOT="$(CURDIR)" sh tools/scan/gke/sidecar/railmon-sidecar.sh scan --help >/dev/null
+	RAILMON_ROOT="$(CURDIR)" sh tools/scan/gke/sidecar/railmon-sidecar.sh scan-webhook --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh scan --help >/dev/null
+	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh gke-scan --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh skills --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh forward --help >/dev/null
 	RAILMON_ROOT="$(CURDIR)" ./entrypoint.sh openshell --help >/dev/null
@@ -107,6 +119,11 @@ build-ebpf: fetch-agentsight
 
 docker:
 	docker build -t railmon .
+
+# The slim scan-sidecar image (RC-518), and its container test.
+scan-sidecar:
+	docker build -f Dockerfile.scan-sidecar -t scan-sidecar .
+	python3 tests/scan_sidecar_acceptance.py --image scan-sidecar
 
 # BDL-F4's local quickstart: one image, one privileged container, both a
 # non-empty inventory and a non-empty capture. Needs what `collect` always

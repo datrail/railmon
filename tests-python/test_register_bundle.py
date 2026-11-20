@@ -651,7 +651,7 @@ def wait_for(predicate, timeout: float = 5.0) -> bool:
 
 
 class ReporterTest(unittest.TestCase):
-    """gke/reporter.py against a local fake gke-scan, for every answer it can give."""
+    """gke/sidecar/reporter.py against a local fake gke-scan, for every answer it can give."""
 
     def setUp(self):
         self.clock = FakeClock()

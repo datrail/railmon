@@ -29,11 +29,15 @@ jobs:
       - id: version
         env:
           TAG: ${{ github.ref_name }}
+          SCAN_SIDECAR_IMAGE: ${{ vars.SCAN_SIDECAR_IMAGE }}
         run: |
           set -euo pipefail
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::'$TAG' is not a vMAJOR.MINOR.PATCH release tag; refusing to publish."
             exit 1
+          fi
+          if [[ -z "$SCAN_SIDECAR_IMAGE" ]]; then
+            echo "::warning::SCAN_SIDECAR_IMAGE isn't set: the scan-sidecar image won't be pushed to Artifact Registry (see the scan-sidecar-build job)."
           fi
           # A prerelease must not move :latest.
           if [[ "$TAG" == *-* ]]; then
@@ -180,6 +184,182 @@ jobs:
             echo '```'
             echo
             echo "digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # RC-518: the scan-sidecar image (Dockerfile.scan-sidecar), to Artifact
+  # Registry, where GKE pulls it with no pull secret. Both architectures,
+  # natively, as the main image is, joined under the same version tags.
+  #
+  # Pushes as a Google service account through Workload Identity Federation,
+  # with no key: the repository's variables name it.
+  #   SCAN_SIDECAR_IMAGE          us-docker.pkg.dev/<project>/<repository>/scan-sidecar
+  #   GCP_WORKLOAD_IDENTITY_PROVIDER  projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+  #   GCP_ARTIFACT_PUSHER         the service account, with roles/artifactregistry.writer on the repository
+  #
+  # Until SCAN_SIDECAR_IMAGE is set, both jobs are skipped and the version job
+  # warns, so a fork or a repository without Artifact Registry still releases
+  # the main image.
+  scan-sidecar-build:
+    needs: ci
+    if: ${{ vars.SCAN_SIDECAR_IMAGE != '' }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_ARTIFACT_PUSHER }}
+          token_format: access_token
+
+      - id: registry
+        env:
+          IMAGE: ${{ vars.SCAN_SIDECAR_IMAGE }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE" =~ ^[a-z0-9-]+-docker\.pkg\.dev/[^/]+/[^/]+/[^/:@]+$ ]]; then
+            echo "::error::SCAN_SIDECAR_IMAGE '$IMAGE' isn't an Artifact Registry image (REGION-docker.pkg.dev/PROJECT/REPOSITORY/IMAGE)."
+            exit 1
+          fi
+          echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ vars.SCAN_SIDECAR_IMAGE }}
+          tags: type=semver,pattern={{version}}
+
+      # The same build CI tested (its cache scope), pushed untagged by digest.
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.scan-sidecar
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ vars.SCAN_SIDECAR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          # The signed attestation in scan-sidecar-publish replaces buildx's unsigned one.
+          provenance: false
+          cache-from: type=gha,scope=scan-sidecar-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=scan-sidecar-${{ matrix.arch }}
+
+      - env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "$DIGEST" > digest
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: scan-sidecar-digest-${{ matrix.arch }}
+          path: digest
+          retention-days: 1
+
+  scan-sidecar-publish:
+    needs: [version, scan-sidecar-build]
+    if: ${{ vars.SCAN_SIDECAR_IMAGE != '' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: scan-sidecar-digest-*
+
+      - uses: docker/setup-buildx-action@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_ARTIFACT_PUSHER }}
+          token_format: access_token
+
+      - id: registry
+        env:
+          IMAGE: ${{ vars.SCAN_SIDECAR_IMAGE }}
+        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ vars.SCAN_SIDECAR_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
+
+      - id: index
+        env:
+          IMAGE: ${{ vars.SCAN_SIDECAR_IMAGE }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while read -r tag; do tag_args+=(-t "$tag"); done <<< "$TAGS"
+          sources=()
+          for digest in scan-sidecar-digest-*/digest; do sources+=("$IMAGE@$(cat "$digest")"); done
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # The build turns buildx's unsigned provenance off (provenance: false), as the
+      # main image's does, so this signed attestation is the image's provenance. It
+      # is pushed beside the image in Artifact Registry with the login above.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ vars.SCAN_SIDECAR_IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+          # The storage record needs `artifact-metadata: write`; verification reads the attestation.
+          create-storage-record: false
+
+      - name: Summary
+        env:
+          IMAGE: ${{ vars.SCAN_SIDECAR_IMAGE }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "### Scan-sidecar image"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo
+            echo "digest: \`$DIGEST\` (pin it in the chart's image.digest)"
+            echo
+            echo "Verify: \`gh attestation verify oci://$IMAGE@$DIGEST --repo $GH_REPO\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # The Release is the page people read. Its own job: only it holds `contents: write`, and a

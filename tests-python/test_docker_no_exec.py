@@ -288,7 +288,7 @@ class DockerScanRunsNothingInTheContainer(unittest.TestCase):
             context, payload, identity = scanner.scan(args)
             bundle = evidence_bundle.build_verified_bundle(args, context, payload, identity)
         attributes = bundle["attributes"]
-        self.assertEqual(bundle["rule_pack_version"], 16)
+        self.assertEqual(bundle["rule_pack_version"], 17)
         self.assertEqual(attributes["harness_identity"]["value"], "openclaw/OpenClaw 2026.10.8 (abcdef1)")
         self.assertIn("build-info.json", attributes["harness_identity"]["method"])
         self.assertIn("not run", attributes["framework_identity"]["method"])

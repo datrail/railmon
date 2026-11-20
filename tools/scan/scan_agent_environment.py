@@ -661,7 +661,7 @@ def collect_self_context() -> dict[str, Any]:
 
 
 def _gke(name: str) -> Any:
-    """tools/scan/gke/<name>.py, loaded by path once, when first used:
+    """tools/scan/gke/sidecar/<name>.py, loaded by path once, when first used:
     everything specific to running as a sidecar in a Kubernetes pod, and
     agent_process's reader of another process's files, which docker mode
     uses too (DR-300)."""
@@ -670,7 +670,7 @@ def _gke(name: str) -> Any:
         import importlib.util
 
         spec = importlib.util.spec_from_file_location(
-            f"gke_{name}", Path(__file__).resolve().parent / "gke" / f"{name}.py")
+            f"gke_{name}", Path(__file__).resolve().parent / "gke" / "sidecar" / f"{name}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules[f"gke_{name}"] = module
@@ -1161,7 +1161,7 @@ def read_mcp_inventory(path: Path) -> list[dict[str, Any]]:
 def mcp_inventory_entries(servers: Any, source: str) -> list[dict[str, Any]]:
     """An mcpServers object as inventory entries (read_mcp_inventory's shape),
     for any reader that has one: a .mcp.json, or a harness's own config read
-    by its profile (gke/harness/)."""
+    by its profile (gke/sidecar/harness/)."""
     if not isinstance(servers, dict):
         return []
     inventory: list[dict[str, Any]] = []
@@ -1381,7 +1381,7 @@ def mcp_server_skills(
     under `origin` (its source and TOOL_SCHEMA_SOURCE_KINDS kind, DR-294;
     `source_label` as a file when not given). `probe` (RC-512) asks the
     server in place of `probe_mcp_server`: pod mode's ProbePool
-    (gke/probe_pool.py), which runs the scan's probes four at a time.
+    (gke/sidecar/probe_pool.py), which runs the scan's probes four at a time.
     """
     schema_source, schema_kind = origin or (str(source_label), "file")
     endpoints = dedupe(
@@ -3660,7 +3660,7 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
         if sandbox:
             context["openshell_sandbox"] = sandbox
     elif args.mode == "pod":
-        # gke/pod_mode.py: the pod from the downward API, and the agent's own
+        # gke/sidecar/pod_mode.py: the pod from the downward API, and the agent's own
         # process beside it. The agent's config is on the config volume at the
         # path the webhook names; the sidecar's own HOME or cwd would describe
         # the sidecar, so there is no default.
@@ -3676,8 +3676,11 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
             container_id_from_cgroup,
         )
         # RC-512: the whole scan has SCAN_DEADLINE_SECONDS from here; the
-        # probe stage (gke/probe_pool.py) waits for no probe past it.
+        # probe stage (gke/sidecar/probe_pool.py) waits for no probe past it.
         context["probe_deadline"] = started + _probe_pool().SCAN_DEADLINE_SECONDS
+        # RC-518: the system prompt's text goes in the bundle only when asked;
+        # without it, system_prompt_present says which files exist.
+        context["collect_system_prompt"] = collect_system_prompt(args)
     else:
         context = collect_self_context()
     identity = collect_identity(args, context)
@@ -3749,7 +3752,7 @@ def build_registration_payload(
         # (http_operations), and every probe runs in one pool of four with
         # the scan's deadline; a probe still out at the deadline is BLIND.
         # The spec results ride on the pod's context, for pod mode's own
-        # http_operations attribute (gke/pod_mode.py).
+        # http_operations attribute (gke/sidecar/pod_mode.py).
         mcp_skills, context["http_operations"], context["http_operations_servers"] = _probe_pool().run_pod_probes(
             mcp_paths, env, declared, tool_schemas, context.get("probe_deadline"))
     else:
@@ -3960,7 +3963,7 @@ class RegistrationError(ScannerError):
     `status` is the HTTP status answered, or None when nothing answered
     (refused, timed out, TLS failure); `retry_after` is the raw Retry-After
     header, if any. A ScannerError that is not one of these failed before a
-    request was sent (no credential, say). gke/reporter.py decides from these
+    request was sent (no credential, say). gke/sidecar/reporter.py decides from these
     whether pod mode retries the bundle."""
 
     sent = True
@@ -4830,6 +4833,13 @@ def wait_for_raildash(
         sleep(RAILDASH_START_POLL_SECONDS)
 
 
+def collect_system_prompt(args: argparse.Namespace) -> bool:
+    """--collect-system-prompt, or RAIL_COLLECT_SYSTEM_PROMPT set to 1, true or yes."""
+    if getattr(args, "collect_system_prompt", False):
+        return True
+    return (os.environ.get("RAIL_COLLECT_SYSTEM_PROMPT") or "").strip().lower() in ("1", "true", "yes")
+
+
 def registration_output_path(args: argparse.Namespace) -> Path:
     configured = first_nonempty(
         args.registration_output,
@@ -5046,7 +5056,7 @@ def _post_bundle(
 ) -> dict[str, Any]:
     """POST a v1 bundle, the one attempt self and docker modes make.
 
-    RC-513: pod mode posts through gke/reporter.py instead, with a 30-second
+    RC-513: pod mode posts through gke/sidecar/reporter.py instead, with a 30-second
     timeout: 429, 5xx and no answer are retried in the background of an
     `--interval` sidecar with backoff, keeping only the latest bundle, and
     any other answer is final for that bundle. A retry that gets through
@@ -5112,7 +5122,7 @@ def make_parser() -> argparse.ArgumentParser:
         description="Scan the local agent environment and emit a rail-center registration payload."
     )
     parser.add_argument("--mode", choices=["self", "docker", "pod"], default="self",
-                        help="pod: a sidecar in a Kubernetes pod (tools/scan/gke/README.md)")
+                        help="pod: a sidecar in a Kubernetes pod (tools/scan/gke/sidecar/README.md)")
     parser.add_argument("--container", help="Docker container name/id to scan when --mode docker is used, "
                         "or openshell:<sandbox> for an OpenShell sandbox's current container")
     parser.add_argument("--output", "-o", help="Write JSON payload to this file instead of stdout")
@@ -5172,6 +5182,13 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--feature-output",
         help=f"Write the feature file here. Defaults to {DEFAULT_FEATURE_OUTPUT}.",
+    )
+    parser.add_argument(
+        "--collect-system-prompt",
+        action="store_true",
+        help="Pod mode: put the text of the agent's system prompt files in the bundle (system_prompt_text), "
+        "each bounded in size. Without it only which files exist is reported (system_prompt_present). "
+        "RAIL_COLLECT_SYSTEM_PROMPT=1, true or yes also works.",
     )
     parser.add_argument(
         "--no-feature-file",
@@ -5487,7 +5504,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "pod":
         # RC-523: a sidecar also rescans when the agent's config changes,
         # waits for an agent still starting, and shuts down on SIGTERM
-        # without sending a half-built bundle (gke/watcher.py). It waits for
+        # without sending a half-built bundle (gke/sidecar/watcher.py). It waits for
         # RailDash (DR-316) too, right before its first scan.
         raildash_url = configured_raildash_url(args)
         return _gke("watcher").run(

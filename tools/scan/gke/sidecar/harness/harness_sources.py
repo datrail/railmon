@@ -90,6 +90,14 @@ class PodSources:
             return None
         return _agent_process().list_in_root(*located)
 
+    def mtime(self, path: str) -> float | None:
+        """A regular file's modification time, with the same guards as a read
+        (RC-530: the newest transcripts are read first)."""
+        located = self._locate(path)
+        if located is None:
+            return None
+        return _agent_process().mtime_in_root(*located)
+
     def digest(self, path: str, max_bytes: int) -> tuple[str, int] | None:
         """The SHA-256 of a regular file's first `max_bytes` and how many
         bytes that was, read a chunk at a time with the same guards (the
@@ -148,7 +156,7 @@ def read_declared_mcp_servers(context: dict[str, Any], config_paths: list[Path],
 
 
 def profiles() -> list[dict[str, Any]]:
-    """The harness profiles shipped with the scanner (gke/harness/profiles)."""
+    """The harness profiles shipped with the scanner (gke/sidecar/harness/profiles)."""
     return reader().load_profiles()
 
 
@@ -174,5 +182,6 @@ def read_agent_harness(context: dict[str, Any], config_paths: list[Path],
     agent = agent_view(subject)
     profile = harness_reader.harness_reader_for(profiles() if known_profiles is None else known_profiles, agent)
     results = harness_reader.read_harness_fields(profile, agent, PodSources(subject.get("root"), config_paths),
-                                                 redact_url=redact_url, config_paths=[str(p) for p in config_paths])
+                                                 redact_url=redact_url, config_paths=[str(p) for p in config_paths],
+                                                 collect_prompt=bool(context.get("collect_system_prompt")))
     return (profile or {}).get("harness", harness_reader.GENERIC_HARNESS), results

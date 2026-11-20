@@ -42,7 +42,7 @@ def _load(name: str, path: Path):
 
 scanner = _load("scan_agent_environment", SCANNER)
 evidence_bundle = _load("evidence_bundle", SCANNER_DIR / "evidence_bundle.py")
-pod_mode = scanner._pod_mode()   # tools/scan/gke/pod_mode.py
+pod_mode = scanner._pod_mode()   # tools/scan/gke/sidecar/pod_mode.py
 
 
 def collect_pod_context(config_paths=()):

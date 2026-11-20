@@ -8,8 +8,8 @@ and then the same under its MCP servers' mount path, and the first OpenAPI 3
 or Swagger 2 JSON document found is kept, cut to each operation's method,
 path, operationId and content types.
 
-Only pod mode runs this (gke/probe_pool.py's probe stage), so it lives here
-with the rest of the sidecar. Like the other modules in tools/scan/gke/, it
+Only pod mode runs this (gke/sidecar/probe_pool.py's probe stage), so it lives here
+with the rest of the sidecar. Like the other modules in tools/scan/gke/sidecar/, it
 imports nothing of railmon's: the scanner hands itself over with `register`
 (as harness/reader.py does its profile hooks), and the helpers it shares with
 every scan mode (redaction, strict JSON, the JSON parse lock) stay there.

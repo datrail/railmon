@@ -1,0 +1,15 @@
+railmon-gke is installed in {{ .Release.Namespace }} for cluster {{ .Values.clusterName }}.
+
+Pods labeled rail.datrail.io/scan=true in {{ join ", " .Values.enrolledNamespaces }} get the scan
+sidecar when they are created; running pods get it when they restart.
+{{- if .Values.networkPolicy.agentEgress.enabled }}
+
+NOTE: labeled pods are now limited to gke-scan and DNS for egress, plus what
+networkPolicy.agentEgress.extraEgress and the namespace's own NetworkPolicies
+allow. An agent that reached its MCP servers or model endpoint without a
+policy needs one now. To leave egress to your own policies, set
+networkPolicy.agentEgress.enabled=false (they must then allow gke-scan and DNS).
+{{- end }}
+
+What the webhook had to guess for a pod (its UID, its config volume) is on the
+pod: kubectl describe pod <pod> | grep scan-sidecar-warnings

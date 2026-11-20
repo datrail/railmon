@@ -1,7 +1,7 @@
 """RC-523: pod mode's watcher rescans when the agent's config changes, waits
 for an agent still starting, shuts down cleanly and reports its health.
 
-The loop tests run gke/watcher.py's Watcher against a temporary folder that
+The loop tests run gke/sidecar/watcher.py's Watcher against a temporary folder that
 stands for the agent's root, with a fake clock: the clock only moves when the
 watcher sleeps (or a fake scan takes time), and files change at set times.
 The SIGTERM tests send the process a real SIGTERM.

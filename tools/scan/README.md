@@ -375,7 +375,7 @@ ASP is locked. OpenClaw's profile is the first to ship: `harness_identity`,
 `tool_allow_deny`, `approval_policy`, `tool_names`, `system_prompt_present`
 and `skills_inventory` can be `ANSWERED` from `openclaw.json`, OpenClaw's
 package, its state and transcript databases and its workspace (see
-[gke/harness/README.md](gke/harness/README.md)). Claude Code's profile
+[gke/sidecar/harness/README.md](gke/sidecar/harness/README.md)). Claude Code's profile
 (RC-526) answers the same fields from its managed, project, local and user
 settings, `~/.claude.json`, the project's `.mcp.json`, its package or native
 install, its transcripts and its `CLAUDE.md` files and skills. Self and
@@ -405,7 +405,7 @@ agent's MCP `headers`, so a server that needs them is `auth_refused` in
 `skills_inventory` too. Self and docker scans send them as before. The same
 pack adds `http_operations` (RC-512), the operations in each HTTP
 destination's public API spec, probed by the pod-mode sidecar only (see
-[`gke/README.md`](gke/README.md#http-operations-rc-512)).
+[`gke/sidecar/README.md`](gke/sidecar/README.md#http-operations-rc-512)).
 
 ## RailDash delivery
 
@@ -888,7 +888,7 @@ locked.
 | Field | Where it comes from |
 |---|---|
 | `host_id` | `RAIL_HOST_ID` (or `--host-id`), the same value every Rail component on the host reads. The scanner's own environment is read before the scanned container's, so a container cannot relabel the host it runs on; `host_id_source` distinguishes `flag`, `env` and `container_env`. **No fallback is invented** — an id this scanner made up would disagree with the proxy and the collector, so an unset variable is reported as unset. |
-| `sandbox_name` | in `--mode pod`, `namespace/workload` from the downward API ([gke/README.md](gke/README.md)); otherwise the `rail.sandbox_name` container label, else the container name, else the hostname. **Never a Rail environment variable**: an agent nobody onboarded carries no Rail configuration, and those are exactly the ones worth discovering. (Pod mode's `POD_NAME` and `POD_NAMESPACE` are the kubelet's, not Rail configuration.) |
+| `sandbox_name` | in `--mode pod`, `namespace/workload` from the downward API ([gke/sidecar/README.md](gke/sidecar/README.md)); otherwise the `rail.sandbox_name` container label, else the container name, else the hostname. **Never a Rail environment variable**: an agent nobody onboarded carries no Rail configuration, and those are exactly the ones worth discovering. (Pod mode's `POD_NAME` and `POD_NAMESPACE` are the kubelet's, not Rail configuration.) |
 | `host_class` | DMI vendor/product — `gce_vm`, `ec2_vm`, `azure_vm`, `virtual_machine`, `bare_metal`, `container`, or `unknown` when the DMI is unreadable. |
 
 Both identity fields are optional on Rail Center's side and bounded to its
@@ -1026,7 +1026,7 @@ the collector's `--webhook` and `railmon forward`.
 `--center-url` host, beside the system store, for a Rail Center (or, in pod
 mode, a gke-scan) whose certificate a private CA signed. No other connection
 the scan makes trusts it. In pod mode the post is also retried; see
-[gke/README.md](gke/README.md#reporting-to-gke-scan-rc-513).
+[gke/sidecar/README.md](gke/sidecar/README.md#reporting-to-gke-scan-rc-513).
 
 ## Local Machine Scan
 
@@ -1056,7 +1056,7 @@ python3 tools/scan/scan_agent_environment.py \
 ## Pod mode
 
 `--mode pod` runs the scanner as a sidecar in a Kubernetes pod (RC-504). Its
-code and its own README are in [`gke/`](gke/README.md): what it reads from
+code and its own README are in [`gke/sidecar/`](gke/sidecar/README.md): what it reads from
 the downward API, how it names the workload, and what it refuses to guess.
 
 ## OpenClaw Integration
@@ -1306,7 +1306,15 @@ registration field: they reach Rail Center in the bundle only.
 The pod-mode sidecar also records each HTTP destination's public API spec
 operations in `http_operations`, and runs its MCP and spec probes in a pool
 with a scan deadline (RC-512). Both run only in pod mode, so they're described
-with the rest of the sidecar in [`gke/README.md`](gke/README.md#http-operations-rc-512).
+with the rest of the sidecar in [`gke/sidecar/README.md`](gke/sidecar/README.md#http-operations-rc-512).
+
+Rule pack 17 (RC-530) changes pod mode's `tool_names`, so a pack-16 baseline
+is `CONTRACT_MISMATCH` until a pack-17 ASP is locked. OpenClaw's profile reads
+the events OpenClaw 2026.10.8 compresses into `event_zstd`, which pack 16
+counted as unparsed, and past `TRANSCRIPT_MAX_FILES` (50) the shared reader
+and Claude Code's profile read the newest transcripts and report `PARTIAL`
+with `SIZE_CAP_EXCEEDED`, where pack 16 was `ANSWERED` from an arbitrary 50
+(see [gke/sidecar/harness/README.md](gke/sidecar/harness/README.md)).
 A self or docker scan reports `http_operations` as `BLIND`,
 `NOT_COLLECTED_BY_PACK`, and probes its MCP servers one after another, with no
 deadline.

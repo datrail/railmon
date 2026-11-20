@@ -109,7 +109,7 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # annotations, redacted and capped, and in pod mode the MCP probe drops the
 # agent's MCP headers, so a server that needs them is auth_refused.
 # Pack 16 adds http_operations (RC-512): in pod mode, each MCP server's
-# origin's public API spec operations (tools/scan/gke/spec_probe.py);
+# origin's public API spec operations (tools/scan/gke/sidecar/spec_probe.py);
 # elsewhere BLIND, NOT_COLLECTED_BY_PACK.
 # Pack 16 fills a pod's harness fields from the harness's own files when a
 # harness profile matches the agent (RC-516: OpenClaw's, the first to ship):
@@ -133,7 +133,11 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 16 also: tool_schemas keeps a copy per server and source with its
 # origin (source, source_kind), and each tool's description and
 # schema_sha256 (DR-294).
-RULE_PACK_VERSION = 16
+# Pack 17 (RC-530): tool_names reads OpenClaw 2026.10.8's event_zstd events,
+# which pack 16 counted as unparsed, and past TRANSCRIPT_MAX_FILES reads the
+# newest transcripts and is PARTIAL with SIZE_CAP_EXCEEDED, where pack 16 was
+# ANSWERED from an arbitrary 50.
+RULE_PACK_VERSION = 17
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1646,13 +1650,13 @@ def build_evidence_bundle(
     attributes["tool_schemas"] = tool_schemas_attribute(identity.get("tool_schemas"), scanned_roots,
                                                         unread=identity.get("tool_schemas_unread"))
     # Only the pod-mode sidecar probes API specs (RC-512): pod mode puts its
-    # own http_operations in place of this (tools/scan/gke/spec_probe.py).
+    # own http_operations in place of this (tools/scan/gke/sidecar/spec_probe.py).
     attributes["http_operations"] = _blind("NOT_COLLECTED_BY_PACK", "declared",
                                            note="API specs are probed by the pod-mode sidecar only")
 
     attributes.update(registration_attributes(payload))
     # A scan mode that reads some attributes its own way fills them last
-    # (pod mode's are in tools/scan/gke/).
+    # (pod mode's are in tools/scan/gke/sidecar/).
     attributes.update(scanner.mode_attributes(context, payload, _answered, _blind, existing=dict(attributes),
                                               absent=_absent, failed=_failed, partial=_partial))
 

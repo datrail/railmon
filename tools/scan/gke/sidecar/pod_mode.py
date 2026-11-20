@@ -584,7 +584,7 @@ def bundle_attributes(context: dict[str, Any], payload: dict[str, Any],
     return attributes
 
 
-# The attributes read from the agent's process (gke/agent_process.py). With no
+# The attributes read from the agent's process (gke/sidecar/agent_process.py). With no
 # readable agent they are BLIND: the sidecar's own process would describe the
 # sidecar, not the agent.
 SUBJECT_ATTRIBUTES = {
