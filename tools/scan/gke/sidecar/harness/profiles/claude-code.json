@@ -39,7 +39,7 @@
       "$CLAUDE_PROJECT/.claude/skills",
       "$CLAUDE_DIR/skills"
     ],
-    "transcripts": {"hook": "claude_transcripts"}
+    "transcripts": {"hook": "claude_transcripts", "mcp_tools": {"pattern": "mcp__{server}__{tool}", "undeclared": true}}
   },
   "watch": {
     "list": ["$CLAUDE_DIR/projects"]

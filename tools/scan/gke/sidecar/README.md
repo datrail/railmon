@@ -216,7 +216,7 @@ Without an interval, a pod-mode scan runs once, as before, without waiting.
 
 The harness fields (`harness_identity`, `model_name`, `llm_provider`,
 `inference_endpoint`, `mcp_servers_declared`, `tool_allow_deny`,
-`approval_policy`, `tool_names`, `system_prompt_present`,
+`approval_policy`, `tool_names`, `mcp_servers_observed`, `system_prompt_present`,
 `system_prompt_text`, `skills_inventory`) are read by the shared harness
 reader, [`harness/reader.py`](harness/README.md), from the profile whose
 markers match the agent's command line or environment. That reader is not

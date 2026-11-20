@@ -54,7 +54,7 @@
       "$OPENCLAW_DIR/skills",
       "$OPENCLAW_DIR/workspace/skills"
     ],
-    "transcripts": {"hook": "openclaw_transcripts"}
+    "transcripts": {"hook": "openclaw_transcripts", "mcp_tools": {"pattern": "{server}__{tool}"}}
   },
   "watch": {
     "content": [

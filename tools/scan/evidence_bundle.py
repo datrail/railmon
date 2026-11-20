@@ -137,6 +137,10 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # which pack 16 counted as unparsed, and past TRANSCRIPT_MAX_FILES reads the
 # newest transcripts and is PARTIAL with SIZE_CAP_EXCEEDED, where pack 16 was
 # ANSWERED from an arbitrary 50.
+# Pack 17 also (RC-545): in pod mode mcp_servers_observed is read from the
+# same transcripts by the harness profile, each MCP server the agent called
+# with the tools it called (names only, no counts), where pack 16 was always BLIND with
+# NOT_COLLECTED_BY_PACK.
 RULE_PACK_VERSION = 17
 
 # The value shape of observed_file_access (DR-154), published in the v1
@@ -1073,6 +1077,8 @@ def build_evidence_bundle(
             note="no MCP config found at the scanned roots",
         )
 
+    # In pod mode the harness profile replaces this account with what the
+    # agent's transcripts show (RC-545, gke/sidecar/pod_mode.py).
     if reach:
         attributes["mcp_servers_observed"] = _blind(
             "NOT_COLLECTED_BY_PACK", "observed",
