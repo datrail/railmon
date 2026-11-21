@@ -295,6 +295,7 @@ class GenericReader:
         results.update(self._policy_fields(walk, config_where))
         for field, what in (("harness_identity", "only a harness profile knows the harness and its version"),
                             ("tool_names", "only a harness profile knows where its transcripts are"),
+                            ("mcp_servers_observed", "only a harness profile knows where its transcripts are"),
                             ("skills_inventory", "only a harness profile knows where its skills are")):
             results[field] = self.result("BLIND", field, reason=UNKNOWN,
                                          note=f"no harness profile matched the agent: {what}")

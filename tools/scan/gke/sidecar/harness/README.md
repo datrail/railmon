@@ -110,8 +110,9 @@ Nothing under a credential-named key (`env`, `headers`, `auth`, `apiKey`, ...) i
 files only, at most 50); one that doesn't parse makes the fields it might
 have held `FAILED` with `PARSE_FAILED`. Every other field it can't fill is
 `BLIND` with `UNKNOWN_HARNESS`, never `ABSENT`: a harness without a profile
-may keep it anywhere. `harness_identity`, `tool_names` and `skills_inventory`
-always are, since only a profile knows the version, transcripts and skills.
+may keep it anywhere. `harness_identity`, `tool_names`, `mcp_servers_observed`
+and `skills_inventory` always are, since only a profile knows the version,
+transcripts and skills.
 
 In pod mode its values are merged as a profile's are. Where it found no
 value, its account replaces a bundle account that only says "not found"
@@ -208,6 +209,31 @@ unknown: `BLIND` with `UNKNOWN_HARNESS` when no MCP config was found, and
   The cap stays at 50: with the newest read first and the note saying how
   many weren't, it keeps a scan's reads bounded at 50 MB, to revisit with
   the overhead benchmark (RC-525).
+  `mcp_servers_observed` (RC-545) comes from the same read: each tool name
+  `tool_names` found, matched to an MCP server by the transcripts' `mcp_tools` pattern,
+  `{"pattern": "<prefix>{server}<separator>{tool}"}` (OpenClaw
+  `{server}__{tool}`, Claude Code `mcp__{server}__{tool}`), against the
+  servers `mcp_servers_declared` names (a declared name with characters
+  other than letters, digits, `_` and `-` matched with `_` for each, as
+  Claude Code spells it; the longest name first). With `"undeclared": true`,
+  for a prefix only MCP tools use, a call to a server no config declares
+  counts too, split at the first separator, under the name the harness
+  spells in the tool name (a Claude Code plugin's server is
+  `plugin_<plugin>_<server>`), which the note lists since it matches no
+  declared name. Two declared names that spell the same key are tried in
+  name order. Each tool name is scrubbed whole before it is split, as in
+  `tool_names`, so a secret written across the server and the tool
+  (`mcp__token=__<value>`) is never reported in two halves redaction can't
+  see together. The value is `[{"name", "tools_called": [tool, ...]}]`, sorted
+  by name and each server's tools sorted, with no endpoint: a transcript
+  names the tool, not the address called. It is a floor, not a count, as
+  `tool_names` is: a count grows with every call, so an agent that keeps
+  calling the same tools would read as drift on every scan. It is `PARTIAL`
+  where `tool_names` is (or `FAILED` with nothing found, as an empty floor),
+  takes `tool_names`' account where no transcript was read, and is `ABSENT`
+  when no call in the transcripts read named an MCP server, as `tool_names`
+  is with no tool calls. A profile without `mcp_tools` reports the field
+  `BLIND` with `NOT_COLLECTED_BY_PACK`.
 - **`watch`** (optional, pod mode's watcher, RC-523): `content`, more paths
   hashed by content beside the `sources`, prompt files and skills, which
   always are (a last part may be a pattern); `list`, folders hashed by file

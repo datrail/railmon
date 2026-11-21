@@ -48,6 +48,7 @@ HARNESS_FIELDS: dict[str, str] = {
     "tool_allow_deny": "declared",
     "approval_policy": "declared",
     "tool_names": "observed",
+    "mcp_servers_observed": "observed",
     "system_prompt_present": "observed",
     "system_prompt_text": "observed",
     "skills_inventory": "declared",
@@ -278,6 +279,12 @@ def validate_profile(profile: Any) -> dict[str, Any]:
     fields = profile.get("fields", {})
     if not isinstance(fields, dict):
         raise ProfileError(f"{name}: fields is an object")
+    transcripts = (profile.get("workspace") or {}).get("transcripts") or {}
+    if "mcp_tools" in transcripts:
+        try:
+            mcp_tool_pattern(transcripts["mcp_tools"])
+        except ValueError as exc:
+            raise ProfileError(f"{name}: workspace.transcripts.mcp_tools: {exc}") from None
     for field, spec in fields.items():
         if field not in HARNESS_FIELDS:
             raise ProfileError(f"{name}: {field} is not a harness field")
@@ -1000,6 +1007,136 @@ def _transcript_field(ctx: Context, spec: dict[str, Any]) -> dict[str, Any]:
     return _result("ANSWERED", "tool_names", value=value, source=files, note=floor)
 
 
+# mcp_servers_observed (RC-545): which MCP servers the agent called, and which
+# of their tools, from the tool names tool_names found in the transcripts. A harness names an
+# MCP server's tool by a pattern its profile gives (workspace.transcripts.
+# mcp_tools): OpenClaw "{server}__{tool}", Claude Code "mcp__{server}__{tool}".
+# A call is the server's when its name matches the pattern with a server
+# mcp_servers_declared names; with "undeclared": true (a prefix only MCP tools
+# use) a server no config declares is kept too, split at the first separator.
+# Names only, never a call's arguments, and no counts: a count grows with
+# every call, so a locked baseline would see drift on every scan.
+_SERVER_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def mcp_tool_pattern(spec: Any) -> tuple[str, str, bool]:
+    """(prefix, separator, undeclared) from a profile's mcp_tools: a pattern
+    "<prefix>{server}<separator>{tool}" and whether undeclared servers count."""
+    if not isinstance(spec, dict) or not isinstance(spec.get("pattern"), str):
+        raise ValueError('an object with "pattern": "<prefix>{server}<separator>{tool}"')
+    pattern = spec["pattern"]
+    prefix, found, rest = pattern.partition("{server}")
+    separator, found_tool, suffix = rest.partition("{tool}")
+    if not found or not found_tool or not separator or suffix or "{" in prefix + separator:
+        raise ValueError(f'{pattern!r} is not "<prefix>{{server}}<separator>{{tool}}" with a separator')
+    undeclared = spec.get("undeclared", False)
+    if not isinstance(undeclared, bool):
+        raise ValueError("undeclared is true or false")
+    return prefix, separator, undeclared
+
+
+def _server_key(name: str) -> str:
+    """A server name as a harness spells it in a tool name: characters other
+    than letters, digits, _ and - become _ (as Claude Code writes them), so a
+    declared "my.server" matches mcp__my_server__tool. A name already in that
+    form is unchanged."""
+    return _SERVER_NAME_UNSAFE.sub("_", name)
+
+
+def _declared_servers(declared: dict[str, Any] | None) -> set[str]:
+    """The names of mcp_servers_declared's servers, from a value the reader
+    found (a {name: spec} object, or a list of {"name": ...})."""
+    value = (declared or {}).get("value") if (declared or {}).get("status") in ("ANSWERED", "PARTIAL") else None
+    if isinstance(value, dict):
+        return {str(name) for name in value}
+    if isinstance(value, list):
+        return {str(entry["name"]) for entry in value if isinstance(entry, dict) and entry.get("name")}
+    return set()
+
+
+def observed_mcp_servers(tool_names: Iterable[str], declared: Iterable[str], spec: Any) -> list[dict[str, Any]]:
+    """[{"name", "tools_called": [tool, ...]}] for the MCP servers whose tools
+    are among `tool_names`, sorted by name, each server's tools sorted.
+    `declared` is the declared servers' names; a call matched to one carries
+    that name, and an undeclared server (with "undeclared": true) the name as
+    the harness spells it in the tool name. A tool of no MCP server (a
+    built-in) is left out. No endpoint: a transcript records the tool's name,
+    not the address that was called, and this is an observed field."""
+    prefix, separator, undeclared = mcp_tool_pattern(spec)
+    # Longest first, so "a__b" is matched before "a" for a__b__tool; then by
+    # key and name, so two declared names one key spells (my.server,
+    # my_server) are tried in the same order on every scan.
+    keys = sorted(((_server_key(name), name) for name in declared), key=lambda item: (-len(item[0]), item))
+    by_server: dict[str, set[str]] = {}
+    for tool_name in tool_names:
+        if not isinstance(tool_name, str) or not tool_name.startswith(prefix):
+            continue
+        rest = tool_name[len(prefix):]
+        server = tool = None
+        for key, name in keys:
+            if rest.startswith(key + separator) and len(rest) > len(key + separator):
+                server, tool = name, rest[len(key + separator):]
+                break
+        if server is None and undeclared:
+            head, sep, tail = rest.partition(separator)
+            if sep and head and tail:
+                server, tool = head, tail
+        if server is not None:
+            by_server.setdefault(server, set()).add(tool)
+    return [{"name": server, "tools_called": sorted(by_server[server])} for server in sorted(by_server)]
+
+
+OBSERVED_FLOOR = ("the agent's own transcripts, not the wire; a floor, not a count: a server or tool not "
+                  "called in the transcripts read is absent here")
+
+
+def _observed_mcp_field(tool_names: dict[str, Any], declared: dict[str, Any] | None,
+                        spec: dict[str, Any]) -> dict[str, Any]:
+    """mcp_servers_observed from the tool names the tool_names result found:
+    the same transcripts, so the same account of them. Where no transcript
+    was read (BLIND, or FAILED for another reason), tool_names' account.
+    Where some weren't (PARTIAL, or FAILED with nothing found), an empty
+    floor at most. Where transcripts were read and no MCP server was called,
+    ABSENT, as tool_names is with no tool calls."""
+    field = "mcp_servers_observed"
+    no_mcp_call = "no call in the transcripts read named an MCP server"
+    if "mcp_tools" not in spec:
+        return _result("BLIND", field, reason="NOT_COLLECTED_BY_PACK",
+                       note="the profile doesn't say how its harness names an MCP server's tools")
+    names = tool_names.get("value") if tool_names["status"] in ("ANSWERED", "PARTIAL") else []
+    # Each name scrubbed whole before it is split into server and tool, as
+    # tool_names' is: "mcp__token=__x" split first would put "token=" and x in
+    # separate strings, where redaction no longer sees them together.
+    names = [scrub_text(name) for name in names if isinstance(name, str)] if isinstance(names, list) else []
+    servers = _declared_servers(declared)
+    value = observed_mcp_servers(names, servers, spec["mcp_tools"])
+    undeclared = [entry["name"] for entry in value if entry["name"] not in servers]
+    source = tool_names.get("source")
+    status = tool_names["status"]
+    if status == "PARTIAL" or (status == "FAILED" and tool_names.get("reason") in ("PARSE_FAILED", "SIZE_CAP_EXCEEDED")):
+        # Some transcripts, or some of one, weren't read: a floor, and none
+        # found isn't "none" (an empty floor).
+        return _result("PARTIAL", field, value=value, reason=tool_names.get("reason") or "PARSE_FAILED",
+                       source=source or [],
+                       note="; ".join(n for n in (OBSERVED_FLOOR, tool_names.get("note")) if n))
+    if status not in ("ANSWERED", "ABSENT"):
+        return _result(status, field, **{key: tool_names[key] for key in ("reason", "note") if key in tool_names})
+    if not value:
+        # As tool_names with no tool calls: looked, and found none.
+        why = no_mcp_call
+        if not servers and not mcp_tool_pattern(spec["mcp_tools"])[2]:
+            why += " (none was declared, so no call could be matched to one)"
+        where = ", ".join(source) if isinstance(source, list) else source or tool_names.get("method")
+        return _result("ABSENT", field, method=f"{why}" + (f": {where}" if where else ""))
+    note = OBSERVED_FLOOR
+    if undeclared:
+        # Named as the harness spells them in a tool name, so they don't
+        # match a name in mcp_servers_declared (a plugin's server, say).
+        note += ("; not declared in any MCP config the scan read, named as the harness spells them in its "
+                 "tool names: " + ", ".join(undeclared))
+    return _result("ANSWERED", field, value=value, source=source or [], note=note)
+
+
 def _generic_reader() -> Any:
     """generic.py beside this file, loaded by path once, as a profile's hooks are."""
     import importlib.util
@@ -1066,6 +1203,8 @@ def read_harness_fields(profile: dict[str, Any] | None, agent: Agent, sources: S
         results["skills_inventory"] = _skills_field(ctx, workspace["skills"])
     if workspace.get("transcripts"):
         results["tool_names"] = _transcript_field(ctx, workspace["transcripts"])
+        results["mcp_servers_observed"] = _observed_mcp_field(
+            results["tool_names"], results.get("mcp_servers_declared"), workspace["transcripts"])
     for field in HARNESS_FIELDS:
         results.setdefault(field, _result("BLIND", field, reason="NOT_COLLECTED_BY_PACK",
                                           note=f"the {profile['harness']} profile doesn't name this field"))

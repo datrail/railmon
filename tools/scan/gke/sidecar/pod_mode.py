@@ -271,6 +271,15 @@ def harness_attributes(context: dict[str, Any], builders: dict[str, Builder],
             if notes:
                 attribute["note"] = "; ".join(notes)
         attributes[field] = attribute
+    # mcp_servers_observed (RC-545): the bundle's own account is a
+    # placeholder for an AgentSight snapshot (BLIND, NOT_COLLECTED_BY_PACK),
+    # so where the profile read no value its own account (no transcript could
+    # be read, say) says more, and replaces it.
+    observed = results.get("mcp_servers_observed") or {}
+    if observed.get("status") not in (None, "ANSWERED", "PARTIAL") \
+            and _weak(existing.get("mcp_servers_observed"), "mcp_servers_observed"):
+        attributes["mcp_servers_observed"] = sources.reader().to_attributes(
+            {"mcp_servers_observed": observed}, builders)["mcp_servers_observed"]
     if shapers and ({"mcp_servers_declared", "inference_endpoint"} & set(attributes)):
         attributes.update(_declared_destinations(attributes, existing, builders, shapers, harness))
     if harness == sources.reader().GENERIC_HARNESS:
