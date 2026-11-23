@@ -191,6 +191,24 @@ def _set_env(container: dict[str, Any], name: str, value: str) -> None:
     container["env"] = env
 
 
+def config_paths(annotation: Any, spec_value: Any) -> list[str]:
+    """The config paths for a pod: the annotation's, comma-separated, else
+    the spec's `configPath` (a string, or a list from the chart). An agent
+    whose files sit on several volumes (OpenClaw's openclaw.json apart from
+    its state, Claude Code's project apart from its config) names each.
+    Order kept, duplicates and empty entries dropped."""
+    if isinstance(annotation, str) and annotation.strip():
+        raw: list[Any] = annotation.split(",")
+    elif isinstance(spec_value, str):
+        raw = spec_value.split(",")
+    elif isinstance(spec_value, list):
+        raw = spec_value
+    else:
+        raw = []
+    paths = [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+    return list(dict.fromkeys(paths))
+
+
 def sidecar_container(pod: dict[str, Any], spec: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """The sidecar container for this pod: the spec's, with the per-pod parts filled in."""
     name = spec.get("containerName") or DEFAULT_CONTAINER_NAME
@@ -203,29 +221,36 @@ def sidecar_container(pod: dict[str, Any], spec: dict[str, Any]) -> tuple[dict[s
         warnings.append(warning)
 
     annotations = pod.get("metadata", {}).get("annotations") or {}
-    config_path = annotations.get(CONFIG_PATH_ANNOTATION) or spec.get("configPath")
-    if config_path:
-        container["args"] = list(container.get("args") or []) + ["--config-path", config_path]
-        mounts = config_mounts(agent, config_path) if agent else []
+    paths = config_paths(annotations.get(CONFIG_PATH_ANNOTATION), spec.get("configPath"))
+    if paths:
+        args = list(container.get("args") or [])
+        for config_path in paths:
+            args += ["--config-path", config_path]
+        container["args"] = args
         # A copied mount at a path the spec mounts already (/tmp, say, for an
         # agent with HOME=/tmp) would make the API server refuse the pod.
         own = list(container.get("volumeMounts") or [])
         own_paths = {posixpath.normpath(m["mountPath"]) for m in own if isinstance(m, dict) and m.get("mountPath")}
-        clashing = [m for m in mounts if posixpath.normpath(m["mountPath"]) in own_paths]
-        mounts = [m for m in mounts if m not in clashing]
-        for m in clashing:
-            warnings.append(
-                f"the agent's volume {m['name']} at {m['mountPath']} holds {config_path}, but the scan sidecar "
-                "mounts its own volume there; it can't read that part of the agent's config, and those config "
-                "fields will be BLIND"
-            )
-        if mounts:
-            container["volumeMounts"] = own + mounts
-        elif not clashing:
-            warnings.append(
-                f"no volume of the agent's container holds {config_path}; the scan sidecar can't read the "
-                "agent's config, and its config fields will be BLIND"
-            )
+        added: list[dict[str, Any]] = []
+        for config_path in paths:
+            mounts = config_mounts(agent, config_path) if agent else []
+            clashing = [m for m in mounts if posixpath.normpath(m["mountPath"]) in own_paths]
+            for m in clashing:
+                warnings.append(
+                    f"the agent's volume {m['name']} at {m['mountPath']} holds {config_path}, but the scan sidecar "
+                    "mounts its own volume there; it can't read that part of the agent's config, and those config "
+                    "fields will be BLIND"
+                )
+            kept = [m for m in mounts if m not in clashing]
+            if not kept and not clashing:
+                warnings.append(
+                    f"no volume of the agent's container holds {config_path}; the scan sidecar can't read the "
+                    "agent's config, and its config fields will be BLIND"
+                )
+            # Two paths on one volume mount it once.
+            added += [m for m in kept if m not in added]
+        if added:
+            container["volumeMounts"] = own + added
     else:
         warnings.append(f"no config path: set sidecar.configPath in the chart, or the {CONFIG_PATH_ANNOTATION} annotation")
 

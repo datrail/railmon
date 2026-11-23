@@ -302,6 +302,54 @@ class PatchTest(unittest.TestCase):
         self.assertEqual(sidecar["securityContext"]["runAsUser"], 0)  # the agent's, not the proxy's
         self.assertEqual(result.warnings, [])
 
+    def split_pod(self, annotation: str) -> dict[str, Any]:
+        """An agent whose files sit on two volumes (RC-549)."""
+        pod = agent_pod()
+        agent = pod["spec"]["containers"][0]
+        agent["volumeMounts"] = [{"name": "config", "mountPath": "/data/openclaw"},
+                                 {"name": "state", "mountPath": "/root/.openclaw"}]
+        pod["spec"]["volumes"] = [{"name": "config", "emptyDir": {}}, {"name": "state", "emptyDir": {}}]
+        pod["metadata"]["annotations"] = {"rail.datrail.io/scan-config-path": annotation}
+        return pod
+
+    def test_two_config_paths_on_two_volumes_give_two_arguments_and_both_mounts(self) -> None:
+        after, result = patched(self.split_pod("/data/openclaw, /root/.openclaw"))
+        sidecar = sidecar_of(after)
+        self.assertEqual(sidecar["args"][-4:], ["--config-path", "/data/openclaw", "--config-path", "/root/.openclaw"])
+        mounts = [m for m in sidecar["volumeMounts"] if m["name"] in ("config", "state")]
+        self.assertEqual(mounts, [{"name": "config", "mountPath": "/data/openclaw", "readOnly": True},
+                                  {"name": "state", "mountPath": "/root/.openclaw", "readOnly": True}])
+        self.assertEqual(result.warnings, [])
+
+    def test_two_config_paths_on_one_volume_mount_it_once(self) -> None:
+        pod = self.split_pod("/root/.claude,/root/work,/root/.claude")
+        pod["spec"]["containers"][0]["volumeMounts"] = [{"name": "home", "mountPath": "/root"}]
+        pod["spec"]["volumes"] = [{"name": "home", "emptyDir": {}}]
+        after, result = patched(pod)
+        sidecar = sidecar_of(after)
+        self.assertEqual(sidecar["args"][-4:], ["--config-path", "/root/.claude", "--config-path", "/root/work"])
+        self.assertEqual([m["name"] for m in sidecar["volumeMounts"]].count("home"), 1)
+        self.assertEqual(result.warnings, [])
+
+    def test_a_path_no_volume_holds_warns_for_that_path_only(self) -> None:
+        after, result = patched(self.split_pod("/root/.openclaw,/workspace"))
+        self.assertIn("state", [m["name"] for m in sidecar_of(after)["volumeMounts"]])
+        no_volume = [w for w in result.warnings if "no volume of the agent's container" in w]
+        self.assertEqual(len(no_volume), 1)
+        self.assertIn("/workspace", no_volume[0])
+        self.assertNotIn("/root/.openclaw", no_volume[0])
+
+    def test_one_path_is_unchanged_and_the_chart_may_give_a_list(self) -> None:
+        one, one_result = patched(self.split_pod("/root/.openclaw"))
+        self.assertEqual(sidecar_of(one)["args"][-2:], ["--config-path", "/root/.openclaw"])
+        self.assertEqual([m["name"] for m in sidecar_of(one)["volumeMounts"] if m["name"] in ("config", "state")], ["state"])
+        self.assertEqual(one_result.warnings, [])
+        pod = self.split_pod("")
+        del pod["metadata"]["annotations"]
+        listed, _ = patched(pod, dict(SPEC, configPath=["/data/openclaw", "/root/.openclaw"]))
+        self.assertEqual(sidecar_of(listed)["args"][-4:], ["--config-path", "/data/openclaw", "--config-path", "/root/.openclaw"])
+        self.assertEqual(patch.config_paths(" , ", None), [])
+
     def test_unknown_agent_container_annotation_falls_back_with_a_warning(self) -> None:
         pod = agent_pod()
         pod["metadata"]["annotations"] = {"rail.datrail.io/scan-agent-container": "nope"}

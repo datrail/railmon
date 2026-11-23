@@ -51,7 +51,11 @@ and shareProcessNamespace on the pod (tools/scan/gke/webhook/patch.py).
 */}}
 {{- define "railmon-gke.sidecarSpec" -}}
 containerName: {{ .Values.sidecar.containerName }}
+{{- if kindIs "slice" .Values.sidecar.configPath }}
+configPath: {{ toJson .Values.sidecar.configPath }}
+{{- else }}
 configPath: {{ .Values.sidecar.configPath | quote }}
+{{- end }}
 nativeSidecar: {{ .Values.sidecar.nativeSidecar }}
 {{- if not (kindIs "invalid" .Values.sidecar.runAsUser) }}
 runAsUser: {{ .Values.sidecar.runAsUser }}

@@ -37,7 +37,10 @@ sidecar:
   containerName: rail-scan
   # The agent's config home, on a volume of the agent's container; the
   # webhook mounts that volume read-only at the same path. A pod can name
-  # another with the rail.datrail.io/scan-config-path annotation.
+  # another with the rail.datrail.io/scan-config-path annotation. For an
+  # agent whose files sit on several volumes (OpenClaw's openclaw.json apart
+  # from its state, Claude Code's project apart from its config), a list
+  # here, or comma-separated paths in the annotation: each volume is mounted.
   configPath: /root/.openclaw
   # Used only when neither the agent container's nor the pod's
   # securityContext gives runAsUser/runAsGroup, and the pod has no

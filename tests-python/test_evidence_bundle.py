@@ -1108,8 +1108,10 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # (DR-293); pack 16 fills a pod's harness fields from OpenClaw's and
         # Claude Code's harness profiles (RC-516, RC-526) and adds tool_schemas
         # (RC-511); pack 17 reads OpenClaw's event_zstd events and the newest
-        # transcripts past the file cap in tool_names (RC-530).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 17)
+        # transcripts past the file cap in tool_names (RC-530); pack 18 reads
+        # image-layer files on layered roots and the interpreter's version, and
+        # takes several config paths (RC-549).
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 18)
 
     def test_the_method_and_notes_name_the_probe_that_wrote_the_file(self):
         # DR-170: `railmon listen` writes "probe": "agentsight" in its start

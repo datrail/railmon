@@ -15,6 +15,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -368,6 +369,146 @@ class AgentRootConfinementTest(unittest.TestCase):
         link = self.agent_root / "etc" / "sidecar-link"
         link.symlink_to(self.sidecar_file)
         self.assertFalse(exists("/etc/sidecar-link"))
+
+
+class LayeredRootTest(unittest.TestCase):
+    """RC-549: on an overlay root whose image layers are filesystems of their
+    own (image streaming's gcfs snapshots, gVisor's overlay), a file from a
+    layer reports the layer's st_dev. It is the root's, and is read; a
+    volume or a single-file mount is still refused."""
+
+    LAYER_FILES = ("package.json", "build-info.json", "openclaw", "os-release")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.fake = FakeProc(self.tmp)
+        self.fake.standard_pod()
+        self.mountinfo = self.fake.proc / "7" / "mountinfo"
+
+    def write_mountinfo(self, *points: str) -> None:
+        lines = ["1 0 0:59 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/containerd/gcfs/1/fs"]
+        lines += [f"{n} 1 0:{60 + n} / {point} rw - ext4 /dev/sda1 rw" for n, point in enumerate(points, 2)]
+        self.mountinfo.write_text("\n".join(lines) + "\n")
+
+    def subject(self, layer_files=LAYER_FILES, directories=()):
+        real_stat = os.stat
+
+        def layer_device(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            is_dir = stat_is_dir(result)
+            if kwargs.get("dir_fd") is not None and ((path in layer_files and not is_dir) or (path in directories and is_dir)):
+                fields = list(result[:10])
+                fields[2] += 6  # st_dev: the image layer's, as gcfs and gVisor report it
+                return os.stat_result(fields)
+            return result
+
+        real_fstat = os.fstat
+
+        def opened_layer_device(fd):
+            result = real_fstat(fd)
+            try:
+                name = os.readlink(f"/proc/self/fd/{fd}").rsplit("/", 1)[-1]
+            except OSError:
+                return result
+            if name in layer_files and stat_is_file(result):
+                fields = list(result[:10])
+                fields[2] += 6
+                return os.stat_result(fields)
+            return result
+
+        with mock.patch.object(agent_process.os, "stat", side_effect=layer_device), \
+                mock.patch.object(agent_process.os, "fstat", side_effect=opened_layer_device):
+            subject, _ = agent_process.read_subject([CONFIG], self.fake.proc, own_pid=99999)
+        return subject
+
+    def test_files_from_an_image_layer_are_read_when_no_mount_sits_at_them(self):
+        self.write_mountinfo("/proc", "/etc/hosts", str(CONFIG))
+        subject = self.subject()
+        self.assertEqual(subject["runtimes"]["openclaw"], "OpenClaw 2026.9.2 (3928bad)")
+        self.assertIn("ID=debian", subject["os_release"])
+
+    def test_without_mountinfo_they_are_refused_as_before(self):
+        subject = self.subject()
+        self.assertNotIn("openclaw", subject["runtimes"])
+        self.assertIsNone(subject["os_release"])
+
+    def test_a_single_file_mount_with_its_own_device_is_still_refused(self):
+        self.write_mountinfo("/proc", "/etc/os-release")
+        subject = self.subject()
+        self.assertIsNone(subject["os_release"])
+        self.assertEqual(subject["runtimes"]["openclaw"], "OpenClaw 2026.9.2 (3928bad)")
+
+    def test_a_directory_on_another_device_is_still_refused_with_mountinfo(self):
+        # A volume, or the pod's /proc: directories report their own filesystem.
+        self.write_mountinfo("/proc")
+        subject = self.subject(layer_files=(), directories=("etc",))
+        self.assertIsNone(subject["os_release"])
+
+    def test_mount_points_unescape_the_kernels_octal(self):
+        self.mountinfo.write_text("1 0 0:59 / / rw - overlay overlay rw\n"
+                                  "2 1 0:60 / /data/my\\040volume rw - ext4 /dev/sda1 rw\n")
+        self.assertEqual(agent_process.mount_points(self.fake.proc / "7" / "root"), frozenset({"/", "/data/my volume"}))
+        self.assertIsNone(agent_process.mount_points(self.fake.roots / "agent"))
+
+
+def stat_is_file(result: os.stat_result) -> bool:
+    return stat.S_ISREG(result.st_mode)
+
+
+def stat_is_dir(result: os.stat_result) -> bool:
+    return stat.S_ISDIR(result.st_mode)
+
+
+class ExecutableRuntimeTest(unittest.TestCase):
+    """RC-549: an image that ships its own interpreter sets no PYTHON_VERSION
+    or NODE_VERSION; the interpreter the process runs gives the version,
+    read from files, never run."""
+
+    HERMES_EXE = "/opt/hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3.14"
+    HERMES_CMDLINE = "/opt/hermes/.venv/bin/python -P -c import os; from hermes_cli.main import main gateway run"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.fake = FakeProc(self.tmp)
+        self.root_dir = self.fake.container("hermes")
+
+    def runtimes(self, exe: str, cmdline: str, env: dict[str, str] | None = None, pyvenv: str | None = None):
+        entry = self.fake.process(30, "hermes", cmdline.split(), env=env or {})
+        (entry / "exe").symlink_to(exe)
+        if pyvenv is not None:
+            venv = self.root_dir / "opt" / "hermes" / ".venv"
+            venv.mkdir(parents=True)
+            (venv / "pyvenv.cfg").write_text(pyvenv)
+        return agent_process.runtime_versions(entry / "root", env or {}, cmdline)
+
+    def test_a_venv_interpreter_gives_its_pyvenv_cfg_version(self):
+        cfg = "home = /usr/local/bin\nimplementation = CPython\nuv = 0.13.5\nversion_info = 3.14.9\n"
+        self.assertEqual(self.runtimes(self.HERMES_EXE, self.HERMES_CMDLINE, pyvenv=cfg), {"python": "Python 3.14.9"})
+
+    def test_a_standalone_build_gives_the_version_in_its_path(self):
+        self.assertEqual(self.runtimes(self.HERMES_EXE, self.HERMES_CMDLINE), {"python": "Python 3.14.9"})
+
+    def test_a_bare_python3_14_gives_its_minor_version(self):
+        self.assertEqual(self.runtimes("/usr/bin/python3.14", "/usr/bin/python3.14 app.py"), {"python": "Python 3.14"})
+
+    def test_node_gives_a_version_only_from_its_path(self):
+        self.assertEqual(self.runtimes("/opt/node-v22.1.0-linux-x64/bin/node", "node app.js"), {"node": "v22.1.0"})
+
+    def test_a_bare_node_gives_nothing(self):
+        self.assertEqual(self.runtimes("/usr/local/bin/node", "node app.js"), {})
+
+    def test_a_variable_still_wins_over_the_executable(self):
+        self.assertEqual(self.runtimes(self.HERMES_EXE, self.HERMES_CMDLINE, env={"PYTHON_VERSION": "3.12.1"}),
+                         {"python": "Python 3.12.1"})
+
+    def test_a_pyvenv_cfg_with_junk_falls_back_to_the_path(self):
+        cfg = "version_info = $(rm -rf /)\n"
+        self.assertEqual(self.runtimes(self.HERMES_EXE, self.HERMES_CMDLINE, pyvenv=cfg), {"python": "Python 3.14.9"})
+
+    def test_a_deleted_or_unreadable_executable_gives_nothing(self):
+        self.assertEqual(self.runtimes("/usr/bin/python3.14 (deleted)", "python3.14"), {})
 
 
 class ScannerFileReadsTest(unittest.TestCase):

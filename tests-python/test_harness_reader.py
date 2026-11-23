@@ -621,6 +621,17 @@ class PodSourcesTest(Fixture):
         self.assertIn("from-root", sources.read_text("/work/.toy/settings.json", 1000))
         self.assertEqual(sources.list_dir(str(self.volume)), ["settings.json"])
 
+    def test_a_project_on_a_second_volume_is_read_under_that_volume(self):
+        # RC-549: the webhook passes each volume's path (`/root/.claude,/workspace`),
+        # so the project the agent's working directory names is read on its own volume.
+        project = self.tmp / "volume" / "workspace"
+        (project / ".toy").mkdir(parents=True)
+        (project / ".toy" / "settings.json").write_text(json.dumps({"permissions": {"deny": ["WebFetch"]}}))
+        self.write(str(project / ".toy" / "settings.json"), {"permissions": {"deny": ["from-root"]}})
+        sources = harness_sources.PodSources(str(self.root), [self.volume, project])
+        self.assertIn("WebFetch", sources.read_text(str(project / ".toy" / "settings.json"), 1000))
+        self.assertEqual(sources.list_dir(str(project)), [".toy"])
+
     def test_a_link_on_the_volume_cannot_leave_it(self):
         secret = self.tmp / "sidecar-secret.json"
         secret.write_text(json.dumps({"model": "sidecar-only"}))

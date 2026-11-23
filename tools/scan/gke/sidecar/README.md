@@ -105,14 +105,20 @@ From `/proc/<pid>` it reads:
 | `environ` | `credential_inventory` and `system_info`'s `environment_keys` (names only, never values), `egress_proxy_declared` (the proxy variables, credentials removed), and model, provider and MCP detection |
 | `status` and the agent's own `/etc/passwd` | `user_info`: the uid, gid and user name the agent runs as |
 | `cmdline` | the command line, kept for the harness markers |
-| `root/…/openclaw/dist/build-info.json`, `NODE_VERSION`, `PYTHON_VERSION` | `framework_identity` and `system_info.runtimes`, read rather than run: nothing is executed in the agent's container |
+| `root/…/openclaw/dist/build-info.json`, `NODE_VERSION`, `PYTHON_VERSION`, else `exe` and the venv's `pyvenv.cfg` | `framework_identity` and `system_info.runtimes`, read rather than run: nothing is executed in the agent's container |
 | `root/etc/os-release` | `system_info.os_release` |
 | `cgroup` | `system_info.container.id` (none when the cgroup namespace hides it) |
 
 Files under the agent's root are read one path component at a time inside
 that root: links resolve there, `..` stops at it, no step crosses into another
 filesystem (the agent's `/proc` is the sidecar's too), and only a regular file
-is opened, without blocking.
+is opened, without blocking. A directory is on the root's filesystem when it
+shares the root's `st_dev`. A file or link may report another: on an overlay
+whose image layers are filesystems of their own (GKE image streaming, gVisor)
+a file from a lower layer reports its layer's. It is the root's when the
+agent's `mountinfo` lists no mount at its path, so a volume, a single-file
+mount (`subPath`, `/etc/hosts`) or `/proc` is still refused; without a
+readable `mountinfo`, `st_dev` alone decides.
 
 The scan logs a warning when its choice of process was uncertain: no
 candidate's root holds the config, or processes in more than one other
@@ -121,7 +127,9 @@ don't count). An agent that runs code in its own container can still start a
 decoy beside itself; its fields are `authored_by: subject` for that reason.
 
 Pod mode needs `--config-path` (the webhook sets it): the agent's config
-folder on the config volume. It has no default, because the sidecar's own
+folder on the config volume, once per volume for an agent whose files sit on
+several (the `rail.datrail.io/scan-config-path` annotation's comma-separated
+paths). It has no default, because the sidecar's own
 `$HOME` or cwd says nothing about the agent. Without `--mcp-config`, it reads
 `.mcp.json` in each `--config-path` folder, never the sidecar's own cwd or
 `$HOME`.
