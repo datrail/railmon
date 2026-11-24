@@ -64,6 +64,12 @@ spec:
               value: {{ printf "0.0.0.0:%d" (int .Values.gkeScan.port) | quote }}
             - name: RAIL_INTAKE_AUDIENCE
               value: {{ .Values.gkeScan.audience | quote }}
+            # The cluster reader (RC-550): the enrolled namespaces, and the
+            # sidecars' interval, which a report stays current for two of.
+            - name: RAIL_NAMESPACES
+              value: {{ join "," .Values.enrolledNamespaces | quote }}
+            - name: RAIL_SIDECAR_INTERVAL_SECONDS
+              value: {{ .Values.sidecar.intervalSeconds | quote }}
           ports:
             - name: https
               containerPort: {{ .Values.gkeScan.port }}

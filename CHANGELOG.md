@@ -13,6 +13,10 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+### Added
+
+- gke-scan's cluster reader and its full configuration (RC-550). `railmon gke-scan` now takes `--namespaces` (`RAIL_NAMESPACES`, required: the enrolled namespaces, or `*`), `--label-selector`, `--interval`, `--registry-access`, `--layer-budget`, `--probe-external`, `--data-guardrail-url`, `--sidecar-interval` and `--register-without-sidecar`, each with its variable and default; a missing or unparsable value exits 2 naming it. `KubeClient` lists and watches, retrying 429 and 5xx with backoff. The reader (`tools/scan/gke/central_service/cluster_reader.py`) lists and watches the enrolled namespaces' agent pods, MCP server pods, Services, NetworkPolicies, PersistentVolumeClaims and Namespaces, re-watching when a watch ends and listing again on 410 Gone and every interval, and reports each change with the workloads it affects. A read gke-scan's role refuses (403) is logged and retried each interval while the rest carry on, and a kind that lists but whose watch keeps failing backs off up to a minute. The intake's pod check answers from the watched copy, never waiting on the reader's API reads, and reads the API for a pod the copy doesn't have with the token's UID. The chart passes `RAIL_NAMESPACES` and `RAIL_SIDECAR_INTERVAL_SECONDS`; the list and watch permissions come with RC-557, and until then the reader logs each refused read once and the intake reads the API as before. No change to any bundle.
+
 ### Changed
 
 - **Rule pack 18:** the webhook gives the sidecar every volume an agent's files are on (RC-549). The `rail.datrail.io/scan-config-path` annotation takes several comma-separated paths (`/data/openclaw,/root/.openclaw`, `/root/.claude,/workspace`), and the chart's `sidecar.configPath` may be a list: each is its own `--config-path`, the agent's volume mounts holding any of them are mounted read-only once each, and a warning names the path it is about. One path behaves as before. An OpenClaw agent with `openclaw.json` apart from its state, or a Claude Code agent with its project on its own volume, no longer reads the other volume's fields `BLIND`.

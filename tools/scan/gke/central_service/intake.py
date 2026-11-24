@@ -41,9 +41,11 @@ own backoff (RC-513). gke-scan doesn't parse beyond these checks, merge,
 change or retry the bundle. When the Kubernetes API can't answer a check, the
 answer is 503 for the same reason.
 
-The pod check reads the pod from the Kubernetes API on each post. The cluster
-reader (gke-scan's watch of labeled pods, a later task) can answer it from
-memory instead, through the same `get_pod`.
+The pod check answers from the cluster reader's copy of the labeled pods
+(cluster_reader.py, RC-550) when the copy has the token's pod with its UID,
+and otherwise reads the pod from the Kubernetes API: a pod created since the
+last watch event, or a namespace not listed yet. The owners up the chain are
+always read from the API (workload.py).
 
 Like the sidecar's modules, this one imports nothing of railmon's but two
 standard-library helpers loaded by path, workload.py beside it and
@@ -103,6 +105,10 @@ def _tls_reload() -> ModuleType:
         sys.modules["gke_tls_reload"] = module
         spec.loader.exec_module(module)
     return module
+
+
+class WatchedPods(Protocol):
+    def cached_pod(self, namespace: str, name: str, uid: str) -> dict[str, Any] | None: ...
 
 
 class KubeAPI(Protocol):
@@ -180,8 +186,9 @@ class Intake:
     """The checks and the relay, apart from HTTP, so each step is testable."""
 
     def __init__(self, kube: KubeAPI, relay: Relay, cluster_name: str, audience: str,
-                 max_bytes: int = MAX_BUNDLE_BYTES):
+                 max_bytes: int = MAX_BUNDLE_BYTES, pods: WatchedPods | None = None):
         self.kube = kube
+        self.pods = pods
         self.relay = relay
         self.cluster_name = cluster_name
         self.audience = audience
@@ -231,7 +238,9 @@ class Intake:
             return refusal(403, "the bundle's pod UID isn't the token's",
                            f"{who}: bundle pod UID {uid!r}, token's {identity.pod_uid}: 403")
         try:
-            pod = self.kube.get_pod(identity.namespace, identity.pod_name)
+            pod = self.watched_pod(identity)
+            if pod is None:
+                pod = self.kube.get_pod(identity.namespace, identity.pod_name)
         except Exception as exc:
             return refusal(503, "the pod can't be checked now", f"{who}: reading the pod failed: {exc}: 503")
         metadata = pod.get("metadata") if isinstance(pod, dict) else None
@@ -250,6 +259,15 @@ class Intake:
             return refusal(403, "the bundle's sandbox_name isn't the pod's workload",
                            f"{who}: sandbox_name {sandbox_name!r}, the pod's is {expected!r} ({how}): 403")
         return None
+
+    def watched_pod(self, identity: Any) -> dict[str, Any] | None:
+        """The token's pod from the cluster reader's copy, or None to read the API."""
+        if self.pods is None:
+            return None
+        try:
+            return self.pods.cached_pod(identity.namespace, identity.pod_name, identity.pod_uid)
+        except Exception:  # noqa: BLE001 - the API answers instead
+            return None
 
     def relay_bundle(self, identity: Any, data: bytes) -> Answer:
         uid = identity.pod_uid
