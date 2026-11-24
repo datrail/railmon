@@ -555,6 +555,44 @@ class DerivedNamesTest(unittest.TestCase):
             self.assertNotIn("AGENT_CWD", reader.with_derived(self.PROFILE, agent).env, cwd)
 
 
+class WindowsTest(unittest.TestCase):
+    """The reader run on native Windows, against the agent beside it."""
+
+    PROFILE = DerivedNamesTest.PROFILE
+
+    def test_a_platform_without_o_nonblock_still_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_bytes(b'{"model": "x"}\r\n')
+            saved = getattr(os, "O_NONBLOCK", None)
+            if saved is not None:
+                del os.O_NONBLOCK
+            try:
+                sources = reader.LocalSources()
+                read, mtime = sources.read_bytes(str(path), 100), sources.mtime(str(path))
+            finally:
+                if saved is not None:
+                    os.O_NONBLOCK = saved
+        self.assertEqual(read, b'{"model": "x"}\r\n')
+        self.assertIsNotNone(mtime)
+
+    def test_a_drive_path_is_a_working_directory(self):
+        for cwd in ("C:\\Users\\toy\\project", "D:/work"):
+            agent = reader.Agent("toyagent", {"USERPROFILE": "C:\\Users\\toy"}, cwd=cwd)
+            self.assertEqual(reader.with_derived(self.PROFILE, agent).env["AGENT_CWD"], cwd)
+        # Relative to a drive's current folder, or no drive at all: none.
+        for cwd in ("C:project", "Users\\toy", "C:\\gone (deleted)"):
+            agent = reader.Agent("toyagent", {"USERPROFILE": "C:\\Users\\toy"}, cwd=cwd)
+            self.assertNotIn("AGENT_CWD", reader.with_derived(self.PROFILE, agent).env, cwd)
+
+    def test_home_is_userprofile_when_home_isnt_set(self):
+        windows = reader.Agent("toyagent", {"USERPROFILE": "C:\\Users\\toy"})
+        self.assertEqual(windows.expand("~/.toy/settings.json"), "C:\\Users\\toy/.toy/settings.json")
+        both = reader.Agent("toyagent", {"HOME": "/home/toy", "USERPROFILE": "C:\\Users\\toy"})
+        self.assertEqual(both.expand("~/.toy/settings.json"), "/home/toy/.toy/settings.json")
+        self.assertIsNone(reader.Agent("toyagent", {}).expand("~/.toy/settings.json"))
+
+
 class SourceShapesTest(Fixture):
     """A source that is a folder of drop-in files, and one with its own cap."""
 
