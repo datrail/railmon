@@ -143,6 +143,14 @@ class Sources(Protocol):
     # def mtime(self, path: str) -> float | None: ...
 
 
+def _read_flags() -> int:
+    """os.open's flags for a read. Non-blocking where the platform has it, so
+    a FIFO at a config path can't hang the reader; Windows has neither
+    O_NONBLOCK nor FIFOs at file paths, and needs O_BINARY to read the bytes
+    as written."""
+    return os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+
+
 class LocalSources:
     """This machine's files, optionally under `root`: regular files only,
     opened without blocking, capped."""
@@ -155,7 +163,7 @@ class LocalSources:
 
     def read_bytes(self, path: str, max_bytes: int) -> bytes | None:
         try:
-            fd = os.open(self._path(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+            fd = os.open(self._path(path), _read_flags())
         except OSError:
             return None
         try:
@@ -186,7 +194,7 @@ class LocalSources:
 
     def mtime(self, path: str) -> float | None:
         try:
-            fd = os.open(self._path(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+            fd = os.open(self._path(path), _read_flags())
         except OSError:
             return None
         try:
@@ -198,6 +206,10 @@ class LocalSources:
             os.close(fd)
 
 
+# A Windows drive's absolute path, C:\ or C:/; "C:folder" is relative to that drive's current one.
+_WINDOWS_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/]")
+
+
 class Agent:
     """What the reader knows about the agent: its command line, environment
     and working directory (from its process), for markers and path
@@ -206,9 +218,11 @@ class Agent:
     def __init__(self, cmdline: str = "", env: dict[str, str] | None = None, cwd: str | None = None):
         self.cmdline = cmdline or ""
         self.env = dict(env or {})
-        # Only an absolute path is a working directory; anything else (a
-        # deleted folder's "(deleted)", nothing at all) is none.
-        self.cwd = cwd if isinstance(cwd, str) and cwd.startswith("/") and " (deleted)" not in cwd else None
+        # Only an absolute path (POSIX, or a Windows drive's) is a working
+        # directory; anything else (a deleted folder's "(deleted)", nothing at
+        # all) is none.
+        absolute = isinstance(cwd, str) and (cwd.startswith("/") or bool(_WINDOWS_ABSOLUTE.match(cwd)))
+        self.cwd = cwd if absolute and " (deleted)" not in cwd else None
 
     def expand(self, path: str) -> str | None:
         """`~` and `$VAR` as the agent's environment gives them; None when a
@@ -227,10 +241,11 @@ class Agent:
         if missing:
             return None
         if expanded == "~" or expanded.startswith("~/"):
-            home = self.env.get("HOME")
+            # Windows sets USERPROFILE, and HOME only sometimes.
+            home = self.env.get("HOME") or self.env.get("USERPROFILE")
             if not home:
                 return None
-            expanded = home.rstrip("/") + expanded[1:]
+            expanded = home.rstrip("/\\") + expanded[1:]
         return expanded
 
 

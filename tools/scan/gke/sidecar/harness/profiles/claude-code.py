@@ -99,8 +99,16 @@ def _project_state(ctx: Any) -> dict:
     projects = _state(ctx).get("projects")
     if not project or not isinstance(projects, dict):
         return {}
-    entry = projects.get(project.rstrip("/") or "/")
-    return entry if isinstance(entry, dict) else {}
+    key = project.rstrip("/") or "/"
+    keys = [key]
+    if re.match(r"[A-Za-z]:", key):
+        # Windows: Claude Code has keyed one file's projects with / and with \.
+        keys += [key.replace("\\", "/"), key.replace("/", "\\")]
+    for candidate in keys:
+        entry = projects.get(candidate)
+        if isinstance(entry, dict):
+            return entry
+    return {}
 
 
 def _no_value(ctx: Any, field: str, what: str) -> dict[str, Any]:

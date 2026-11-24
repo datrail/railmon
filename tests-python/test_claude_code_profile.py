@@ -99,6 +99,56 @@ class Install(unittest.TestCase):
         return reader.read_harness_fields(CLAUDE, who or agent(), reader.LocalSources(self.root), **kwargs)
 
 
+class MemorySources:
+    """Files by their exact path, so a Windows agent's paths can be laid out
+    on any platform; a folder is listed from the paths under it."""
+
+    def __init__(self, files: dict[str, str]):
+        self.files = files
+
+    def read_bytes(self, path: str, max_bytes: int) -> bytes | None:
+        text = self.files.get(path)
+        return None if text is None else text.encode()[:max_bytes]
+
+    def read_text(self, path: str, max_bytes: int) -> str | None:
+        data = self.read_bytes(path, max_bytes)
+        return None if data is None else data.decode()
+
+    def list_dir(self, path: str) -> list[str] | None:
+        prefix = path.rstrip("/") + "/"
+        names = {name[len(prefix):].split("/")[0] for name in self.files if name.startswith(prefix)}
+        return sorted(names) or None
+
+
+class WindowsTest(unittest.TestCase):
+    """Claude Code on native Windows: its home from USERPROFILE, a drive path
+    for its project, and ~/.claude.json keying that project with / or \\."""
+
+    HOME = "C:\\Users\\toy"
+    PROJECT = "C:\\Users\\toy\\work"
+
+    def files(self, key: str) -> dict[str, str]:
+        return {
+            self.HOME + "/.claude/settings.json": json.dumps({"model": "opus"}),
+            self.HOME + "/.claude.json": json.dumps(
+                {"projects": {key: {"hasTrustDialogAccepted": True, "mcpServers": {"docs": {"command": "docs-mcp"}}}}}),
+            self.PROJECT + "/.claude/settings.json": json.dumps({"permissions": {"allow": ["Bash(ls)"]}}),
+            self.HOME + "/.claude/projects/C--Users-toy-work/s1.jsonl": (FIXTURES / "transcript.jsonl").read_text(),
+        }
+
+    def test_claude_code_is_read_on_windows(self):
+        windows = reader.Agent("claude.exe -p hi", {"USERPROFILE": self.HOME}, cwd=self.PROJECT)
+        for key in ("C:/Users/toy/work", self.PROJECT):
+            with self.subTest(key=key):
+                results = reader.read_harness_fields(CLAUDE, windows, MemorySources(self.files(key)))
+                self.assertEqual((results["model_name"]["value"], results["model_name"]["source"]),
+                                 ("opus", "$CLAUDE_DIR/settings.json"))
+                self.assertEqual(results["tool_allow_deny"]["status"], "ANSWERED")
+                self.assertEqual(results["mcp_servers_declared"]["value"], {"docs": {"command": "docs-mcp"}})
+                self.assertEqual(results["tool_names"]["value"], ["Bash", "Read"])
+                self.assertNotIn("toy", json.dumps(results))
+
+
 class ClaudeCodeProfileTest(Install):
     def test_the_profile_ships_and_recognizes_claude_code(self):
         for cmdline, env in ((CMDLINE, {}),                                   # the npm package's native binary
