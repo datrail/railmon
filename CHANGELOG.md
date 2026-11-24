@@ -13,6 +13,11 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+_Nothing yet. Each PR adds its line here; a release moves them under its
+version below._
+
+## [v0.1.0-m19] - 2026-11-22
+
 **Rule pack 17** (was 16 since v0.1.0-m18). A baseline locked on pack 16 reads `CONTRACT_MISMATCH` until it is re-locked.
 
 ### Added
@@ -276,6 +281,7 @@ The initial public release, commit `45c58a8`. The work merged before it
 Note: the `v0.1.0` tag points at the same commit `45c58a8`. It is a stray
 tag, not a release; the milestone is `v0.1.0-m2`.
 
+[v0.1.0-m19]: https://github.com/datrail/railmon/compare/v0.1.0-m18...v0.1.0-m19
 [v0.1.0-m18]: https://github.com/datrail/railmon/compare/v0.1.0-m17...v0.1.0-m18
 [v0.1.0-m17]: https://github.com/datrail/railmon/compare/v0.1.0-m16...v0.1.0-m17
 [v0.1.0-m16]: https://github.com/datrail/railmon/compare/v0.1.0-m15...v0.1.0-m16
