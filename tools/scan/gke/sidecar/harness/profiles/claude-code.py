@@ -97,6 +97,11 @@ def _state(ctx: Any) -> dict:
     return {}
 
 
+def _drive_upper(path: str) -> str:
+    """A Windows path with its drive letter uppercase, as Node gives it."""
+    return path[0].upper() + path[1:] if re.match(r"[a-z]:", path) else path
+
+
 def _project_state(ctx: Any) -> dict:
     """The agent's project's entry in ~/.claude.json's projects, keyed by its
     absolute path (used to find it, never reported)."""
@@ -107,8 +112,10 @@ def _project_state(ctx: Any) -> dict:
     key = project.rstrip("/") or "/"
     keys = [key]
     if re.match(r"[A-Za-z]:", key):
-        # Windows: Claude Code has keyed one file's projects with / and with \.
-        keys += [key.replace("\\", "/"), key.replace("/", "\\")]
+        # Windows: Claude Code has keyed one file's projects with / and with \,
+        # and Node gives the drive letter uppercase.
+        for path in (key, _drive_upper(key)):
+            keys += [path, path.replace("\\", "/"), path.replace("/", "\\")]
     for candidate in keys:
         entry = projects.get(candidate)
         if isinstance(entry, dict):
@@ -333,9 +340,10 @@ def _hooks(ctx: Any) -> tuple[dict[str, list[str]], list[str], list[str]]:
 
 def _project_folder(ctx: Any) -> str | None:
     """The folder Claude Code keeps the agent's project's transcripts in:
-    its path with every character but a letter or digit made a dash."""
+    its path with every character but a letter or digit made a dash (a
+    Windows drive letter uppercase, as Node gives it)."""
     project = ctx.agent.expand("$CLAUDE_PROJECT")
-    return re.sub(r"[^A-Za-z0-9]", "-", project.rstrip("/") or "/") if project else None
+    return re.sub(r"[^A-Za-z0-9]", "-", _drive_upper(project.rstrip("/") or "/")) if project else None
 
 
 def _transcript_files(ctx: Any, reader: Any) -> tuple[list[tuple[str, str]], str | None]:

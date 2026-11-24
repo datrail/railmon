@@ -148,6 +148,15 @@ class WindowsTest(unittest.TestCase):
                 self.assertEqual(results["tool_names"]["value"], ["Bash", "Read"])
                 self.assertNotIn("toy", json.dumps(results))
 
+    def test_a_lowercase_drive_letter_finds_the_project(self):
+        # Node uppercases the drive letter for the projects key and the
+        # transcript folder; the agent's own working directory may not.
+        lower = reader.Agent("claude.exe -p hi", {"USERPROFILE": self.HOME}, cwd="c" + self.PROJECT[1:])
+        results = reader.read_harness_fields(CLAUDE, lower, MemorySources(self.files(self.PROJECT)))
+        self.assertEqual(results["mcp_servers_declared"]["value"], {"docs": {"command": "docs-mcp"}})
+        self.assertEqual(results["tool_names"]["value"], ["Bash", "Read"])
+        self.assertNotIn("toy", json.dumps(results))
+
 
 class WindowsVersionTest(unittest.TestCase):
     """Claude Code's version on Windows, however it was installed, with no
