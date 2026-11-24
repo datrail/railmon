@@ -210,6 +210,11 @@ class LocalSources:
 _WINDOWS_ABSOLUTE = re.compile(r"[A-Za-z]:[\\/]")
 
 
+def slashed(word: str) -> str:
+    """A Windows path (C:\\...) with its backslashes as slashes; any other word as is."""
+    return word.replace("\\", "/") if _WINDOWS_ABSOLUTE.match(word) else word
+
+
 class Agent:
     """What the reader knows about the agent: its command line, environment
     and working directory (from its process), for markers and path
@@ -349,10 +354,11 @@ def _command_line_evidence(cmdline: str, markers: dict[str, Any]) -> tuple[int, 
     earliest one: a program comes before its arguments. Every word is looked
     at, since the program can come after any wrapper (`npm run`, `uv run`,
     `sh -c cd /app && ...`, an entrypoint script, a launcher's flags and
-    their values), and /proc gives the command line with its quoting lost."""
+    their values), and /proc gives the command line with its quoting lost.
+    A Windows path's backslashes count as slashes."""
     packages, commands = markers.get("packages", []), set(markers.get("commands", []))
     best: tuple[int, int] | None = None
-    for position, word in enumerate(cmdline.split()):
+    for position, word in enumerate(slashed(word) for word in cmdline.split()):
         if any(f"/node_modules/{package}/" in word for package in packages):
             found = (PACKAGE_EVIDENCE, position)
         elif word.rsplit("/", 1)[-1] in commands:
