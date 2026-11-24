@@ -44,7 +44,7 @@ more than the label; these annotations cover the rest:
 
 | Annotation | Default | What for |
 |---|---|---|
-| `rail.datrail.io/scan-config-path` | `sidecar.configPath` (`/root/.openclaw`) | The agent's config home. The agent's volume mounts that hold it are mounted read-only in the sidecar at the same paths. A config that isn't on a volume can't be read, and the webhook warns |
+| `rail.datrail.io/scan-config-path` | `sidecar.configPath` (`/root/.openclaw`; a list for several) | The agent's config home, or several comma-separated paths (`/data/openclaw,/root/.openclaw`, `/root/.claude,/workspace`) for an agent whose files sit on several volumes. Each goes to the sidecar as its own `--config-path`, and the agent's volume mounts that hold any of them are mounted read-only in the sidecar at the same paths, once each. A path that isn't on a volume can't be read, and the webhook warns for that path |
 | `rail.datrail.io/scan-agent-container` | The pod's first container | Which container is the agent |
 | `rail.datrail.io/scan-run-as-user`, `-run-as-group` | The agent container's, then the pod's `securityContext` | The agent's UID and GID, when the pod spec doesn't say (an image that sets its own `USER`). The sidecar must run as the agent's UID and GID to read its process |
 | `rail.datrail.io/owner` (a label) | none | The `owner` the agent is filed under, through the downward API |

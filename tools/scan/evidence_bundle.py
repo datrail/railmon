@@ -141,7 +141,17 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # same transcripts by the harness profile, each MCP server the agent called
 # with the tools it called (names only, no counts), where pack 16 was always BLIND with
 # NOT_COLLECTED_BY_PACK.
-RULE_PACK_VERSION = 17
+# Pack 18 (RC-549): in pod mode, a file or link from an image layer whose
+# st_dev differs from the agent root's is read when the agent's mountinfo
+# lists no mount at its path (GKE image streaming, gVisor), where pack 17
+# refused it: Claude Code's harness_identity is read rather than BLIND, and
+# OpenClaw's version appears in framework_identity. framework_identity also
+# reads Python's or Node's version from the interpreter the agent's process
+# runs (its venv's pyvenv.cfg, its path or its name) when no PYTHON_VERSION
+# or NODE_VERSION gives it. And the webhook passes one --config-path per
+# path in the scan-config-path annotation, so fields on an agent's other
+# volumes are read rather than BLIND.
+RULE_PACK_VERSION = 18
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -1029,7 +1039,8 @@ def build_evidence_bundle(
             {name: str(version) for name, version in sorted(runtimes.items())}, "observed",
             authored_by="subject",
             method=("the runtime versions in the agent's files and environment (build stamps, "
-                    "NODE_VERSION, PYTHON_VERSION), not run" if read_not_run
+                    "NODE_VERSION, PYTHON_VERSION, the interpreter the process runs and its "
+                    "pyvenv.cfg), not run" if read_not_run
                     else "the runtime versions the harness reports for itself"),
             note="the runtime versions observed; the framework build identity is not collected",
         )

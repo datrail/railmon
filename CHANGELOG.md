@@ -13,8 +13,14 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
-_Nothing yet. Each PR adds its line here; a release moves them under its
-version below._
+### Changed
+
+- **Rule pack 18:** the webhook gives the sidecar every volume an agent's files are on (RC-549). The `rail.datrail.io/scan-config-path` annotation takes several comma-separated paths (`/data/openclaw,/root/.openclaw`, `/root/.claude,/workspace`), and the chart's `sidecar.configPath` may be a list: each is its own `--config-path`, the agent's volume mounts holding any of them are mounted read-only once each, and a warning names the path it is about. One path behaves as before. An OpenClaw agent with `openclaw.json` apart from its state, or a Claude Code agent with its project on its own volume, no longer reads the other volume's fields `BLIND`.
+- **Rule pack 18:** `framework_identity` in pod mode reads Python's or Node's version from the interpreter the agent's process runs when no `PYTHON_VERSION` or `NODE_VERSION` says it (RC-549): a venv's `pyvenv.cfg` beside the interpreter the command line starts, else a version in the executable's path (a standalone build's `python-3.14.9+.../bin/python3.14`), else `python3.14`'s own name. Read, never run; a variable still wins. An image that ships its own interpreter (Hermes) gets it `ANSWERED` rather than `BLIND`.
+
+### Fixed
+
+- **Rule pack 18:** pod mode reads the files of an agent image whose layers report their own device (RC-549): on GKE image streaming (Autopilot's default for Artifact Registry images) and under gVisor (GKE Sandbox), a file from a lower layer reports that layer's `st_dev`, and RC-509's guard took it for another filesystem, so Claude Code's `harness_identity` read `BLIND` and OpenClaw's version was missing from `framework_identity`. A file or link whose `st_dev` differs is now the root's when the agent's `/proc/<pid>/mountinfo` lists no mount at its path; directories must still share the root's `st_dev`, and volumes, single-file mounts (`subPath`, `/etc/hosts`) and the pod's `/proc` are still refused. Without a readable mountinfo the guard compares `st_dev` alone, as before.
 
 ## [v0.1.0-m19] - 2026-11-22
 

@@ -1315,6 +1315,17 @@ counted as unparsed, and past `TRANSCRIPT_MAX_FILES` (50) the shared reader
 and Claude Code's profile read the newest transcripts and report `PARTIAL`
 with `SIZE_CAP_EXCEEDED`, where pack 16 was `ANSWERED` from an arbitrary 50
 (see [gke/sidecar/harness/README.md](gke/sidecar/harness/README.md)).
+
+Rule pack 18 (RC-549) changes pod mode's output for an unchanged agent, so a
+pack-17 baseline is `CONTRACT_MISMATCH` until a pack-18 ASP is locked. On a
+layered root (GKE image streaming, gVisor), files from the image's layers that
+pack 17 refused are read, so Claude Code's `harness_identity` is read rather
+than `BLIND` and OpenClaw's version appears in `framework_identity`;
+`framework_identity` also reads Python's or Node's version from the
+interpreter the agent runs when no `PYTHON_VERSION` or `NODE_VERSION` gives
+it; and an agent whose `scan-config-path` annotation names several paths gets
+the fields on each of its volumes rather than `BLIND`.
+
 A self or docker scan reports `http_operations` as `BLIND`,
 `NOT_COLLECTED_BY_PACK`, and probes its MCP servers one after another, with no
 deadline.

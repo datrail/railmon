@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,50 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEX
 _LIST_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
+_MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def mount_points(root: Path) -> frozenset[str] | None:
+    """The mount points of the process whose root is `root` (a
+    /proc/<pid>/root), as paths within that root, from the kernel's
+    /proc/<pid>/mountinfo beside it; None when there is none to read, and the
+    guard then compares st_dev alone."""
+    # Only a process's root: a config volume the sidecar mounts at /root is
+    # read under its own path, and has no mountinfo beside it.
+    if root.name != "root" or not root.parent.name.isdigit():
+        return None
+    try:
+        with open(root.parent / "mountinfo", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(1_000_000)
+    except OSError:
+        return None
+    points = set()
+    for line in text.splitlines():
+        fields = line.split(" ")
+        if len(fields) > 4 and fields[4].startswith("/"):
+            points.add(_MOUNTINFO_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), fields[4]))
+    return frozenset(points) or None
+
+
+def _on_root_filesystem(info: os.stat_result, root_dev: int, where: str, mounts: frozenset[str] | None) -> bool:
+    """Whether the object `info` describes, at `where` in the agent's root,
+    is on the root's own filesystem.
+
+    An overlay root whose image layers are filesystems of their own (GKE
+    image streaming's gcfs snapshots, gVisor's overlay) reports a file from
+    a lower layer with that layer's st_dev, though the file is part of the
+    root; its directories report the overlay's. So a directory must share
+    the root's st_dev, as before. A file or link may differ when the agent's
+    mountinfo is read and no mount sits at its path: its directory is the
+    root's, so only a mount at the file itself (a subPath or /etc/hosts bind)
+    could put it elsewhere, and those are listed there."""
+    if info.st_dev == root_dev:
+        return True
+    if mounts is None or stat.S_ISDIR(info.st_mode):
+        return False
+    return where not in mounts
+
+
 def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = True,
                   hops: int = 32, open_dir: bool = False,
                   refuse: tuple[str, ...] = ()) -> tuple[list[str], int | None] | None:
@@ -124,7 +169,9 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
     target restarts at the agent's root, and `..` never climbs above it.
     With `same_device`, no component may leave the root's filesystem: the
     agent's own /proc is the sidecar's too (one process namespace), so a
-    relative link into it would reach the sidecar the same way.
+    relative link into it would reach the sidecar the same way. A component
+    is on it when `_on_root_filesystem` says so: by st_dev, and for a file
+    from an image layer by the agent's mount points.
 
     Returns the resolved components and, with `open_file`, a descriptor of
     the regular file (opened without blocking, so a FIFO can't hang the
@@ -137,6 +184,7 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
         return None
     stack, names = [root_fd], []
     pending = [part for part in path.split("/") if part]
+    mounts = mount_points(root) if same_device else None
     try:
         root_dev = os.fstat(root_fd).st_dev
         while pending:
@@ -151,7 +199,7 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
             if len(stack) == 1 and part in refuse:
                 return None
             info = os.stat(part, dir_fd=stack[-1], follow_symlinks=False)
-            if same_device and info.st_dev != root_dev:
+            if same_device and not _on_root_filesystem(info, root_dev, "/" + "/".join(names + [part]), mounts):
                 return None
             if stat.S_ISLNK(info.st_mode):
                 hops -= 1
@@ -177,7 +225,8 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
                     return None
                 fd = os.open(part, _LIST_FLAGS, dir_fd=stack[-1])
                 opened = os.fstat(fd)
-                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino) or (same_device and opened.st_dev != root_dev):
+                # The same object as the one checked above, so on the root too.
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                     os.close(fd)
                     return None
                 return names, fd
@@ -187,8 +236,7 @@ def _walk_in_root(root: Path, path: str, open_file: bool, same_device: bool = Tr
                 return None
             fd = os.open(part, _FILE_FLAGS, dir_fd=stack[-1])
             opened = os.fstat(fd)
-            if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
-                    or (same_device and opened.st_dev != root_dev)):
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                 os.close(fd)
                 return None
             return names, fd
@@ -307,14 +355,81 @@ def resolve_under_root(root: Path, path: str, same_device: bool = True,
     return None if walked is None else "/" + "/".join(walked[0])
 
 
-def runtime_versions(root: Path, env: dict[str, str]) -> dict[str, str]:
+_PYTHON_NAME = re.compile(r"python(\d+(?:\.\d+)*)?")
+_VERSION_IN_PATH = {"python": re.compile(r"python-?(\d+\.\d+\.\d+)"),
+                    "node": re.compile(r"node-?v?(\d+\.\d+\.\d+)")}
+
+
+def _process_link(process: Path, name: str) -> str | None:
+    """/proc/<pid>/<name> (cwd, exe) as the agent's root names it, or None."""
+    try:
+        target = os.readlink(process / name)
+    except OSError:
+        return None
+    if not target.startswith("/") or target.endswith(" (deleted)") or len(target) > CWD_MAX_CHARS or "\x00" in target:
+        return None
+    return target
+
+
+def _pyvenv_version(root: Path, interpreter: str) -> str | None:
+    """The version a venv's pyvenv.cfg records, for an interpreter started
+    as <venv>/bin/python: "Python 3.14.9", or "PyPy 7.3.17" for another
+    implementation."""
+    head, _, _ = interpreter.rpartition("/bin/")
+    if not head:
+        return None
+    text = read_in_root(root, f"{head}/pyvenv.cfg", 4096)
+    if not text:
+        return None
+    values = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip().lower()] = value.strip()
+    version = values.get("version_info") or values.get("version")
+    if not version or not re.fullmatch(r"\d+(?:\.\d+){1,3}[\w.+-]*", version) or len(version) > 40:
+        return None
+    implementation = values.get("implementation") or "CPython"
+    return f"{'Python' if implementation == 'CPython' else implementation[:20]} {version}"
+
+
+def executable_runtime(root: Path, cmdline: str) -> tuple[str, str] | None:
+    """("python", "Python 3.14.9") or ("node", "v22.1.0") from the
+    interpreter the agent's process runs, read rather than run: the
+    executable /proc/<pid>/exe names, a version in its path (a standalone
+    build's python-3.14.9+.../bin/python3.14), the venv's pyvenv.cfg beside
+    the interpreter the command line starts. None when it isn't Python or
+    Node, or no version is written down."""
+    exe = _process_link(root.parent, "exe")
+    if exe is None:
+        return None
+    name = exe.rsplit("/", 1)[-1]
+    python = _PYTHON_NAME.fullmatch(name)
+    if python:
+        argv0 = (cmdline.split() or [""])[0]
+        venv = _pyvenv_version(root, argv0) if argv0.startswith("/") else None
+        if venv:
+            return "python", venv
+        in_path = _VERSION_IN_PATH["python"].search(exe)
+        if in_path:
+            return "python", f"Python {in_path.group(1)}"
+        return ("python", f"Python {python.group(1)}") if python.group(1) and "." in python.group(1) else None
+    if name in ("node", "nodejs"):
+        in_path = _VERSION_IN_PATH["node"].search(exe)
+        return ("node", f"v{in_path.group(1)}") if in_path else None
+    return None
+
+
+def runtime_versions(root: Path, env: dict[str, str], cmdline: str = "") -> dict[str, str]:
     """The agent's runtimes, read rather than run: OpenClaw's build stamp
     (dist/build-info.json, else package.json) for the openclaw on the agent's
     PATH or in a usual install folder, and the base image's NODE_VERSION and
     PYTHON_VERSION, and Claude Code's version from its npm package or the
     native installer's versions/<version> file the `claude` on PATH links
     to. The same strings `openclaw --version`, `claude --version`,
-    `node --version` and `python3 --version` print."""
+    `node --version` and `python3 --version` print. Without a variable for
+    it, the interpreter the process runs gives Python's or Node's
+    (executable_runtime): an image that ships its own sets neither."""
     versions: dict[str, str] = {}
     package_dirs: list[str] = []
     for directory in (env.get("PATH") or "").split(":"):
@@ -349,6 +464,9 @@ def runtime_versions(root: Path, env: dict[str, str]) -> dict[str, str]:
         versions["node"] = "v" + env["NODE_VERSION"].lstrip("v")
     if env.get("PYTHON_VERSION"):
         versions["python"] = "Python " + env["PYTHON_VERSION"]
+    executable = executable_runtime(root, cmdline) if "python" not in versions or "node" not in versions else None
+    if executable and executable[0] not in versions:
+        versions[executable[0]] = executable[1]
     return versions
 
 
@@ -486,7 +604,7 @@ def read_subject(config_paths: list[Path], proc: Path | None = None,
         "gid": gid,
         "username": _passwd_name(root, uid) or env.get("USER") or env.get("LOGNAME"),
         "home": env.get("HOME"),
-        "runtimes": runtime_versions(root, env),
+        "runtimes": runtime_versions(root, env, agent["cmdline"]),
         "os_release": read_in_root(root, "/etc/os-release"),
         "machine_id": read_in_root(root, "/etc/machine-id", 256),
     }, "found"
