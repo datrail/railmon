@@ -874,6 +874,32 @@ is `FAILED`. A scan inside a container in `self` mode is `BLIND`. The
 attribute is closed, as `$defs.egress_containment_value` in the v1 schema, and
 sandbox-scoped in v2.
 
+### A Kubernetes pod (RC-552)
+
+gke-scan reports a pod's `egress_containment` from the cluster's objects
+(`classify_kubernetes`), with its own `observations`: whether the pod is on
+the node's network, the NetworkPolicies that select it and restrict egress,
+their egress rules as written (`to` and `ports` null for any), the rules that
+open some ports to any address, any policy whose podSelector couldn't be
+evaluated, and whether the cluster enforces policies (anetd, GKE Dataplane
+V2, or calico-node in `kube-system`, with every scheduled pod Ready;
+`enforced` null when that couldn't be read, or an enforcer has a pod that
+isn't Ready). The schema tells the two shapes apart by `network_mode`, which only
+Docker's has.
+
+| Level | Contained | When |
+| --- | --- | --- |
+| `host_network` | no | `hostNetwork` is set: NetworkPolicies don't apply to the node's network |
+| `open` | no | no policy of type Egress selects the pod; one allows all egress; the cluster doesn't enforce policies; or a rule opens some ports to any address (no `to`, or an ipBlock of `0.0.0.0/0` or `::/0`, however it's written, as `10.0.0.0/0` is, and an `except` list notwithstanding), as the test bed's TCP 443 rule does |
+| `allow_list_enforced` | yes | an enforced policy restricts egress and nothing opens it to any address; `enforcer` is `kubernetes_network_policy` |
+
+It is `PARTIAL`, at level `open`, when the enforcement check was refused or
+failed, or found an enforcer with a pod not Ready, and a policy would
+otherwise restrict egress (`NO_SOURCE_ACCESS`), or
+when a policy's selector couldn't be evaluated, since it may select the pod
+and allow more (`PARSE_FAILED`). Nothing is called contained that wasn't
+shown to be.
+
 `egress_proxy_declared` (declared) lists the `HTTP_PROXY`, `HTTPS_PROXY`,
 `ALL_PROXY` and `NO_PROXY` the container's environment sets, with credentials
 removed. It never raises the level, because any client can ignore a proxy

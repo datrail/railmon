@@ -17,6 +17,7 @@ gke-scan design, in this same process.
 | [`kube.py`](kube.py) | TokenReview, get, list and watch, with gke-scan's own service account |
 | [`cluster_reader.py`](cluster_reader.py) | The watched copy of the enrolled namespaces, and the workloads each change affects |
 | [`workload.py`](workload.py) | A pod's `namespace/workload`, with each owner checked through the API |
+| [`enforcement.py`](enforcement.py) | Whether the cluster enforces NetworkPolicies: anetd or calico-node in kube-system |
 | [`pod_fields.py`](pod_fields.py) | The agent container, revision, sidecar and `agent_type` of a pod, and the fields read from the pod spec and the objects around it |
 
 It shares the scanner's `auth_headers` (`RAIL_AUTH_MODE`), `registration_url`
@@ -210,6 +211,21 @@ contributes nothing; with none, no attributes):
 | `declared_ports` | The agent container's ports |
 | `services_exposing_agent` | The Services in its namespace whose selector matches the pod's labels, with their type, ports and any load balancer address |
 | `sandbox_network_policy` | The NetworkPolicies that select the pod, with their types and rules as written |
+| `egress_containment` | Those policies and whether the cluster enforces them (RC-552): `allow_list_enforced`, `open` or `host_network`, as [the scan README](../../README.md#a-kubernetes-pod-rc-552) sets out. Given only with the enforcement check's answer |
+
+The enforcement check ([`enforcement.py`](enforcement.py)) reads DaemonSets
+`anetd` (GKE Dataplane V2) and `calico-node` in `kube-system` by name, at most
+once per interval, with their status: an enforcer counts only when every pod
+it's scheduled on is Ready, and one scheduled on no node doesn't enforce. A
+read that is refused or fails, or an enforcer with a pod not Ready (or no
+status yet), is unknown, never "not enforced", and is tried again next time.
+It needs `get` on daemonsets in `kube-system`, which the chart grants with
+RC-557; the status comes with the same read.
+
+`declared_ports` and `services_exposing_agent` have published value shapes in
+the v1 schema (`$defs.declared_ports_value` and
+`$defs.services_exposing_agent_value`, RC-552), and v2 checks them in code;
+lists past 64 items are cut, with a note saying how many were left out.
 
 A NetworkPolicy's podSelector is evaluated with matchLabels and every
 matchExpressions operator (`In`, `NotIn`, `Exists`, `DoesNotExist`). An

@@ -7,10 +7,14 @@ re-derive it (RailMon provides data; Daniel, 2026-10-08).
 
 `classify` is a pure function of inspect output. `collect_inputs` is the only part that
 calls Docker, and it runs in the scan that already inspected the target.
+`classify_kubernetes` is gke-scan's, for a pod (RC-552): its levels are
+allow_list_enforced (enforcer `kubernetes_network_policy`), open and
+host_network.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 from datetime import datetime
@@ -463,6 +467,132 @@ def classify(
         },
         "via": f"container:{_container_name(owner)}" if owner is not None else None,
         "allow_list": allow_list,
+        "reasons": [reason[:MAX_REASON] for reason in reasons][:16],
+    }
+    return status, value
+
+
+# ── Kubernetes (RC-552) ──────────────────────────────────────────────────
+# gke-scan's view of a pod: the NetworkPolicies that select it (as
+# central_service/pod_fields.py's selecting_policies gives them) and whether
+# the cluster enforces policies at all. Kubernetes allows a pod everything
+# until a policy of type Egress selects it, then only the union of what the
+# selecting policies allow; and a pod on the node's network isn't subject to
+# policies at all.
+
+KUBERNETES_ENFORCER = "kubernetes_network_policy"
+
+
+def _is_any_address(cidr: Any) -> bool:
+    """0.0.0.0/0 or ::/0, however it's written: Kubernetes masks an ipBlock's
+    cidr, so 10.0.0.0/0 is 0.0.0.0/0. A cidr that doesn't parse isn't."""
+    if not isinstance(cidr, str):
+        return False
+    try:
+        return ipaddress.ip_network(cidr, strict=False).prefixlen == 0
+    except ValueError:
+        return False
+
+
+def _any_address_peers(rule: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The rule's peers that are any address: None when the rule names no
+    peer (any destination), else the ipBlocks of 0.0.0.0/0 or ::/0. An
+    except list carves out ranges, not the internet, so it doesn't count."""
+    peers = rule.get("to")
+    if not isinstance(peers, list) or not peers:
+        return None
+    return [peer["ipBlock"] for peer in peers if isinstance(peer, dict)
+            and isinstance(peer.get("ipBlock"), dict) and _is_any_address(peer["ipBlock"].get("cidr"))]
+
+
+def _ports_text(ports: Any) -> str:
+    if not isinstance(ports, list) or not ports:
+        return "every port"
+    return ", ".join(f"{p.get('protocol', 'TCP')} {p.get('port', 'any')}" + (f"-{p['endPort']}" if p.get("endPort") else "")
+                     for p in ports if isinstance(p, dict))
+
+
+def classify_kubernetes(host_network: bool, selecting: list[dict[str, Any]], unevaluable: list[str],
+                        enforcement: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """(status, value) for a pod's `egress_containment`: ANSWERED, or PARTIAL
+    when a policy's selector couldn't be evaluated (it may select the pod and
+    allow more) or enforcement couldn't be checked (a restrictive policy may
+    not be enforced). Both are reported at level open: nothing is called
+    contained that wasn't shown to be.
+
+    `selecting` is the policies that select the pod, each with `name`,
+    `policy_types` and `egress` (rules as written); `enforcement` is
+    `{"enforced": True/False/None, "by": "anetd"/"calico-node"/None,
+    "detail": ...}`."""
+    egress_policies = [p for p in selecting if "Egress" in (p.get("policy_types") or [])]
+    allowed, open_to_any, reasons = [], [], []
+    for policy in egress_policies:
+        for rule in policy.get("egress") or []:
+            if not isinstance(rule, dict):
+                continue
+            ports = rule.get("ports") if isinstance(rule.get("ports"), list) and rule.get("ports") else None
+            peers = rule.get("to") if isinstance(rule.get("to"), list) and rule.get("to") else None
+            allowed.append({"policy": policy["name"], "to": _capped(peers) if peers else None,
+                            "ports": _capped(ports) if ports else None})
+            anywhere = _any_address_peers(rule)
+            if anywhere is None:
+                open_to_any.append({"policy": policy["name"], "ports": _capped(ports) if ports else None,
+                                    "cidr": None, "except": []})
+            for block in anywhere or []:
+                open_to_any.append({"policy": policy["name"], "ports": _capped(ports) if ports else None,
+                                    "cidr": block.get("cidr"),
+                                    "except": _capped([str(e)[:64] for e in block.get("except") or [] if e])})
+    enforced = enforcement.get("enforced")
+    status = "ANSWERED"
+    enforcer = None
+    if host_network:
+        level, reasons = "host_network", ["hostNetwork: the pod uses the node's network, which NetworkPolicies "
+                                          "don't apply to"]
+    elif not egress_policies:
+        level, reasons = "open", ["no NetworkPolicy of type Egress selects the pod"]
+    elif any(a["to"] is None and a["ports"] is None for a in allowed):
+        level = "open"
+        reasons = [_joined("a policy allows all egress: ", sorted({a["policy"] for a in allowed
+                                                                   if a["to"] is None and a["ports"] is None}))]
+    elif enforced is False:
+        level, reasons = "open", [f"egress is restricted by policy, but the cluster doesn't enforce policies "
+                                  f"({enforcement.get('detail')})"]
+    elif open_to_any:
+        ports = sorted({_ports_text(o["ports"]) for o in open_to_any})
+        level, reasons = "open", [f"a policy allows {'; '.join(ports)} to any address"]
+        if enforced is None:
+            reasons.append(f"whether policies are enforced couldn't be checked ({enforcement.get('detail')})")
+    elif enforced is None:
+        level, status = "open", "PARTIAL"
+        reasons = [_joined("egress is restricted by policy: ", [p["name"] for p in egress_policies]),
+                   f"whether the cluster enforces policies couldn't be checked ({enforcement.get('detail')})"]
+    else:
+        level, enforcer = "allow_list_enforced", KUBERNETES_ENFORCER
+        reasons = [_joined("egress is restricted by policy: ", [p["name"] for p in egress_policies]),
+                   f"enforced by {enforcement.get('by')}"]
+    if unevaluable and not host_network:
+        status = "PARTIAL"
+        if level == "allow_list_enforced":
+            level, enforcer = "open", None
+        reasons.append(_joined("not evaluated, and may select the pod and allow more: ", unevaluable))
+    if len(allowed) > MAX_LIST:
+        reasons.append(f"{len(allowed) - MAX_LIST} more egress rule(s) not listed")
+    value = {
+        "level": level,
+        "contained": level in CONTAINED_LEVELS,
+        "enforcer": enforcer,
+        "observations": {
+            "host_network": bool(host_network),
+            "enforcement": {"enforced": enforced if enforced in (True, False) else None,
+                            "by": enforcement.get("by") if enforcement.get("by") in ("anetd", "calico-node") else None,
+                            "detail": str(enforcement.get("detail") or "not checked")[:MAX_REASON]},
+            "egress_policies": _capped([p["name"] for p in egress_policies]),
+            "unevaluable_policies": _capped(list(unevaluable)),
+            "allowed_egress": _capped(allowed),
+            "open_to_any_address": _capped(open_to_any),
+        },
+        "via": None,
+        "allow_list": None,
         "reasons": [reason[:MAX_REASON] for reason in reasons][:16],
     }
     return status, value
