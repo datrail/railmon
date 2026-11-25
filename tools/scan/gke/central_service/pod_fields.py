@@ -55,6 +55,10 @@ Like the other central_service modules, it uses only the standard library.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, Iterable
 
 AGENT_CONTAINER_ANNOTATION = "rail.datrail.io/scan-agent-container"
@@ -72,7 +76,31 @@ VOLUME_SOURCES = {
     "downwardAPI": None, "projected": None, "image": "reference",
 }
 
+# The schema's bounds for these values (RC-552): past one, a list is cut and
+# the note says how much was left out, so a bundle never fails its contract.
+MAX_LIST = 64
+
 Builder = Callable[..., dict[str, Any]]
+
+
+def _egress() -> ModuleType:
+    """tools/scan/egress_containment.py, loaded by path once."""
+    module = sys.modules.get("egress_containment")
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            "egress_containment", Path(__file__).resolve().parent.parent.parent / "egress_containment.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["egress_containment"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def _capped(items: list[Any], what: str) -> tuple[list[Any], dict[str, str]]:
+    """The list cut to MAX_LIST, and a note when it was."""
+    if len(items) <= MAX_LIST:
+        return items, {}
+    return items[:MAX_LIST], {"note": f"{len(items) - MAX_LIST} more {what} not listed"}
 
 
 def _metadata(obj: Any) -> dict[str, Any]:
@@ -426,8 +454,9 @@ def declared_ports_attribute(pods: list[dict[str, Any]], b: dict[str, Builder]) 
             entry["host_port"] = port["hostPort"]
         ports.append(entry)
     ports.sort(key=lambda p: (p["port"], p["protocol"]))
+    ports, cut = _capped(ports, "port(s)")
     return b["answered"](ports, "declared", method="the agent container's ports",
-                         **({} if ports else {"note": "the agent container declares no ports"}))
+                         **(cut or ({} if ports else {"note": "the agent container declares no ports"})))
 
 
 def service_selects(service: dict[str, Any], pod: dict[str, Any]) -> bool:
@@ -459,18 +488,19 @@ def services_exposing_attribute(pods: list[dict[str, Any]], services: Iterable[d
                         if port.get(key):
                             entry[out] = port[key]
                     ports.append(entry)
-                entry: dict[str, Any] = {"name": name, "type": spec.get("type") or "ClusterIP", "ports": ports}
+                entry: dict[str, Any] = {"name": name, "type": spec.get("type") or "ClusterIP",
+                                         "ports": ports[:MAX_LIST]}
                 ingress = [i.get("ip") or i.get("hostname") for i in
                            _list(_dict(_dict(service.get("status")).get("loadBalancer")).get("ingress"))
                            if isinstance(i, dict) and (i.get("ip") or i.get("hostname"))]
                 if ingress:
-                    entry["load_balancer_ingress"] = ingress
+                    entry["load_balancer_ingress"] = ingress[:MAX_LIST]
                 if spec.get("externalIPs"):
-                    entry["external_ips"] = _list(spec.get("externalIPs"))
+                    entry["external_ips"] = _list(spec.get("externalIPs"))[:MAX_LIST]
                 exposing[name] = entry
-    value = sorted(exposing.values(), key=lambda s: s["name"])
+    value, cut = _capped(sorted(exposing.values(), key=lambda s: s["name"]), "Service(s)")
     return b["answered"](value, "declared", method="the Services whose selector matches the pod's labels",
-                         **({} if value else {"note": "no Service selects the agent's pods"}))
+                         **(cut or ({} if value else {"note": "no Service selects the agent's pods"})))
 
 
 def sandbox_network_policy_attribute(pods: list[dict[str, Any]], policies: Iterable[dict[str, Any]],
@@ -489,12 +519,32 @@ def sandbox_network_policy_attribute(pods: list[dict[str, Any]], policies: Itera
                                                           "allows all its traffic"}))
 
 
+def egress_containment_attribute(pods: list[dict[str, Any]], policies: Iterable[dict[str, Any]],
+                                 enforcement: dict[str, Any], b: dict[str, Builder]) -> dict[str, Any]:
+    """Can the agent's pod reach any outside host (RC-552): the NetworkPolicies
+    that select it and whether the cluster enforces them
+    (egress_containment.classify_kubernetes). Observed, as Docker's is: from
+    the cluster's own objects, never from what the agent declares."""
+    pod = pods[0]
+    selecting, unevaluable = selecting_policies(pod, policies)
+    status, value = _egress().classify_kubernetes(bool(_spec(pod).get("hostNetwork")), selecting, unevaluable,
+                                                  enforcement)
+    method = ("the NetworkPolicies that select the pod and restrict its egress, and whether anetd or "
+              "calico-node enforces them")
+    if status == "PARTIAL":
+        reason = "PARSE_FAILED" if unevaluable else "NO_SOURCE_ACCESS"
+        return b["partial"](value, "observed", reason, method=method, note="; ".join(value["reasons"]))
+    return b["answered"](value, "observed", method=method)
+
+
 def pod_spec_attributes(pods: Iterable[dict[str, Any]], services: Iterable[dict[str, Any]],
                         claims: Iterable[dict[str, Any]], policies: Iterable[dict[str, Any]],
-                        b: dict[str, Builder]) -> dict[str, dict[str, Any]] | None:
-    """The six attributes over one revision's pods, Ready ones only (newest
+                        b: dict[str, Builder],
+                        enforcement: dict[str, Any] | None = None) -> dict[str, dict[str, Any]] | None:
+    """The attributes over one revision's pods, Ready ones only (newest
     first is the caller's order; the first Ready pod is read for the fields
-    that come from one pod's spec). None when no pod is Ready."""
+    that come from one pod's spec). None when no pod is Ready. With
+    `enforcement` (enforcement.py's answer), egress_containment too."""
     ready = [pod for pod in pods if is_ready(pod)]
     if not ready:
         return None
@@ -506,4 +556,6 @@ def pod_spec_attributes(pods: Iterable[dict[str, Any]], services: Iterable[dict[
         "declared_ports": declared_ports_attribute(ready, b),
         "services_exposing_agent": services_exposing_attribute(ready, services, b),
         "sandbox_network_policy": sandbox_network_policy_attribute(ready, policies, b),
+        **({"egress_containment": egress_containment_attribute(ready, policies, enforcement, b)}
+           if enforcement is not None else {}),
     }

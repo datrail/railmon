@@ -190,6 +190,11 @@ def _sibling(name: str) -> Any:
 # DR-207: egress_containment's value, published as `$defs.egress_containment_value`
 # for the same two statuses; v2 holds its sandbox value to it the same way.
 EGRESS_VALUE_SCHEMA: dict[str, Any] = SCHEMA["$defs"]["egress_containment_value"]
+# RC-552: gke-scan's two new attributes' values, published as `$defs.<name>_value`;
+# v2 holds them to the same defs in code, as it does egress_containment's.
+GKE_VALUE_SCHEMAS: dict[str, dict[str, Any]] = {
+    name: SCHEMA["$defs"][f"{name}_value"] for name in ("declared_ports", "services_exposing_agent")
+}
 # DR-293: skills_inventory's closed reachability/schema_omitted/tools_truncated
 # values, published as `$defs.skills_inventory_value`; v2 holds each scope's
 # value to it the same way.
@@ -313,7 +318,7 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: di
     """A minimal, stdlib-only walker for the slice of JSON Schema this
     contract uses: type (one, or a list)/const/enum/required/properties/additionalProperties/
     items/minProperties/minItems/maxItems/uniqueItems,
-    minLength/maxLength/minimum/pattern,
+    minLength/maxLength/minimum/maximum/pattern,
     format:date-time, and allOf/if/then/else/not/$ref, and the boolean
     schemas `true`/`false` (`"value": true` marks an attribute's value as
     accepting anything).
@@ -410,6 +415,9 @@ def _schema_problems(instance: Any, schema: dict[str, Any], where: str, root: di
     if isinstance(instance, int) and not isinstance(instance, bool) and "minimum" in schema:
         if instance < schema["minimum"]:
             problems.append(f"{where}: must be at least {schema['minimum']}")
+    if isinstance(instance, int) and not isinstance(instance, bool) and "maximum" in schema:
+        if instance > schema["maximum"]:
+            problems.append(f"{where}: must be at most {schema['maximum']}")
     for branch in schema.get("allOf", ()):
         problems += _schema_problems(instance, branch, where, root)
     if "if" in schema:
@@ -514,6 +522,10 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     if isinstance(egress, dict) and egress.get("status") in FILE_ACCESS_VALUED_STATUSES:
         problems += _schema_problems(egress.get("value"), EGRESS_VALUE_SCHEMA,
                                      "sandbox.attributes.egress_containment.value")
+    for name, value_schema in GKE_VALUE_SCHEMAS.items():
+        field = ((bundle.get("sandbox") or {}).get("attributes") or {}).get(name)
+        if isinstance(field, dict) and field.get("status") in FILE_ACCESS_VALUED_STATUSES:
+            problems += _schema_problems(field.get("value"), value_schema, f"sandbox.attributes.{name}.value")
     scopes = [("sandbox.attributes", (bundle.get("sandbox") or {}).get("attributes"))]
     scopes += [(f"agents[{index}].attributes", agent.get("attributes"))
                for index, agent in enumerate(bundle.get("agents") or []) if isinstance(agent, dict)]
