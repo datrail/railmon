@@ -878,6 +878,7 @@ class EntryPointTest(unittest.TestCase):
         self.assertEqual(stderr.returncode, 2)
         self.assertIn("--cluster-name/RAIL_CLUSTER_NAME", stderr.stderr)
         self.assertIn("--tls-cert-file", stderr.stderr)
+        self.assertIn("--namespaces/RAIL_NAMESPACES", stderr.stderr)
 
     def test_sigterm_stops_the_service(self):
         if not shutil.which("openssl"):
@@ -891,7 +892,8 @@ class EntryPointTest(unittest.TestCase):
         proc = subprocess.Popen(
             [sys.executable, str(CENTRAL / "gke_scan.py"), "--cluster-name", CLUSTER, "--center-url",
              "http://127.0.0.1:9", "--tls-cert-file", str(cert), "--tls-key-file", str(key), "--listen",
-             "127.0.0.1:0", "--kube-api-url", "http://127.0.0.1:9", "--kube-token-file", str(token)],
+             "127.0.0.1:0", "--kube-api-url", "http://127.0.0.1:9", "--kube-token-file", str(token),
+             "--namespaces", "agents"],
             stderr=subprocess.PIPE, text=True)
         try:
             line = proc.stderr.readline()
