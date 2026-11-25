@@ -1,0 +1,522 @@
+{
+ "central_v3": {
+  "network_policies_in_namespace": 1,
+  "network_policies_selecting_agent": [
+   {
+    "egress": [
+     {
+      "ports": [
+       {
+        "port": 53,
+        "protocol": "UDP"
+       },
+       {
+        "port": 53,
+        "protocol": "TCP"
+       }
+      ],
+      "to": [
+       {
+        "namespaceSelector": {},
+        "podSelector": {
+         "matchLabels": {
+          "k8s-app": "kube-dns"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "ports": [
+       {
+        "port": 53,
+        "protocol": "UDP"
+       },
+       {
+        "port": 53,
+        "protocol": "TCP"
+       }
+      ],
+      "to": [
+       {
+        "ipBlock": {
+         "cidr": "169.254.20.10/32"
+        }
+       }
+      ]
+     },
+     {
+      "ports": [
+       {
+        "port": 23004,
+        "protocol": "TCP"
+       }
+      ],
+      "to": [
+       {
+        "podSelector": {
+         "matchLabels": {
+          "app": "finretail-mcp-server"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "ports": [
+       {
+        "port": 28081,
+        "protocol": "TCP"
+       }
+      ],
+      "to": [
+       {
+        "podSelector": {
+         "matchLabels": {
+          "app": "finretail-data-service"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "ports": [
+       {
+        "port": 8080,
+        "protocol": "TCP"
+       }
+      ],
+      "to": [
+       {
+        "podSelector": {
+         "matchLabels": {
+          "app": "rail-receiver"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "ports": [
+       {
+        "port": 3128,
+        "protocol": "TCP"
+       }
+      ],
+      "to": [
+       {
+        "podSelector": {
+         "matchLabels": {
+          "app": "rail-proxy"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "ports": [
+       {
+        "port": 443,
+        "protocol": "TCP"
+       }
+      ],
+      "to": [
+       {
+        "ipBlock": {
+         "cidr": "0.0.0.0/0"
+        }
+       }
+      ]
+     }
+    ],
+    "ingress": [],
+    "name": "agent-finretail-egress",
+    "policyTypes": [
+     "Egress"
+    ],
+    "selects_agent": true
+   }
+  ],
+  "pod": "agent-finretail-58cd78b55d-48jcw",
+  "services_exposing_agent": [
+   {
+    "name": "agent-finretail-gateway",
+    "ports": [
+     {
+      "port": 18789,
+      "targetPort": 18789
+     }
+    ],
+    "type": "ClusterIP"
+   }
+  ]
+ },
+ "pods": [
+  {
+   "metadata": {
+    "annotations": {
+     "kubectl.kubernetes.io/restartedAt": "2026-10-20T11:35:24-07:00"
+    },
+    "labels": {
+     "app": "agent-finretail",
+     "pod-template-hash": "58cd78b55d",
+     "rail.datrail.io/owner": "team-a",
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a"
+    },
+    "name": "agent-finretail-58cd78b55d-48jcw",
+    "namespace": "gke-test",
+    "ownerReferences": [
+     {
+      "apiVersion": "apps/v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "ReplicaSet",
+      "name": "agent-finretail-58cd78b55d",
+      "uid": "1c8076e3-420e-4c19-949a-f3bee59b7a47"
+     }
+    ],
+    "uid": "f3fe5e58-b328-40cb-9b03-1acf558d773d"
+   },
+   "spec": {
+    "containers": [
+     {
+      "args": [
+       "bash",
+       "/rail-policy/policy.sh"
+      ],
+      "env": [
+       {
+        "name": "AGENT_NAME",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "AGENT_MCP_NAME",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "AGENT_MCP_URL",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "HTTPS_PROXY",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "HTTP_PROXY",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "NO_PROXY",
+        "value": "<recorded value left out>"
+       }
+      ],
+      "envFrom": [
+       {
+        "secretRef": {
+         "name": "agent-llm"
+        }
+       }
+      ],
+      "image": "us-central1-docker.pkg.dev/example-project/gke-test/agent-finretail-test:phase14",
+      "name": "agent",
+      "ports": [
+       {
+        "containerPort": 18789,
+        "protocol": "TCP"
+       }
+      ],
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "seccompProfile": {
+        "type": "RuntimeDefault"
+       }
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/rail-agent",
+        "name": "agent-setup",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/rail-policy",
+        "name": "agent-policy",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/root/.openclaw",
+        "name": "openclaw-config"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access-wclm9",
+        "readOnly": true
+       }
+      ]
+     },
+     {
+      "args": [
+       "scan",
+       "--mode",
+       "pod",
+       "--config-path",
+       "/root/.openclaw",
+       "--output",
+       "/work/registration-payload.json",
+       "--register",
+       "--interval",
+       "3600"
+      ],
+      "env": [
+       {
+        "name": "AGENT_NAME",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "AGENT_MCP_NAME",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "AGENT_MCP_URL",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "POD_NAME",
+        "valueFrom": "<left out>"
+       },
+       {
+        "name": "POD_NAMESPACE",
+        "valueFrom": "<left out>"
+       },
+       {
+        "name": "POD_UID",
+        "valueFrom": "<left out>"
+       },
+       {
+        "name": "NODE_NAME",
+        "valueFrom": "<left out>"
+       },
+       {
+        "name": "RAIL_NAMESPACE",
+        "valueFrom": "<left out>"
+       },
+       {
+        "name": "RAIL_DEPLOYMENT",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_AUTH_AUDIENCE",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_HOST_ID",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_CENTER_URL",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_AUTH_MODE",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_AUTH_TOKEN",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_RAILDASH_URL",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_RAILDASH_TOKEN",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "RAIL_OWNER",
+        "valueFrom": "<left out>"
+       },
+       {
+        "name": "HTTPS_PROXY",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "HTTP_PROXY",
+        "value": "<recorded value left out>"
+       },
+       {
+        "name": "NO_PROXY",
+        "value": "<recorded value left out>"
+       }
+      ],
+      "envFrom": [
+       {
+        "secretRef": {
+         "name": "agent-llm"
+        }
+       }
+      ],
+      "image": "us-central1-docker.pkg.dev/example-project/gke-test/railmon:pod-mode-fwid",
+      "name": "railmon-scan",
+      "securityContext": {
+       "allowPrivilegeEscalation": false,
+       "capabilities": {
+        "drop": [
+         "ALL"
+        ]
+       },
+       "seccompProfile": {
+        "type": "RuntimeDefault"
+       }
+      },
+      "volumeMounts": [
+       {
+        "mountPath": "/root/.openclaw",
+        "name": "openclaw-config",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/etc/podinfo",
+        "name": "podinfo",
+        "readOnly": true
+       },
+       {
+        "mountPath": "/work",
+        "name": "work"
+       },
+       {
+        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        "name": "kube-api-access-wclm9",
+        "readOnly": true
+       }
+      ]
+     }
+    ],
+    "securityContext": {},
+    "serviceAccountName": "agent-finretail",
+    "volumes": [
+     {
+      "configMap": {
+       "defaultMode": 420,
+       "name": "agent-setup"
+      },
+      "name": "agent-setup"
+     },
+     {
+      "configMap": {
+       "defaultMode": 420,
+       "name": "agent-policy"
+      },
+      "name": "agent-policy"
+     },
+     {
+      "emptyDir": {},
+      "name": "openclaw-config"
+     },
+     {
+      "emptyDir": {},
+      "name": "work"
+     },
+     {
+      "downwardAPI": {
+       "defaultMode": 420,
+       "items": [
+        {
+         "fieldRef": {
+          "apiVersion": "v1",
+          "fieldPath": "metadata.labels"
+         },
+         "path": "labels"
+        }
+       ]
+      },
+      "name": "podinfo"
+     },
+     {
+      "name": "kube-api-access-wclm9",
+      "projected": {
+       "defaultMode": 420,
+       "sources": [
+        {
+         "serviceAccountToken": {
+          "expirationSeconds": 3607,
+          "path": "token"
+         }
+        },
+        {
+         "configMap": {
+          "items": [
+           {
+            "key": "ca.crt",
+            "path": "ca.crt"
+           }
+          ],
+          "name": "kube-root-ca.crt"
+         }
+        },
+        {
+         "downwardAPI": {
+          "items": [
+           {
+            "fieldRef": {
+             "apiVersion": "v1",
+             "fieldPath": "metadata.namespace"
+            },
+            "path": "namespace"
+           }
+          ]
+         }
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "status": {
+    "conditions": [
+     {
+      "status": "True",
+      "type": "PodReadyToStartContainers"
+     },
+     {
+      "status": "True",
+      "type": "Initialized"
+     },
+     {
+      "status": "True",
+      "type": "Ready"
+     },
+     {
+      "status": "True",
+      "type": "ContainersReady"
+     },
+     {
+      "status": "True",
+      "type": "PodScheduled"
+     }
+    ],
+    "containerStatuses": [
+     {
+      "image": "us-central1-docker.pkg.dev/example-project/gke-test/agent-finretail-test:phase14",
+      "imageID": "us-central1-docker.pkg.dev/example-project/gke-test/agent-finretail-test@sha256:c8a91b6d3f8ed4558092200dca895dddf69db2c292cb989bab63cdad78d7cd5f",
+      "name": "agent",
+      "ready": true
+     },
+     {
+      "image": "us-central1-docker.pkg.dev/example-project/gke-test/railmon:pod-mode-fwid",
+      "imageID": "us-central1-docker.pkg.dev/example-project/gke-test/railmon@sha256:8c71944310c4604fae2b5bd03a20f6ebd04b513d8fd6802d87c3688478356c64",
+      "name": "railmon-scan",
+      "ready": true
+     }
+    ],
+    "phase": "Running"
+   }
+  }
+ ],
+ "recorded": "2026-11-04/05, research phase 15 (outputs/phase15/gke-test): agent-pod.json, and central_v3.py's output"
+}
