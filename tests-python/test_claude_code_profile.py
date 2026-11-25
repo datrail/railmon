@@ -148,6 +148,56 @@ class WindowsTest(unittest.TestCase):
                 self.assertEqual(results["tool_names"]["value"], ["Bash", "Read"])
                 self.assertNotIn("toy", json.dumps(results))
 
+    def test_a_lowercase_drive_letter_finds_the_project(self):
+        # Node uppercases the drive letter for the projects key and the
+        # transcript folder; the agent's own working directory may not.
+        lower = reader.Agent("claude.exe -p hi", {"USERPROFILE": self.HOME}, cwd="c" + self.PROJECT[1:])
+        results = reader.read_harness_fields(CLAUDE, lower, MemorySources(self.files(self.PROJECT)))
+        self.assertEqual(results["mcp_servers_declared"]["value"], {"docs": {"command": "docs-mcp"}})
+        self.assertEqual(results["tool_names"]["value"], ["Bash", "Read"])
+        self.assertNotIn("toy", json.dumps(results))
+
+
+class WindowsVersionTest(unittest.TestCase):
+    """Claude Code's version on Windows, however it was installed, with no
+    path of the user's in the results."""
+
+    HOME = "C:\\Users\\toy"
+    ROAMING = HOME + "\\AppData\\Roaming"
+    MANIFEST = json.dumps({"name": "@anthropic-ai/claude-code", "version": "2.1.300"})
+
+    def identity(self, cmdline: str, files: dict[str, str], **env: str) -> dict:
+        agent = reader.Agent(cmdline, {"USERPROFILE": self.HOME, **env})
+        result = reader.read_harness_fields(CLAUDE, agent, MemorySources(files))["harness_identity"]
+        self.assertNotIn("toy", json.dumps(result))
+        return result
+
+    def test_a_windows_command_line_is_claude_code(self):
+        for cmdline in (self.HOME + "\\.local\\bin\\claude.exe --print hi",
+                        "node " + self.ROAMING + "\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js"):
+            with self.subTest(cmdline=cmdline):
+                self.assertIs(reader.harness_reader_for(PROFILES, reader.Agent(cmdline, {})), CLAUDE)
+
+    def test_the_desktop_apps_own_copy_names_its_version(self):
+        cmdline = (self.HOME + "\\AppData\\Local\\Claude-Data\\claude_x\\claude-code\\2.1.330\\9424831ad51c\\claude.exe")
+        result = self.identity(cmdline, {})
+        self.assertEqual((result["status"], result["value"]), ("ANSWERED", "claude-code/2.1.330"))
+
+    def test_an_npm_install_names_its_version(self):
+        package = "/npm/node_modules/@anthropic-ai/claude-code/package.json"
+        # The package the command line runs, its path given with backslashes.
+        cli = self.ROAMING + "\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js"
+        result = self.identity("node " + cli, {self.ROAMING.replace("\\", "/") + package: self.MANIFEST})
+        self.assertEqual(result["value"], "claude-code/2.1.300")
+        # npm's global folder, found from APPDATA when the command line is only claude.exe.
+        result = self.identity("claude.exe", {self.ROAMING + package: self.MANIFEST}, APPDATA=self.ROAMING)
+        self.assertEqual((result["value"], result["source"]),
+                         ("claude-code/2.1.300", "$APPDATA/npm/node_modules/@anthropic-ai/claude-code/package.json"))
+
+    def test_a_native_install_names_its_version(self):
+        result = self.identity("claude.exe", {self.HOME + "/.local/share/claude/versions/2.1.300": ""})
+        self.assertEqual(result["value"], "claude-code/2.1.300")
+
 
 class ClaudeCodeProfileTest(Install):
     def test_the_profile_ships_and_recognizes_claude_code(self):

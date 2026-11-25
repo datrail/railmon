@@ -49,7 +49,12 @@ from urllib.parse import urlsplit
 PACKAGE = "@anthropic-ai/claude-code"
 PACKAGE_DIRS = ("/usr/local/lib/node_modules/@anthropic-ai/claude-code",
                 "/usr/lib/node_modules/@anthropic-ai/claude-code")
+# npm's global folder on Windows, by default.
+WINDOWS_PACKAGE_DIR = "$APPDATA/npm/node_modules/@anthropic-ai/claude-code"
 NATIVE_VERSIONS = "~/.local/share/claude/versions"
+WINDOWS_PATH = re.compile(r"[A-Za-z]:[\\/]")
+# The Claude desktop app runs its own Claude Code from .../claude-code/<version>/<build>/claude(.exe).
+DESKTOP_APP = re.compile(r"/claude-code/([^/]+)/[^/]+/claude(?:[.]exe)?$")
 MANAGED_MCP = "/etc/claude-code/managed-mcp.json"
 PROJECT_MCP = "$CLAUDE_PROJECT/.mcp.json"
 STATE = "$CLAUDE_JSON"
@@ -92,6 +97,11 @@ def _state(ctx: Any) -> dict:
     return {}
 
 
+def _drive_upper(path: str) -> str:
+    """A Windows path with its drive letter uppercase, as Node gives it."""
+    return path[0].upper() + path[1:] if re.match(r"[a-z]:", path) else path
+
+
 def _project_state(ctx: Any) -> dict:
     """The agent's project's entry in ~/.claude.json's projects, keyed by its
     absolute path (used to find it, never reported)."""
@@ -102,8 +112,10 @@ def _project_state(ctx: Any) -> dict:
     key = project.rstrip("/") or "/"
     keys = [key]
     if re.match(r"[A-Za-z]:", key):
-        # Windows: Claude Code has keyed one file's projects with / and with \.
-        keys += [key.replace("\\", "/"), key.replace("/", "\\")]
+        # Windows: Claude Code has keyed one file's projects with / and with \,
+        # and Node gives the drive letter uppercase.
+        for path in (key, _drive_upper(key)):
+            keys += [path, path.replace("\\", "/"), path.replace("/", "\\")]
     for candidate in keys:
         entry = projects.get(candidate)
         if isinstance(entry, dict):
@@ -210,12 +222,18 @@ def _version_key(version: str) -> tuple[int, ...]:
 
 def _identity(ctx: Any) -> dict[str, Any] | None:
     """claude-code/<version> from the package the command line runs, an npm
-    install's package.json, or a native install's versions folder."""
+    install's package.json, the Claude desktop app's own copy, or a native
+    install's versions folder. A Windows path's backslashes count as slashes."""
+    words = [word.replace("\\", "/") if WINDOWS_PATH.match(word) else word
+             for word in ctx.agent.cmdline.split()]
     marker = f"/node_modules/{PACKAGE}/"
     roots = [(word[:word.index(marker) + len(marker) - 1],
               f"node_modules/{PACKAGE}/package.json (the package the command line runs)")
-             for word in ctx.agent.cmdline.split() if marker in word]
+             for word in words if marker in word]
     roots += [(folder, f"{folder}/package.json") for folder in PACKAGE_DIRS]
+    windows = ctx.agent.expand(WINDOWS_PACKAGE_DIR)
+    if windows:
+        roots.append((windows, f"{WINDOWS_PACKAGE_DIR}/package.json"))
     for root, shown in roots:
         text = ctx.sources.read_text(f"{root}/package.json", MANIFEST_MAX_BYTES)
         if text is None:
@@ -228,11 +246,15 @@ def _identity(ctx: Any) -> dict[str, Any] | None:
             return ctx.result("ANSWERED", "harness_identity", value=f"claude-code/{manifest['version']}",
                               source=shown, note="installed with npm")
     # A native install runs ~/.local/share/claude/versions/<version> itself.
-    for word in ctx.agent.cmdline.split():
+    for word in words:
         head, _, version = word.rpartition("/")
         if head.endswith("/.local/share/claude/versions") and VERSION.fullmatch(version):
             return ctx.result("ANSWERED", "harness_identity", value=f"claude-code/{version}",
                               source=f"{NATIVE_VERSIONS}/{version}", note="a native install; the command line runs it")
+        desktop = DESKTOP_APP.search(word)
+        if desktop and VERSION.fullmatch(desktop.group(1)):
+            return ctx.result("ANSWERED", "harness_identity", value=f"claude-code/{desktop.group(1)}",
+                              source="the command line", note="the Claude desktop app's own Claude Code")
     folder = ctx.agent.expand(NATIVE_VERSIONS)
     versions = [v for v in (ctx.sources.list_dir(folder) or []) if VERSION.fullmatch(v)] if folder else []
     if versions:
@@ -318,9 +340,10 @@ def _hooks(ctx: Any) -> tuple[dict[str, list[str]], list[str], list[str]]:
 
 def _project_folder(ctx: Any) -> str | None:
     """The folder Claude Code keeps the agent's project's transcripts in:
-    its path with every character but a letter or digit made a dash."""
+    its path with every character but a letter or digit made a dash (a
+    Windows drive letter uppercase, as Node gives it)."""
     project = ctx.agent.expand("$CLAUDE_PROJECT")
-    return re.sub(r"[^A-Za-z0-9]", "-", project.rstrip("/") or "/") if project else None
+    return re.sub(r"[^A-Za-z0-9]", "-", _drive_upper(project.rstrip("/") or "/")) if project else None
 
 
 def _transcript_files(ctx: Any, reader: Any) -> tuple[list[tuple[str, str]], str | None]:
