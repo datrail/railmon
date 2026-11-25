@@ -17,6 +17,7 @@ gke-scan design, in this same process.
 | [`kube.py`](kube.py) | TokenReview, get, list and watch, with gke-scan's own service account |
 | [`cluster_reader.py`](cluster_reader.py) | The watched copy of the enrolled namespaces, and the workloads each change affects |
 | [`workload.py`](workload.py) | A pod's `namespace/workload`, with each owner checked through the API |
+| [`pod_fields.py`](pod_fields.py) | The agent container, revision, sidecar and `agent_type` of a pod, and the fields read from the pod spec and the objects around it |
 
 It shares the scanner's `auth_headers` (`RAIL_AUTH_MODE`), `registration_url`
 and register opener, which refuses redirects, through
@@ -185,6 +186,42 @@ before the copy is locked, and a change's workloads come from what was read,
 so a slow API server never holds up the intake's pod check. Nothing consumes the
 changes yet: the bundle builder and scheduler ([RC-555](https://railxia.atlassian.net/browse/RC-555)) will.
 
+## Pod-spec fields (RC-551)
+
+gke-scan keys a workload as (`--cluster-name`, `sandbox_name`), the
+`sandbox_name` [above](#the-workload): the same pair the sidecar reports
+under, for every workload kind. For each pod, [`pod_fields.py`](pod_fields.py) works out:
+
+| What | From |
+|---|---|
+| The agent container | The `rail.datrail.io/scan-agent-container` annotation, the one the webhook reads, so both views read the same container. Else the first container that is neither the scan sidecar nor `rail-proxy`, with a note when there was more than one. An annotation naming a container the pod doesn't have falls back the same way, with a note |
+| The revision | `pod-template-hash` (a Deployment's or Argo Rollout's ReplicaSet), else `controller-revision-hash` (a StatefulSet or DaemonSet) |
+| Whether it has a sidecar | The webhook's `rail.datrail.io/scan-sidecar` annotation, or a container or native-sidecar init container named `rail-scan` or running `scan --mode pod` |
+| `agent_type` | The `rail.datrail.io/agent-type` label, `personal` or `service`, for a workload with no sidecar. Without it there is no `agent_type`, and Rail Center doesn't register the agent |
+
+And over one revision's Ready pods (a pod not yet Ready, or terminating,
+contributes nothing; with none, no attributes):
+
+| Field | From |
+|---|---|
+| `image_digest` | The agent container's status `imageID`. When the pods run different digests (a tag that moved between pod starts), PARTIAL with every digest, and the pods running each in the note |
+| `mounts` | The agent container's volumeMounts, each with its volume's kind and the object it names (a ConfigMap's or Secret's name, never its contents); a claim's storage class, access modes and capacity. The service account token is left out. A claim not in the copy makes it PARTIAL |
+| `permissions` | `privileged`, `cap_add` and `cap_drop` (docker mode's keys), and the rest of the pod's and container's securityContext (the container's winning), hostNetwork, hostPID, hostIPC, hostUsers, runtimeClassName and the service account |
+| `declared_ports` | The agent container's ports |
+| `services_exposing_agent` | The Services in its namespace whose selector matches the pod's labels, with their type, ports and any load balancer address |
+| `sandbox_network_policy` | The NetworkPolicies that select the pod, with their types and rules as written |
+
+A NetworkPolicy's podSelector is evaluated with matchLabels and every
+matchExpressions operator (`In`, `NotIn`, `Exists`, `DoesNotExist`). An
+empty one selects every pod in its namespace. One that can't be evaluated is
+left out, and the field is PARTIAL naming it. Without `policyTypes`, a policy
+is Ingress, and Egress too when it has egress rules, as Kubernetes defaults
+it. What its peers allow is `egress_containment`'s to say (RC-552).
+
+The attributes are built with the scanner's own helpers, handed in, so they
+have its shape; `authored_by` is added where gke-scan's bundle is built
+(RC-555). Nothing sends them yet.
+
 ## Running it
 
 ```sh
@@ -254,6 +291,16 @@ mocked TokenReview and pod read, and relays through the real relay to a fake
 Rail Center. It covers every check, every Rail Center answer, one bundle per
 pod at a time, HTTPS with a test certificate, and `KubeClient` against a fake
 Kubernetes API.
+
+`tests-python/test_gke_scan_pod_fields.py` covers the resolver and the
+pod-spec fields: every workload kind keys as the sidecar's `workload_name`
+does, the agent container's choice, the revision, the sidecar and
+`agent_type`, and each field on the research's recorded pods
+(`tests-python/fixtures/gke-scan/`, from gke-test, gke-auto and gke-sandbox
+on 11/4 and 11/5: the pod fields the collectors read, and env names with
+every value left out, so a test can check no env content reaches a field) against what
+`central_v3.py` recorded, a moved tag, a pod not yet Ready, and every
+podSelector case.
 
 `tests-python/test_gke_scan_reader.py` covers the configuration (a missing or
 bad value exits 2 naming it; variables over defaults, flags over variables),
