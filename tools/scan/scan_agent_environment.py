@@ -2865,16 +2865,22 @@ class _ProbeHealth:
 
     A start after the first is a restart, a gap the agent ran through,
     unless both it and the start before it (in file order) name the agent's
-    run (`agent_run`, written by `railmon listen`'s supervisor) and the two
-    differ: the agent itself restarted, and this attach covers its new run
-    from the start, as the first one did (DR-320). Those are counted apart,
-    in `agent_restarts`."""
+    run (`agent_run`, written by `railmon listen`'s supervisor), its run is
+    one no start has named yet, and it doesn't say `after_gap` (the probe
+    ended while the previous run went on): then the agent itself
+    restarted, and this attach covers its new run as the first one covered
+    the first (DR-320). Those are counted apart, in `agent_restarts`. A run
+    named again after another was alive unseen meanwhile."""
+
+    # Runs remembered, so one named again is found; past it, the oldest go.
+    RUNS_TRACKED = 1024
 
     def __init__(self, default: str) -> None:
         self.starts = 0
         self.restarts = 0
         self.agent_restarts = 0
         self.run: str | None = None
+        self.runs: dict[str, None] = {}
         self.every = 0
         self.last_alive: datetime | None = None
         self.last_start: datetime | None = None
@@ -2885,12 +2891,17 @@ class _ProbeHealth:
             run = event.get("agent_run")
             run = run if isinstance(run, str) and run else None
             if self.starts:
-                if run is not None and self.run is not None and run != self.run:
+                if (run is not None and self.run is not None and run not in self.runs
+                        and event.get("after_gap") is not True):
                     self.agent_restarts += 1
                 else:
                     self.restarts += 1
             self.starts += 1
             self.run = run
+            if run is not None:
+                self.runs[run] = None
+                if len(self.runs) > self.RUNS_TRACKED:
+                    del self.runs[next(iter(self.runs))]
             if self.last_start is None or seen >= self.last_start:
                 self.last_start = seen
                 named = event.get("probe")
@@ -2943,9 +2954,10 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
         was down (it does not report sockets already listening; `railmon
         listen`'s snapshot at each attach adds those still open, as records
         with `"snapshot": true`, but not one opened and closed meanwhile).
-        Not when the start names another run of the agent than the one
-        before it (`agent_run`, DR-320): the agent restarted too, so there
-        was no gap it ran through (see `_ProbeHealth`);
+        Not when it and the start before it both name the agent's run
+        (`agent_run`, DR-320), and it names a new one without `after_gap`:
+        the agent restarted too, so there was no gap it ran through (see
+        `_ProbeHealth`);
       * the newest start/alive more than HEARTBEAT_GRACE intervals from
         `now`, either way (a clock stepped back too): it is `stale`.
 

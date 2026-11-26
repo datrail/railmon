@@ -454,6 +454,18 @@ class LivenessTest(unittest.TestCase):
             "; further losses from this cause are not logged"), logged)
         self.assertEqual(logged[-1], "lost 2 events: the probe reported FILE_OPEN_LOST")
 
+    def test_a_diagnostic_reason_is_quoted_short_and_printable(self):
+        logged: list[str] = []
+        instance = adapter.Adapter("files", log=logged.append)
+        lines = [json.dumps({"source": "diagnostic",
+                             "data": {"reason": f"bad\nline {n} " + "x" * 200,
+                                      "parse_error_count": n}}).encode()
+                 for n in range(adapter.LOSS_CAUSES + 3)]
+        adapt(lines, "files", instance)
+        self.assertTrue(all("\n" not in entry and len(entry) < 200 for entry in logged))
+        self.assertEqual(len(instance.losses), adapter.LOSS_CAUSES + 1)
+        self.assertEqual(instance.losses["other causes"], 3)
+
 
 class StreamTest(unittest.TestCase):
 
@@ -542,10 +554,10 @@ class WiringTest(unittest.TestCase):
 
     def test_each_start_names_the_agents_run_so_its_restart_is_no_gap(self):
         # DR-320: a reboot or `docker restart` is a new run of the agent,
-        # and the attach to it is not a probe restart.
-        first = subprocess.Popen(["sleep", "60"])
-        second = subprocess.Popen(["sleep", "60"])
-        expected = [follow.agent_run(first.pid), follow.agent_run(second.pid)]
+        # and the attach to it is not a probe restart. A probe that ended
+        # while its run went on is a gap, whatever run comes next.
+        first, second, third = (subprocess.Popen(["sleep", "60"]) for _ in range(3))
+        expected = [follow.agent_run(p.pid) for p in (first, second, third)]
         pid_file = self.dir / "pid"
         pid_file.write_text(f"{first.pid}\n")
         docker = self.dir / "docker"
@@ -558,27 +570,42 @@ class WiringTest(unittest.TestCase):
             env={**self.env, "RAIL_DOCKER": str(docker)}, stderr=subprocess.PIPE, text=True)
         try:
             self.assertTrue(self.wait_for(lambda: output.exists() and '"kind":"start"' in output.read_text()))
-            pid_file.write_text(f"{second.pid}\n")  # the agent restarted
+            first.kill()  # the agent restarted: its old run is gone
+            first.wait()
+            pid_file.write_text(f"{second.pid}\n")
             self.assertTrue(self.wait_for(lambda: output.read_text().count('"kind":"start"') >= 2))
-            pid_file.write_text(f"{first.pid}\n")  # and again, to another run
+            # The probe stopped while `second` still runs (here: the watcher
+            # saw another PID, as after Docker stopped answering), so the
+            # attach to `third` follows a gap.
+            pid_file.write_text(f"{third.pid}\n")
             self.assertTrue(self.wait_for(lambda: output.read_text().count('"kind":"start"') >= 3))
         finally:
             supervisor.send_signal(signal.SIGTERM)
             supervisor.communicate(timeout=20)
-            for process in (first, second):
+            for process in (first, second, third):
                 process.kill()
                 process.wait()
         lines = output.read_text().splitlines()
-        starts = [json.loads(line) for line in lines if line.startswith('{"kind":"start"')]
-        runs = [start["agent_run"] for start in starts[:3]]
-        self.assertIsNotNone(expected[0])
-        self.assertNotEqual(expected[0], expected[1])
-        self.assertEqual(runs, [expected[0], expected[1], expected[0]])
+        starts = [json.loads(line) for line in lines if line.startswith('{"kind":"start"')][:3]
+        self.assertTrue(all(expected), expected)
+        self.assertEqual(len(set(expected)), 3)
+        self.assertEqual([start["agent_run"] for start in starts], expected)
+        self.assertEqual([start.get("after_gap") for start in starts], [None, None, True])
         summary = scanner.summarize_file_access(lines)
-        # Each start names another run than the one before it: no gap.
-        # (A probe restart on the same run is test_agent_identity's.)
         self.assertEqual((summary["restarted"], summary["restarts"], summary["agent_restarts"]),
-                         (False, 0, 2))
+                         (True, 1, 1))
+
+    def test_a_start_tag_keeps_kind_first_and_closes_the_gap(self):
+        gap = follow.Gap()
+        gap.open = True
+        start = b'{"kind":"start","time":"t","every":5}\n'
+        out = list(follow.tag_starts([start, start, b'{"kind":"alive"}\n'], "b:1:2", gap))
+        self.assertTrue(out[0].startswith(b'{"kind":"start"'))
+        self.assertEqual([json.loads(line).get("after_gap") for line in out[:2]], [True, None])
+        self.assertEqual(json.loads(out[1])["agent_run"], "b:1:2")
+        self.assertEqual(out[2], b'{"kind":"alive"}\n')
+        self.assertEqual(list(follow.tag_starts([start], None)), [start])
+        self.assertIsNone(follow.agent_run(2 ** 22 + 12345))  # no such process
 
     def test_tracefs_is_mounted_only_when_missing_and_a_refusal_is_logged(self):
         # A privileged container has no tracefs, and the process probe's

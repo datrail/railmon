@@ -102,8 +102,12 @@ TRACKED = 65536
 LINE_MAX = 256 * 1024
 # How long the stream may sit quiet before a held batch is written.
 IDLE_SECONDS = 0.5
-# Losses logged per cause before the rest of that cause go unlogged.
+# Losses logged per cause before the rest of that cause go unlogged, and
+# the causes counted apart (past it, a new one counts as "other").
 LOSS_LOGGED = 10
+LOSS_CAUSES = 64
+# How much of a runner diagnostic's reason a cause quotes.
+REASON_MAX = 80
 # Probe events written with their pid, so a runner diagnostic that refused
 # one for a missing pid cannot be read as a record from pid 0 (which the
 # scanner counts as outside the namespace).
@@ -220,8 +224,12 @@ class Adapter:
                 # A runner parse error: the line it refused, if it says.
                 refused = data.get("raw")
                 reason = data.get("reason")
-                why = f"AgentSight's runner refused a line ({reason})" if isinstance(reason, str) \
-                    else "AgentSight's runner refused a line"
+                if isinstance(reason, str):
+                    # Printable only, and short: it reaches the log.
+                    shown = "".join(c if c.isprintable() else "?" for c in reason[:REASON_MAX])
+                    why = f"AgentSight's runner refused a line ({shown})"
+                else:
+                    why = "AgentSight's runner refused a line"
                 if not isinstance(refused, dict) or not isinstance(refused.get("event"), str):
                     return [*self.flush(), self._lost(1, why)]
                 if refused["event"] in NEEDS_PID and _int(refused.get("pid")) is None:
@@ -277,6 +285,8 @@ class Adapter:
 
     def _lost(self, count: int, cause: str) -> dict[str, Any]:
         """A gap record, with its cause logged (DR-320)."""
+        if cause not in self.losses and len(self.losses) >= LOSS_CAUSES:
+            cause = "other causes"
         seen = self.losses[cause] = self.losses.get(cause, 0) + 1
         if self.log is not None and seen <= LOSS_LOGGED:
             more = "; further losses from this cause are not logged" if seen == LOSS_LOGGED else ""

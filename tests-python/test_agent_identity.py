@@ -1537,6 +1537,12 @@ class ListenersTest(unittest.TestCase):
         # A gap after an agent restart still shows.
         mixed = self.summary_at(now, start % run("a:1"), start % run("b:1"), start % run("b:1"))
         self.assertEqual((mixed["restarts"], mixed["agent_restarts"]), (1, 1))
+        # The probe ended while the run went on: a gap, whatever run is next.
+        killed = self.summary_at(now, start % run("a:1"), start % (run("b:1") + ',"after_gap":true'))
+        self.assertEqual((killed["restarted"], killed["restarts"], killed["agent_restarts"]), (True, 1, 0))
+        # A run named again was alive, unseen, while another was watched.
+        back = self.summary_at(now, start % run("a:1"), start % run("b:1"), start % run("a:1"))
+        self.assertEqual((back["restarts"], back["agent_restarts"]), (1, 1))
 
     def test_a_heartbeat_from_the_future_is_stale_too(self):
         # A clock stepped back would otherwise keep it "fresh" for as long.

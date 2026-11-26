@@ -25,10 +25,15 @@ bundle says so instead of reading as "no new listeners".
 That holds only while the agent kept running across the gap. Each start
 record also carries `agent_run`, which names the agent's run: the host's
 boot ID, PID and start time of the container's init process (DR-320). After
-a reboot, `docker restart` or a recreated container it differs, the new
-attach covers the new run from its start as the first attach did, and the
-scanner does not count it as a restart. Unreadable, it is left out, and the
-start counts as before.
+a reboot, `docker restart` or a recreated container it differs, and the
+scanner does not count it as a restart: the new attach covers the new run
+as the first attach covered the first (what the agent does before the
+probe attaches is unseen in both, and the snapshot adds the listeners
+still open). Unreadable, it is left out, and the start counts as before.
+When the probe ended while the agent's run went on (the agent killed it,
+or it failed and failed to come back), the gap is real even if the agent
+then restarts, so the next start also says `"after_gap": true` and counts
+as a restart whatever its run.
 
 The same supervisor runs the probe for `railmon files` (DR-154), written in
 filesnoop's lines: `--command files` picks the mode and `--output` the file
@@ -186,24 +191,41 @@ def agent_run(pid: int, proc: str | None = None) -> str | None:
         with open(f"{proc}/{pid}/stat", "rb") as f:
             stat = f.read()
         # The comm in parentheses may hold spaces and ')': split after the last.
-        started = int(stat[stat.rindex(b")") + 2:].split()[19])
+        fields = stat[stat.rindex(b")") + 2:].split()
+        state, started = fields[0], int(fields[19])
     except (OSError, ValueError, IndexError):
         return None
+    if state in (b"Z", b"X"):
+        return None  # it has exited, only not been reaped yet
     return f"{boot}:{pid}:{started}" if boot else None
 
 
-def tag_starts(stream, run: str | None):
+class Gap:
+    """Whether the probe ended while the agent's run went on, so the next
+    start record says `"after_gap": true` (DR-320). Cleared once a start
+    record has said so."""
+
+    def __init__(self) -> None:
+        self.open = False
+
+
+def tag_starts(stream, run: str | None, gap: Gap | None = None):
     """Pass the probe's lines on, with `agent_run` added to each start
-    record, `kind` still first so the prefix checks below find it. With
-    no run, or a start line that isn't a JSON object, the line is as is."""
+    record, and `"after_gap": true` while `gap` is open; `kind` stays first
+    so the prefix checks below find it. A start line that isn't a JSON
+    object is passed as is."""
     for line in stream:
-        if run is not None and line.startswith(b'{"kind":"start"'):
+        if (run is not None or (gap is not None and gap.open)) and line.startswith(b'{"kind":"start"'):
             try:
                 record = json.loads(line)
             except ValueError:
                 record = None
             if isinstance(record, dict):
-                record["agent_run"] = run
+                if run is not None:
+                    record["agent_run"] = run
+                if gap is not None and gap.open:
+                    record["after_gap"] = True
+                    gap.open = False
                 line = json.dumps(record, separators=(",", ":")).encode() + b"\n"
         yield line
 
@@ -546,6 +568,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
 
     waiting = preflight.Waiting(log)
+    gap = Gap()
     while not stopping:
         pid = container_pid(docker, args.container, log)
         if not pid:
@@ -585,7 +608,7 @@ def main() -> int:
             adapter = adapter_module.Adapter(mode, proc=PROC, log=log)
             on_snapshot = adapter.note_listeners
             stream = adapter_module.adapt_stream(child.stdout, adapter)
-        stream = tag_starts(stream, run)
+        stream = tag_starts(stream, run, gap)
         if agentsight and not args.snapshot_listeners:
             stream = announce_attach(stream, probe_name)
         if args.snapshot_listeners:
@@ -598,6 +621,13 @@ def main() -> int:
                 sink.flush()
         code = child.wait()
         child = None
+        # The probe is gone. If the agent's run is still alive (the agent
+        # killed the probe, the probe failed, or Docker stopped answering),
+        # what it does until the next attach is unseen: the next start says
+        # so, even when the agent has restarted by then. A run that ended
+        # (the watcher saw a new PID, or listensnoop died with it) is no gap.
+        if not stopping and (run is None or agent_run(pid) == run):
+            gap.open = True
         if not stopping:
             log(f"{probe_name} exited ({code}); reattaching")
             time.sleep(POLL_SECONDS)
