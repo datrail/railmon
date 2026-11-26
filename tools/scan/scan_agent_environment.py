@@ -1168,14 +1168,21 @@ def mcp_inventory_entries(servers: Any, source: str) -> list[dict[str, Any]]:
     for name, spec in servers.items():
         if not isinstance(spec, dict):
             continue
+        # An operator-chosen nickname, but this file is persisted and shipped
+        # to a scorer the same as a skill's name/description, so it gets the
+        # treatment `normalize_skill` gives those and a skill's `server`:
+        # redacted, then stripped. Spelled alike, a declared server and its
+        # skills join (Rail Center's capture plan joins them, DR-295); a key
+        # that is empty once stripped names nothing and is left out, as a
+        # skill with no name is.
+        declared = first_nonempty(redact_text(str(name)))
+        if not declared:
+            continue
         url = spec.get("url")
         command = spec.get("command")
         inventory.append(
             {
-                # An operator-chosen nickname, but this file is persisted and
-                # shipped to a scorer the same as a skill's name/description —
-                # same redact_text() treatment `normalize_skill` gives those.
-                "name": redact_text(str(name)),
+                "name": declared,
                 # The executable, not its arguments: an MCP server is routinely
                 # launched with `--token …` on the command line, and this file is
                 # persisted and shipped to a scorer.
@@ -1417,7 +1424,10 @@ def mcp_server_skills(
             result.append(
                 {
                     "name": tool_name,
-                    "description": description or f"tool declared by {name} ({source_label})",
+                    # Not the config's path: Rail Center keys its cache and
+                    # its model prompt on the description, so the same tool
+                    # read from two paths would be two (DR-295).
+                    "description": description or f"tool declared by {name}",
                     "destination_endpoints": endpoints,
                     "source_type": "mcp_config",
                     "entry": "tool",
