@@ -113,7 +113,7 @@ impl ObservedSummary {
             let (Some(host), Some(count)) = (
                 row.get("host")
                     .and_then(Value::as_str)
-                    .and_then(normalize_host),
+                    .and_then(stored_host),
                 row.get("count").and_then(Value::as_u64),
             ) else {
                 return false;
@@ -280,6 +280,16 @@ fn normalize_host(authority: &str) -> Option<String> {
     } else {
         (authority.split(':').next().unwrap_or(""), false)
     };
+    host_name(host, v6)
+}
+
+/// A host as this file stores it (an IPv6 address without its brackets),
+/// read back at start.
+fn stored_host(host: &str) -> Option<String> {
+    host_name(host, host.contains(':'))
+}
+
+fn host_name(host: &str, v6: bool) -> Option<String> {
     let host = host.to_ascii_lowercase();
     let valid = !host.is_empty()
         && host != "unknown"
@@ -386,12 +396,19 @@ mod tests {
         .unwrap();
         let mut summary = ObservedSummary::open(&path, Duration::ZERO);
         summary.note(&legacy("api.example.com", Some(200)));
+        summary.note(&legacy("[::1]:8080", Some(200)));
         summary.finish();
+        // An IPv6 host, stored without its brackets, reads back too.
+        let mut again = ObservedSummary::open(&path, Duration::ZERO);
+        again.finish();
         let doc = read(&path);
         assert_eq!(doc["started_at"], "2026-11-20T08:00:00Z");
         assert_eq!(
             doc["network_targets"],
-            json!([{"host": "api.example.com", "count": 5, "error_count": 4}])
+            json!([
+                {"host": "api.example.com", "count": 5, "error_count": 4},
+                {"host": "::1", "count": 1, "error_count": 0},
+            ])
         );
         assert_eq!(doc["uncounted_requests"], 2);
     }
