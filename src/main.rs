@@ -412,8 +412,7 @@ async fn main() -> Result<()> {
     });
     if let Some(path) = summary_file {
         if matches!(args.mode, Mode::Http) {
-            let summary = observed::ObservedSummary::open(&path, flush_interval)
-                .context("opening the destinations summary")?;
+            let summary = observed::ObservedSummary::open(&path, flush_interval);
             log::info!("destinations summary: {}", path.display());
             sink = sink.with_observed(summary);
         } else {
@@ -422,7 +421,9 @@ async fn main() -> Result<()> {
     }
 
     if sink.is_silent() {
-        log::warn!("no --webhook and no --output: interactions will be counted but not stored");
+        log::warn!(
+            "no --webhook, --output or --summary-file: interactions will be counted but not stored"
+        );
     }
 
     if let Some(manifest) = target_manifest.as_ref() {

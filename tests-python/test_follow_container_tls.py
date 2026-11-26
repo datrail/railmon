@@ -145,8 +145,6 @@ class ResolverTest(unittest.TestCase):
             self.assertIn(flag, out.stderr)
 
 
-@unittest.skipUnless(Path("/proc/self/maps").exists() and os.geteuid() == 0,
-                     "needs Linux /proc, and root to read /proc/<pid>/map_files")
 class SummaryFileTest(unittest.TestCase):
     """The destinations summary is one agent's, like the listen and files
     probes' output (DR-296)."""
@@ -173,6 +171,8 @@ class SummaryFileTest(unittest.TestCase):
             self.assertEqual(Path(path + ".previous").read_text(), "{}")
 
 
+@unittest.skipUnless(Path("/proc/self/maps").exists() and os.geteuid() == 0,
+                     "needs Linux /proc, and root to read /proc/<pid>/map_files")
 class FollowTest(unittest.TestCase):
     """The supervisor against real processes: a session leader standing in for
     the container's init, a fake `docker` naming it, and a fake collector that

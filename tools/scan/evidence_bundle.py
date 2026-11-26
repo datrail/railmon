@@ -691,7 +691,8 @@ def _source(attempted: bool, reached: bool, reason: str, window_seconds: int | N
     """One `inputs_attempted` entry, with `reached` and a `reason` exactly
     where the schema wants them: `reached` on anything attempted, and the
     reason whenever the source was not attempted or not reached.
-    `window_seconds`, for the runtime source only, is how long it watched."""
+    `window_seconds`, for the runtime source only, is the length of the
+    window its observation covers."""
     entry: dict[str, Any] = {"attempted": attempted}
     if attempted:
         entry["reached"] = reached
@@ -1176,7 +1177,7 @@ def build_evidence_bundle(
         attributes["observed_destinations"] = _partial(
             reach.get("destinations") or [], "observed", "SIZE_CAP_EXCEEDED", authored_by="none",
             method="railmon collect's destinations summary: hosts and counts, no paths",
-            note=f"{uncounted} request(s) went to hosts past the summary's cap and are not listed",
+            note="requests went to hosts past the summary's cap of 1024, and those hosts are not listed",
         )
     elif reach:
         attributes["observed_destinations"] = _answered(
@@ -2113,11 +2114,14 @@ def _without_counts(node: Any) -> Any:
                 for name, source in value.items()
             }
         elif key == "observed_destinations" and isinstance(value, dict) and isinstance(value.get("value"), list):
-            value = {**value, "value": [
+            # The list is ordered by count, so the view is sorted as well:
+            # two hosts trading places is no change either.
+            items = [
                 {k: v for k, v in item.items() if k not in _COUNTED_DESTINATION_KEYS}
                 if isinstance(item, dict) else item
                 for item in value["value"]
-            ]}
+            ]
+            value = {**value, "value": sorted(items, key=lambda item: json.dumps(item, sort_keys=True))}
         else:
             value = _without_counts(value)
         view[key] = value

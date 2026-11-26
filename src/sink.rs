@@ -192,7 +192,7 @@ impl Sink {
     /// True when neither destination is configured — the caller warns rather
     /// than discovering later that a long capture went nowhere.
     pub fn is_silent(&self) -> bool {
-        self.file.is_none() && self.webhook.is_none()
+        self.file.is_none() && self.webhook.is_none() && self.observed.is_none()
     }
 
     pub async fn emit(&mut self, event: &Value) -> Result<()> {
@@ -229,6 +229,11 @@ impl Sink {
     }
 
     pub async fn shutdown(&mut self) {
+        // First, since it waits on no receiver: a webhook slow to answer can
+        // use up the stop grace.
+        if let Some(summary) = self.observed.as_mut() {
+            summary.finish();
+        }
         if let Some(hook) = self.webhook.as_mut() {
             hook.flush(&self.session_id, &self.capture_start).await;
             if hook.failures > 0 {
@@ -237,9 +242,6 @@ impl Sink {
         }
         if let Some(file) = self.file.as_mut() {
             let _ = file.flush();
-        }
-        if let Some(summary) = self.observed.as_mut() {
-            summary.finish();
         }
     }
 

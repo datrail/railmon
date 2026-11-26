@@ -16,7 +16,7 @@
 //! The file covers everything since `started_at`, the first time this file
 //! was written, across collector restarts: it is read back at start. The
 //! scanner reports `generated_at - started_at` as the runtime source's
-//! `window_seconds`.
+//! `window_seconds`, so time the collector was stopped is inside the window.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -56,8 +56,10 @@ pub struct ObservedSummary {
 impl ObservedSummary {
     /// Reads back the summary at `path` if it is one of ours, so the window
     /// goes on from its `started_at`, and writes it once, so the scanner
-    /// sees that collection runs before the first request.
-    pub fn open(path: &Path, interval: Duration) -> Result<Self> {
+    /// sees that collection runs before the first request. A file that can't
+    /// be read or written is logged, and capture goes on without it until a
+    /// later write succeeds: the summary is one output among the others.
+    pub fn open(path: &Path, interval: Duration) -> Self {
         let mut summary = Self {
             path: path.to_path_buf(),
             started_at: now(),
@@ -82,14 +84,13 @@ impl ObservedSummary {
                 ),
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("reading {}", path.display()));
-            }
+            Err(error) => log::warn!(
+                "reading destinations summary {}: {error}; starting it over",
+                path.display()
+            ),
         }
+        summary.write_logged();
         summary
-            .write()
-            .with_context(|| format!("writing {}", path.display()))?;
-        Ok(summary)
     }
 
     /// Takes `previous`'s window if it is a summary of ours.
@@ -225,8 +226,19 @@ impl ObservedSummary {
         let mut tmp = self.path.clone().into_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
+        // Removed first and then created exclusively, so a link planted at
+        // the temporary name is replaced rather than written through.
+        match std::fs::remove_file(&tmp) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("removing {}", tmp.display()));
+            }
+            _ => {}
+        }
         {
-            let mut file = std::fs::File::create(&tmp)
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
                 .with_context(|| format!("creating {}", tmp.display()))?;
             file.write_all(serde_json::to_string(&self.document())?.as_bytes())?;
             file.write_all(b"\n")?;
@@ -251,32 +263,30 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// The host of an authority (`host`, `host:port`, `[v6]:port`), lowercased
-/// and without a trailing dot, as the scanner's `url_host` spells a declared
-/// one, so `undeclared_destinations` compares like with like. An IPv6
-/// address loses its brackets, as `urlsplit().hostname` does. `None` for
-/// what isn't a host: empty, the collector's `unknown`, or text with
-/// characters no host name or address has.
+/// The host of an authority (`host`, `host:port`, `[v6]:port`), spelled as
+/// the scanner's `url_host` (`urlsplit("//" + authority).hostname`) spells a
+/// declared one, so `undeclared_destinations` compares like with like:
+/// lowercased, cut at the first `:` (an IPv6 address only in brackets, which
+/// it loses), and a trailing dot kept. `None` for what isn't a host: empty,
+/// the collector's `unknown`, or text with characters no host name or
+/// address has.
 fn normalize_host(authority: &str) -> Option<String> {
     let authority = authority.trim();
     let authority = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once(']')?.0
+    let (host, v6) = if let Some(rest) = authority.strip_prefix('[') {
+        (rest.split_once(']')?.0, true)
     } else {
-        match authority.rsplit_once(':') {
-            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-            _ => authority,
-        }
+        (authority.split(':').next().unwrap_or(""), false)
     };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
     let valid = !host.is_empty()
         && host != "unknown"
         && host.len() <= MAX_HOST_LEN
         && host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') || (v6 && c == ':'));
     valid.then_some(host)
 }
 
@@ -297,22 +307,21 @@ mod tests {
 
     #[test]
     fn hosts_are_spelled_as_the_scanner_spells_a_declared_one() {
-        assert_eq!(
-            normalize_host("API.Example.com:443").as_deref(),
-            Some("api.example.com")
-        );
-        assert_eq!(
-            normalize_host("api.example.com.").as_deref(),
-            Some("api.example.com")
-        );
-        assert_eq!(normalize_host("[::1]:8080").as_deref(), Some("::1"));
-        assert_eq!(
-            normalize_host("user@host.test").as_deref(),
-            Some("host.test")
-        );
-        assert_eq!(normalize_host("unknown"), None);
-        assert_eq!(normalize_host(""), None);
-        assert_eq!(normalize_host("evil.test/x"), None);
+        // Each as Python's urlsplit("//" + it).hostname reads it.
+        for (authority, host) in [
+            ("API.Example.com:443", Some("api.example.com")),
+            ("api.example.com.", Some("api.example.com.")),
+            ("api.example.com:abc", Some("api.example.com")),
+            ("a:b:c", Some("a")),
+            ("[::1]:8080", Some("::1")),
+            ("::1", None),
+            ("user@host.test", Some("host.test")),
+            ("unknown", None),
+            ("", None),
+            ("evil.test/x", None),
+        ] {
+            assert_eq!(normalize_host(authority).as_deref(), host, "{authority}");
+        }
         assert_eq!(normalize_host(&"a".repeat(254)), None);
     }
 
@@ -320,7 +329,7 @@ mod tests {
     fn a_fresh_summary_is_written_at_once_and_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
-        ObservedSummary::open(&path, Duration::ZERO).unwrap();
+        ObservedSummary::open(&path, Duration::ZERO);
         let doc = read(&path);
         assert_eq!(doc["schema_version"], SCHEMA_VERSION);
         assert_eq!(doc["network_targets"], json!([]));
@@ -332,7 +341,7 @@ mod tests {
     fn counts_each_host_and_its_failures_in_both_formats() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
-        let mut summary = ObservedSummary::open(&path, Duration::ZERO).unwrap();
+        let mut summary = ObservedSummary::open(&path, Duration::ZERO);
         summary.note(&legacy("api.example.com", Some(200)));
         summary.note(&legacy("api.example.com:443", Some(500)));
         summary.note(&legacy("api.example.com", None));
@@ -375,7 +384,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let mut summary = ObservedSummary::open(&path, Duration::ZERO).unwrap();
+        let mut summary = ObservedSummary::open(&path, Duration::ZERO);
         summary.note(&legacy("api.example.com", Some(200)));
         summary.finish();
         let doc = read(&path);
@@ -397,7 +406,7 @@ mod tests {
             json!({"schema_version": SCHEMA_VERSION, "started_at": "yesterday", "network_targets": []}).to_string(),
         ] {
             std::fs::write(&path, content).unwrap();
-            ObservedSummary::open(&path, Duration::ZERO).unwrap();
+            ObservedSummary::open(&path, Duration::ZERO);
             let doc = read(&path);
             assert_eq!(doc["network_targets"], json!([]));
             assert_ne!(doc["started_at"], "2026-11-20T08:00:00Z");
@@ -408,7 +417,7 @@ mod tests {
     fn hosts_past_the_cap_are_counted_not_kept() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
-        let mut summary = ObservedSummary::open(&path, Duration::ZERO).unwrap();
+        let mut summary = ObservedSummary::open(&path, Duration::ZERO);
         for i in 0..MAX_HOSTS + 3 {
             summary.note(&legacy(&format!("h{i}.test"), Some(200)));
         }
@@ -424,10 +433,35 @@ mod tests {
     }
 
     #[test]
+    fn a_link_at_the_temporary_name_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.json");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("observed.json.tmp")).unwrap();
+        ObservedSummary::open(&path, Duration::ZERO);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(read(&path)["schema_version"], SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_summary_that_cannot_be_written_does_not_stop_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "").unwrap();
+        // Its parent is a file, so no write can succeed.
+        let path = dir.path().join("file/observed.json");
+        let mut summary = ObservedSummary::open(&path, Duration::ZERO);
+        summary.note(&legacy("api.example.com", Some(200)));
+        summary.write_if_due();
+        summary.finish();
+        assert!(summary.dirty);
+    }
+
+    #[test]
     fn writes_wait_for_the_interval() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.json");
-        let mut summary = ObservedSummary::open(&path, Duration::from_secs(3600)).unwrap();
+        let mut summary = ObservedSummary::open(&path, Duration::from_secs(3600));
         summary.note(&legacy("api.example.com", Some(200)));
         summary.write_if_due();
         assert_eq!(read(&path)["network_targets"], json!([]));

@@ -1098,7 +1098,10 @@ class ObservedDestinationsBundleTest(unittest.TestCase):
     def test_hosts_past_the_summarys_cap_make_the_list_partial(self):
         field = self.collected(uncounted_requests=7)["attributes"]["observed_destinations"]
         self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
-        self.assertIn("7 request(s)", field["note"])
+        self.assertIn("past the summary's cap", field["note"])
+        # The note carries no count, so a growing one is no new bundle.
+        self.assertEqual(evidence_bundle.content_fingerprint(self.collected(uncounted_requests=7)),
+                         evidence_bundle.content_fingerprint(self.collected(uncounted_requests=8)))
 
     def test_a_window_that_cannot_be_read_is_left_out(self):
         for changes in ({"started_at": "yesterday"}, {"generated_at": None},
@@ -1115,6 +1118,13 @@ class ObservedDestinationsBundleTest(unittest.TestCase):
         ])
         self.assertNotEqual(first["inputs_attempted"], later["inputs_attempted"])
         self.assertEqual(evidence_bundle.content_fingerprint(first), evidence_bundle.content_fingerprint(later))
+        # Ordered by count, the two hosts trade places: still no change.
+        swapped = self.collected(network_targets=[
+            {"host": "api.example.test", "count": 5, "error_count": 1},
+            {"host": "evil.test", "count": 9, "error_count": 0},
+        ])
+        self.assertEqual(swapped["attributes"]["observed_destinations"]["value"][0]["host"], "evil.test")
+        self.assertEqual(evidence_bundle.content_fingerprint(first), evidence_bundle.content_fingerprint(swapped))
         new_host = self.collected(network_targets=self.SUMMARY["network_targets"] + [
             {"host": "third.test", "count": 1, "error_count": 0}])
         self.assertNotEqual(evidence_bundle.content_fingerprint(first), evidence_bundle.content_fingerprint(new_host))
