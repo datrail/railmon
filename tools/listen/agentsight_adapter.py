@@ -42,8 +42,15 @@ listen`) and filesnoop (`--mode files`), so `scan --listen-file` and `scan
   or access, so it is an open with no path, which the scanner counts as
   unnamed: a gap, never a file it invents;
 - losses: FILE_OPEN_LOST (files) and AGG_MAP_OVERFLOW (listen; the network
-  summaries live in that map) become `{"kind":"lost"}`, as does a runner
-  parse error or an unreadable event line in either mode.
+  summaries live in that map) become `{"kind":"lost"}`, as does an
+  unreadable event line in either mode. A runner parse error
+  (`runner_parse_error`) carries the probe line it refused as `raw`: that
+  line is read as if it had come alone, so it is lost only if it is an
+  event the adapter cannot write (a file open or a listener with no pid),
+  and a refused liveness or warning line drops nothing (DR-320). One that
+  carries no event is lost. Each loss's cause goes to `log` (stderr under
+  `railmon listen`), so services.log names it; the first LOSS_LOGGED of
+  each cause are logged, then one line that the rest are not.
 
 AgentSight prints its network summaries in batches, one map flush at a
 time, in hash order, so a listener can come before the bind that asked for
@@ -95,6 +102,12 @@ TRACKED = 65536
 LINE_MAX = 256 * 1024
 # How long the stream may sit quiet before a held batch is written.
 IDLE_SECONDS = 0.5
+# Losses logged per cause before the rest of that cause go unlogged.
+LOSS_LOGGED = 10
+# Probe events written with their pid, so a runner diagnostic that refused
+# one for a missing pid cannot be read as a record from pid 0 (which the
+# scanner counts as outside the namespace).
+NEEDS_PID = {"FILE_OPEN"}
 
 
 def _bounded_set(store: OrderedDict, key: Any, value: Any = True) -> None:
@@ -161,10 +174,13 @@ class Adapter:
     filesnoop's (`files`) records. `feed` takes a line and returns the
     records it completes; `flush` ends the current network batch."""
 
-    def __init__(self, mode: str, proc: str | None = None) -> None:
+    def __init__(self, mode: str, proc: str | None = None, log=None) -> None:
         if mode not in ("listen", "files"):
             raise ValueError(f"mode must be listen or files, not {mode!r}")
         self.mode = mode
+        # Where each loss's cause is told (DR-320); None tells nobody.
+        self.log = log
+        self.losses: dict[str, int] = {}
         # The host's /proc, so a listener or peer is named for its process,
         # not the thread that acted (see _process_name). Only for a caller in
         # the host's PID namespace, as AgentSight's pids are the host's:
@@ -189,20 +205,30 @@ class Adapter:
         if not line.startswith(b"{"):
             return []  # blank, or the runner's banner text
         if len(line) > LINE_MAX:
-            return [*self.flush(), self._lost(1)]
+            return [*self.flush(), self._lost(1, f"a line longer than {LINE_MAX} bytes")]
         try:
             record = json.loads(line.decode("utf-8", "surrogateescape"), strict=False)
         except ValueError:
-            return [*self.flush(), self._lost(1)]
+            return [*self.flush(), self._lost(1, "a line that is not JSON")]
         if not isinstance(record, dict):
-            return [*self.flush(), self._lost(1)]
+            return [*self.flush(), self._lost(1, "a JSON line that is not an object")]
         if "event" not in record and isinstance(record.get("data"), dict):
             data = record["data"]
             if record.get("source") != "process":
-                # A runner diagnostic: a parse error is an event it dropped.
-                failed = "parse_error_count" in data or data.get("reason")
-                return [*self.flush(), self._lost(1)] if failed else []
-            record = data
+                if not ("parse_error_count" in data or data.get("reason")):
+                    return []  # a diagnostic that refused nothing (CLOCK_SYNC)
+                # A runner parse error: the line it refused, if it says.
+                refused = data.get("raw")
+                reason = data.get("reason")
+                why = f"AgentSight's runner refused a line ({reason})" if isinstance(reason, str) \
+                    else "AgentSight's runner refused a line"
+                if not isinstance(refused, dict) or not isinstance(refused.get("event"), str):
+                    return [*self.flush(), self._lost(1, why)]
+                if refused["event"] in NEEDS_PID and _int(refused.get("pid")) is None:
+                    return [*self.flush(), self._lost(1, f"{why}: a {refused['event']} with no pid")]
+                record = refused
+            else:
+                record = data
         event = record.get("event")
         if event == "SUMMARY":
             self._summary(record)
@@ -215,12 +241,13 @@ class Adapter:
         elif event == "FILE_OPEN_LOST" and self.mode == "files":
             count = _int(record.get("count"))
             if count:
-                out.append(self._lost(count))
+                out.append(self._lost(count, "the probe reported FILE_OPEN_LOST"))
         elif (event == "WARNING" and record.get("type") == "AGG_MAP_OVERFLOW"
               and self.mode == "listen"):
             count = _int(record.get("overflow_count"))
             if count:
-                out.append(self._lost(count))
+                out.append(self._lost(count, "the probe's network summary map overflowed "
+                                      "(AGG_MAP_OVERFLOW)"))
         return out
 
     def flush(self) -> list[dict[str, Any]]:
@@ -248,8 +275,12 @@ class Adapter:
 
     # ── mapping ──────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _lost(count: int) -> dict[str, Any]:
+    def _lost(self, count: int, cause: str) -> dict[str, Any]:
+        """A gap record, with its cause logged (DR-320)."""
+        seen = self.losses[cause] = self.losses.get(cause, 0) + 1
+        if self.log is not None and seen <= LOSS_LOGGED:
+            more = "; further losses from this cause are not logged" if seen == LOSS_LOGGED else ""
+            self.log(f"lost {count} event{'s' if count != 1 else ''}: {cause}{more}")
         return {"kind": "lost", "count": count}
 
     def _liveness(self, record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -316,7 +347,8 @@ class Adapter:
         if (kind == "bind" and protocol not in DATAGRAM_PROTOCOLS) or protocol not in PROTOCOLS:
             return None
         if parsed is None or port is None or not 0 < port <= 65535 or pid is None:
-            return self._lost(1)  # a listener opened that cannot be written
+            # A listener opened that cannot be written.
+            return self._lost(1, f"a {record.get('type')} with no usable address, port or pid")
         start = _int(record.get("process_start_ns"))
         ephemeral = (pid, start, port) not in self.asked
         family, addr = parsed
@@ -329,13 +361,13 @@ class Adapter:
         protocol, port, pid = record.get("protocol"), _int(record.get("port")), _int(record.get("pid"))
         peer = _peer(record.get("peer"))
         if protocol not in PROTOCOLS or port is None or pid is None or peer is None:
-            return self._lost(1)
+            return self._lost(1, "a NET_ACCEPT with no usable protocol, port, pid or peer")
         listener = (self.listeners.get((pid, _int(record.get("process_start_ns")), protocol, port))
                     or self.by_port.get((protocol, port)))
         if listener is None:
             local = _address(record.get("address"))
             if local is None:
-                return self._lost(1)
+                return self._lost(1, "a NET_ACCEPT on a listener not seen, with no local address")
             listener = (local[0], local[1], False)
         family, addr, ephemeral = listener
         return {**self._base(record, "peer"), "protocol": protocol, "family": family,
@@ -503,7 +535,10 @@ def main() -> int:
     # No proc: run directly, this may share the agent's PID namespace
     # (`--pid container:<agent>`), whose /proc doesn't hold the host pids
     # AgentSight writes, so records keep AgentSight's comm.
-    for line in adapt_stream(child.stdout, Adapter(args.mode)):
+    def tell(message: str) -> None:
+        print(f"[agentsight adapter] {message}", file=sys.stderr, flush=True)
+
+    for line in adapt_stream(child.stdout, Adapter(args.mode, log=tell)):
         sink.write(line)
         sink.flush()
     return child.wait()

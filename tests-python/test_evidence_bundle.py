@@ -1111,7 +1111,7 @@ class ObservedListenersBundleTest(unittest.TestCase):
         # transcripts past the file cap in tool_names (RC-530); pack 18 reads
         # image-layer files on layered roots and the interpreter's version, and
         # takes several config paths (RC-549).
-        self.assertEqual(self.bundle(None)["rule_pack_version"], 18)
+        self.assertEqual(self.bundle(None)["rule_pack_version"], 19)
 
     def test_the_method_and_notes_name_the_probe_that_wrote_the_file(self):
         # DR-170: `railmon listen` writes "probe": "agentsight" in its start
@@ -1146,6 +1146,17 @@ class ObservedListenersBundleTest(unittest.TestCase):
                     self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
                     self.assertEqual(field["value"], list(listeners))
                     self.assertIn("may be missing", field["note"])
+
+    def test_an_agent_restart_alone_leaves_the_list_answered(self):
+        # DR-320: three starts, each for a new run of the agent, no gap.
+        rebooted = self.attribute(self.listening([self.LISTENER], starts=3, restarted=False,
+                                                 restarts=0, agent_restarts=2))
+        self.assertEqual(rebooted["status"], "ANSWERED")
+        self.assertNotIn("restarted", rebooted["note"] or "")
+        # A probe gap among them counts only the gap.
+        gap = self.attribute(self.listening([self.LISTENER], starts=3, restarted=True,
+                                            restarts=1, agent_restarts=1))
+        self.assertIn("restarted 1 time ", gap["note"])
 
     def test_a_restarted_or_never_attached_probe_is_a_source_we_cannot_reach(self):
         # A restart is a gap the probe cannot fill (it does not report

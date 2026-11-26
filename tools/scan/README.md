@@ -568,8 +568,10 @@ RailDash's comparison against the locked baseline: a new entry is a change to
 - PARTIAL when the list may be missing a listener. A gap never reads as
   "none". There are two reasons:
   - `NO_SOURCE_ACCESS` covers three cases: the probe restarted (a second
-    `start` record), its heartbeat is more than three intervals old, or it
-    never attached (no `start` record);
+    `start` record for the same run of the agent: one whose `agent_run`
+    differs from the start before it is the agent's own restart, and the
+    attach covers its new run, rule pack 19), its heartbeat is more than
+    three intervals old, or it never attached (no `start` record);
   - `SIZE_CAP_EXCEEDED`: it reported lost events, or more than 256 distinct
     listeners were seen;
 - BLIND without a file.
@@ -1351,6 +1353,16 @@ than `BLIND` and OpenClaw's version appears in `framework_identity`;
 interpreter the agent runs when no `PYTHON_VERSION` or `NODE_VERSION` gives
 it; and an agent whose `scan-config-path` annotation names several paths gets
 the fields on each of its volumes rather than `BLIND`.
+
+Rule pack 19 (DR-320) changes the observed lists for an agent that restarted,
+so a pack-18 baseline is `CONTRACT_MISMATCH` until a pack-19 ASP is locked.
+A `start` record whose `agent_run` differs from the one before it is the
+agent's own restart (a reboot, `docker restart`, a recreated container), not
+a probe gap, so `observed_listeners`, `observed_ingress_peers` and
+`observed_file_access` stay `ANSWERED` across it where pack 18 read them
+`PARTIAL` with "restarted N times". An AgentSight runner diagnostic that
+carries the line it refused is read as that line, so a refused line that
+dropped nothing (a warning, a liveness record) is no longer a lost event.
 
 A self or docker scan reports `http_operations` as `BLIND`,
 `NOT_COLLECTED_BY_PACK`, and probes its MCP servers one after another, with no

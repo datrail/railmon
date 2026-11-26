@@ -2861,10 +2861,20 @@ class _ProbeHealth:
     records: no start record, a restart, or a stale heartbeat (see
     `summarize_listeners`), and which probe wrote it: the newest start
     record's `probe`, else `default`. Shared by the listener and file-open
-    files, whichever probe wrote them."""
+    files, whichever probe wrote them.
+
+    A start after the first is a restart, a gap the agent ran through,
+    unless both it and the start before it (in file order) name the agent's
+    run (`agent_run`, written by `railmon listen`'s supervisor) and the two
+    differ: the agent itself restarted, and this attach covers its new run
+    from the start, as the first one did (DR-320). Those are counted apart,
+    in `agent_restarts`."""
 
     def __init__(self, default: str) -> None:
         self.starts = 0
+        self.restarts = 0
+        self.agent_restarts = 0
+        self.run: str | None = None
         self.every = 0
         self.last_alive: datetime | None = None
         self.last_start: datetime | None = None
@@ -2872,7 +2882,15 @@ class _ProbeHealth:
 
     def beat(self, kind: str, seen: datetime, interval: int, event: dict[str, Any]) -> None:
         if kind == "start":
+            run = event.get("agent_run")
+            run = run if isinstance(run, str) and run else None
+            if self.starts:
+                if run is not None and self.run is not None and run != self.run:
+                    self.agent_restarts += 1
+                else:
+                    self.restarts += 1
             self.starts += 1
+            self.run = run
             if self.last_start is None or seen >= self.last_start:
                 self.last_start = seen
                 named = event.get("probe")
@@ -2885,7 +2903,9 @@ class _ProbeHealth:
         last_alive, every = self.last_alive, self.every
         return {
             "starts": self.starts,
-            "restarted": self.starts > 1,
+            "restarted": self.restarts > 0,
+            "restarts": self.restarts,
+            "agent_restarts": self.agent_restarts,
             "last_alive": last_alive.strftime("%Y-%m-%dT%H:%M:%SZ") if last_alive else None,
             # None when there is no interval to judge by: no -H, or no record.
             "stale": (
@@ -2922,7 +2942,10 @@ def summarize_listeners(lines: Iterable[str], now: datetime | None = None) -> di
       * more than one: it `restarted`, and missed whatever opened while it
         was down (it does not report sockets already listening; `railmon
         listen`'s snapshot at each attach adds those still open, as records
-        with `"snapshot": true`, but not one opened and closed meanwhile);
+        with `"snapshot": true`, but not one opened and closed meanwhile).
+        Not when the start names another run of the agent than the one
+        before it (`agent_run`, DR-320): the agent restarted too, so there
+        was no gap it ran through (see `_ProbeHealth`);
       * the newest start/alive more than HEARTBEAT_GRACE intervals from
         `now`, either way (a clock stepped back too): it is `stale`.
 

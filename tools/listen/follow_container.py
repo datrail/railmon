@@ -22,6 +22,14 @@ record per socket already open to accept traffic, in listensnoop's shape with
 probe was down: a socket opened and closed in the gap is missing, and the
 bundle says so instead of reading as "no new listeners".
 
+That holds only while the agent kept running across the gap. Each start
+record also carries `agent_run`, which names the agent's run: the host's
+boot ID, PID and start time of the container's init process (DR-320). After
+a reboot, `docker restart` or a recreated container it differs, the new
+attach covers the new run from its start as the first attach did, and the
+scanner does not count it as a restart. Unreadable, it is left out, and the
+start counts as before.
+
 The same supervisor runs the probe for `railmon files` (DR-154), written in
 filesnoop's lines: `--command files` picks the mode and `--output` the file
 it appends to (default RAIL_LISTEN_FILE). Its start records are the same, so
@@ -162,6 +170,42 @@ def listening_sockets(pid: int, proc: str = PROC, host_pids: bool = False) -> li
                             "family": "ipv6" if family == socket.AF_INET6 else "ipv4",
                             "addr": addr, "port": port, "ephemeral": False, "snapshot": True})
     return records
+
+
+def agent_run(pid: int, proc: str | None = None) -> str | None:
+    """Which run of the agent `pid` is (DR-320): the host's boot ID, the
+    PID and its start time in clock ticks since boot (/proc/<pid>/stat
+    field 22). A PID and its start time name one process within a boot
+    (two processes can start in the same tick, never under one PID), so a
+    restarted agent, or the same PID after a reboot, never reads as the
+    same run. None when any of them can't be read."""
+    proc = proc or PROC
+    try:
+        with open(f"{proc}/sys/kernel/random/boot_id", encoding="ascii") as f:
+            boot = f.read().strip()
+        with open(f"{proc}/{pid}/stat", "rb") as f:
+            stat = f.read()
+        # The comm in parentheses may hold spaces and ')': split after the last.
+        started = int(stat[stat.rindex(b")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    return f"{boot}:{pid}:{started}" if boot else None
+
+
+def tag_starts(stream, run: str | None):
+    """Pass the probe's lines on, with `agent_run` added to each start
+    record, `kind` still first so the prefix checks below find it. With
+    no run, or a start line that isn't a JSON object, the line is as is."""
+    for line in stream:
+        if run is not None and line.startswith(b'{"kind":"start"'):
+            try:
+                record = json.loads(line)
+            except ValueError:
+                record = None
+            if isinstance(record, dict):
+                record["agent_run"] = run
+                line = json.dumps(record, separators=(",", ":")).encode() + b"\n"
+        yield line
 
 
 def load_container_ref():
@@ -526,10 +570,8 @@ def main() -> int:
             # PIDs are the agent's) but keeps this container's mounts and BPF
             # privilege. nsenter forks for -p, so its child is the one inside.
             command = [nsenter, "-t", str(pid), "-p", "--", listensnoop, *args.listensnoop_args]
-        child = subprocess.Popen(command,
-                                 stdout=subprocess.PIPE
-                                 if agentsight or args.snapshot_listeners or args.distinct_opens
-                                 else sink)
+        run = agent_run(pid)
+        child = subprocess.Popen(command, stdout=subprocess.PIPE)
         # A signal that landed before `child` was set found nothing to stop.
         # (Not a blocked mask around Popen: the child would inherit it, and
         # listensnoop would never see the SIGTERM meant for it.)
@@ -540,16 +582,17 @@ def main() -> int:
         if agentsight:
             threading.Thread(target=watch_container, daemon=True,
                              args=(docker, args.container, pid, child, stop_probe)).start()
-            adapter = adapter_module.Adapter(mode, proc=PROC)
+            adapter = adapter_module.Adapter(mode, proc=PROC, log=log)
             on_snapshot = adapter.note_listeners
             stream = adapter_module.adapt_stream(child.stdout, adapter)
+        stream = tag_starts(stream, run)
         if agentsight and not args.snapshot_listeners:
             stream = announce_attach(stream, probe_name)
         if args.snapshot_listeners:
             copy_with_snapshot(stream, sink, pid, probe_name, on_snapshot, host_pids=agentsight)
         elif args.distinct_opens:
             copy_distinct(stream, sink, seen)
-        elif agentsight:
+        else:
             for line in stream:
                 sink.write(line)
                 sink.flush()
