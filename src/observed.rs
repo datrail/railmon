@@ -108,7 +108,7 @@ impl ObservedSummary {
         let Some(rows) = previous.get("network_targets").and_then(Value::as_array) else {
             return false;
         };
-        let mut targets = BTreeMap::new();
+        let mut targets: BTreeMap<String, Target> = BTreeMap::new();
         for row in rows {
             let (Some(host), Some(count)) = (
                 row.get("host")
@@ -123,7 +123,11 @@ impl ObservedSummary {
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 .min(count);
-            if targets.len() < MAX_HOSTS {
+            // Two stored spellings of one host (`a.` and `a`) add up.
+            if let Some(target) = targets.get_mut(&host) {
+                target.count = target.count.saturating_add(count);
+                target.error_count = target.error_count.saturating_add(error_count);
+            } else if targets.len() < MAX_HOSTS {
                 targets.insert(host, Target { count, error_count });
             }
         }
@@ -267,7 +271,8 @@ fn now() -> String {
 /// the scanner's `url_host` (`urlsplit("//" + authority).hostname`) spells a
 /// declared one, so `undeclared_destinations` compares like with like:
 /// lowercased, cut at the first `:` (an IPv6 address only in brackets, which
-/// it loses), and a trailing dot kept. `None` for what isn't a host: empty,
+/// it loses), and without one trailing dot, as
+/// `schemas/vectors/destination-hosts.json` spells it. `None` for what isn't a host: empty,
 /// the collector's `unknown`, or text with characters no host name or
 /// address has.
 fn normalize_host(authority: &str) -> Option<String> {
@@ -291,13 +296,14 @@ fn stored_host(host: &str) -> Option<String> {
 
 fn host_name(host: &str, v6: bool) -> Option<String> {
     let host = host.to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host);
     let valid = !host.is_empty()
         && host != "unknown"
         && host.len() <= MAX_HOST_LEN
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') || (v6 && c == ':'));
-    valid.then_some(host)
+    valid.then(|| host.to_owned())
 }
 
 #[cfg(test)]
@@ -317,10 +323,12 @@ mod tests {
 
     #[test]
     fn hosts_are_spelled_as_the_scanner_spells_a_declared_one() {
-        // Each as Python's urlsplit("//" + it).hostname reads it.
+        // Each as the scanner's url_host reads it: urlsplit("//" + it).hostname,
+        // without one trailing dot.
         for (authority, host) in [
             ("API.Example.com:443", Some("api.example.com")),
-            ("api.example.com.", Some("api.example.com.")),
+            ("api.example.com.", Some("api.example.com")),
+            (".", None),
             ("api.example.com:abc", Some("api.example.com")),
             ("a:b:c", Some("a")),
             ("[::1]:8080", Some("::1")),
@@ -333,6 +341,26 @@ mod tests {
             assert_eq!(normalize_host(authority).as_deref(), host, "{authority}");
         }
         assert_eq!(normalize_host(&"a".repeat(254)), None);
+    }
+
+    #[test]
+    fn hosts_are_spelled_as_the_shared_vectors_say() {
+        let file: Value =
+            serde_json::from_str(include_str!("../schemas/vectors/destination-hosts.json"))
+                .unwrap();
+        let cases = file["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let (id, authority) = (&case["id"], case["authority"].as_str().unwrap());
+            assert_eq!(
+                normalize_host(authority).as_deref(),
+                case["host"].as_str(),
+                "{id}"
+            );
+            // A host this file stored reads back as itself.
+            let host = case["host"].as_str().unwrap();
+            assert_eq!(stored_host(host).as_deref(), Some(host), "{id} stored");
+        }
     }
 
     #[test]
@@ -411,6 +439,30 @@ mod tests {
             ])
         );
         assert_eq!(doc["uncounted_requests"], 2);
+    }
+
+    #[test]
+    fn two_stored_spellings_of_one_host_add_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.json");
+        std::fs::write(
+            &path,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "started_at": "2026-11-20T08:00:00Z",
+                "network_targets": [
+                    {"host": "api.example.com.", "count": 3, "error_count": 1},
+                    {"host": "api.example.com", "count": 2, "error_count": 0},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        ObservedSummary::open(&path, Duration::ZERO).finish();
+        assert_eq!(
+            read(&path)["network_targets"],
+            json!([{"host": "api.example.com", "count": 5, "error_count": 1}])
+        );
     }
 
     #[test]

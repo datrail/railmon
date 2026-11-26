@@ -2582,9 +2582,21 @@ def url_host(url: str) -> str:
     if not text:
         return ""
     try:
-        return (urlsplit(text if "://" in text else f"//{text}").hostname or "").lower()
+        return destination_host((urlsplit(text if "://" in text else f"//{text}").hostname or "").lower())
     except ValueError:
         return ""
+
+
+def destination_host(host: str) -> str:
+    """A host as a destination is spelled, without one trailing dot.
+
+    `api.example.com.` is the same DNS name as `api.example.com` (RFC 1034
+    §3.1), and a proxy that records the agent's calls drops the dot too, so
+    with it kept a declared host and the same host observed would read as two
+    destinations, and `api.anthropic.com.` as an unknown proxy.
+    `schemas/vectors/destination-hosts.json` holds the spelling.
+    """
+    return host[:-1] if host.endswith(".") else host
 
 
 # A host as an operator writes one: dotted with an alphabetic TLD, or a short
@@ -2770,7 +2782,7 @@ def summarize_observed(snapshot: dict[str, Any], declared_hosts: set[str]) -> di
     destinations = []
     observed_hosts = set()
     for target in snapshot.get("network_targets") or []:
-        host = str(target.get("host") or "").lower()
+        host = destination_host(str(target.get("host") or "").lower())
         if not host:
             continue
         observed_hosts.add(host)
