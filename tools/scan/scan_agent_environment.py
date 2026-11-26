@@ -1227,13 +1227,14 @@ def read_mcp_inventory_from_env(env: dict[str, str]) -> list[dict[str, Any]]:
     (`AGENT_MCP_NAME`/`AGENT_MCP_URL`); without this the file-derived inventory is
     silently empty and a scan reports the agent as having no tools.
     """
-    name = env.get(ENV_MCP_NAME_KEY)
+    # Spelled as mcp_inventory_entries spells a config's key (DR-295).
+    name = first_nonempty(redact_text(env.get(ENV_MCP_NAME_KEY) or ""))
     url = env.get(ENV_MCP_URL_KEY)
     if not name or not url:
         return []
     return [
         {
-            "name": redact_text(name),
+            "name": name,
             "command": None,
             "url": redact_url(url),
             "transport": "http",

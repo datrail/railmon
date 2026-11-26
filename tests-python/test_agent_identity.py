@@ -782,6 +782,10 @@ class McpEnvInventoryTest(unittest.TestCase):
 
     def test_missing_either_var_yields_nothing(self):
         self.assertEqual(scanner.read_mcp_inventory_from_env({"AGENT_MCP_NAME": "delivery"}), [])
+        # DR-295: spelled as a config's key is, and as its skills' server.
+        spaced = {"AGENT_MCP_NAME": " delivery ", "AGENT_MCP_URL": "http://d.example/mcp"}
+        self.assertEqual([e["name"] for e in scanner.read_mcp_inventory_from_env(spaced)], ["delivery"])
+        self.assertEqual(scanner.read_mcp_inventory_from_env({**spaced, "AGENT_MCP_NAME": "  "}), [])
         self.assertEqual(scanner.read_mcp_inventory_from_env({"AGENT_MCP_URL": "http://x:1/mcp"}), [])
         self.assertEqual(scanner.read_mcp_inventory_from_env({}), [])
 
