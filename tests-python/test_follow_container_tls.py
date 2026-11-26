@@ -147,6 +147,32 @@ class ResolverTest(unittest.TestCase):
 
 @unittest.skipUnless(Path("/proc/self/maps").exists() and os.geteuid() == 0,
                      "needs Linux /proc, and root to read /proc/<pid>/map_files")
+class SummaryFileTest(unittest.TestCase):
+    """The destinations summary is one agent's, like the listen and files
+    probes' output (DR-296)."""
+
+    def test_the_flag_wins_over_the_environment(self):
+        os.environ.pop("RAIL_COLLECT_SUMMARY_FILE", None)
+        self.assertIsNone(tls.summary_file(["--mode", "http"]))
+        self.assertEqual(tls.summary_file(["--summary-file", "/a"]), "/a")
+        self.assertEqual(tls.summary_file(["--summary-file=/b"]), "/b")
+        os.environ["RAIL_COLLECT_SUMMARY_FILE"] = "/env"
+        self.addCleanup(os.environ.pop, "RAIL_COLLECT_SUMMARY_FILE", None)
+        self.assertEqual(tls.summary_file(["--mode", "http"]), "/env")
+        self.assertEqual(tls.summary_file(["--summary-file", "/a"]), "/a")
+
+    def test_another_agents_summary_moves_aside(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "observed.json")
+            Path(path).write_text("{}")
+            self.assertIsNone(tls.claim_output(path, "agent-a"))
+            self.assertTrue(os.path.exists(path))
+            self.assertIsNone(tls.claim_output(path, "agent-a"))
+            self.assertIn("moved", tls.claim_output(path, "agent-b"))
+            self.assertFalse(os.path.exists(path))
+            self.assertEqual(Path(path + ".previous").read_text(), "{}")
+
+
 class FollowTest(unittest.TestCase):
     """The supervisor against real processes: a session leader standing in for
     the container's init, a fake `docker` naming it, and a fake collector that

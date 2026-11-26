@@ -14,6 +14,7 @@ mod http1_decode;
 mod http1_guard;
 mod identity;
 mod interaction;
+mod observed;
 mod pipeline;
 mod process_tree;
 mod sink;
@@ -142,6 +143,13 @@ struct Args {
     /// Session id recorded on every interaction. Generated when not given.
     #[arg(long)]
     session_id: Option<String>,
+
+    /// File to keep the destinations summary in: each host requests went to,
+    /// with counts and no paths, rewritten at most every flush interval
+    /// (DR-296). `railmon scan` reads it as RAIL_OBSERVED_FILE. Defaults to
+    /// RAIL_COLLECT_SUMMARY_FILE. HTTP mode only.
+    #[arg(long, value_name = "PATH")]
+    summary_file: Option<PathBuf>,
 }
 
 /// SIGINT or SIGTERM, whichever comes first. Both mean "stop and flush": SIGTERM
@@ -395,6 +403,22 @@ async fn main() -> Result<()> {
              POST /v1/interactions accepts the legacy-http shape and will store \
              these rows unattributed. Use --output-format legacy-http for the webhook."
         );
+    }
+
+    let summary_file = args.summary_file.clone().or_else(|| {
+        std::env::var_os("RAIL_COLLECT_SUMMARY_FILE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(path) = summary_file {
+        if matches!(args.mode, Mode::Http) {
+            let summary = observed::ObservedSummary::open(&path, flush_interval)
+                .context("opening the destinations summary")?;
+            log::info!("destinations summary: {}", path.display());
+            sink = sink.with_observed(summary);
+        } else {
+            log::warn!("--summary-file is for --mode http; raw events are not summarized");
+        }
     }
 
     if sink.is_silent() {
