@@ -1,0 +1,22 @@
+{
+  "description": "How RailMon spells the host of a destination: each case is an authority (a Host header or :authority, or the host and port of a URL) and the host RailMon writes for it in declared_destinations, observed_destinations and undeclared_destinations. The host is in lower case, without its port, without an IPv6 address's brackets, and without one trailing dot. A reader that records calls to a destination, such as railguard's proxy, spells a host this way too, so its records and RailMon's bundle name one host alike. Only authorities every reader accepts are here; what a reader does with a malformed one (an empty or non-numeric port, a user part, a character no host name has) is its own.",
+  "readers": [
+    "tools/scan/scan_agent_environment.py url_host, run by tests-python/test_destination_hosts.py",
+    "src/observed.rs normalize_host, run by its tests"
+  ],
+  "cases": [
+    {"id": "lower-case", "authority": "API.Example.com", "host": "api.example.com"},
+    {"id": "port-dropped", "authority": "api.example.com:8443", "host": "api.example.com"},
+    {"id": "default-port-dropped", "authority": "API.Example.com:443", "host": "api.example.com"},
+    {"id": "trailing-dot-dropped", "authority": "api.example.com.", "host": "api.example.com"},
+    {"id": "trailing-dot-before-port", "authority": "Api.Example.com.:8443", "host": "api.example.com"},
+    {"id": "single-label", "authority": "LocalHost", "host": "localhost"},
+    {"id": "single-label-trailing-dot", "authority": "localhost.:11434", "host": "localhost"},
+    {"id": "underscore", "authority": "my_host.internal", "host": "my_host.internal"},
+    {"id": "ipv4", "authority": "10.0.0.1", "host": "10.0.0.1"},
+    {"id": "ipv4-port", "authority": "127.0.0.1:11434", "host": "127.0.0.1"},
+    {"id": "ipv6-brackets-dropped", "authority": "[::1]", "host": "::1"},
+    {"id": "ipv6-port", "authority": "[::1]:8080", "host": "::1"},
+    {"id": "ipv6-lower-case", "authority": "[2001:DB8::A]:443", "host": "2001:db8::a"}
+  ]
+}
