@@ -151,8 +151,9 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # or NODE_VERSION gives it. And the webhook passes one --config-path per
 # path in the scan-config-path annotation, so fields on an agent's other
 # volumes are read rather than BLIND.
-# Pack 19 (DR-320): a probe start whose agent_run differs from the one
-# before it is the agent's own restart, not a probe gap, so a reboot,
+# Pack 19 (DR-320): a probe start naming a new agent_run after one that
+# named another, without after_gap (the probe ended while the previous run
+# went on), is the agent's own restart, not a probe gap, so a reboot,
 # `docker restart` or recreated container no longer makes
 # observed_listeners, observed_ingress_peers and observed_file_access
 # PARTIAL with "restarted N times". And an AgentSight runner diagnostic

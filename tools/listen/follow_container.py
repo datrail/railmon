@@ -200,6 +200,23 @@ def agent_run(pid: int, proc: str | None = None) -> str | None:
     return f"{boot}:{pid}:{started}" if boot else None
 
 
+# How long a run that still reads as alive when its probe ended gets to
+# show it is exiting: a PID namespace's init reads as running until every
+# process in it is reaped, which for listensnoop under nsenter can come
+# just after the probe's pipe closes.
+EXIT_GRACE_SECONDS = 0.5
+
+
+def still_running(pid: int, run: str, grace: float = EXIT_GRACE_SECONDS) -> bool:
+    """Whether `pid` is still the run `run` once `grace` has passed."""
+    deadline = time.monotonic() + grace
+    while agent_run(pid) == run:
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 class Gap:
     """Whether the probe ended while the agent's run went on, so the next
     start record says `"after_gap": true` (DR-320). Cleared once a start
@@ -626,7 +643,7 @@ def main() -> int:
         # what it does until the next attach is unseen: the next start says
         # so, even when the agent has restarted by then. A run that ended
         # (the watcher saw a new PID, or listensnoop died with it) is no gap.
-        if not stopping and (run is None or agent_run(pid) == run):
+        if not stopping and (run is None or still_running(pid, run)):
             gap.open = True
         if not stopping:
             log(f"{probe_name} exited ({code}); reattaching")

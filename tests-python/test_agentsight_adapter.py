@@ -607,6 +607,19 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(list(follow.tag_starts([start], None)), [start])
         self.assertIsNone(follow.agent_run(2 ** 22 + 12345))  # no such process
 
+    def test_a_run_that_ends_within_the_grace_is_no_gap(self):
+        alive = subprocess.Popen(["sleep", "60"])
+        ending = subprocess.Popen(["sleep", "0.2"])
+        try:
+            runs = follow.agent_run(alive.pid), follow.agent_run(ending.pid)
+            threading.Thread(target=ending.wait, daemon=True).start()  # reaped as it exits
+            self.assertTrue(follow.still_running(alive.pid, runs[0], grace=0.3))
+            self.assertFalse(follow.still_running(ending.pid, runs[1], grace=2))
+        finally:
+            alive.kill()
+            alive.wait()
+            ending.wait()
+
     def test_tracefs_is_mounted_only_when_missing_and_a_refusal_is_logged(self):
         # A privileged container has no tracefs, and the process probe's
         # tracepoints need it (the image job's -ENOENT).
