@@ -13,6 +13,13 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+_Nothing yet. Each PR adds its line here; a release moves them under its
+version below._
+
+## [v0.1.0-m20] - 2026-11-26
+
+**Rule pack 18** (was 17 since v0.1.0-m19). A baseline locked on pack 17 reads `CONTRACT_MISMATCH` until it is re-locked.
+
 ### Added
 
 - gke-scan's cluster reader and its full configuration (RC-550). `railmon gke-scan` now takes `--namespaces` (`RAIL_NAMESPACES`, required: the enrolled namespaces, or `*`), `--label-selector`, `--interval`, `--registry-access`, `--layer-budget`, `--probe-external`, `--data-guardrail-url`, `--sidecar-interval` and `--register-without-sidecar`, each with its variable and default; a missing or unparsable value exits 2 naming it. `KubeClient` lists and watches, retrying 429 and 5xx with backoff. The reader (`tools/scan/gke/central_service/cluster_reader.py`) lists and watches the enrolled namespaces' agent pods, MCP server pods, Services, NetworkPolicies, PersistentVolumeClaims and Namespaces, re-watching when a watch ends and listing again on 410 Gone and every interval, and reports each change with the workloads it affects. A read gke-scan's role refuses (403) is logged and retried each interval while the rest carry on, and a kind that lists but whose watch keeps failing backs off up to a minute. The intake's pod check answers from the watched copy, never waiting on the reader's API reads, and reads the API for a pod the copy doesn't have with the token's UID. The chart passes `RAIL_NAMESPACES` and `RAIL_SIDECAR_INTERVAL_SECONDS`; the list and watch permissions come with RC-557, and until then the reader logs each refused read once and the intake reads the API as before. No change to any bundle.
