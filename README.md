@@ -428,13 +428,14 @@ The ones you are most likely to set:
 | `RAIL_SCAN_INTERVAL_IN_SECONDS` | `scan` (`--interval`) | unset: scan once and exit | Keeps `scan` running and scans again on this interval (3600 if the value is not a number). Set but empty counts as set, so it scans every 3600 seconds. With a RailDash URL, the first scan waits up to 120 s for RailDash to answer (after a reboot both start together). |
 | `RAIL_CENTER_URL` | `scan --register` (`--center-url`), `forward` | none | Rail Center's base URL. `scan --register` sends it the evidence bundle at `/v1/agents/register` (needs a Rail Center that accepts the evidence bundle there). |
 | `RAIL_AUTH_MODE` | collector `--webhook`, `forward`, `scan --register` | `none` | The credential to present: `none`, `bearer` or `gcp`. See above for `RAIL_AUTH_TOKEN`, `RAIL_AUTH_TOKEN_FILE` and `RAIL_AUTH_AUDIENCE`. |
-| `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot summarised into observed reach. |
+| `RAIL_OBSERVED_FILE` | `scan` (`--observed-file`) | none | AgentSight snapshot, or `collect`'s destinations summary, summarised into observed reach. A file not there yet reads as `BLIND`. |
 | `RAIL_LISTEN_FILE` | `scan` (`--listen-file`), `listen` | none | The listener JSON lines (listensnoop's shape): where `listen` appends and `scan` reads. |
 | `RAIL_FILES_FILE` | `scan` (`--files-file`), `files` | none | The file-open JSON lines (filesnoop's shape): where `files` appends and `scan` reads. |
 | `RAIL_LISTEN_SOURCE`, `RAIL_FILES_SOURCE` | `listen`, `files` | `agentsight` | `listensnoop` / `filesnoop` runs your own probe from `LISTENSNOOP_PATH` / `FILESNOOP_PATH` instead; see [The probe behind `listen` and `files`](#the-probe-behind-listen-and-files). |
 | `RAIL_TARGET_MANIFEST` | `scan` (`--target-manifest`) | none | The multi-agent target manifest; see [docs/multi-agent-targets.md](docs/multi-agent-targets.md). |
 | `RAIL_EVIDENCE_BUNDLE_OUTPUT` | `scan` (`--evidence-bundle-output`) | `.rail/railmon/evidence-bundle.json` | Where the evidence bundle is written. |
 | `AGENTSIGHT_PATH` | collector (`--agentsight`) | `SSLSNIFF_PATH`, else `bin/agentsight` if it exists, else `/usr/local/bin/agentsight`; the image sets its own | The AgentSight probe binary. |
+| `RAIL_COLLECT_SUMMARY_FILE` | `collect` (`--summary-file`) | none | Where `collect` keeps its destinations summary for `scan`'s `RAIL_OBSERVED_FILE`: each host it forwarded requests to, with counts, no paths. |
 | `RAIL_COLLECT_CONTAINER` | `collect` | none | Capture one container's agent, or with `openshell:<sandbox>` an OpenShell sandbox's: see [Following a container](#following-a-container). |
 | `RAIL_OPENSHELL_SANDBOX` | `openshell` (`--sandbox`) | the name in `AGENT_CONTAINER=openshell:<sandbox>` | The OpenShell sandbox whose policy and denials `openshell` posts; see [An OpenShell sandbox's policy and denials](#an-openshell-sandboxs-policy-and-denials). |
 | `RAIL_OPENSHELL_INTERVAL` | `openshell` (`--interval`) | `60` | Seconds between polls (5 to 3600). |

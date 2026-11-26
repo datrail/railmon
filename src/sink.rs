@@ -7,6 +7,7 @@
 
 use crate::auth::{Credential, RailDashToken};
 use crate::heartbeat::Heartbeat;
+use crate::observed::ObservedSummary;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::Write;
@@ -25,6 +26,8 @@ pub struct Sink {
     file: Option<std::fs::File>,
     webhook: Option<Webhook>,
     heartbeat: Option<Heartbeat>,
+    /// The destinations summary `railmon scan` reads (DR-296).
+    observed: Option<ObservedSummary>,
     written: u64,
     /// Batch metadata Rail Center requires on the envelope.
     session_id: String,
@@ -96,10 +99,17 @@ impl Sink {
                 raildash_token: None,
             }),
             heartbeat: None,
+            observed: None,
             written: 0,
             session_id: session_id.to_string(),
             capture_start: capture_start.to_string(),
         })
+    }
+
+    /// Counts every interaction emitted into `summary` as well.
+    pub fn with_observed(mut self, summary: ObservedSummary) -> Self {
+        self.observed = Some(summary);
+        self
     }
 
     /// The credential every webhook batch presents (`RAIL_AUTH_MODE`). Without
@@ -182,7 +192,7 @@ impl Sink {
     /// True when neither destination is configured — the caller warns rather
     /// than discovering later that a long capture went nowhere.
     pub fn is_silent(&self) -> bool {
-        self.file.is_none() && self.webhook.is_none()
+        self.file.is_none() && self.webhook.is_none() && self.observed.is_none()
     }
 
     pub async fn emit(&mut self, event: &Value) -> Result<()> {
@@ -193,6 +203,9 @@ impl Sink {
             file.flush()?;
         }
         self.written += 1;
+        if let Some(summary) = self.observed.as_mut() {
+            summary.note(event);
+        }
 
         if let Some(hook) = self.webhook.as_mut() {
             hook.batch.push(event.clone());
@@ -205,6 +218,9 @@ impl Sink {
 
     /// Called on the timer, so a partial batch still leaves on a quiet link.
     pub async fn flush_if_due(&mut self) {
+        if let Some(summary) = self.observed.as_mut() {
+            summary.write_if_due();
+        }
         if let Some(hook) = self.webhook.as_mut() {
             if !hook.batch.is_empty() && hook.last_flush.elapsed() >= hook.flush_interval {
                 hook.flush(&self.session_id, &self.capture_start).await;
@@ -213,6 +229,11 @@ impl Sink {
     }
 
     pub async fn shutdown(&mut self) {
+        // First, since it waits on no receiver: a webhook slow to answer can
+        // use up the stop grace.
+        if let Some(summary) = self.observed.as_mut() {
+            summary.finish();
+        }
         if let Some(hook) = self.webhook.as_mut() {
             hook.flush(&self.session_id, &self.capture_start).await;
             if hook.failures > 0 {

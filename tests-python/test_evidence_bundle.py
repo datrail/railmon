@@ -1059,6 +1059,76 @@ class ObservedDestinationsBundleTest(unittest.TestCase):
         field = self.attributes(scanner.summarize_observed({"summary": {}}, set()))["observed_destinations"]
         self.assertEqual((field["status"], field["value"]), ("ANSWERED", []))
 
+    SUMMARY = {
+        "schema_version": "railmon-observed/1",
+        "source": "railmon collect",
+        "started_at": "2026-11-26T08:00:00Z",
+        "generated_at": "2026-11-26T09:30:00Z",
+        "network_targets": [
+            {"host": "api.example.test", "count": 5, "error_count": 1},
+            {"host": "evil.test", "count": 1, "error_count": 0},
+        ],
+        "uncounted_requests": 0,
+    }
+
+    def collected(self, **changes):
+        reach = scanner.summarize_observed({**self.SUMMARY, **changes}, {"api.example.test"})
+        bundle = evidence_bundle.build_evidence_bundle(
+            build_args(), self_context(), dict(HOST_PAIR), identity(observed_reach=reach)
+        )
+        self.assertEqual(evidence_bundle.contract_problems(bundle), [])
+        return bundle
+
+    def test_the_collectors_summary_answers_destinations_with_its_window(self):
+        # DR-296: hosts and counts from `railmon collect --summary-file`.
+        bundle = self.collected()
+        attributes = bundle["attributes"]
+        field = attributes["observed_destinations"]
+        self.assertEqual(field["status"], "ANSWERED")
+        self.assertIn("railmon collect", field["method"])
+        self.assertEqual([d["host"] for d in field["value"]], ["api.example.test", "evil.test"])
+        self.assertEqual(field["value"][0]["count"], 5)
+        self.assertEqual(attributes["undeclared_destinations"]["value"], ["evil.test"])
+        self.assertEqual(bundle["inputs_attempted"]["runtime"],
+                         {"attempted": True, "reached": True, "window_seconds": 5400})
+        # It reads no tool calls, so it says nothing of tool names.
+        self.assertEqual((attributes["tool_names"]["status"], attributes["tool_names"]["reason"]),
+                         ("BLIND", "NOT_COLLECTED_BY_PACK"))
+
+    def test_hosts_past_the_summarys_cap_make_the_list_partial(self):
+        field = self.collected(uncounted_requests=7)["attributes"]["observed_destinations"]
+        self.assertEqual((field["status"], field["reason"]), ("PARTIAL", "SIZE_CAP_EXCEEDED"))
+        self.assertIn("past the summary's cap", field["note"])
+        # The note carries no count, so a growing one is no new bundle.
+        self.assertEqual(evidence_bundle.content_fingerprint(self.collected(uncounted_requests=7)),
+                         evidence_bundle.content_fingerprint(self.collected(uncounted_requests=8)))
+
+    def test_a_window_that_cannot_be_read_is_left_out(self):
+        for changes in ({"started_at": "yesterday"}, {"generated_at": None},
+                        {"started_at": "2026-11-26T10:00:00Z"}, {"started_at": "2026-11-26T08:00:00"}):
+            with self.subTest(changes=changes):
+                runtime = self.collected(**changes)["inputs_attempted"]["runtime"]
+                self.assertNotIn("window_seconds", runtime)
+
+    def test_counts_and_the_window_alone_do_not_make_a_new_bundle(self):
+        first = self.collected()
+        later = self.collected(generated_at="2026-11-26T10:00:00Z", network_targets=[
+            {"host": "api.example.test", "count": 50, "error_count": 9},
+            {"host": "evil.test", "count": 2, "error_count": 2},
+        ])
+        self.assertNotEqual(first["inputs_attempted"], later["inputs_attempted"])
+        self.assertEqual(evidence_bundle.content_fingerprint(first), evidence_bundle.content_fingerprint(later))
+        # Ordered by count, the two hosts trade places: still no change.
+        swapped = self.collected(network_targets=[
+            {"host": "api.example.test", "count": 5, "error_count": 1},
+            {"host": "evil.test", "count": 9, "error_count": 0},
+        ])
+        self.assertEqual(swapped["attributes"]["observed_destinations"]["value"][0]["host"], "evil.test")
+        self.assertEqual(evidence_bundle.content_fingerprint(first), evidence_bundle.content_fingerprint(swapped))
+        new_host = self.collected(network_targets=self.SUMMARY["network_targets"] + [
+            {"host": "third.test", "count": 1, "error_count": 0}])
+        self.assertNotEqual(evidence_bundle.content_fingerprint(first), evidence_bundle.content_fingerprint(new_host))
+
 
 class ObservedListenersBundleTest(unittest.TestCase):
     """The listening half of observed reach in the bundle (DR-125)."""
@@ -2143,6 +2213,20 @@ class ScanExitAndConfigTest(unittest.TestCase):
                 features = json.loads(Path(tmp, "features.json").read_text())
                 hosts = [d["host"] for d in features["observed_reach"]["destinations"]]
                 self.assertEqual(hosts, ["api.example.test"])
+
+    def test_an_observed_file_not_yet_written_reads_blind(self):
+        # DR-296: `railmon collect` writes it when it first attaches; a scan
+        # before then has nobody watching, and goes on.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self.run_scan(tmp, ["--mode", "self", "--host-id", "h-1", "--no-feature-file",
+                                       "--evidence-bundle-output", f"{tmp}/bundle.json"],
+                                 {"RAIL_OBSERVED_FILE": f"{tmp}/observed.json"})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("not there yet", proc.stderr)
+            bundle = json.loads(Path(tmp, "bundle.json").read_text())
+            self.assertEqual(bundle["attributes"]["observed_destinations"]["status"], "BLIND")
 
 
 class UnchangedBundleReuseTest(unittest.TestCase):

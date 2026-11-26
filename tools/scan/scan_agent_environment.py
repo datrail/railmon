@@ -2728,6 +2728,33 @@ def collect_model_egress(env: dict[str, str]) -> dict[str, Any]:
     return {"base_url": redact_url(base_url), "base_url_class": classify_base_url(base_url)}
 
 
+# The destinations summary `railmon collect --summary-file` writes (DR-296):
+# AgentSight's `network_targets` shape, host names and counts only.
+OBSERVED_SUMMARY_SCHEMA = "railmon-observed/1"
+
+
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def observed_window_seconds(snapshot: dict[str, Any]) -> int | None:
+    """Seconds from the summary's `started_at` to its `generated_at`, or
+    None when either is missing or unreadable, or they run backwards."""
+    def when(name: str) -> datetime | None:
+        text = snapshot.get(name)
+        if not isinstance(text, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else None
+    start, end = when("started_at"), when("generated_at")
+    if start is None or end is None or end < start:
+        return None
+    return int((end - start).total_seconds())
+
+
 def summarize_observed(snapshot: dict[str, Any], declared_hosts: set[str]) -> dict[str, Any]:
     """Turn an AgentSight snapshot into the behaviour dimension.
 
@@ -2758,10 +2785,15 @@ def summarize_observed(snapshot: dict[str, Any], declared_hosts: set[str]) -> di
         )
 
     summary = snapshot.get("summary") or {}
+    collected = snapshot.get("schema_version") == OBSERVED_SUMMARY_SCHEMA
     return {
-        "source": "agentsight",
+        "source": "railmon-collect" if collected else "agentsight",
         "snapshot_schema_version": snapshot.get("schema_version"),
         "generated_at": snapshot.get("generated_at"),
+        # `railmon collect --summary-file` (DR-296) says when its window
+        # began, and how many requests went to hosts past its cap.
+        **({"window_seconds": observed_window_seconds(snapshot),
+            "uncounted_requests": _count(snapshot.get("uncounted_requests"))} if collected else {}),
         "sessions": summary.get("sessions"),
         "llm_calls": summary.get("llm_calls"),
         "destinations": sorted(destinations, key=lambda d: -(d["count"] or 0)),
@@ -3594,12 +3626,16 @@ def load_file_events(path: Path, env: dict[str, str] | None = None) -> dict[str,
         raise ScannerError(f"cannot read filesnoop events {path}: {exc}") from exc
 
 
-def load_snapshot(path: Path) -> dict[str, Any]:
+def load_snapshot(path: Path, missing_ok: bool = False) -> dict[str, Any] | None:
     # Read it whole. load_json_file() goes through read_text(), which caps at
     # 64 KB for config files; a snapshot of a real session is megabytes, and the
     # truncated read fails to parse with nothing to suggest the file was fine.
     try:
         data = strict_json_loads(path.read_text(encoding="utf-8", errors="replace"))
+    except FileNotFoundError as exc:
+        if missing_ok:
+            return None
+        raise ScannerError(f"cannot read AgentSight snapshot {path}: {exc}") from exc
     except OSError as exc:
         raise ScannerError(f"cannot read AgentSight snapshot {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
@@ -3745,10 +3781,16 @@ def scan(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any], dict
     )
     observed_file = resolve_observed_file(args)
     if observed_file:
-        identity["observed_reach"] = summarize_observed(
-            load_snapshot(Path(observed_file).expanduser()),
-            declared_hosts(identity, context["env"]),
-        )
+        observed_path = Path(observed_file).expanduser()
+        check_probe_file_owner(observed_path, getattr(args, "container", None))
+        snapshot = load_snapshot(observed_path, missing_ok=True)
+        if snapshot is None:
+            # `railmon collect` writes it when it first attaches; until then
+            # nobody has watched, which the bundle says as BLIND.
+            print(f"[railmon scan] {observed_path} is not there yet; observed reach stays blind",
+                  file=sys.stderr)
+        else:
+            identity["observed_reach"] = summarize_observed(snapshot, declared_hosts(identity, context["env"]))
     listen_file = resolve_listen_file(args)
     if listen_file:
         check_probe_file_owner(Path(listen_file).expanduser(), getattr(args, "container", None))

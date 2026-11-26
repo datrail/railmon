@@ -473,6 +473,18 @@ python3 .../scan_agent_environment.py --observed-file snapshot.json
 `RAIL_OBSERVED_FILE` works in place of the flag, like `RAIL_LISTEN_FILE` for
 `--listen-file`.
 
+`railmon collect --summary-file PATH` (`RAIL_COLLECT_SUMMARY_FILE`) writes a
+file of the same shape from the requests it forwards (DR-296): each host, how
+many requests went there and how many got no response or an error status. It
+has no paths, headers, bodies or tool calls, so `tool_names` stays `BLIND`
+when it's the source. Its `started_at` is when it was first written, and the
+runtime source's `window_seconds` is the time from then to its last write,
+time the collector was stopped included.
+Past 1024 hosts, `observed_destinations` is `PARTIAL`. A scan before the
+collector has written it reads observed reach as `BLIND`. The window length
+and the counts don't count as a change when an interval scan decides whether
+to re-send the previous bundle, so a new ASP comes only with a new host.
+
 AgentSight has already done the parsing and the aggregation, so the scanner only
 classifies, redacts and diffs — it grows no parser of its own. The payoff is
 `undeclared_destinations`: hosts the agent reached that nothing in its

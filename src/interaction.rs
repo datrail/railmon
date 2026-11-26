@@ -172,7 +172,7 @@ fn opt_string(v: Option<String>) -> Value {
     v.map(Value::String).unwrap_or(Value::Null)
 }
 
-fn path_and_destination(request: Option<&Value>) -> (String, String) {
+pub(crate) fn path_and_destination(request: Option<&Value>) -> (String, String) {
     let raw_path = request
         .and_then(|r| r.get("path"))
         .and_then(Value::as_str)

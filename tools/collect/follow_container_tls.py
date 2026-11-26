@@ -48,7 +48,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "listen"))
-from follow_container import container_pid, container_ref, preflight, waiting_reason  # noqa: E402
+from follow_container import claim_output, container_pid, container_ref, preflight, waiting_reason  # noqa: E402
 
 POLL_SECONDS = 2.0
 PROC = "/proc"
@@ -208,6 +208,17 @@ def stop(child: subprocess.Popen) -> int:
         return child.wait()
 
 
+def summary_file(collector_args: list[str]) -> str | None:
+    """The collector's `--summary-file`, else RAIL_COLLECT_SUMMARY_FILE, as
+    the collector itself resolves it."""
+    for i, arg in enumerate(collector_args):
+        if arg == "--summary-file" and i + 1 < len(collector_args):
+            return collector_args[i + 1] or None
+        if arg.startswith("--summary-file="):
+            return arg.split("=", 1)[1] or None
+    return os.environ.get("RAIL_COLLECT_SUMMARY_FILE") or None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--collector", default=os.environ.get("RAIL_COLLECTOR", "/usr/local/bin/railmon"),
@@ -227,6 +238,17 @@ def main() -> int:
     if problem:
         log(problem)
         return 2
+    # The destinations summary (DR-296) outlives the collector, like the
+    # listen and files probes' output: started for another agent, it moves
+    # to `<path>.previous` and a fresh one begins.
+    summary = summary_file(passthrough)
+    if summary:
+        try:
+            moved = claim_output(summary, args.container)
+        except OSError as exc:
+            moved = f"cannot mark {summary} as {args.container}'s, keeping it: {exc}"
+        if moved:
+            log(moved)
     docker = os.environ.get("RAIL_DOCKER", "docker")
     cache: dict = {}
     child: subprocess.Popen | None = None

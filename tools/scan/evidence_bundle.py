@@ -163,7 +163,11 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # Pack 19 also (DR-295): mcp_servers_declared's names are redacted and then
 # stripped, as a skill's server is, with a name empty once stripped left
 # out; a tool with no description is "tool declared by <server>", without
-# the config path.
+# the config path. Pack 19 also (DR-296): `railmon collect --summary-file`
+# writes the hosts it forwarded requests to, and a scan reading that file
+# as RAIL_OBSERVED_FILE reports observed_destinations and
+# undeclared_destinations from it (BLIND before), with the runtime source's
+# window_seconds; tool_names stays BLIND, since the file holds no tool calls.
 RULE_PACK_VERSION = 19
 
 # The value shape of observed_file_access (DR-154), published in the v1
@@ -683,15 +687,19 @@ def failed_attributes(template_attributes: dict[str, Any], exclude_keys: frozens
     }
 
 
-def _source(attempted: bool, reached: bool, reason: str) -> dict[str, Any]:
+def _source(attempted: bool, reached: bool, reason: str, window_seconds: int | None = None) -> dict[str, Any]:
     """One `inputs_attempted` entry, with `reached` and a `reason` exactly
     where the schema wants them: `reached` on anything attempted, and the
-    reason whenever the source was not attempted or not reached."""
+    reason whenever the source was not attempted or not reached.
+    `window_seconds`, for the runtime source only, is the length of the
+    window its observation covers."""
     entry: dict[str, Any] = {"attempted": attempted}
     if attempted:
         entry["reached"] = reached
     if not attempted or not reached:
         entry["reason"] = reason
+    if window_seconds is not None and attempted and reached:
+        entry["window_seconds"] = window_seconds
     return entry
 
 
@@ -991,6 +999,8 @@ def build_evidence_bundle(
             True,
             mode == "self" or bool(reach) or listening is not None or file_access is not None,
             "NO_SOURCE_ACCESS",
+            # How long `railmon collect`'s summary has watched (DR-296).
+            window_seconds=reach.get("window_seconds"),
         ),
         # A root the operator named and we could not read is the failure the
         # permissions attribute names precisely; any failure means this source
@@ -1128,8 +1138,16 @@ def build_evidence_bundle(
             note="no AgentSight snapshot was provided to this scan",
         )
 
+    # `railmon collect`'s destinations summary (DR-296) counts hosts and
+    # reads no tool calls, so it says nothing about tool names.
+    collected = reach.get("source") == "railmon-collect"
     tools_used = sorted(reach.get("tools_used") or [])
-    if reach:
+    if collected:
+        attributes["tool_names"] = _blind(
+            "NOT_COLLECTED_BY_PACK", "observed",
+            note="railmon collect's destinations summary carries hosts, not tool calls",
+        )
+    elif reach:
         attributes["tool_names"] = (
             _answered(tools_used, "observed", authored_by="none",
                       note="floor, not a count — tools not exercised in the window are absent here")
@@ -1154,10 +1172,18 @@ def build_evidence_bundle(
     else:
         attributes["declared_destinations"] = _absent("no declared hosts in the MCP config or env", "declared")
 
-    if reach:
+    uncounted = reach.get("uncounted_requests") or 0
+    if collected and uncounted:
+        attributes["observed_destinations"] = _partial(
+            reach.get("destinations") or [], "observed", "SIZE_CAP_EXCEEDED", authored_by="none",
+            method="railmon collect's destinations summary: hosts and counts, no paths",
+            note="requests went to hosts past the summary's cap of 1024, and those hosts are not listed",
+        )
+    elif reach:
         attributes["observed_destinations"] = _answered(
             reach.get("destinations") or [], "observed", authored_by="none",
-            method="AgentSight snapshot, names and counts only",
+            method=("railmon collect's destinations summary: hosts and counts, no paths" if collected
+                    else "AgentSight snapshot, names and counts only"),
             note="a finite window; destinations unseen in it are not destinations that do not exist",
         )
     else:
@@ -2065,10 +2091,48 @@ _VOLATILE_ENVELOPE_KEYS = frozenset({"bundle_id", "collected_at"})
 _previous_bundles: dict[tuple[Any, ...], tuple[str, dict[str, Any]]] = {}
 
 
+# What only measures how much was watched (DR-296): the runtime source's
+# window length and the traffic counts on each observed destination. They
+# grow on every scan while the agent runs, so leaving them in the
+# fingerprint would make every interval a new ASP. A change to anything
+# else (a new host) is still a new bundle, which carries the counts and the
+# window as they are then.
+_COUNTED_DESTINATION_KEYS = frozenset({"count", "error_count"})
+
+
+def _without_counts(node: Any) -> Any:
+    if isinstance(node, list):
+        return [_without_counts(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    view: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "inputs_attempted" and isinstance(value, dict):
+            value = {
+                name: ({k: v for k, v in source.items() if k != "window_seconds"}
+                       if isinstance(source, dict) else source)
+                for name, source in value.items()
+            }
+        elif key == "observed_destinations" and isinstance(value, dict) and isinstance(value.get("value"), list):
+            # The list is ordered by count, so the view is sorted as well:
+            # two hosts trading places is no change either.
+            items = [
+                {k: v for k, v in item.items() if k not in _COUNTED_DESTINATION_KEYS}
+                if isinstance(item, dict) else item
+                for item in value["value"]
+            ]
+            value = {**value, "value": sorted(items, key=lambda item: json.dumps(item, sort_keys=True))}
+        else:
+            value = _without_counts(value)
+        view[key] = value
+    return view
+
+
 def content_fingerprint(bundle: dict[str, Any]) -> str:
-    """sha256 over the bundle minus `bundle_id` and `collected_at`."""
+    """sha256 over the bundle minus `bundle_id` and `collected_at`, and
+    minus the window length and destination counts (`_without_counts`)."""
     content = {key: value for key, value in bundle.items() if key not in _VOLATILE_ENVELOPE_KEYS}
-    canonical = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    canonical = json.dumps(_without_counts(content), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
