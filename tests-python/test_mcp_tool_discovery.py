@@ -170,6 +170,15 @@ class McpServerSkillsTest(unittest.TestCase):
         for skill in skills:
             self.assertEqual(skill["source_type"], "mcp_config")
 
+    def test_a_tool_without_a_description_is_described_without_the_config_path(self):
+        # DR-295: Rail Center keys its cache and its prompt on the
+        # description, so one tool read from two config paths stays one.
+        with FakeMcpServer([{"name": "track_package"}]) as server:
+            first = scanner.mcp_server_skills("shipping", {"url": server.url}, Path("/a/.mcp.json"))
+            second = scanner.mcp_server_skills("shipping", {"url": server.url}, Path("/b/openclaw.json"))
+        self.assertEqual(first[0]["description"], "tool declared by shipping")
+        self.assertEqual(first[0]["description"], second[0]["description"])
+
     def test_a_key_shaped_endpoint_stays_out_of_the_tool_description(self):
         with FakeMcpServer([{"name": "t", "description": "d"}]) as server:
             skills = scanner.mcp_server_skills(

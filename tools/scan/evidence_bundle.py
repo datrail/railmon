@@ -160,6 +160,10 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # that carries the probe record it could not parse is read as that record:
 # lost only if the record itself is (a start-up line the runner refused
 # for a missing pid, which dropped nothing, no longer reads as a loss).
+# Pack 19 also (DR-295): mcp_servers_declared's names are redacted and then
+# stripped, as a skill's server is, with a name empty once stripped left
+# out; a tool with no description is "tool declared by <server>", without
+# the config path.
 RULE_PACK_VERSION = 19
 
 # The value shape of observed_file_access (DR-154), published in the v1

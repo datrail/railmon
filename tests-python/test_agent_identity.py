@@ -653,6 +653,17 @@ class McpInventoryTest(unittest.TestCase):
 
         self.assertNotIn("sk-live-abc123def456ghi789", repr(inventory))
 
+    def test_a_declared_name_is_spelled_as_its_skills_server_and_an_empty_one_is_left_out(self):
+        """DR-295: Rail Center's capture plan joins skills_inventory[].server
+        to mcp_servers_declared[].name, and a skill's server is stripped."""
+        servers = {"github ": {"url": "https://api.example.com/mcp"}, "  ": {"url": "https://x.example/mcp"},
+                   "": {"command": "x"}, "files": {"command": "files-mcp"}}
+        inventory = scanner.mcp_inventory_entries(servers, ".mcp.json")
+        self.assertEqual([entry["name"] for entry in inventory], ["github", "files"])
+        skill = scanner.normalize_skill({"name": "t", "description": "d", "source_type": "mcp_config",
+                                         "entry": "tool", "server": "github "}, ".mcp.json")
+        self.assertEqual(skill["server"], inventory[0]["name"])
+
     def test_a_servers_tool_allow_list_is_recorded(self):
         """DR-218: adding tools to a server's allow list widens what the agent
         can do, so it changes the inventory. The lists are sets: order and
@@ -771,6 +782,10 @@ class McpEnvInventoryTest(unittest.TestCase):
 
     def test_missing_either_var_yields_nothing(self):
         self.assertEqual(scanner.read_mcp_inventory_from_env({"AGENT_MCP_NAME": "delivery"}), [])
+        # DR-295: spelled as a config's key is, and as its skills' server.
+        spaced = {"AGENT_MCP_NAME": " delivery ", "AGENT_MCP_URL": "http://d.example/mcp"}
+        self.assertEqual([e["name"] for e in scanner.read_mcp_inventory_from_env(spaced)], ["delivery"])
+        self.assertEqual(scanner.read_mcp_inventory_from_env({**spaced, "AGENT_MCP_NAME": "  "}), [])
         self.assertEqual(scanner.read_mcp_inventory_from_env({"AGENT_MCP_URL": "http://x:1/mcp"}), [])
         self.assertEqual(scanner.read_mcp_inventory_from_env({}), [])
 

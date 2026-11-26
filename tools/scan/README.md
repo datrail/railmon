@@ -1365,6 +1365,10 @@ a probe gap, so `observed_listeners`, `observed_ingress_peers` and
 `PARTIAL` with "restarted N times". An AgentSight runner diagnostic that
 carries the line it refused is read as that line, so a refused line that
 dropped nothing (a warning, a liveness record) is no longer a lost event.
+`mcp_servers_declared` spells each name as its skills' `server` is spelled
+(redacted, then stripped), leaving out a name that is empty once stripped, and
+a tool listed with no description is `tool declared by <server>`, without the
+config's path (DR-295).
 
 A self or docker scan reports `http_operations` as `BLIND`,
 `NOT_COLLECTED_BY_PACK`, and probes its MCP servers one after another, with no
