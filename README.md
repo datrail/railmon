@@ -244,6 +244,12 @@ the agent container and runs the probe beside itself, scoped to the
 container's PID namespace. The agent sees and can signal neither. When the
 container's PID changes (the agent restarted) the supervisor restarts the
 probe on the new namespace, and when the probe exits it attaches again.
+Each attach's `start` record names the agent's run (`agent_run`: the host's
+boot ID and the PID and start time of the container's init process), so an
+attach to a new run (after a reboot, `docker restart` or an upgrade that
+recreates the agent) is not read as a gap the agent ran through, and the
+lists stay as they were. A probe that restarts while the agent runs on is
+still a gap. Each event counted as lost is logged with its cause.
 Start `listen` before the scan: it creates the file, and a scan fails while
 the file is missing. The file holds one agent's records:
 `listen.jsonl.container` names the agent it was written for, and when

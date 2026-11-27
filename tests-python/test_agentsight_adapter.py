@@ -46,6 +46,7 @@ def _load(name: str, path: Path):
 adapter = _load("agentsight_adapter", ADAPTER)
 scanner = _load("scan_agent_environment", ROOT / "tools" / "scan" / "scan_agent_environment.py")
 evidence_bundle = _load("evidence_bundle", ROOT / "tools" / "scan" / "evidence_bundle.py")
+follow = _load("follow_container", SUPERVISOR)
 
 # Just after the fixtures' last heartbeat (10:00:04Z, every 2s): fresh.
 NOW = datetime(2026, 10, 8, 10, 0, 5, tzinfo=timezone.utc)
@@ -407,6 +408,65 @@ class LivenessTest(unittest.TestCase):
                                {"kind": "lost", "count": 2}])
 
 
+    def test_a_refused_line_the_diagnostic_carries_is_read_as_itself(self):
+        # DR-320: AgentSight's runner wraps a probe line it refused (missing
+        # pid, comm or timestamp) in a runner_parse_error with the line as
+        # `raw`. Only an event that is itself unwritable is a loss.
+        def refused(line, reason="missing pid"):
+            return json.dumps({"timestamp": 1, "source": "diagnostic", "pid": 0, "comm": "process",
+                               "data": {"type": "runner_parse_error", "runner": "process",
+                                        "reason": reason, "parse_error_count": 1,
+                                        "raw": line}}).encode()
+        logged: list[str] = []
+        instance = adapter.Adapter("listen", log=logged.append)
+        out = records(adapt([
+            refused({"event": "WARNING", "type": "ATTACH_FALLBACK"}),
+            refused({"event": "WARNING", "type": "AGG_MAP_OVERFLOW", "overflow_count": 3}),
+            refused({"event": "SUMMARY", "type": "NET_LISTEN", "protocol": "tcp", "port": 80,
+                     "address": "0.0.0.0", "timestamp": 1, "comm": "srv"}),
+            refused("not an object"),
+            json.dumps({"source": "diagnostic", "data": {"event": "CLOCK_SYNC"}}).encode(),
+        ], "listen", instance))
+        self.assertEqual(out, [{"kind": "lost", "count": 3}, {"kind": "lost", "count": 1},
+                               {"kind": "lost", "count": 1}])
+        self.assertEqual(logged, [
+            "lost 3 events: the probe's network summary map overflowed (AGG_MAP_OVERFLOW)",
+            "lost 1 event: a NET_LISTEN with no usable address, port or pid",
+            "lost 1 event: AgentSight's runner refused a line (missing pid)",
+        ])
+        # A file open needs its pid: one refused without it is a loss, not
+        # an open from pid 0 (outside the namespace).
+        files = records(adapt([refused({"event": "FILE_OPEN", "filepath": "/a", "read": True,
+                                        "write": False, "exec": False, "comm": "a"})], "files"))
+        self.assertEqual(files, [{"kind": "lost", "count": 1}])
+        recovered = records(adapt([refused({"event": "FILE_OPEN", "pid": 5, "filepath": "/a",
+                                            "read": True, "write": False, "exec": False},
+                                           "missing comm")], "files"))
+        self.assertEqual([(r["kind"], r["path"], r["pid"]) for r in recovered], [("open", "/a", 5)])
+
+    def test_each_cause_is_logged_a_bounded_number_of_times(self):
+        logged: list[str] = []
+        instance = adapter.Adapter("files", log=logged.append)
+        adapt([b"{not json\n"] * (adapter.LOSS_LOGGED + 5)
+              + [raw(event="FILE_OPEN_LOST", pid=0, comm="process", count=2)], "files", instance)
+        self.assertEqual(len(logged), adapter.LOSS_LOGGED + 1)
+        self.assertTrue(logged[adapter.LOSS_LOGGED - 1].endswith(
+            "; further losses from this cause are not logged"), logged)
+        self.assertEqual(logged[-1], "lost 2 events: the probe reported FILE_OPEN_LOST")
+
+    def test_a_diagnostic_reason_is_quoted_short_and_printable(self):
+        logged: list[str] = []
+        instance = adapter.Adapter("files", log=logged.append)
+        lines = [json.dumps({"source": "diagnostic",
+                             "data": {"reason": f"bad\nline {n} " + "x" * 200,
+                                      "parse_error_count": n}}).encode()
+                 for n in range(adapter.LOSS_CAUSES + 3)]
+        adapt(lines, "files", instance)
+        self.assertTrue(all("\n" not in entry and len(entry) < 200 for entry in logged))
+        self.assertEqual(len(instance.losses), adapter.LOSS_CAUSES + 1)
+        self.assertEqual(instance.losses["other causes"], 3)
+
+
 class StreamTest(unittest.TestCase):
 
     def test_a_held_batch_is_written_when_the_stream_goes_quiet(self):
@@ -491,6 +551,74 @@ class WiringTest(unittest.TestCase):
                          ["-m 0 --pidns-of 4242 --heartbeat 5", "-m 0 --pidns-of 4343 --heartbeat 5"])
         self.assertIn("[railmon files] attaching to agent (pid 4343)", stderr)
         self.assertEqual(supervisor.returncode, 0)
+
+    def test_each_start_names_the_agents_run_so_its_restart_is_no_gap(self):
+        # DR-320: a reboot or `docker restart` is a new run of the agent,
+        # and the attach to it is not a probe restart. A probe that ended
+        # while its run went on is a gap, whatever run comes next.
+        first, second, third = (subprocess.Popen(["sleep", "60"]) for _ in range(3))
+        expected = [follow.agent_run(p.pid) for p in (first, second, third)]
+        pid_file = self.dir / "pid"
+        pid_file.write_text(f"{first.pid}\n")
+        docker = self.dir / "docker"
+        docker.write_text(f'#!/bin/sh\ncat "{pid_file}"\n')
+        docker.chmod(0o755)
+        output = self.dir / "files.jsonl"
+        supervisor = subprocess.Popen(
+            [sys.executable, str(SUPERVISOR), "--source", "agentsight", "--command", "files",
+             "--output", str(output), "--heartbeat", "5", "agent"],
+            env={**self.env, "RAIL_DOCKER": str(docker)}, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(self.wait_for(lambda: output.exists() and '"kind":"start"' in output.read_text()))
+            first.kill()  # the agent restarted: its old run is gone
+            first.wait()
+            pid_file.write_text(f"{second.pid}\n")
+            self.assertTrue(self.wait_for(lambda: output.read_text().count('"kind":"start"') >= 2))
+            # The probe stopped while `second` still runs (here: the watcher
+            # saw another PID, as after Docker stopped answering), so the
+            # attach to `third` follows a gap.
+            pid_file.write_text(f"{third.pid}\n")
+            self.assertTrue(self.wait_for(lambda: output.read_text().count('"kind":"start"') >= 3))
+        finally:
+            supervisor.send_signal(signal.SIGTERM)
+            supervisor.communicate(timeout=20)
+            for process in (first, second, third):
+                process.kill()
+                process.wait()
+        lines = output.read_text().splitlines()
+        starts = [json.loads(line) for line in lines if line.startswith('{"kind":"start"')][:3]
+        self.assertTrue(all(expected), expected)
+        self.assertEqual(len(set(expected)), 3)
+        self.assertEqual([start["agent_run"] for start in starts], expected)
+        self.assertEqual([start.get("after_gap") for start in starts], [None, None, True])
+        summary = scanner.summarize_file_access(lines)
+        self.assertEqual((summary["restarted"], summary["restarts"], summary["agent_restarts"]),
+                         (True, 1, 1))
+
+    def test_a_start_tag_keeps_kind_first_and_closes_the_gap(self):
+        gap = follow.Gap()
+        gap.open = True
+        start = b'{"kind":"start","time":"t","every":5}\n'
+        out = list(follow.tag_starts([start, start, b'{"kind":"alive"}\n'], "b:1:2", gap))
+        self.assertTrue(out[0].startswith(b'{"kind":"start"'))
+        self.assertEqual([json.loads(line).get("after_gap") for line in out[:2]], [True, None])
+        self.assertEqual(json.loads(out[1])["agent_run"], "b:1:2")
+        self.assertEqual(out[2], b'{"kind":"alive"}\n')
+        self.assertEqual(list(follow.tag_starts([start], None)), [start])
+        self.assertIsNone(follow.agent_run(2 ** 22 + 12345))  # no such process
+
+    def test_a_run_that_ends_within_the_grace_is_no_gap(self):
+        alive = subprocess.Popen(["sleep", "60"])
+        ending = subprocess.Popen(["sleep", "0.2"])
+        try:
+            runs = follow.agent_run(alive.pid), follow.agent_run(ending.pid)
+            threading.Thread(target=ending.wait, daemon=True).start()  # reaped as it exits
+            self.assertTrue(follow.still_running(alive.pid, runs[0], grace=0.3))
+            self.assertFalse(follow.still_running(ending.pid, runs[1], grace=2))
+        finally:
+            alive.kill()
+            alive.wait()
+            ending.wait()
 
     def test_tracefs_is_mounted_only_when_missing_and_a_refusal_is_logged(self):
         # A privileged container has no tracefs, and the process probe's

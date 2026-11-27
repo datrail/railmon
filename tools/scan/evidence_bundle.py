@@ -151,7 +151,16 @@ BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 # or NODE_VERSION gives it. And the webhook passes one --config-path per
 # path in the scan-config-path annotation, so fields on an agent's other
 # volumes are read rather than BLIND.
-RULE_PACK_VERSION = 18
+# Pack 19 (DR-320): a probe start naming a new agent_run after one that
+# named another, without after_gap (the probe ended while the previous run
+# went on), is the agent's own restart, not a probe gap, so a reboot,
+# `docker restart` or recreated container no longer makes
+# observed_listeners, observed_ingress_peers and observed_file_access
+# PARTIAL with "restarted N times". And an AgentSight runner diagnostic
+# that carries the probe record it could not parse is read as that record:
+# lost only if the record itself is (a start-up line the runner refused
+# for a missing pid, which dropped nothing, no longer reads as a loss).
+RULE_PACK_VERSION = 19
 
 # The value shape of observed_file_access (DR-154), published in the v1
 # schema as `$defs.file_access_value`, which the v1 walk applies to an
@@ -893,7 +902,9 @@ def _probe_gaps(summary: dict[str, Any], probe: str) -> tuple[list[str], bool]:
         # The one count a note carries: it changes only when the probe
         # restarts, so each restart is one drift a user can accept, and the
         # next one is drift again rather than hidden by that accept.
-        restarts = summary["starts"] - 1
+        # A summary from before DR-320 has no `restarts`: every start after
+        # the first was one.
+        restarts = summary.get("restarts", summary["starts"] - 1)
         gaps.append(
             f"{probe} restarted {restarts} time{'s' if restarts != 1 else ''}"
             " (what opened while it was down is missing)"

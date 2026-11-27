@@ -1515,6 +1515,35 @@ class ListenersTest(unittest.TestCase):
         none = self.summary_at(now, self.event())
         self.assertEqual((none["starts"], none["restarted"]), (0, False))
 
+    def test_a_start_for_a_new_run_of_the_agent_is_not_a_restart(self):
+        # DR-320: after a reboot or `docker restart` the supervisor attaches
+        # to the agent's new run, whose start names it; nothing ran unseen.
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 10, 2, 9, 0, 0, tzinfo=timezone.utc)
+        start = '{"kind":"start","time":"2026-10-02T08:59:00Z","every":60%s}'
+        run = lambda name: ',"agent_run":"%s"' % name
+        rebooted = self.summary_at(now, start % run("boot-a:100"), self.event(),
+                                   start % run("boot-b:100"), start % run("boot-b:900"))
+        self.assertEqual((rebooted["starts"], rebooted["restarted"], rebooted["restarts"],
+                          rebooted["agent_restarts"]), (3, False, 0, 2))
+        # The same run twice: the probe restarted while the agent ran on.
+        gap = self.summary_at(now, start % run("boot-a:100"), start % run("boot-a:100"))
+        self.assertEqual((gap["restarted"], gap["restarts"], gap["agent_restarts"]), (True, 1, 0))
+        # A start without the run, either side, counts as before.
+        for lines in ((start % "", start % run("boot-a:100")), (start % run("boot-a:100"), start % "")):
+            older = self.summary_at(now, *lines)
+            self.assertEqual((older["restarted"], older["restarts"]), (True, 1), lines)
+        # A gap after an agent restart still shows.
+        mixed = self.summary_at(now, start % run("a:1"), start % run("b:1"), start % run("b:1"))
+        self.assertEqual((mixed["restarts"], mixed["agent_restarts"]), (1, 1))
+        # The probe ended while the run went on: a gap, whatever run is next.
+        killed = self.summary_at(now, start % run("a:1"), start % (run("b:1") + ',"after_gap":true'))
+        self.assertEqual((killed["restarted"], killed["restarts"], killed["agent_restarts"]), (True, 1, 0))
+        # A run named again was alive, unseen, while another was watched.
+        back = self.summary_at(now, start % run("a:1"), start % run("b:1"), start % run("a:1"))
+        self.assertEqual((back["restarts"], back["agent_restarts"]), (1, 1))
+
     def test_a_heartbeat_from_the_future_is_stale_too(self):
         # A clock stepped back would otherwise keep it "fresh" for as long.
         from datetime import datetime, timezone
