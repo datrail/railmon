@@ -13,6 +13,8 @@ gke-scan design, in this same process.
 | File | What it does |
 |---|---|
 | [`gke_scan.py`](gke_scan.py) | The entry point: configuration, the relay to Rail Center, SIGTERM |
+| [`registry.py`](registry.py) | An image's manifest, config and layers, read by digest from its registry |
+| [`image_fields.py`](image_fields.py) | `user`, `framework_identity`, `credential_provenance` and `in_layer_deleted_secrets`, from the pod spec and the image |
 | [`intake.py`](intake.py) | The intake's HTTPS server and its checks |
 | [`kube.py`](kube.py) | TokenReview, get, list and watch, with gke-scan's own service account |
 | [`cluster_reader.py`](cluster_reader.py) | The watched copy of the enrolled namespaces, and the workloads each change affects |
@@ -238,6 +240,96 @@ The attributes are built with the scanner's own helpers, handed in, so they
 have its shape; `authored_by` is added where gke-scan's bundle is built
 (RC-555). Nothing sends them yet.
 
+## Image fields (RC-553)
+
+gke-scan reads the agent's image by the digest the kubelet pulled (the agent
+container's status `imageID`), never by tag, with [`registry.py`](registry.py):
+
+| Registry | Read with |
+|---|---|
+| Artifact Registry and Container Registry (`*-docker.pkg.dev`, `gcr.io`, `*.gcr.io`) | gke-scan's Google identity: an access token from the metadata server, through Workload Identity. Needs `roles/artifactregistry.reader` on each repository (the setup script, RC-557) |
+| Any other | An anonymous pull token from the token endpoint the registry's `WWW-Authenticate` names, as the public reads it. A registry that still refuses holds a private image: PRIVATE_STORE |
+
+An image index (multi-arch) is followed to the manifest for the node's OS and
+architecture (`linux/amd64` unless the caller says otherwise). Manifests and
+configs get 10 seconds and 4 MiB each, and each is checked against its
+digest. Each layer gets 120 seconds, and an image's layers 10 minutes in all.
+These are deadlines, not socket timeouts: when one passes the read's sockets
+are shut down, however slowly the server was sending, and decompression
+stops. A connection's name lookup and connect attempts get only what is left
+of the deadline, and at most 4 of a name's addresses are tried, so a name
+with many unreachable addresses (or a resolver that stalls) can't stretch a
+read past it. A manifest or config past its deadline is NO_SOURCE_ACCESS
+(tried again after 5 minutes); a layer past its deadline makes the field
+PARTIAL with SIZE_CAP_EXCEEDED, keeping the layers read before it. A layer is read as
+it arrives, gzip, zstd
+(where Python has `compression.zstd`, 3.14 on) or uncompressed, through
+[`image_layers.py`](../../image_layers.py), which keeps only a layer's
+secret-looking file names and its whiteouts, so memory doesn't grow with the
+layer. Each name is normalized as an extractor would place it (`//`, `/./`
+and `..` resolved), so a file and the whiteout that deletes it match however
+the layer spells them. A hostile layer can't make it grow either: zstd is decompressed no
+faster than it is read (every frame of it, with a window of at most
+32 MiB), a tar header (with its long name
+or pax records) gets 1 MiB from where it starts, global pax headers 1 MiB in
+all and an image's kept names 8 MiB, past which the field is PARTIAL with
+SIZE_CAP_EXCEEDED. A manifest or config with more than 262,144 values isn't
+parsed. An image's layers together get `--layer-budget` bytes
+(2 GiB): a layer that would pass it isn't downloaded. A blob's redirect to the
+registry's storage is followed over https only, without reading the
+redirect's body, and the registry's credential is never sent to another
+host. The registry comes from the imageID only when it is a host name, and
+gke-scan's Google token goes only where the request's own URL is a Google
+registry. A token endpoint or redirect that a registry other than Google's
+names isn't followed to a loopback, private or link-local address unless it
+is that registry's own host: the name is resolved once and only its public
+addresses are connected to, so a refused address never sees even a TCP
+handshake. Behind an https proxy (`HTTPS_PROXY`) the proxy resolves the
+name, so this check is then the proxy's to make. The metadata server is
+asked for gke-scan's token directly, never through a proxy, which would see
+the token in clear, and never following a redirect. A token endpoint's
+answer that isn't a JSON object with a usable token (at most 8 KiB), a
+redirect urllib can't follow, or a host name the resolver won't take
+(`a..b`), is NO_SOURCE_ACCESS. Anonymous tokens are kept for at most 256
+registry and repository pairs. What was read is kept for 256 images and
+32 MiB (an image keeps only its config's User, at most 256 characters of it, and the first 1,024 entries
+or 128 KiB of its Env, past which `credential_provenance` is PARTIAL with
+SIZE_CAP_EXCEEDED, and at most 1,024 deleted files), by registry,
+repository, digest and platform, so what one registry answers for a digest
+is never what another's image gets. When the cache is full, a registry host
+holding more than a quarter of it gives up its oldest images first, so one
+registry's images, however large, don't push out another's. A network
+failure, including a read the connection resets or ends short of its
+`Content-Length` or layer size, is NO_SOURCE_ACCESS. Such a read (and any
+other NO_SOURCE_ACCESS: a 404, a token endpoint that failed), and anything
+the reader didn't anticipate (PARSE_FAILED, keeping what was read before
+it), is kept for 5 minutes and then tried again, no
+more often while it stays in the cache however often the image is asked
+for, so a registry that always fails a read halfway can't have every scan
+download the image again. A refusal (PRIVATE_STORE) is kept for 30 minutes,
+so a permission granted later is seen within that. While one thread reads an
+image, another asking for it waits up to 60 seconds for that answer rather
+than reading it alongside, and past that answers NO_SOURCE_ACCESS (not
+cached), so a slow registry holds one thread, not every thread that asks
+for its image.
+
+From the pod spec and that image, [`image_fields.py`](image_fields.py) gives:
+
+| Field | From |
+|---|---|
+| `user` | The agent container's `runAsUser`, else the pod's, else the image config's `User` (empty is root). With no `runAsUser` and an image that can't be read, BLIND with the registry's reason; an image `User` that isn't a user or `user:group` (letters, digits and `._-`, at most 64 characters each), FAILED with PARSE_FAILED, not given |
+| `framework_identity` | The image config's runtime-version variables (`NODE_VERSION`, `PYTHON_VERSION`, `GOLANG_VERSION`, `JAVA_VERSION`, `RUBY_VERSION`, `YARN_VERSION`), named as the sidecar names them (`node: v24.18.1`), each only when it reads as a version (digits, letters and `.+_~-`, at most 64 characters): one that doesn't makes the field PARTIAL with PARSE_FAILED and isn't given. ABSENT when the image sets none |
+| `credential_provenance` | Each credential by name: `baked` (the image config's `Env`, still in the image even when the pod overrides it, `overridden`), or `injected` (a `secretKeyRef`'s Secret and key, a `configMapKeyRef`, or a literal value in the pod spec). An `envFrom` of a whole Secret is PARTIAL naming it, since gke-scan doesn't read Secrets. A URL-shaped value that carries a credential is given as `redact_url` leaves it; no other value is given. At most 256 credentials are listed, by name, and a name longer than 256 characters isn't: either makes the field PARTIAL with SIZE_CAP_EXCEEDED, so an image can't hide a credential behind decoys that sort ahead of it |
+| `in_layer_deleted_secrets` | Each secret-looking file a layer adds and a later layer deletes: its path, size, and the layers that added and deleted it, never its content. PARTIAL with SIZE_CAP_EXCEEDED past the budget, keeping what the layers read show, and when there are more than the 256 it lists; a layer that can't be read is PARTIAL with its reason, keeping what the layers before it found (so a failing last layer can't hide a secret an earlier one deleted), and FAILED only when no layer was read; an empty layer is an empty tar, as it is to containerd |
+
+With `--no-registry-access`, nothing is read: `framework_identity` and
+`in_layer_deleted_secrets` are BLIND with NO_SOURCE_ACCESS, `user` answers
+only from a `runAsUser`, and `credential_provenance` is PARTIAL with only
+what the pod spec injects. A credential is named the way the scanner's
+`credential_inventory` names one (`looks_secret`, `is_benign_secret_name`),
+so a token budget like `AGENT_LLM_MAX_TOKENS=4096` isn't one. Nothing sends
+these yet: gke-scan's bundle is RC-555.
+
 ## Running it
 
 ```sh
@@ -317,6 +409,13 @@ on 11/4 and 11/5: the pod fields the collectors read, and env names with
 every value left out, so a test can check no env content reaches a field) against what
 `central_v3.py` recorded, a moved tag, a pod not yet Ready, and every
 podSelector case.
+
+`tests-python/test_gke_scan_registry.py` covers the registry reader and the
+image fields against a local registry with an anonymous-token endpoint, a
+private repository, a Google-identity repository and blob redirects to
+another host, with images built in the test (the test bed's deleted-secret
+layer, its baked test key, a multi-arch index). `tests-python/test_image_layers.py`
+covers the layer walker.
 
 `tests-python/test_gke_scan_reader.py` covers the configuration (a missing or
 bad value exits 2 naming it; variables over defaults, flags over variables),
